@@ -1,5 +1,6 @@
 from requests import get
 from tomlkit import dumps
+from description_parser import parse_description
 
 project_id = 11167699
 per_page = 100
@@ -24,12 +25,12 @@ def main():
                 "id": i['iid'],
                 "title": i['title'],
                 "state": i['state'],
-                "description": i['description'],
                 "created_at": i['created_at'],
                 "closed_at": i['closed_at'] if i['closed_at'] else "n/a",
                 "labels": i['labels'],
                 "url": i['web_url']
             }
+            issue = issue | parse_description(i['description'])
 
             toml_string = dumps(issue)
             print(toml_string)
