@@ -1,5 +1,5 @@
 from requests import get
-from json import dumps
+from tomlkit import dumps
 
 project_id = 11167699
 per_page = 100
@@ -20,20 +20,19 @@ def main():
 
         data = response.json()
         for i in data:
-
             issue = {
                 "id": i['iid'],
                 "title": i['title'],
                 "state": i['state'],
                 "description": i['description'],
                 "created_at": i['created_at'],
-                "closed_at": i['closed_at'],
+                "closed_at": i['closed_at'] if i['closed_at'] else "n/a",
                 "labels": i['labels'],
                 "url": i['web_url']
             }
 
-            json_string = dumps(obj = issue, indent = 2)
-            print(json_string)
+            toml_string = dumps(issue)
+            print(toml_string)
 
 if __name__ == "__main__":
     main()
