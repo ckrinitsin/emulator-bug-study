@@ -1,0 +1,70 @@
+id = 2337
+title = "Os boot issues on 9p filesystem due to unix domain sockets open failure"
+state = "closed"
+created_at = "2024-05-08T09:53:25.856Z"
+closed_at = "2024-12-11T18:14:04.559Z"
+labels = ["block:9p"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2337"
+host-os = "Ubuntu 22.04 LTS"
+host-arch = "s390x ( but any is affected)"
+qemu-version = "QEMU emulator version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.16)"
+guest-os = "Ubuntu (23.11)"
+guest-arch = "s390x"
+description = """Unix filesystem API is broken, unix domain socket special files return an error at open()"""
+reproduce = """Simple script. Tries to use netcat to get data through a local unix domain socket file   
+```
+#!/bin/bash
+
+# Cleanup target dir
+[ -d ./target ] && rm -rf target
+mkdir target
+
+# Add configuration updates
+mkdir -p ./target/etc/initramfs-tools/
+echo 9p >> ./target/etc/initramfs-tools/modules
+echo 9pnet_virtio >> ./target/etc/initramfs-tools/modules
+
+# Add the test script
+cat > ./target/test_init << EOF
+#!/bin/bash
+
+echo "Test for unix domain sockets"
+
+nc -Ul /socket &
+sleep 1
+echo "Sockets work" | nc -UN /socket || echo "Sockets fail"
+
+echo o > /proc/sysrq-trigger
+sleep 999
+EOF
+chmod 700 ./target/test_init
+
+# Create an Ubuntu 23.10 around it
+echo "Creating Ubuntu target OS"
+debootstrap --variant=minbase\\
+            --include=udev,kmod,initramfs-tools,systemd,netcat-openbsd,linux-image-generic \\
+            --exclude=man,bash-completion \\
+            mantic ./target > /dev/null || exit 1
+
+# Run the test in 9p forwarded filesystem
+echo "Running OS in qemu"
+qemu-system-s390x \\
+  -m 8192 \\
+  -smp 4 \\
+  -nodefaults -nographic -no-reboot -no-user-config \\
+  -kernel ./target/boot/vmlinuz \\
+  -initrd ./target/boot/initrd.img \\
+  -append 'root=fsRoot rw rootfstype=9p rootflags=trans=virtio,version=9p2000.L,msize=512000,cache=mmap,posixacl console=ttysclp0 init=/test_init quiet' \\
+  -fsdev local,security_model=passthrough,multidevs=remap,id=fsdev-fsRoot,path=./target \\
+  -device virtio-9p-pci,id=fsRoot,fsdev=fsdev-fsRoot,mount_tag=fsRoot \\
+  -device virtio-serial-ccw -device sclpconsole,chardev=console \\
+  -chardev stdio,id=console,signal=off 
+```"""
+additional = """Test output:
+```
+Test for unix domain sockets
+qemu-system-s390x: 9p: broken or compromised client detected; attempt to open special file (i.e. neither regular file, nor directory)
+nc: No such device or address
+nc: /socket: No such file or directory
+Sockets fail
+```"""

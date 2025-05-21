@@ -1,0 +1,67 @@
+id = 2111
+title = "Assertion failure with active vhost NIC when snapshot_save_job_bh() is executed as part of a vCPU thread's aio_poll()"
+state = "opened"
+created_at = "2024-01-18T15:19:40.659Z"
+closed_at = "n/a"
+labels = []
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2111"
+host-os = "Proxmox VE 8.1 (but using upstream QEMU)"
+host-arch = "x86"
+qemu-version = "8.2.0 [but originally found with an older version](https://lore.kernel.org/qemu-devel/31757c45-695d-4408-468c-c2de560aff9c@proxmox.com/)"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """During a `snapshot-save` QMP command the `snapshot_save_job_bh()` bottom half can end up being executed as part of a vCPU thread's `aio_poll()`. This is problematic and can lead to an assertion failure (see below for backtrace) when there is an active vhost network device:
+
+```
+qemu-system-x86_64: ../hw/net/virtio-net.c:3835: virtio_net_pre_save: Assertion `!n->vhost_started' failed.
+```"""
+reproduce = """It is very racy and very difficult to reproduce when actually taking snapshots. So the way I can get it pretty reliably is: 
+
+1. Issue `snapshot-save` QMP commands with an invalid device ID in a loop. At the same time, have the guest write to the pflash.
+2. In GDB, wait for `snapshot_save_job_bh()` to be hit by a vCPU thread.
+3. Manually change the device ID to a valid one (`scsi1` in the example) so that taking a snapshot will actually be attempted.
+4. Continue in GDB and the assertion failure will happen."""
+additional = """Full backtrace:
+
+```
+ #0  __pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+ #1  0x00007f1de5ae3d9f in __pthread_kill_internal (signo=6, threadid=<optimized out>) at ./nptl/pthread_kill.c:78
+ #2  0x00007f1de5a94f32 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+ #3  0x00007f1de5a7f472 in __GI_abort () at ./stdlib/abort.c:79
+ #4  0x00007f1de5a7f395 in __assert_fail_base (fmt=0x7f1de5bf3a90 "%s%s%s:%u: %s%sAssertion `%s' failed.\\n%n", assertion=assertion@entry=0x563cb92d56e7 "!n->vhost_started", 
+    file=file@entry=0x563cb92d56d0 "../hw/net/virtio-net.c", line=line@entry=3835, function=function@entry=0x563cb92d65a0 <__PRETTY_FUNCTION__.2> "virtio_net_pre_save") at ./assert/assert.c:92
+ #5  0x00007f1de5a8de32 in __GI___assert_fail (assertion=assertion@entry=0x563cb92d56e7 "!n->vhost_started", file=file@entry=0x563cb92d56d0 "../hw/net/virtio-net.c", line=line@entry=3835, 
+    function=function@entry=0x563cb92d65a0 <__PRETTY_FUNCTION__.2> "virtio_net_pre_save") at ./assert/assert.c:101
+ #6  0x0000563cb8ebf23c in virtio_net_pre_save (opaque=<optimized out>) at ../hw/net/virtio-net.c:3835
+ #7  virtio_net_pre_save (opaque=<optimized out>) at ../hw/net/virtio-net.c:3829
+ #8  0x0000563cb917515b in vmstate_save_state_v (f=0x7f1dc43aec30, vmsd=0x563cb9e5a580 <vmstate_virtio_net>, opaque=0x563cbbb6eb40, vmdesc=0x7f1dc4080040, version_id=11, errp=0x7f1dcbdf9908)
+    at ../migration/vmstate.c:359
+ #9  0x0000563cb9175d0c in vmstate_save_state_with_err (f=<optimized out>, vmsd=<optimized out>, opaque=<optimized out>, vmdesc_id=<optimized out>, errp=<optimized out>) at ../migration/vmstate.c:347
+ #10 0x0000563cb8d9a1b2 in vmstate_save (f=f@entry=0x7f1dc43aec30, se=se@entry=0x563cbbcbdc70, vmdesc=vmdesc@entry=0x7f1dc4080040) at ../migration/savevm.c:1037
+ #11 0x0000563cb8d9d6e6 in qemu_savevm_state_complete_precopy_non_iterable (f=f@entry=0x7f1dc43aec30, in_postcopy=in_postcopy@entry=false, inactivate_disks=inactivate_disks@entry=false)
+    at ../migration/savevm.c:1553
+ #12 0x0000563cb8d9daa2 in qemu_savevm_state_complete_precopy (f=f@entry=0x7f1dc43aec30, iterable_only=iterable_only@entry=false, inactivate_disks=inactivate_disks@entry=false) at ../migration/savevm.c:1628
+ #13 0x0000563cb8da076e in qemu_savevm_state (errp=0x7f1dc42c59f0, f=0x7f1dc43aec30) at ../migration/savevm.c:1734
+ #14 save_snapshot (name=<optimized out>, overwrite=overwrite@entry=false, vmstate=<optimized out>, has_devices=has_devices@entry=true, devices=0x7f1dc4096600, errp=0x7f1dc42c59f0) at ../migration/savevm.c:3131
+ #15 0x0000563cb8da0926 in snapshot_save_job_bh (opaque=0x7f1dc42c5930) at ../migration/savevm.c:3430
+ #16 0x0000563cb9110036 in aio_bh_poll (ctx=ctx@entry=0x563cba818b40) at ../util/async.c:216
+ #17 0x0000563cb90fa09a in aio_poll (ctx=ctx@entry=0x563cba818b40, blocking=blocking@entry=true) at ../util/aio-posix.c:722
+ #18 0x0000563cb8fb1015 in bdrv_poll_co (s=0x7f1dcbdf9db0) at /home/febner/repos/qemu/block/block-gen.h:43
+ #19 blk_pwrite (blk=<optimized out>, offset=offset@entry=91136, bytes=bytes@entry=512, buf=0x7f1dc9a16400, flags=flags@entry=0) at block/block-gen.c:2012
+ #20 0x0000563cb8bb8985 in pflash_update (pfl=pfl@entry=0x563cbaa84bf0, offset=91136, offset@entry=91526, size=size@entry=1) at ../hw/block/pflash_cfi01.c:394
+ #21 0x0000563cb8bbacd8 in pflash_write (be=0, width=1, value=63, offset=91526, pfl=0x563cbaa84bf0) at ../hw/block/pflash_cfi01.c:522
+ #22 pflash_mem_write_with_attrs (opaque=0x563cbaa84bf0, addr=91526, value=<optimized out>, len=1, attrs=...) at ../hw/block/pflash_cfi01.c:681
+ #23 0x0000563cb8f06e2e in access_with_adjusted_size (addr=addr@entry=91526, value=value@entry=0x7f1dcbdf9f58, size=size@entry=1, access_size_min=<optimized out>, access_size_max=<optimized out>, 
+    access_fn=0x563cb8f06710 <memory_region_write_with_attrs_accessor>, mr=<optimized out>, attrs=...) at ../system/memory.c:573
+ #24 0x0000563cb8f07e59 in memory_region_dispatch_write (mr=mr@entry=0x563cbaa84fb0, addr=addr@entry=91526, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ../system/memory.c:1528
+ #25 0x0000563cb8f0f43c in flatview_write_continue (fv=fv@entry=0x7f1dc42e4720, addr=addr@entry=4290864518, attrs=..., attrs@entry=..., ptr=ptr@entry=0x7f1de7946028, len=len@entry=1, addr1=<optimized out>, 
+    l=<optimized out>, mr=0x563cbaa84fb0) at ../system/physmem.c:2714
+ #26 0x0000563cb8f0f6b3 in flatview_write (fv=0x7f1dc42e4720, addr=addr@entry=4290864518, attrs=attrs@entry=..., buf=buf@entry=0x7f1de7946028, len=len@entry=1) at ../system/physmem.c:2756
+ #27 0x0000563cb8f12959 in address_space_write (len=1, buf=0x7f1de7946028, attrs=..., addr=4290864518, as=0x563cb9fd8ec0 <address_space_memory>) at ../system/physmem.c:2863
+ #28 address_space_rw (as=0x563cb9fd8ec0 <address_space_memory>, addr=4290864518, attrs=attrs@entry=..., buf=buf@entry=0x7f1de7946028, len=1, is_write=<optimized out>) at ../system/physmem.c:2873
+ #29 0x0000563cb8f64ab8 in kvm_cpu_exec (cpu=cpu@entry=0x563cbac066d0) at ../accel/kvm/kvm-all.c:2915
+ #30 0x0000563cb8f65ce5 in kvm_vcpu_thread_fn (arg=arg@entry=0x563cbac066d0) at ../accel/kvm/kvm-accel-ops.c:51
+ #31 0x0000563cb90fd1c8 in qemu_thread_start (args=0x563cbaac33c0) at ../util/qemu-thread-posix.c:541
+ #32 0x00007f1de5ae2044 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+ #33 0x00007f1de5b6261c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```"""

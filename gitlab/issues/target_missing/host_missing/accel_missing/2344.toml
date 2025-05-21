@@ -1,0 +1,55 @@
+id = 2344
+title = "Plugin scoreboard deadlock (plugin.lock vs start_exclusive)"
+state = "closed"
+created_at = "2024-05-15T06:27:54.424Z"
+closed_at = "2024-08-17T22:04:10.272Z"
+labels = ["TCG plugins", "workflow::Patch available"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2344"
+host-os = "n/a"
+host-arch = "n/a"
+qemu-version = "9rc4->tip"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """Deadlock
+
+In frame 9 the thread grabs the plugin.lock, and starts to wait for other cpus to enter exclusive idle.
+```
+#7  0x00005555555a1295 in start_exclusive () at ../hw/core/cpu-common.c:199
+#8  plugin_grow_scoreboards__locked (cpu=0x7fff0c2b4720) at ../plugins/core.c:238
+#9  qemu_plugin_vcpu_init_hook (cpu=0x7fff0c2b4720) at ../plugins/core.c:258
+```
+
+The other thread just finished a TB and do the callback to the plugin, so it will not become exclusive idle until it finishes.
+That callback tries to create a new 'scoreboard', but plugin.lock is already taken.
+```
+#7  qemu_plugin_scoreboard_new (element_size=element_size@entry=8) at ../plugins/api.c:464
+#8  0x00007ffff7fb973d in vcpu_tb_trans (id=<optimized out>, tb=0x555555858d60) at /home/rehn/source/qemu/contrib/plugins/hotblocks.c:125
+#9  0x00005555557394f1 in qemu_plugin_tb_trans_cb (cpu=<optimized out>, tb=0x555555858d60) at ../plugins/core.c:418
+```
+
+Locally I'm using this fix, reverse order so we enter exclusive idle before grabbing the plugin.lock:
+```
+diff --git a/plugins/core.c b/plugins/core.c
+index 1e58a57bf1..0e41c4ef22 100644
+--- a/plugins/core.c
++++ b/plugins/core.c
+@@ -236,4 +236,2 @@ static void plugin_grow_scoreboards__locked(CPUState *cpu)
+ 
+-    /* cpus must be stopped, as tb might still use an existing scoreboard. */
+-    start_exclusive();
+     struct qemu_plugin_scoreboard *score;
+@@ -244,3 +242,2 @@ static void plugin_grow_scoreboards__locked(CPUState *cpu)
+     tb_flush(cpu);
+-    end_exclusive();
+ }
+@@ -250,2 +247,4 @@ void qemu_plugin_vcpu_init_hook(CPUState *cpu)
+     bool success;
++    /* cpus must be stopped, as tb might still use an existing scoreboard. */
++    start_exclusive();
+ 
+@@ -259,2 +258,3 @@ void qemu_plugin_vcpu_init_hook(CPUState *cpu)
+     qemu_rec_mutex_unlock(&plugin.lock);
++    end_exclusive();
+```"""
+reproduce = """Run command a few times and get 'unlucky'"""
+additional = "n/a"

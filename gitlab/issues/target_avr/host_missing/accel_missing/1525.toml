@@ -1,0 +1,86 @@
+id = 1525
+title = "Wrong initial value of stack pointer on AVR devices"
+state = "closed"
+created_at = "2023-03-01T15:03:46.130Z"
+closed_at = "2023-11-28T23:12:55.240Z"
+labels = ["target: avr"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/1525"
+host-os = "Windows 11 22H2"
+host-arch = "AMD64"
+qemu-version = "v7.2.0-11948-ge6523b71fc-dirty"
+guest-os = "None"
+guest-arch = "AVR"
+description = """The initial value of stack pointer of AVR MCUs should be RAMEND (address of the end of their RAM), but QEMU initialize them to 0.
+
+`qemu-system-avr -machine help` lists 4 flavors of MCUs which are ATmega168, ATmega2560, ATmega1280, ATmega328P. According to their datasheets, the stack pointer should be initialized as follows on reset.
+
+- [ATmega168](https://ww1.microchip.com/downloads/en/DeviceDoc/Atmel-9365-Automotive-Microcontrollers-ATmega88-ATmega168_Datasheet.pdf#page=12): RAMEND (which is 0x04FF)
+- [ATmega2560 and ATmega1280](https://ww1.microchip.com/downloads/en/devicedoc/atmel-2549-8-bit-avr-microcontroller-atmega640-1280-1281-2560-2561_datasheet.pdf#page=15): RAMEND (which is 0x21FF)
+- [ATmega328P](https://ww1.microchip.com/downloads/aemDocuments/documents/MCU08/ProductDocuments/DataSheets/ATmega48A-PA-88A-PA-168A-PA-328-P-DS-DS40002061B.pdf#page=22): RAMEND (which is 0x08FF)"""
+reproduce = """1. Assemble the assembly code below: `avrasm2 -fI test.asm`
+
+    ```asm
+    ;; test.asm
+    .INCLUDE "m328Pdef.inc"
+
+    .EQU F_CPU = 16000000
+    .EQU BAUD_RATE = 9600
+    .EQU PRESCALE = (F_CPU / (16 * BAUD_RATE)) - 1
+
+    .CSEG
+    start:
+    \t;; initialize USART (serial port)
+    \tLDI R16, LOW(PRESCALE)
+    \tLDI R17, HIGH(PRESCALE)
+    \tSTS UBRR0L, R16
+    \tSTS UBRR0H, R17
+    \tLDI R16, (1 << RXEN0) | (1 << TXEN0)
+    \tSTS UCSR0B, R16
+
+    \t;; Get stack pointer low byte and print it in ASCII
+    \tIN R16, SPL
+    \tLDI R17, 0x30
+    \tADD R16, R17
+    print1:
+    \tLDS r17, UCSR0A
+    \tSBRS r17, UDRE0
+    \tRJMP print1
+    \tSTS UDR0, r16
+
+    \t;; Get stack pointer high byte and print it in ASCII
+    \tIN R16, SPH
+    \tLDI R17, 0x30
+    \tADD R16, R17
+    print2:
+    \tLDS r17, UCSR0A
+    \tSBRS r17, UDRE0
+    \tRJMP print2
+    \tSTS UDR0, r16
+
+    end:
+    \tRJMP end
+    ```
+
+2. Convert it to bin file: `avr-objcopy --input-target=ihex --output-target=binary test.hex test.bin`
+
+3. Run it with QEMU: `qemu-system-avr -machine uno -bios test.bin -serial stdio`
+
+This should print 00 which means that the stack pointer is initialized to 0."""
+additional = """I examined the source code and I think that editing the function `avr_cpu_reset_hold` in `/target/avr/cpu.c` might fix this issue. This is my first time seeing QEMU source code, so I might be wrong, though.
+
+```c
+// in /target/avr/cpu.c line 70
+static void avr_cpu_reset_hold(Object *obj)
+{
+    // ...
+
+    env->rampD = 0;
+    env->rampX = 0;
+    env->rampY = 0;
+    env->rampZ = 0;
+    env->eind = 0;
+    env->sp = 0;    // <-- change this value in accordance with board type?
+
+    //...
+}
+```"""

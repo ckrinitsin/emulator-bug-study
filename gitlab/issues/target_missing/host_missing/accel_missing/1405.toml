@@ -1,0 +1,129 @@
+id = 1405
+title = "linux-user: calling SYS_get_thread_area and SYS_get_thread_area has incorrent result on multithread environment"
+state = "closed"
+created_at = "2023-01-01T12:24:41.485Z"
+closed_at = "2023-03-12T17:41:43.585Z"
+labels = ["linux-user"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/1405"
+host-os = "Ubuntu 22.10"
+host-arch = "x86"
+qemu-version = "qemu-i386 version 7.2.50 (v7.2.0-333-g222059a0fc)"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """"""
+reproduce = """1. Compile test.out by Command and source code: 
+```
+gcc -m32 -g test.c -lpthread -o test.out
+```
+```
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <pthread.h>
+#include <asm/ldt.h>
+
+static inline int set_thread_area( struct user_desc *ptr )
+{
+    return syscall( SYS_set_thread_area, ptr );
+}
+
+static inline int get_thread_area( struct user_desc *ptr )
+{
+    return syscall( SYS_get_thread_area, ptr );
+}
+
+static unsigned int entry_number;
+
+static void* start_routine(void* ptr) 
+{
+    struct user_desc user_desc0 = { entry_number };
+    struct user_desc user_desc1 = { entry_number };
+    struct user_desc user_desc2 = { entry_number };
+    get_thread_area(&user_desc0);
+    printf("child thread: %u\\n", user_desc0.base_addr);
+
+    user_desc1.base_addr = 2;
+    user_desc1.limit     = 0xFFF;
+    user_desc1.seg_32bit = 1;
+    set_thread_area( &user_desc1 );
+
+    get_thread_area(&user_desc2);
+    printf("child thread: %u\\n", user_desc2.base_addr);
+    return NULL;
+}
+
+int main(void) {
+    struct user_desc user_desc0 = { -1 }, user_desc1 = { 0 }, user_desc2 = { 0 };
+    user_desc0.seg_32bit = 1;
+    user_desc0.useable = 1;
+    set_thread_area( &user_desc0 );
+
+    entry_number = user_desc0.entry_number;
+
+    user_desc1.entry_number = entry_number;
+    user_desc1.base_addr = 1;
+    user_desc1.limit     = 0xFFF;
+    user_desc1.seg_32bit = 1;
+    set_thread_area( &user_desc1 );
+
+    pthread_t thread_id;
+    pthread_create(&thread_id, NULL, &start_routine, NULL);
+    pthread_join(thread_id, NULL);
+
+    user_desc2.entry_number = entry_number;
+    get_thread_area(&user_desc2);
+    printf("main  thread: %u\\n", user_desc2.base_addr); // main  thread: 1
+    return 0;
+}
+ ```
+2. Correct Result:
+```
+child thread: 1
+child thread: 2
+main  thread: 1
+```
+qemu-i386 Print Result:
+```
+child thread: 1
+child thread: 2
+main  thread: 2
+```"""
+additional = """patch for fix the bug: 
+
+https://lists.nongnu.org/archive/html/qemu-devel/2023-02/msg02203.html
+
+CPUX86State::gdt::base on differect threads must have different vaules, but it points to same memory.
+value of CPUX86State::gdt::base must be copied when clone thread.
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/x86/kernel/tls.c
+
+SYS_set_thread_area call do_set_thread_area in kernel, it set user_desc to different memroy area on differernt threads. tls_array is in thread local memory.
+
+```
+static void set_tls_desc(struct task_struct *p, int idx,
+\t\t\t const struct user_desc *info, int n)
+{
+\tstruct thread_struct *t = &p->thread;
+\tstruct desc_struct *desc = &t->tls_array[idx - GDT_ENTRY_TLS_MIN];
+\tint cpu;
+
+\t/*
+\t * We must not get preempted while modifying the TLS.
+\t */
+\tcpu = get_cpu();
+
+\twhile (n-- > 0) {
+\t\tif (LDT_empty(info) || LDT_zero(info))
+\t\t\tmemset(desc, 0, sizeof(*desc));
+\t\telse
+\t\t\tfill_ldt(desc, info);
+\t\t++info;
+\t\t++desc;
+\t}
+
+\tif (t == &current->thread)
+\t\tload_TLS(t, cpu);
+
+\tput_cpu();
+}
+```"""

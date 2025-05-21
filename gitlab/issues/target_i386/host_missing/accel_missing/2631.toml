@@ -1,0 +1,89 @@
+id = 2631
+title = "qemu-system-i386: void msix_vector_use(PCIDevice *, unsigned int): Assertion `vector < dev->msix_entries_nr' failed."
+state = "opened"
+created_at = "2024-10-21T05:06:13.988Z"
+closed_at = "n/a"
+labels = ["Fuzzer", "device: PCI", "target: i386"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2631"
+host-os = "Ubuntu"
+host-arch = "ARM"
+qemu-version = "9.0.94"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """While fuzzing, we observed a assertion failures in several virtio devices supporting msi-x functionality."""
+reproduce = """Here is qtest reproducer:
+```bash
+cat << EOF | qemu-system-i386 -display none -machine accel=qtest, -m 512M -machine pc -nodefaults \\
+-device virtio-mouse-pci,vectors=19923041 -qtest stdio
+outl 0xcf8 0x80001020
+outl 0xcfc 0xe0800000
+outl 0xcf8 0x80001004
+outw 0xcfc 0x02
+write 0xe0800010 0x4 0x6100
+EOF
+```
+
+and execution log:
+```
+cat << EOF | qemu-system-i386 -display none -machine accel=qtest, -m 512M -machine pc -nodefaults \\
+-device virtio-mouse-pci,vectors=19923041 -qtest stdio
+outl 0xcf8 0x80001020
+outl 0xcfc 0xe0800000
+outl 0xcf8 0x80001004
+outw 0xcfc 0x02
+write 0xe0800010 0x4 0x6100
+EOF
+[I 0.000001] OPENED
+[R +0.067760] outl 0xcf8 0x80001020
+[S +0.067795] OK
+OK
+[R +0.067821] outl 0xcfc 0xe0800000
+[S +0.067959] OK
+OK
+[R +0.067993] outl 0xcf8 0x80001004
+[S +0.068005] OK
+OK
+[R +0.068020] outw 0xcfc 0x02
+[S +0.068520] OK
+OK
+[R +0.068554] write 0xe0800010 0x4 0x6100
+qemu-system-i386: ../hw/pci/msix.c:569: void msix_vector_use(PCIDevice *, unsigned int): Assertion `vector < dev->msix_entries_nr' failed.
+Aborted
+```
+
+If you need more information, let me know so I can discuss more about this issue."""
+additional = """```c
+int msix_init(PCIDevice *dev, unsigned short nentries,
+              MemoryRegion *table_bar, uint8_t table_bar_nr,
+              unsigned table_offset, MemoryRegion *pba_bar,
+              uint8_t pba_bar_nr, unsigned pba_offset, uint8_t cap_pos,
+              Error **errp);
+int msix_init_exclusive_bar(PCIDevice *dev, unsigned short nentries,
+                            uint8_t bar_nr, Error **errp);
+```
+
+`msix_init` accepts `nentries` as `unsigned short` type. 
+
+```c
+static void virtio_pci_device_plugged(DeviceState *d, Error **errp):
+
+    ...
+
+    if (proxy->nvectors) {
+        int err = msix_init_exclusive_bar(&proxy->pci_dev, proxy->nvectors,
+                                          proxy->msix_bar_idx, NULL);
+        if (err) {
+            /* Notice when a system that supports MSIx can't initialize it */
+            if (err != -ENOTSUP) {
+                warn_report("unable to init msix vectors to %" PRIu32,
+                            proxy->nvectors);
+            }
+            proxy->nvectors = 0;
+        }
+    }
+```
+
+When virtio-pci device is initialized, `proxy->nvectors` (`uint32_t` here) is casted into `unsigned short`.
+This causes inconsistency between `msix_entries_nr` and `nvectors` and triggers the above crash.
+
+While this is due to setting invalid value to `nvectors`, we need proper handling of the wrong value in the configuration."""

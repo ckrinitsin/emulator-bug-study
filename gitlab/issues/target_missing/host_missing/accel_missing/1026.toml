@@ -1,0 +1,124 @@
+id = 1026
+title = "Backup with large RBD disk is slow since QEMU 6.2.0 (since commit 0347a8fd)"
+state = "closed"
+created_at = "2022-05-16T11:27:05.695Z"
+closed_at = "2024-02-08T14:51:07.145Z"
+labels = ["Regression", "Storage"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/1026"
+host-os = "Proxmox VE 7.2 (but using upstream QEMU builds)"
+host-arch = "x86"
+qemu-version = ">= 6.2.0"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """Since commit 0347a8fd4c ("block/rbd: implement bdrv_co_block_status"), there is a big slowdown for large RBD images for backup."""
+reproduce = """I used the following script
+```
+root@pve701 ~ # cat rbdbackup.sh
+#!/bin/bash
+rbd create emptytestA -p rbdkvm --size $2
+rbd create emptytestB -p rbdkvm --size $2
+$1 \\
+    -qmp stdio \\
+    -drive file=rbd:rbdkvm/emptytestA:conf=/etc/pve/ceph.conf:id=admin:keyring=/etc/pve/priv/ceph/rbdkvm.keyring,if=none,id=driveA,format=raw \\
+    -drive file=rbd:rbdkvm/emptytestB:conf=/etc/pve/ceph.conf:id=admin:keyring=/etc/pve/priv/ceph/rbdkvm.keyring,if=none,id=driveB,format=raw \\
+<<EOF
+{"execute": "qmp_capabilities"}
+{"execute": "blockdev-backup",
+     "arguments": { "device": "driveA",
+                    "sync": "full",
+                    "target": "driveB" } }
+EOF
+rbd -p rbdkvm rm emptytestA
+rbd -p rbdkvm rm emptytestB
+```
+with 200G and 500G images respectively and QEMU binaries built from current master (i.e. 10c2a0c5e7d48e590d945c017b5b8af5b4c89a3c) and from current master with fc176116cdea816ceb8dd969080b2b95f58edbc0, 9e302f64bb407a9bb097b626da97228c2654cfee and 0347a8fd4c3faaedf119be04c197804be40a384b reverted.
+
+
+Timings:
+```
+200G master:         92s
+200G master+reverts: 57s
+500G master:         526s
+500G master+reverts: 142s
+```
+
+I checked how long a single call to `rbd_diff_iterate2()` in `block/rbd.c` takes, and it seems to take about linearly more time the bigger the image is. But it is also called linearly more often, resulting in about quadratic slowdown overall."""
+additional = """Full commands/output:
+```
+root@pve701 ~ # ./rbdbackup.sh ./qemu-upstream/10c2a0c5e7d48e590d945c017b5b8af5b4c89a3c/qemu-system-x86_64 200G                 
+{"QMP": {"version": {"qemu": {"micro": 50, "minor": 0, "major": 7}, "package": "v7.0.0-981-g10c2a0c5e7"}, "capabilities": ["oob"]}}
+VNC server running on 127.0.0.1:5900
+{"return": {}}
+{"timestamp": {"seconds": 1652695629, "microseconds": 651397}, "event": "JOB_STATUS_CHANGE", "data": {"status": "created", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695629, "microseconds": 651447}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695629, "microseconds": 651464}, "event": "JOB_STATUS_CHANGE", "data": {"status": "paused", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695629, "microseconds": 651490}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"return": {}}
+{"timestamp": {"seconds": 1652695721, "microseconds": 415892}, "event": "JOB_STATUS_CHANGE", "data": {"status": "waiting", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695721, "microseconds": 416066}, "event": "JOB_STATUS_CHANGE", "data": {"status": "pending", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695721, "microseconds": 416197}, "event": "BLOCK_JOB_COMPLETED", "data": {"device": "driveA", "len": 214748364800, "offset": 214748364800, "speed": 0, "type": "backup"}}
+{"timestamp": {"seconds": 1652695721, "microseconds": 416239}, "event": "JOB_STATUS_CHANGE", "data": {"status": "concluded", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695721, "microseconds": 416265}, "event": "JOB_STATUS_CHANGE", "data": {"status": "null", "id": "driveA"}}
+^Cqemu-system-x86_64: terminating on signal 2
+{"timestamp": {"seconds": 1652695727, "microseconds": 145031}, "event": "SHUTDOWN", "data": {"guest": false, "reason": "host-signal"}}
+Removing image: 100% complete...done.
+Removing image: 100% complete...done.
+./rbdbackup.sh  200G  81.15s user 6.31s system 89% cpu 1:38.21 total
+root@pve701 ~ # ./rbdbackup.sh ./qemu-upstream/10c2a0c5e7d48e590d945c017b5b8af5b4c89a3c-with-rbd-reverts/qemu-system-x86_64 200G 
+{"QMP": {"version": {"qemu": {"micro": 50, "minor": 0, "major": 7}, "package": "v7.0.0-984-g20a19f8eae"}, "capabilities": ["oob"]}}
+VNC server running on 127.0.0.1:5900
+{"return": {}}
+{"timestamp": {"seconds": 1652695737, "microseconds": 444734}, "event": "JOB_STATUS_CHANGE", "data": {"status": "created", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695737, "microseconds": 444818}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695737, "microseconds": 444860}, "event": "JOB_STATUS_CHANGE", "data": {"status": "paused", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695737, "microseconds": 444885}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"return": {}}
+{"timestamp": {"seconds": 1652695794, "microseconds": 437168}, "event": "JOB_STATUS_CHANGE", "data": {"status": "waiting", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695794, "microseconds": 437248}, "event": "JOB_STATUS_CHANGE", "data": {"status": "pending", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695794, "microseconds": 437341}, "event": "BLOCK_JOB_COMPLETED", "data": {"device": "driveA", "len": 214748364800, "offset": 214748364800, "speed": 0, "type": "backup"}}
+{"timestamp": {"seconds": 1652695794, "microseconds": 437368}, "event": "JOB_STATUS_CHANGE", "data": {"status": "concluded", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695794, "microseconds": 437381}, "event": "JOB_STATUS_CHANGE", "data": {"status": "null", "id": "driveA"}}
+^Cqemu-system-x86_64: terminating on signal 2
+{"timestamp": {"seconds": 1652695803, "microseconds": 242148}, "event": "SHUTDOWN", "data": {"guest": false, "reason": "host-signal"}}
+Removing image: 100% complete...done.
+Removing image: 100% complete...done.
+./rbdbackup.sh  200G  40.68s user 111.12s system 228% cpu 1:06.47 total
+root@pve701 ~ # ./rbdbackup.sh ./qemu-upstream/10c2a0c5e7d48e590d945c017b5b8af5b4c89a3c/qemu-system-x86_64 500G 
+{"QMP": {"version": {"qemu": {"micro": 50, "minor": 0, "major": 7}, "package": "v7.0.0-981-g10c2a0c5e7"}, "capabilities": ["oob"]}}
+VNC server running on 127.0.0.1:5900
+{"return": {}}
+{"timestamp": {"seconds": 1652695970, "microseconds": 663752}, "event": "JOB_STATUS_CHANGE", "data": {"status": "created", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695970, "microseconds": 663892}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695970, "microseconds": 663920}, "event": "JOB_STATUS_CHANGE", "data": {"status": "paused", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695970, "microseconds": 663980}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"return": {}}
+{"timestamp": {"seconds": 1652696496, "microseconds": 556219}, "event": "JOB_STATUS_CHANGE", "data": {"status": "waiting", "id": "driveA"}}
+{"timestamp": {"seconds": 1652696496, "microseconds": 556386}, "event": "JOB_STATUS_CHANGE", "data": {"status": "pending", "id": "driveA"}}
+{"timestamp": {"seconds": 1652696496, "microseconds": 556497}, "event": "BLOCK_JOB_COMPLETED", "data": {"device": "driveA", "len": 536870912000, "offset": 536870912000, "speed": 0, "type": "backup"}}
+{"timestamp": {"seconds": 1652696496, "microseconds": 556536}, "event": "JOB_STATUS_CHANGE", "data": {"status": "concluded", "id": "driveA"}}
+{"timestamp": {"seconds": 1652696496, "microseconds": 556555}, "event": "JOB_STATUS_CHANGE", "data": {"status": "null", "id": "driveA"}}
+^Cqemu-system-x86_64: terminating on signal 2
+{"timestamp": {"seconds": 1652696786, "microseconds": 408273}, "event": "SHUTDOWN", "data": {"guest": false, "reason": "host-signal"}}
+Removing image: 100% complete...done.
+Removing image: 100% complete...done.
+./rbdbackup.sh  500G  453.34s user 28.30s system 58% cpu 13:36.48 total
+root@pve701 ~ # ./rbdbackup.sh ./qemu-upstream/10c2a0c5e7d48e590d945c017b5b8af5b4c89a3c-with-rbd-reverts/qemu-system-x86_64 500G
+{"QMP": {"version": {"qemu": {"micro": 50, "minor": 0, "major": 7}, "package": "v7.0.0-984-g20a19f8eae"}, "capabilities": ["oob"]}}
+VNC server running on 127.0.0.1:5900
+{"return": {}}
+{"timestamp": {"seconds": 1652695810, "microseconds": 648931}, "event": "JOB_STATUS_CHANGE", "data": {"status": "created", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695810, "microseconds": 649012}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695810, "microseconds": 649057}, "event": "JOB_STATUS_CHANGE", "data": {"status": "paused", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695810, "microseconds": 649080}, "event": "JOB_STATUS_CHANGE", "data": {"status": "running", "id": "driveA"}}
+{"return": {}}
+{"timestamp": {"seconds": 1652695952, "microseconds": 13070}, "event": "JOB_STATUS_CHANGE", "data": {"status": "waiting", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695952, "microseconds": 13144}, "event": "JOB_STATUS_CHANGE", "data": {"status": "pending", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695952, "microseconds": 13210}, "event": "BLOCK_JOB_COMPLETED", "data": {"device": "driveA", "len": 536870912000, "offset": 536870912000, "speed": 0, "type": "backup"}}
+{"timestamp": {"seconds": 1652695952, "microseconds": 13233}, "event": "JOB_STATUS_CHANGE", "data": {"status": "concluded", "id": "driveA"}}
+{"timestamp": {"seconds": 1652695952, "microseconds": 13249}, "event": "JOB_STATUS_CHANGE", "data": {"status": "null", "id": "driveA"}}
+^Cqemu-system-x86_64: terminating on signal 2
+{"timestamp": {"seconds": 1652695955, "microseconds": 692599}, "event": "SHUTDOWN", "data": {"guest": false, "reason": "host-signal"}}
+Removing image: 100% complete...done.
+Removing image: 100% complete...done.
+./rbdbackup.sh  500G  99.49s user 277.78s system 258% cpu 2:25.78 total
+```"""

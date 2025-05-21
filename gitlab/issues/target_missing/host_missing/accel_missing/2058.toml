@@ -1,0 +1,62 @@
+id = 2058
+title = "QEMU should pad Ethernet frames from vmnet.framework on macOS hosts"
+state = "closed"
+created_at = "2023-12-27T22:25:20.754Z"
+closed_at = "2025-01-01T23:41:23.832Z"
+labels = ["Networking", "hostos: macOS"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2058"
+host-os = "macOS Monterey 12.7.2"
+host-arch = "x86-64"
+qemu-version = "8.2.0"
+guest-os = "Mac OS X"
+guest-arch = "PowerPC"
+description = """When using a `vmnet` network device on a macOS host, the host’s [ARP](https://en.wikipedia.org/wiki/Address_Resolution_Protocol) replies are smaller than the 64-octet minimum frame size defined for Ethernet in IEEE Std 802.3-2022 (subclause 4.2.3.3 and Table 4–2).
+
+When QEMU presents such frames to a guest, the guest’s Ethernet device driver may drop them with “frame too short” or “runt” errors, since they are smaller than actual Ethernet frames should ever be. This prevents the guest from resolving the host’s MAC address, so the guest and host can’t communicate as expected.
+
+I observed this problem with a Mac OS X 10.4.11 guest using a `sungem` or `rtl8139` virtual network device, but it might also affect other guests and virtual network devices."""
+reproduce = "n/a"
+additional = """To prevent this problem, QEMU should pad Ethernet frames received from `vmnet` to the minimum size, 60 bytes before the frame check sequence, before handing them off to a guest. (QEMU’s virtual network devices used to add such padding, but that was changed earlier this year in commits such as 63b901bf and aee87b43.)
+
+Here is a patch for `net/vmnet-common.m` that calls `eth_pad_short_frame()` for this, as `net/tap.c` and `net/slirp.c` already do:
+
+```
+--- net/vmnet-common.m.orig\t2023-12-19 13:24:34.000000000 -0800
++++ net/vmnet-common.m\t2023-12-27 13:30:15.000000000 -0800
+@@ -18,6 +18,7 @@
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
+ #include "sysemu/runstate.h"
++#include "net/eth.h"
+ 
+ #include <vmnet/vmnet.h>
+ #include <dispatch/dispatch.h>
+@@ -150,10 +151,23 @@
+  */
+ static void vmnet_write_packets_to_qemu(VmnetState *s)
+ {
++    uint8_t *pkt;
++    size_t pktsz;
++    uint8_t min_pkt[ETH_ZLEN];
++    size_t min_pktsz = sizeof(min_pkt);
++
+     while (s->packets_send_current_pos < s->packets_send_end_pos) {
+-        ssize_t size = qemu_send_packet_async(&s->nc,
+-                                      s->iov_buf[s->packets_send_current_pos].iov_base,
+-                                      s->packets_buf[s->packets_send_current_pos].vm_pkt_size,
++        pkt = s->iov_buf[s->packets_send_current_pos].iov_base;
++        pktsz = s->packets_buf[s->packets_send_current_pos].vm_pkt_size;
++
++        if (net_peer_needs_padding(&s->nc)) {
++            if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pktsz)) {
++                pkt = min_pkt;
++                pktsz = min_pktsz;
++            }
++        }
++
++        ssize_t size = qemu_send_packet_async(&s->nc, pkt, pktsz,
+                                       vmnet_send_completed);
+ 
+         if (size == 0) {
+
+```"""

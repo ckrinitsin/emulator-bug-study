@@ -1,0 +1,136 @@
+id = 1122
+title = "ARMv7M (Cortex M) NVIC does not make number of priority bits a board/SoC-configurable parameter"
+state = "closed"
+created_at = "2022-07-29T04:07:35.344Z"
+closed_at = "2024-01-12T16:10:28.459Z"
+labels = ["target: arm"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/1122"
+host-os = "Linux, MacOS"
+host-arch = "ARMv8, x86_64"
+qemu-version = "any (>7.0, git)"
+guest-os = "FreeRTOS"
+guest-arch = "ARMv7M"
+description = """In FreeRTOS code for function of `xPortStartScheduler()` in [`main/portable/GCC/ARM_CM4F/port.c`](https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/main/portable/GCC/ARM_CM4F/port.c#L293) file code sets the value of 0x400 register of NVIC to the maximum bits and expect to read back only maximum priority bits that are supported by the platform. The QEMU code doesn't unset these bits (same 0xff value written is read back):
+```
+NVIC: priority [0x400] = 0x00
+NVIC[NS]: [0x400] -> 0x00000000
+NVIC: priority [0x400] = 0xff
+NVIC[NS]: [0x400] <- 0x000000ff
+nvic_recompute_state NVIC state recomputed: vectpending 0 vectpending_prio 256 exception_prio 256
+NVIC: priority [0x400] = 0x00
+NVIC[NS]: [0x400] -> 0x000000ff
+```
+Logging function for reading and writing added in `hw/intc/armv7_nvic.c` like these:
+writing:
+```c
+    case 0x400 ... 0x5ef: /* NVIC Priority */
+        startvec = (offset - 0x400) + NVIC_FIRST_IRQ; /* vector # */
+
+        for (i = 0; i < size && startvec + i < s->num_irq; i++) {
+            if (attrs.secure || s->itns[startvec + i]) {
+                qemu_log("NVIC: priority [0x%03x] = 0x%02llx\\n", offset, (value >> (i * 8)) & 0xff);
+                set_prio(s, startvec + i, false, (value >> (i * 8)) & 0xff);
+            }
+        }
+        qemu_log("NVIC[%s]: [0x%03x] <- 0x%08llx\\n", attrs.secure ? "S" : "NS", offset, value);
+
+        nvic_irq_update(s);
+        goto exit_ok;
+```
+reading:
+```c
+    case 0x400 ... 0x5ef: /* NVIC Priority */
+        val = 0;
+        startvec = offset - 0x400 + NVIC_FIRST_IRQ; /* vector # */
+
+        // TODO: should return either 0x70 or 0x78
+        for (i = 0; i < size && startvec + i < s->num_irq; i++) {
+            qemu_log("NVIC: priority [0x%03x] = 0x%02x\\n", offset, 8 * i);
+            if (attrs.secure || s->itns[startvec + i]) {
+                val |= s->vectors[startvec + i].prio << (8 * i);
+            }
+        }
+        qemu_log("NVIC[%s]: [0x%03x] -> 0x%08x\\n", attrs.secure ? "S" : "NS", offset, val);
+        break;
+```"""
+reproduce = """1. Run FreeRTOS for any ARMv7 Cortex-M platform with NVIC
+2. Observe failure to proceed to `prvPortStartFirstTask();` function."""
+additional = """Here is the piece of standard FreeRTOS code that runs that check:
+```c
+   /* configMAX_SYSCALL_INTERRUPT_PRIORITY must not be set to 0.
+     * See https://www.FreeRTOS.org/RTOS-Cortex-M3-M4.html */
+    configASSERT( configMAX_SYSCALL_INTERRUPT_PRIORITY );
+
+    /* This port can be used on all revisions of the Cortex-M7 core other than
+     * the r0p1 parts.  r0p1 parts should use the port from the
+     * /source/portable/GCC/ARM_CM7/r0p1 directory. */
+    configASSERT( portCPUID != portCORTEX_M7_r0p1_ID );
+    configASSERT( portCPUID != portCORTEX_M7_r0p0_ID );
+
+    #if ( configASSERT_DEFINED == 1 )
+        {
+            volatile uint32_t ulOriginalPriority;
+            volatile uint8_t * const pucFirstUserPriorityRegister = ( volatile uint8_t * const ) ( portNVIC_IP_REGISTERS_OFFSET_16 + portFIRST_USER_INTERRUPT_NUMBER );
+            volatile uint8_t ucMaxPriorityValue;
+
+            /* Determine the maximum priority from which ISR safe FreeRTOS API
+             * functions can be called.  ISR safe functions are those that end in
+             * "FromISR".  FreeRTOS maintains separate thread and ISR API functions to
+             * ensure interrupt entry is as fast and simple as possible.
+             *
+             * Save the interrupt priority value that is about to be clobbered. */
+            ulOriginalPriority = *pucFirstUserPriorityRegister;
+
+            /* Determine the number of priority bits available.  First write to all
+             * possible bits. */
+            *pucFirstUserPriorityRegister = portMAX_8_BIT_VALUE;
+
+            /* Read the value back to see how many bits stuck. */
+            ucMaxPriorityValue = *pucFirstUserPriorityRegister;
+
+            /* Use the same mask on the maximum system call priority. */
+            ucMaxSysCallPriority = configMAX_SYSCALL_INTERRUPT_PRIORITY & ucMaxPriorityValue;
+
+            /* Calculate the maximum acceptable priority group value for the number
+             * of bits read back. */
+            ulMaxPRIGROUPValue = portMAX_PRIGROUP_BITS;
+
+            while( ( ucMaxPriorityValue & portTOP_BIT_OF_BYTE ) == portTOP_BIT_OF_BYTE )
+            {
+                ulMaxPRIGROUPValue--;
+                ucMaxPriorityValue <<= ( uint8_t ) 0x01;
+            }
+
+            #ifdef __NVIC_PRIO_BITS
+                {
+                    /* Check the CMSIS configuration that defines the number of
+                     * priority bits matches the number of priority bits actually queried
+                     * from the hardware. */
+                    configASSERT( ( portMAX_PRIGROUP_BITS - ulMaxPRIGROUPValue ) == __NVIC_PRIO_BITS );
+                }
+            #endif
+
+            #ifdef configPRIO_BITS
+                {
+                    /* Check the FreeRTOS configuration that defines the number of
+                     * priority bits matches the number of priority bits actually queried
+                     * from the hardware. */
+                    configASSERT( ( portMAX_PRIGROUP_BITS - ulMaxPRIGROUPValue ) == configPRIO_BITS );
+                }
+            #endif
+
+            /* Shift the priority group value back to its position within the AIRCR
+             * register. */
+            ulMaxPRIGROUPValue <<= portPRIGROUP_SHIFT;
+            ulMaxPRIGROUPValue &= portPRIORITY_GROUP_MASK;
+
+            /* Restore the clobbered interrupt priority register to its original
+             * value. */
+            *pucFirstUserPriorityRegister = ulOriginalPriority;
+        }
+    #endif /* configASSERT_DEFINED */
+```
+
+See also these pages:
+- https://www.freertos.org/RTOS-Cortex-M3-M4.html
+- https://www.freertos.org/freertos-on-qemu-mps2-an385-model.html"""

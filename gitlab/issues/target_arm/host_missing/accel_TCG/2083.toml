@@ -1,0 +1,119 @@
+id = 2083
+title = "AArch64 SME SMOPA (4-way) outer product instruction gives incorrect result"
+state = "closed"
+created_at = "2024-01-09T12:04:29.786Z"
+closed_at = "2024-03-09T14:58:17.548Z"
+labels = ["Closed::Fixed", "accel: TCG", "kind::Bug", "target: arm"]
+url = "https://gitlab.com/qemu-project/qemu/-/issues/2083"
+host-os = "Ubuntu 20.04"
+host-arch = "AArch64"
+qemu-version = "8.2.50 (v8.2.0-442-gffd454c67e)"
+guest-os = "same as host"
+guest-arch = "same as host but with SME feature"
+description = """The SME SMOPA (4-way) instruction ([spec](https://developer.arm.com/documentation/ddi0602/2023-09/SME-Instructions/SMOPA--4-way---Signed-integer-sum-of-outer-products-and-accumulate-?lang=en)) is giving incorrect result. Example below for 8-bit variant, which is equivalent to following Python example (128-bit VL) to make it clearer:
+
+```
+import numpy as np
+vl = 128
+esize = 32
+dim = vl // esize
+
+A = range(16)
+B = range(16, 32)
+C = np.zeros((4, 4,), dtype=np.int32)
+
+for row in range(dim):
+    for col in range(dim):
+        for k in range(4):
+            C[row, col] += A[4*row + k] * B[4*col + k]
+
+print(C)
+
+[[ 110  134  158  182]
+ [ 390  478  566  654]
+ [ 670  822  974 1126]
+ [ 950 1166 1382 1598]]
+```
+
+main.c
+```
+#include <stdio.h>
+#include <stdint.h>
+
+void foo(int *dst);
+
+int main() {
+  int32_t dst[16];
+  foo(dst);
+
+  // This should print:
+  // >>> 110  134  158  182
+  // >>> 390  478  566  654
+  // >>> 670  822  974  1126
+  // >>> 950  1166  1382  1598
+  for (int i=0; i<4; ++i) {
+    printf(">>> ");
+    for (int j=0; j<4; ++j) {
+      printf("%d  ", dst[i * 4 + j]);
+    }
+    printf("\\n");
+  }
+}
+```
+
+foo.S
+
+```
+.global foo
+foo:
+  stp x29, x30, [sp, -80]!
+  mov x29, sp
+  stp d8, d9, [sp, 16]
+  stp d10, d11, [sp, 32]
+  stp d12, d13, [sp, 48]
+  stp d14, d15, [sp, 64]
+
+  smstart
+
+  ptrue p0.b
+  index z0.b, #0, #1
+  mov   z1.d, z0.d
+  add   z1.b, z1.b, #16
+
+  zero  {za}
+  smopa za0.s, p0/m, p0/m, z0.b, z1.b
+
+  // Read the first 4x4 sub-matrix of elements from tile 0:
+  mov w12, #0
+  mova z0.s, p0/m, za0h.s[w12, #0]
+  mova z1.s, p0/m, za0h.s[w12, #1]
+  mova z2.s, p0/m, za0h.s[w12, #2]
+  mova z3.s, p0/m, za0h.s[w12, #3]
+
+  // And store them to the input pointer (dst in the C code):
+  st1w {z0.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z1.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z2.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z3.s}, p0, [x0]
+
+  smstop
+
+  ldp d8, d9, [sp, 16]
+  ldp d10, d11, [sp, 32]
+  ldp d12, d13, [sp, 48]
+  ldp d14, d15, [sp, 64]
+  ldp x29, x30, [sp], 80
+  ret
+```"""
+reproduce = """```
+$ clang -target aarch64-linux-gnu -march=armv9-a+sme main.c foo.S
+$ ~/qemu/build/qemu-aarch64 -cpu max,sme128=on a.out
+>>> 110  478  158  654
+>>> 0  0  0  0
+>>> 670  1166  974  1598
+>>> 0  0  0  0
+```"""
+additional = """"""
