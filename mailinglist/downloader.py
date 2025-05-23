@@ -55,7 +55,8 @@ def main():
 
             re_match = search(r'\[Bug\s(\d+)\]', text) # matches [Bug <number>] if bug is issued in launchpad
             if re_match:
-                process_launchpad_bug(re_match.group(1).strip())
+                if not process_launchpad_bug(re_match.group(1).strip()):
+                    print(f"Could not parse launchpad bug with id: {re_match.group(1).strip()}")
                 continue
 
             re_match = match(r'(?i)^re:\s*(.*)', text) # matches 'Re:', meaning it's not a new thread
