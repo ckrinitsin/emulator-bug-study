@@ -26,7 +26,3 @@ def process_thread(url, hash_value):
             if match:
                 href = match.group(1)
                 process_thread(urljoin(url, href), hash_value)
-
-if __name__ == "__main__":
-    makedirs("output_mailinglist", exist_ok=True)
-    process_thread("https://lists.nongnu.org/archive/html/qemu-devel/2025-04/msg05446.html", 861041)
