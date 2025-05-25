@@ -5,13 +5,13 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-def write_message(html, hash_value):
+def write_message(html : str, hash_value : str) -> None:
     soup = BeautifulSoup(html, 'html.parser')
-    text = soup.get_text(separator='\n', strip=True)
+    text = soup.get_text(separator = '\n', strip = True)
     with open(f"output_mailinglist/{hash_value}", "a") as file:
         file.write(f"{text}\n\n")
 
-def process_thread(url, hash_value):
+def process_thread(url : str, hash_value : str) -> None:
     request = get(url)
     text = request.text
 
