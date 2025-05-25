@@ -1,18 +1,18 @@
 from tomlkit import dumps
 from os import path, makedirs
 
-def find_label(labels, keyword):
+def find_label(labels : list, keyword : str) -> str:
     match = next((s for s in labels if f"{keyword}:" in s), None)
     if not match:
         return f"{keyword}_missing"
     return match.replace(": ", "_")
 
-def write_file(file_path, string):
-    makedirs(path.dirname(file_path), exist_ok=True)
+def write_file(file_path : str, string : str) -> None:
+    makedirs(path.dirname(file_path), exist_ok = True)
     with open(file_path, "w") as file:
         file.write(string)
 
-def output_issue(issue):
+def output_issue(issue : dict) -> None:
     labels = issue['labels']
     issue_id = issue['id']
     toml_string = dumps(issue)

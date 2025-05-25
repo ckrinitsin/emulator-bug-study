@@ -1,29 +1,29 @@
-import re
+from re import sub, search, DOTALL
 from tomlkit import string
 
-def remove_comments(description):
-    return re.sub(r'<!--(.|\n)*?-->', '', description)
+def remove_comments(description : str) -> str:
+    return sub(r'<!--(.|\n)*?-->', '', description)
 
-def get_headline_content(description, headline):
+def get_headline_content(description : str, headline : str) -> str:
     pattern = rf'## {headline}\s+(.*?)(?=##\s|\Z)'
 
-    match = re.search(pattern, description, re.DOTALL)
+    match = search(pattern, description, DOTALL)
     if match:
-        return string(match.group(1).strip(), multiline=True)
+        return string(match.group(1).strip(), multiline = True)
     else:
         return "n/a"
 
-def get_bullet_point(description, headline, category):
+def get_bullet_point(description : str, headline : str, category : str) -> str:
     pattern = rf'{headline}(?:(?:.|\n)+?){category}:\s+(?:`)?(.+?)(?:`)?(?=\s)(?:\n|$)'
 
-    match = re.search(pattern, description)
+    match = search(pattern, description)
     if match:
         return match.group(1).strip()
     else:
         return "n/a"
 
-def parse_description(desc):
-    desc = remove_comments(desc)
+def parse_description(description : str) -> dict:
+    desc = remove_comments(description)
 
     result = {
         "host-os": get_bullet_point(desc, "Host", "Operating system"),
