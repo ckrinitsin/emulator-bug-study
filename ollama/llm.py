@@ -12,9 +12,6 @@ for name in listdir(directory):
     with open(path.join(directory, name)) as file:
         content = preambel + "\n" + file.read()
 
-    with open("test", "r") as file:
-        content = file.read()
-
     response : ChatResponse = chat(
         model=model, messages=[
             {
