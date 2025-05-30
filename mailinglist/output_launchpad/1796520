@@ -1,0 +1,105 @@
+autogen crashes on qemu-sh4-user after 61dedf2af7
+
+Running "autogen --help" crashes on qemu-sh4-user with:
+
+(sid-sh4-sbuild)root@nofan:/# autogen --help
+Unhandled trap: 0x180
+pc=0xf64dd2de sr=0x00000000 pr=0xf63b9c74 fpscr=0x00080000
+spc=0x00000000 ssr=0x00000000 gbr=0xf61102a8 vbr=0x00000000
+sgr=0x00000000 dbr=0x00000000 delayed_pc=0xf64dd2a0 fpul=0x00000003
+r0=0xf6fc1320 r1=0x00000000 r2=0xffff5dc4 r3=0xf67bfb50
+r4=0xf6fc1230 r5=0xf6fc141c r6=0x000003ff r7=0x00000000
+r8=0x00000004 r9=0xf63e20bc r10=0xf6fc141c r11=0xf63e28f0
+r12=0xf63e2258 r13=0xf63eae1c r14=0x00000804 r15=0xf6fc1220
+r16=0x00000000 r17=0x00000000 r18=0x00000000 r19=0x00000000
+r20=0x00000000 r21=0x00000000 r22=0x00000000 r23=0x00000000
+(sid-sh4-sbuild)root@nofan:/#
+
+Bi-secting found this commit to be the culprit:
+
+61dedf2af79fb5866dc7a0f972093682f2185e17 is the first bad commit
+commit 61dedf2af79fb5866dc7a0f972093682f2185e17
+Author: Richard Henderson <email address hidden>
+Date:   Tue Jul 18 10:02:50 2017 -1000
+
+    target/sh4: Add missing FPSCR.PR == 0 checks
+    
+    Both frchg and fschg require PR == 0, otherwise undefined_operation.
+    
+    Reviewed-by: Aurelien Jarno <email address hidden>
+    Signed-off-by: Richard Henderson <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Aurelien Jarno <email address hidden>
+
+:040000 040000 980d79b69ae712f23a1e4c56983e97a843153b4a 1024c109f506c7ad57367c63bc8bbbc8a7a36cd7 M      target
+
+Reverting 61dedf2af79fb5866dc7a0f972093682f2185e17 fixes the problem for me.
+
+This is still reproducible on git master:
+
+(sid-sh4-sbuild)root@nofan:/# autogen
+Unhandled trap: 0x180
+pc=0x7f4da99e sr=0x00000000 pr=0x7f3bfc74 fpscr=0x00080000
+spc=0x00000000 ssr=0x00000000 gbr=0x7f114320 vbr=0x00000000
+sgr=0x00000000 dbr=0x00000000 delayed_pc=0x7f4da960 fpul=0x00000003
+r0=0x7ffc130c r1=0x00000000 r2=0xffff5dc4 r3=0x7f7bfb54
+r4=0x7ffc121c r5=0x7ffc1408 r6=0x000003ff r7=0x00000000
+r8=0x00000004 r9=0x7f3e80bc r10=0x7ffc1408 r11=0x7f3e88f0
+r12=0x7f3e8258 r13=0x7f3f0e1c r14=0x00000804 r15=0x7ffc120c
+r16=0x00000000 r17=0x00000000 r18=0x00000000 r19=0x00000000
+r20=0x00000000 r21=0x00000000 r22=0x00000000 r23=0x00000000
+(sid-sh4-sbuild)root@nofan:/#
+
+Can we just revert 61dedf2af7 which fixes the problem?
+
+I can reproduce this bug, but I'm not sure what QEMU is doing wrong. Looking at the "SH4 Software Manual", it definitely says that if the FPSCR.PR bit is 0 then the 'frchg' and 'fschg' instructions should both trap.
+
+The 'frchg' that autogen is hitting is the one in glibc's "getcontext" implementation:
+https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/sh/sh4/getcontext.S;hb=b6d2c4475d5abc05dd009575b90556bdd3c78ad0#l70
+
+QEMU linux-user mode runs with FPSCR=0x000800000, which is "FPSCR.PR == 1", ie "double precision". This seems to match what the kernel has for its FPSCR_INIT value.
+
+Are you in a position to test what the actual hardware/real Linux kernel using for its FPSCR value when running sh4 userspace binaries ?
+
+
+I can provide access to a machine connected to the internet so you can test it yourself. I'll send you an email.
+
+On that hardware, at least, the user-space visible FPSCR value is indeed 0x000800000. Execution of the 'frchg' insn either doesn't trap, or the trap is caught by the kernel and emulated. I think it is not being emulated because CONFIG_SH_FPU_EMU is not set.
+
+The comment at the top of arch/sh/kernel/cpu/sh4/fpu.c:
+https://elixir.bootlin.com/linux/latest/source/arch/sh/kernel/cpu/sh4/fpu.c
+
+says that on "some SH4 implementations" executing frchg with the FPSCR.PR bit set causes a trap; the "SH-4 Software Manual" says it is "undefined_operation()" which I think means "implementation could do anything" (though the manual doesn't clearly define its terms here). The kernel code in fpu.c carefully sets the FPSCR value to clear the PR bit before performing the frchg instruction.
+
+My best guess is that this is a glibc bug, where its getcontext etc implementations should be doing the same set-fpscr-first work that the kernel code is doing, and so the glibc code happens to work OK on implementations like the SH7785 that seem to not trap here, but will fail on whatever the SH4 variants are that do trap (as well as on QEMU). But this needs an SH4 expert to clarify (for instance I might well have misread the kernel code and maybe it does trap-and-emulate here so that userspace can rely on the frchg behaviour with FPSCR.PR=1 ?).
+
+Is there somebody we can ask for clarification on what the defined behaviour of the architecture is here and what the impdef behaviour of the 7750/7751/7785 happen to be ?
+
+
+(Edit to note that "that hardware" is an SH7785LCR with an SH7785 CPU.)
+
+
+We can ask both glibc upstream and some SuperH experts. I'll ask.
+
+Did you ever ask the glibc or SuperH experts? Is this bug still pending in the latest version of QEMU?
+
+Bug is still pending on git master. Have not pinged the SuperH crew yet. Will try to do that tomorrow, I'll also ping glibc upstream.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Reported as https://sourceware.org/bugzilla/show_bug.cgi?id=27543
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+We’re looking whether this can be fixed on the glibc side currently.
+
+The patch suggested by Thorsten Glaser glibc Bugzilla #27543 fixes the issue for me:
+
+> https://sourceware.org/bugzilla/show_bug.cgi?id=27543#c2
+
+So could we close this QEMU ticket now, or is there still something to be done from the QEMU side?
+
+Yes, it can be closed.
+
+Thanks, closing now.
+

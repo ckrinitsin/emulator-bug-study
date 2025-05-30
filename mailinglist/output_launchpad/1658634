@@ -1,0 +1,400 @@
+Can't get correct display with latest QEMU and OVMF BIOS
+
+I tried to install a Ubuntu 16.04.1 Desktop 64bits with latest QEMU and OVMF UEFI BIOS, however I can't get correct display output with default vga configuration (-vga std). However, qemu works with a couple of different configurations:
+1. "-vga cirrus" + "-bios OVMF.fd": works
+2. "-vga std" + non-UEFI bios: works
+
+The same error with QEMU 2.8.0 release. Everything works well on 2.7.0/1.
+
+(1) What phase of the guest do you get invalid video output in? Do you see the TianoCore splash screen? Does the grub2 menu appear?
+
+(2) I cannot reproduce the issue (with a different guest OS anyway); I just tried QEMU (at d1c82f7cc344) and OVMF (built from edk2 at 7cf59c854f35), with stdvga; this combo works fine.
+
+(3) Can you bisect QEMU from 2.7 through 2.8, using the same OVMF binary?
+
+(4) Side point: please *never* use "-bios OVMF.fd"; use two pflash chips instead. Libvirt (strongly recommended) will do this for you.
+
+Thanks.
+
+Splash screen and UEFI shell were displayed correctly. Grub2 menu and
+Ubuntu login screen also appeared, however the display didn't seem right. I
+got very blurry output.
+
+[image: Inline image 1]
+
+With QEMU 2.7.0 and the same OVMF.fd, everything works well.
+
+Please let me know if anything is not clear.
+
+Thanks,
+Kai
+
+On Mon, Jan 23, 2017 at 4:50 AM, Laszlo Ersek (Red Hat) <email address hidden>
+wrote:
+
+> (1) What phase of the guest do you get invalid video output in? Do you
+> see the TianoCore splash screen? Does the grub2 menu appear?
+>
+> (2) I cannot reproduce the issue (with a different guest OS anyway); I
+> just tried QEMU (at d1c82f7cc344) and OVMF (built from edk2 at
+> 7cf59c854f35), with stdvga; this combo works fine.
+>
+> (3) Can you bisect QEMU from 2.7 through 2.8, using the same OVMF
+> binary?
+>
+> (4) Side point: please *never* use "-bios OVMF.fd"; use two pflash chips
+> instead. Libvirt (strongly recommended) will do this for you.
+>
+> Thanks.
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1658634
+>
+> Title:
+>   Can't get correct display with latest QEMU and OVMF BIOS
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   I tried to install a Ubuntu 16.04.1 Desktop 64bits with latest QEMU and
+> OVMF UEFI BIOS, however I can't get correct display output with default vga
+> configuration (-vga std). However, qemu works with a couple of different
+> configurations:
+>   1. "-vga cirrus" + "-bios OVMF.fd": works
+>   2. "-vga std" + non-UEFI bios: works
+>
+>   The same error with QEMU 2.8.0 release. Everything works well on
+>   2.7.0/1.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1658634/+subscriptions
+>
+
+
+I downloaded "ubuntu-16.04.1-desktop-amd64.iso" (MD5: 17643c29e3c4609818f26becf76d29a3), and I can reproduce the issue -- the grub2 display is corrupt. (I didn't even look further than that.) I also confirm that it works fine with the same firmware, but using QEMU 2.7.
+
+Here's the result of the bisection:
+
+cd958edb1fae85d0c7d1e1acbff82d22724e8d64 is the first bad commit
+commit cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+Author: Marc-André Lureau <email address hidden>
+Date:   Fri Aug 26 13:47:11 2016 +0400
+
+    console: skip same-size resize
+    
+    virtio-gpu does a set-scanout at each frame (it might be a driver
+    regression). qemu_console_resize() recreate a surface even if the size
+    didn't change, and this shows up in profiling reports because the
+    surface is cleared. With this patch, I get a +15-20% glmark2
+    improvement.
+    
+    Signed-off-by: Marc-André Lureau <email address hidden>
+    Message-id: <email address hidden>
+    Signed-off-by: Gerd Hoffmann <email address hidden>
+
+If I revert this commit on top of current master -- it reverts cleanly -- then the grub2 screen displays fine again.
+
+For reference, this is my script:
+
+ISO=ubuntu-16.04.1-desktop-amd64.iso
+CODE=OVMF_CODE.fd
+TMPL=OVMF_VARS.fd
+
+cp $TMPL vars.fd
+
+qemu-system-x86_64 \
+  -m 1024 \
+  -M pc,accel=kvm \
+  -device VGA \
+  -drive if=pflash,readonly,format=raw,file=$CODE \
+  -drive if=pflash,format=raw,file=vars.fd \
+  -drive id=cdrom,if=none,readonly,format=raw,file=$ISO \
+  -device virtio-scsi-pci,id=scsi0 \
+  -device scsi-cd,bus=scsi0.0,drive=cdrom,bootindex=0 \
+  -debugcon file:debug.log \
+  -global isa-debugcon.iobase=0x402 \
+  -chardev stdio,signal=off,mux=on,id=char0 \
+  -mon chardev=char0,mode=readline,default \
+  -serial chardev:char0
+
+
+Added Marc-André and Gerd to the CC list.
+
+Only skip surface reallocation in case the old surface was created using
+qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+might end up with a DisplaySurface with the wrong backing storage.
+
+Cc: <email address hidden>
+Cc: Marc-André Lureau <email address hidden>
+Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ ui/console.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/console.c b/ui/console.c
+index b9575f2..67c65b7 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -2121,7 +2121,7 @@ void qemu_console_resize(QemuConsole *s, int width, int height)
+ 
+     assert(s->console_type == GRAPHIC_CONSOLE);
+ 
+-    if (s->surface &&
++    if (s->surface && (surface->flags & QEMU_ALLOCATED_FLAG) &&
+         pixman_image_get_width(s->surface->image) == width &&
+         pixman_image_get_height(s->surface->image) == height) {
+         return;
+-- 
+1.8.3.1
+
+
+
+Hi
+
+On Tue, Jan 24, 2017 at 2:31 PM Gerd Hoffmann <email address hidden>
+wrote:
+
+> Only skip surface reallocation in case the old surface was created using
+> qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+> might end up with a DisplaySurface with the wrong backing storage.
+>
+> Cc: <email address hidden>
+> Cc: Marc-André Lureau <email address hidden>
+> Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+> Signed-off-by: Gerd Hoffmann <email address hidden>
+> ---
+>  ui/console.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+>
+> diff --git a/ui/console.c b/ui/console.c
+> index b9575f2..67c65b7 100644
+> --- a/ui/console.c
+> +++ b/ui/console.c
+> @@ -2121,7 +2121,7 @@ void qemu_console_resize(QemuConsole *s, int width,
+> int height)
+>
+>      assert(s->console_type == GRAPHIC_CONSOLE);
+>
+> -    if (s->surface &&
+> +    if (s->surface && (surface->flags & QEMU_ALLOCATED_FLAG) &&
+>          pixman_image_get_width(s->surface->image) == width &&
+>          pixman_image_get_height(s->surface->image) == height) {
+>          return;
+>
+
+You are missing the 's->' !
+
+with that,
+Reviewed-by: Marc-André Lureau <email address hidden>
+
+
+--
+> 1.8.3.1
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1658634
+>
+> Title:
+>   Can't get correct display with latest QEMU and OVMF BIOS
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1658634/+subscriptions
+>
+-- 
+Marc-André Lureau
+
+
+> > -    if (s->surface &&
+> > +    if (s->surface && (surface->flags & QEMU_ALLOCATED_FLAG) &&
+> >          pixman_image_get_width(s->surface->image) == width &&
+> >          pixman_image_get_height(s->surface->image) == height) {
+> >          return;
+> >
+> 
+> You are missing the 's->' !
+
+Good catch.  /me wonders why gcc didn't throw a warning on that one.
+
+Fixed.
+
+thanks,
+  Gerd
+
+
+
+Only skip surface reallocation in case the old surface was created using
+qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+might end up with a DisplaySurface with the wrong backing storage.
+
+Cc: <email address hidden>
+Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Reviewed-by: Marc-André Lureau <email address hidden>
+---
+ ui/console.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/console.c b/ui/console.c
+index b9575f2..d573351 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -2121,7 +2121,7 @@ void qemu_console_resize(QemuConsole *s, int width, int height)
+ 
+     assert(s->console_type == GRAPHIC_CONSOLE);
+ 
+-    if (s->surface &&
++    if (s->surface && (s->surface->flags & QEMU_ALLOCATED_FLAG) &&
+         pixman_image_get_width(s->surface->image) == width &&
+         pixman_image_get_height(s->surface->image) == height) {
+         return;
+-- 
+1.8.3.1
+
+
+
+On 01/24/17 11:37, elmarco wrote:
+> Hi
+> 
+> On Tue, Jan 24, 2017 at 2:31 PM Gerd Hoffmann <email address hidden>
+> wrote:
+> 
+>> Only skip surface reallocation in case the old surface was created using
+>> qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+>> might end up with a DisplaySurface with the wrong backing storage.
+>>
+>> Cc: <email address hidden>
+>> Cc: Marc-André Lureau <email address hidden>
+>> Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+>> Signed-off-by: Gerd Hoffmann <email address hidden>
+>> ---
+>>  ui/console.c | 2 +-
+>>  1 file changed, 1 insertion(+), 1 deletion(-)
+>>
+>> diff --git a/ui/console.c b/ui/console.c
+>> index b9575f2..67c65b7 100644
+>> --- a/ui/console.c
+>> +++ b/ui/console.c
+>> @@ -2121,7 +2121,7 @@ void qemu_console_resize(QemuConsole *s, int width,
+>> int height)
+>>
+>>      assert(s->console_type == GRAPHIC_CONSOLE);
+>>
+>> -    if (s->surface &&
+>> +    if (s->surface && (surface->flags & QEMU_ALLOCATED_FLAG) &&
+>>          pixman_image_get_width(s->surface->image) == width &&
+>>          pixman_image_get_height(s->surface->image) == height) {
+>>          return;
+>>
+> 
+> You are missing the 's->' !
+> 
+> with that,
+> Reviewed-by: Marc-André Lureau <email address hidden>
+
+With that change:
+
+Tested-by: Laszlo Ersek <email address hidden>
+
+Also,
+
+Cc: <email address hidden>
+
+Thanks
+Laszlo
+
+
+> --
+>> 1.8.3.1
+>>
+>> --
+>> You received this bug notification because you are subscribed to the bug
+>> report.
+>> https://bugs.launchpad.net/bugs/1658634
+>>
+>> Title:
+>>   Can't get correct display with latest QEMU and OVMF BIOS
+>>
+>> To manage notifications about this bug go to:
+>> https://bugs.launchpad.net/qemu/+bug/1658634/+subscriptions
+>>
+
+
+
+On 01/24/17 12:10, Gerd Hoffmann wrote:
+> Only skip surface reallocation in case the old surface was created using
+> qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+> might end up with a DisplaySurface with the wrong backing storage.
+> 
+> Cc: <email address hidden>
+> Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+> Signed-off-by: Gerd Hoffmann <email address hidden>
+> Reviewed-by: Marc-André Lureau <email address hidden>
+> ---
+>  ui/console.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/ui/console.c b/ui/console.c
+> index b9575f2..d573351 100644
+> --- a/ui/console.c
+> +++ b/ui/console.c
+> @@ -2121,7 +2121,7 @@ void qemu_console_resize(QemuConsole *s, int width, int height)
+>  
+>      assert(s->console_type == GRAPHIC_CONSOLE);
+>  
+> -    if (s->surface &&
+> +    if (s->surface && (s->surface->flags & QEMU_ALLOCATED_FLAG) &&
+>          pixman_image_get_width(s->surface->image) == width &&
+>          pixman_image_get_height(s->surface->image) == height) {
+>          return;
+> 
+
+Tested-by: Laszlo Ersek <email address hidden>
+Cc: <email address hidden>
+
+Thanks
+Laszlo
+
+
+It works well on my side with the patch. Thanks!
+
+Only skip surface reallocation in case the old surface was created using
+qemu_alloc_display (via qemu_create_displaysurface) too, otherwise we
+might end up with a DisplaySurface with the wrong backing storage.
+
+Cc: <email address hidden>
+Fixes: cd958edb1fae85d0c7d1e1acbff82d22724e8d64
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Reviewed-by: Marc-André Lureau <email address hidden>
+Tested-by: Laszlo Ersek <email address hidden>
+Message-id: <email address hidden>
+---
+ ui/console.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/console.c b/ui/console.c
+index fe03a66..e353c85 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -2116,7 +2116,7 @@ void qemu_console_resize(QemuConsole *s, int width, int height)
+ 
+     assert(s->console_type == GRAPHIC_CONSOLE);
+ 
+-    if (s->surface &&
++    if (s->surface && (s->surface->flags & QEMU_ALLOCATED_FLAG) &&
+         pixman_image_get_width(s->surface->image) == width &&
+         pixman_image_get_height(s->surface->image) == height) {
+         return;
+-- 
+1.8.3.1
+
+
+
+Fixed in commit 3ef0c573d37b ("console: fix console resize", 2017-01-31), released in v2.9.0.
+
+

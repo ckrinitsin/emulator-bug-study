@@ -1,0 +1,82 @@
+Regression: QEMU 4.0 hangs the host (*bisect included*)
+
+The commit b2fc91db84470a78f8e93f5b5f913c17188792c8 seemingly introduced a regression on my system.
+
+When I start QEMU, the guest and the host hang (I need a hard reset to get back to a working system), before anything shows on the guest.
+
+I use QEMU with GPU passthrough (which worked perfectly until the commit above). This is the command I use:
+
+```
+/path/to/qemu-system-x86_64
+  -drive if=pflash,format=raw,readonly,file=/path/to/OVMF_CODE.fd
+  -drive if=pflash,format=raw,file=/tmp/OVMF_VARS.fd.tmp
+  -enable-kvm
+  -machine q35,accel=kvm,mem-merge=off
+  -cpu host,kvm=off,hv_vendor_id=vgaptrocks,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time
+  -smp 4,cores=4,sockets=1,threads=1
+  -m 10240
+  -vga none
+  -rtc base=localtime
+  -serial none
+  -parallel none
+  -usb
+  -device usb-tablet
+  -device vfio-pci,host=01:00.0,multifunction=on
+  -device vfio-pci,host=01:00.1
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device usb-host,vendorid=<vid>,productid=<pid>
+  -device virtio-scsi-pci,id=scsi
+  -drive file=/path/to/guest.img,id=hdd1,format=qcow2,if=none,cache=writeback
+  -device scsi-hd,drive=hdd1
+  -net nic,model=virtio
+  -net user,smb=/path/to/shared
+```
+
+If I run QEMU without GPU passthrough, it runs fine.
+
+Some details about my system:
+
+- O/S: Mint 19.1 x86-64 (it's based on Ubuntu 18.04)
+- Kernel: 4.15
+- `configure` options: `--target-list=x86_64-softmmu --enable-gtk --enable-spice --audio-drv-list=pa`
+- EDK2 version: 1a734ed85fda71630c795832e6d24ea560caf739 (20/Apr/2019)
+- CPU: i7-6700k
+- Motherboard: ASRock Z170 Gaming-ITX/ac
+- VGA: Gigabyte GTX 960 Mini-ITX
+
+Does adding "kernel_irqchip=on" to the comma separated list of options for -machine resolve it?
+
+> Does adding "kernel_irqchip=on" to the comma separated list of options for -machine resolve it?
+
+Yes, that solved it, thanks!
+
+This seems related to INTx (legacy) interrupt mode, which NVIDIA GeForce will use by default.  Using regedit in a Windows VM or adjusting nvidia.ko module parameters of a Linux VM can enable the driver to use MSI, which seems unaffected.  We also have the vfio-pci device option x-no-kvm-intx=on, which is probably a good compliment to configuring the driver to use MSI until we get this figured out, as the Windows driver likes to occasional switch MSI off, which would leave you in a bad state.  Routing INTx through QEMU would be a performance regression though, so while a workaround, having it routed through QEMU and not using MSI, is not a great combination.
+
+Not just NVIDIA, forcing a NIC to use INTx also fails and it's apparent from the host that the device is stuck with DisINTx+.  Looks like the resampling mechanism that allows KVM to unmask the interrupt is broken with split irqchip.
+
+ok, so, if I understand correctly, the workaround is:
+
+- set `x-no-kvm-intx=on` and enable MSI in the guest (via regedit or module params)
+
+which may lead to a performance regression (at least under certain circumstances).
+
+Is it therefore preferrable, performance and configuration-wise, to use QEMU 3.1.0, if there are no 4.0.0 feature requirements, until this issue is sorted out?
+
+The change in QEMU 4.0 is only a change in defaults of the machine type, it can be entirely reverted in the VM config with kernel_irqchip=on or <ioapic driver='kvm'/> with libvirt.  Using a machine type prior to the q35 4.0 machine type would also avoid it.  There are no performance issues with these configurations that would favor using 3.1 over 4.0.
+
+> The change in QEMU 4.0 is only a change in defaults of the machine type, it can be entirely reverted in the VM config with kernel_irqchip=on or <ioapic driver='kvm'/> with libvirt. Using a machine type prior to the q35 4.0 machine type would also avoid it. There are no performance issues with these configurations that would favor using 3.1 over 4.0.
+
+Thanks for the detailed answer :-)
+
+Just to provide an update, patches are posted to revert this change in both the q35 4.1 machine type for the next release as well as introduce a q35 4.0.1 machine type making the same change for 4.0-stable.  References:
+
+https://patchwork.ozlabs.org/patch/1099695/
+https://patchwork.ozlabs.org/patch/1099659/
+
+Fix has been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=c87759ce876a7a0b17c2b
+

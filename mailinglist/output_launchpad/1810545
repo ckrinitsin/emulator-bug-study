@@ -1,0 +1,31 @@
+[alpha] Strange exception address reported
+
+For some reason the SIGILL handler receives a different address under qemu than it used to on real hardware. I don't know specifics about the hardware used back then – it was some sort of 21264a somewhere between 600-800 MHz –, and I cannot say anything about the kernel as well, but I know that it delivered the faulting address +4, while under qemu it receives +8. I know because CACAO, an early Java JIT compiler extracts the address from the SIGILL handler and inspects the code at the faulting site, and it has substracted 4 from the handler address since the dawn of time, and this used to produce the desired result on the Alpha hardware. It actually ran on two different Alpha machines over the years, and both behaved identically.
+
+The handler looks like this:
+void handler_sigill(int sig, siginfo_t *siginfo, void *_p)
+{
+  uintptr_t trap_address = (uintptr_t) (((ucontext_t*) _p)->uc_mcontext.sc_pc) - 4;
+}
+
+(paraphrasing, the actual code is here: https://bitbucket.org/cacaovm/cacao-staging/src/c8d3fbab864c3243f97629fcfa8d84ba71f38157/src/vm/jit/alpha/linux/md-os.cpp?at=default&fileviewer=file-view-default#md-os.cpp-65)
+
+I don't know much about the qemu source code and cannot say where this is coming from at first glance. The gen_invalid function uses pc_next, which sounds like the next instruction, not the next-to-next ;). In theory it could actually be the kernel's fault, although I consider this unlikely.
+
+This is qemu-system-alpha with apparently the last Debian which existed for Alpha (lenny). The kernel is 2.6.26-2-alpha-generic (Debian 2.6.26-29). Observed with qemu git 1b3e80082b, but I guess it is the same with any version.
+
+Hmm, qemu-system-alpha ? The guest kernel should be doing the same thing it would on real hardware -- I guess we're getting the value of the exception address wrong when we deliver the exception to it.
+
+
+The problem seems to be that the PC we report for an OPCDEC is first selected by gen_invalid()/gen-excp() in target/alpha/translate.c, which uses pc_next (ie the insn's address plus 4). But that is then handed through to our custom PALcode (https://git.qemu.org/?p=qemu-palcode.git;a=blob;f=pal.S;h=1781c4b415700ca3a68af07fdae90ae43e722501;hb=HEAD) which does
+  addq    p6, 4, p1  // increment past the faulting insn
+resulting in insn + 8.
+
+That is, the palcode and the QEMU code have a disagreement about what the (private) API between them is. I'm not sure which side is wrong and should be corrected. I think the linux-user code assumes the same thing that translate.c is doing, so perhaps the palcode.
+
+
+commit ac89de40ef5d4eb1704aa now in QEMU git master updates the palcode guest ROM blob to a version which includes the fix for this bug.
+
+
+Works, thanks!
+

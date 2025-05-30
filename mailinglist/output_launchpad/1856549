@@ -1,0 +1,115 @@
+qemu-4.2.0/hw/misc/mac_via.c: 2 * bad test ?
+
+1.
+
+qemu-4.2.0/hw/misc/mac_via.c:417:27: style: Expression is always false because 'else if' condition matches previous condition at line 412. [multiCondition]
+
+                } else if ((m->data_out & 0xf3) == 0xa1) {
+...
+                } else if ((m->data_out & 0xf3) == 0xa1) {
+
+2.
+
+qemu-4.2.0/hw/misc/mac_via.c:467:27: style: Expression is always false because 'else if' condition matches previous condition at line 463. [multiCondition]
+
+Duplicate.
+
+gcc compiler flag -Wduplicated-cond will catch this kind of problem.
+
+You might want to switch it on in your builds. It has been available for over a year.
+
+
+On 12/16/19 12:58 PM, dcb wrote:
+> gcc compiler flag -Wduplicated-cond will catch this kind of problem.
+
+Interesting, thanks for sharing!
+
+> 
+> You might want to switch it on in your builds. It has been available for
+> over a year.
+> 
+
+
+
+This code seems to emulate a RTC device connected via I2C to the VIA chipset.
+
+This might be the expected code (simply looking at this file, without checking the datasheet):
+-- >8 --
+--- a/hw/misc/mac_via.c
++++ b/hw/misc/mac_via.c
+@@ -409,7 +409,7 @@ static void via1_rtc_update(MacVIAState *m)
+                 } else if (m->data_out == 0x8d) { /* seconds register 3 */
+                     m->data_in = (time >> 24) & 0xff;
+                     m->data_in_cnt = 8;
+-                } else if ((m->data_out & 0xf3) == 0xa1) {
++                } else if ((m->data_out & 0xf3) == 0xa3) {
+                     /* PRAM address 0x10 -> 0x13 */
+                     int addr = (m->data_out >> 2) & 0x03;
+                     m->data_in = v1s->PRAM[addr];
+@@ -460,7 +460,7 @@ static void via1_rtc_update(MacVIAState *m)
+                 } else if (m->cmd == 0x35) {
+                     /* Write Protect register */
+                     m->wprotect = m->data_out & 1;
+-                } else if ((m->cmd & 0xf3) == 0xa1) {
++                } else if ((m->cmd & 0xf3) == 0xa3) {
+                     /* PRAM address 0x10 -> 0x13 */
+                     int addr = (m->cmd >> 2) & 0x03;
+                     v1s->PRAM[addr] = m->data_out;
+---
+
+This file won a "/* TODO port to I2CBus */" comment :)
+
+I think VIA RTC access method has been implemented earlier (Classic Mac, 1984-1989) than the I2C specification, so I'm not sure we can/should port this to an I2C bus.
+
+Specs are (from Apple Macintosh Family Hardware Reference Chapter 2, Classi Macitosh Processor and Control)
+
+z0000001  Seconds register 0 (lowest-order byte)
+z0000101  Seconds register 1
+z0001001  Seconds register 2
+z0001101  Seconds register 3 (highest-order byte)
+00110001  Test register (write-only)
+00110101  Write-Protect Register (write-only)
+z010aa01  RAM address 100aa ($10-$13) (first 20 bytes only)
+z1aaaa01  RAM address 0aaaa ($00-$0F) (first 20 bytes only)
+z0111aaa  Extended memory designator and sector number
+          (Macintohs 512K enhanced and Macintosh plus only)
+
+For a read request, z=1, for a write z=0
+The letter a indicates bits whose value depend on what parameter RAM byte you want to address
+
+So I think the mask/values should be:
+
+diff --git a/hw/misc/mac_via.c b/hw/misc/mac_via.c
+index f3f130ad96cc..7402cf3f1ee8 100644
+--- a/hw/misc/mac_via.c
++++ b/hw/misc/mac_via.c
+@@ -414,7 +414,7 @@ static void via1_rtc_update(MacVIAState *m)
+                     int addr = (m->data_out >> 2) & 0x03;
+                     m->data_in = v1s->PRAM[addr];
+                     m->data_in_cnt = 8;
+-                } else if ((m->data_out & 0xf3) == 0xa1) {
++                } else if ((m->data_out & 0xc3) == 0xc1) {
+                     /* PRAM address 0x00 -> 0x0f */
+                     int addr = (m->data_out >> 2) & 0x0f;
+                     m->data_in = v1s->PRAM[addr];
+@@ -460,11 +460,11 @@ static void via1_rtc_update(MacVIAState *m)
+                 } else if (m->cmd == 0x35) {
+                     /* Write Protect register */
+                     m->wprotect = m->data_out & 1;
+-                } else if ((m->cmd & 0xf3) == 0xa1) {
++                } else if ((m->cmd & 0xf3) == 0x21) {
+                     /* PRAM address 0x10 -> 0x13 */
+                     int addr = (m->cmd >> 2) & 0x03;
+                     v1s->PRAM[addr] = m->data_out;
+-                } else if ((m->cmd & 0xf3) == 0xa1) {
++                } else if ((m->cmd & 0xc3) == 0x41) {
+                     /* PRAM address 0x00 -> 0x0f */
+                     int addr = (m->cmd >> 2) & 0x0f;
+                     v1s->PRAM[addr] = m->data_out;
+
+
+Patch posted: https://<email address hidden>/msg666836.html
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=b2619c158ab5
+

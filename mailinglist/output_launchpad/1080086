@@ -1,0 +1,211 @@
+MC146818 RTC breaks when SET bit in Register B is on.
+
+This bug occurs when the SET flag of Register B is enabled. When an RTC
+data register (i.e. any of the 10 bytes of time/calender data in CMOS) is set,
+the data is (as expected) correctly stored in the cmos_data array. However,
+since the SET flag is enabled, the function rtc_set_time is not invoked.
+As a result, the field base_rtc in RTCState remains uninitialized. This appears to
+cause a problem on subsequent writes which can end up overwriting data.
+
+To see this, consider writing data to Register A after having written
+data to any of the RTC data registers; the following figure illustrates
+the call stack for the Register A write operation:
+
+ +- cmos_io_port_write
+ +-- check_update_timer
+ +---- get_next_alarm
+ +------ rtc_update_time
+
+In rtc_update_time, get_guest_rtc calculates the wrong time and
+overwrites the previously written RTC data register values.
+
+I have created a standalone test case which exposes this bug:
+
+   https://github.com/ahorn/benchmarks/commit/fff1ca40694bbef6f7f9de323bb0bed63419ef99
+
+I have attached a patch for the most recent version of the file hw/mc146818rtc.c [1]. The patch also features a functional test which executes through the QTest framework.
+
+I would appreciate your thoughts on this.
+
+[1] http://git.qemu.org/?p=qemu.git;a=blob;f=hw/mc146818rtc.c;h=98839f278d93452d071054e2a017b3d909b45ab2;hb=9cb535fe4ef08b01e583ec955767a0899ff79afe#l563
+
+Cross reference:
+
+  https://lists.gnu.org/archive/html/qemu-devel/2012-11/msg01759.html
+
+> [...] the patch is almost good for inclusion. I'd ask for two changes:
+> 1) please test == 0, not != REG_B_SET;
+> 2) please leave the fuzzicsng test last
+
+I have attached a new patch with the requested changes.
+
+This patch also improves the quality of the functional test by
+checking that RTC_SECONDS is equal (==) to the previously written data
+provided the SET flag in Register B is still enabled. This is
+justified by the data sheet which states that an enabled SET bit
+"stops an existing update" and prevents "a new one from occurring" [1,
+p. 15]. In contrast, once the SET flag is disabled, the RTC_SECONDS
+check uses an inequality (>=) as in the original test case.
+
+Out of curiosity, does anyone know how long this particular bug has
+been undetected or how/when it was introduced? This could help me
+explain to others my research interest in symbolic execution of
+hardware models and its application in form of automated test
+generation.
+
+Finally, if there is interest to improve the robustness of the RTC
+model, I could send a patch with several verification conditions (i.e.
+assertions) which can help to expose these kind of bugs in the RTC
+hardware model. Recall that most compiler can usually optimize these
+assertions away unless a developer explicitly enables them. They also
+serve as unambiguous code documentation.
+
+With best regards,
+Alex
+
+[1] http://www.freescale.com/files/microcontrollers/doc/data_sheet/MC146818.pdf
+
+On 18 November 2012 08:52, Paolo Bonzini <email address hidden> wrote:
+> Il 17/11/2012 19:47, Alex Horn ha scritto:
+>> I have attached a patch for the most recent version of the file
+>> hw/mc146818rtc.c [1]. The patch also features a functional test which
+>> executes through the QTest framework.
+>>
+>> I would appreciate your thoughts on this.
+>>
+>> [1]
+>> http://git.qemu.org/?p=qemu.git;a=blob;f=hw/mc146818rtc.c;h=98839f278d93452d071054e2a017b3d909b45ab2;hb=9cb535fe4ef08b01e583ec955767a0899ff79afe#l563
+>>
+>> ** Patch added: "register_b_set_flag.patch"
+>>    https://bugs.launchpad.net/qemu/+bug/1080086/+attachment/3436808/+files/register_b_set_flag.patch
+>>
+>
+> Hi Alex, the patch is almost good for inclusion.  I'd ask for two
+> changes: 1) please test == 0, not != REG_B_SET; 2) please leave the
+> fuzzing test last, because it may leave some registers in an undefined
+> state.
+>
+> Paolo
+
+
+>> Out of curiosity, does anyone know how long this particular bug has
+>> been undetected or how/when it was introduced?
+>
+> Probably it was introduced last September when the model was rewritten.
+>  But it's really unlikely that the bug would have been detected.
+
+Thanks for that quick assessment.
+
+> On the other hand, the bug in commit b6db4ac (which also includes a
+> qtest) was detected by autotest.  Could your tool find it, too?
+
+That's a very respectable achievement. I understand that Autotest runs
+predefined (i.e. hand-written) tests on a large scale. In contrast, we
+seek a higher degree of automation but on a smaller scale. These
+differences could make a comparison difficult. However, your example
+is much appreciated because it helps us to set our work in
+perspective.
+
+>> This could help me explain to others my research interest in symbolic
+>> execution of hardware models and its application in form of automated
+>> test generation.
+>
+> Very interesting (at least to me :)).
+
+Perhaps you find the following background helpful. To kick start our
+work, we extracted from QEMU a standalone RTC hardware model [2]
+because QOM, QMP, TCG or QTest would render the semi-automatic
+analysis infeasible. As a next step, we would like to combine this
+standalone hardware model with a Linux x86 driver [3]. The reported
+bug is a good exemplar of the type of firmware/hardware interface
+properties we are interested in. Note that this is only the initial
+phase of our research and there is much work yet to be done.
+
+Of course, any comments or collaboration are always welcome.
+
+With kind regards,
+Alex
+
+[2] https://github.com/ahorn/benchmarks/tree/master/qemu-hw
+[3] https://github.com/ahorn/benchmarks/tree/master/sw-hw/linux/rtc_x86
+
+On 19 November 2012 11:42, Paolo Bonzini <email address hidden> wrote:
+> Il 19/11/2012 12:34, Alex Horn ha scritto:
+>>> [...] the patch is almost good for inclusion. I'd ask for two changes:
+>>> 1) please test == 0, not != REG_B_SET;
+>>> 2) please leave the fuzzicsng test last
+>>
+>> I have attached a new patch with the requested changes.
+>>
+>> This patch also improves the quality of the functional test by
+>> checking that RTC_SECONDS is equal (==) to the previously written data
+>> provided the SET flag in Register B is still enabled. This is
+>> justified by the data sheet which states that an enabled SET bit
+>> "stops an existing update" and prevents "a new one from occurring" [1,
+>> p. 15]. In contrast, once the SET flag is disabled, the RTC_SECONDS
+>> check uses an inequality (>=) as in the original test case.
+>
+> Right.
+>
+>> Out of curiosity, does anyone know how long this particular bug has
+>> been undetected or how/when it was introduced?
+>
+> Probably it was introduced last September when the model was rewritten.
+>  But it's really unlikely that the bug would have been detected.
+>
+> On the other hand, the bug in commit b6db4ac (which also includes a
+> qtest) was detected by autotest.  Could your tool find it, too?
+>
+>> This could help me explain to others my research interest in symbolic
+>> execution of hardware models and its application in form of automated
+>> test generation.
+>
+> Very interesting (at least to me :)).
+>
+>> Finally, if there is interest to improve the robustness of the RTC
+>> model, I could send a patch with several verification conditions (i.e.
+>> assertions) which can help to expose these kind of bugs in the RTC
+>> hardware model.
+>
+> Sure, that's welcome.
+>
+> In particular, I assume you verified the "next alarm" code to be correct? :)
+>
+> Paolo
+>
+>> Recall that most compiler can usually optimize these
+>> assertions away unless a developer explicitly enables them. They also
+>> serve as unambiguous code documentation.
+>>
+>> With best regards,
+>> Alex
+>>
+>> [1] http://www.freescale.com/files/microcontrollers/doc/data_sheet/MC146818.pdf
+>>
+>> On 18 November 2012 08:52, Paolo Bonzini <email address hidden> wrote:
+>>> Il 17/11/2012 19:47, Alex Horn ha scritto:
+>>>> I have attached a patch for the most recent version of the file
+>>>> hw/mc146818rtc.c [1]. The patch also features a functional test which
+>>>> executes through the QTest framework.
+>>>>
+>>>> I would appreciate your thoughts on this.
+>>>>
+>>>> [1]
+>>>> http://git.qemu.org/?p=qemu.git;a=blob;f=hw/mc146818rtc.c;h=98839f278d93452d071054e2a017b3d909b45ab2;hb=9cb535fe4ef08b01e583ec955767a0899ff79afe#l563
+>>>>
+>>>> ** Patch added: "register_b_set_flag.patch"
+>>>>    https://bugs.launchpad.net/qemu/+bug/1080086/+attachment/3436808/+files/register_b_set_flag.patch
+>>>>
+>>>
+>>> Hi Alex, the patch is almost good for inclusion.  I'd ask for two
+>>> changes: 1) please test == 0, not != REG_B_SET; 2) please leave the
+>>> fuzzing test last, because it may leave some registers in an undefined
+>>> state.
+>>>
+>>> Paolo
+>
+
+
+We fixed this bug long ago in 2012, in commit 02c6ccc6dde90d (thanks for your patch!) but forgot to close the bug...so I'm doing it now.
+
+

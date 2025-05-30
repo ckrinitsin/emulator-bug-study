@@ -1,0 +1,106 @@
+USB assert failure on dev-storage.c
+
+On executing the attached python script in the guest OS, QEMU dies with assert failure:
+
+[run python script in guest root shell]
+# python a.py
+
+[host message]
+qemu-system-x86_64: hw/usb/dev-storage.c:445: usb_msd_handle_data: Assertion `le32_to_cpu(s->csw.residue) == 0' failed.
+Aborted (core dumped)
+
+
+When I detach the kernel driver and send CBW and reattach it again, without conforming to the command/data/status protocol, QEMU dies.
+I think this is due to misimplementation of Command/Data/Status protocol in Bulk-only transfer.
+This kind of assert failure can be misused by malwares to avoid being analyzed by terminating only in the virtual environments and still execute the malicious code in real machines.
+Before running python script, make sure to change a.py that it should points to usb mass storage's vid and pid.
+
+QEMU was running on these environment : 
+[CPU model]    Intel(R) Core(TM) i5-4590 CPU @ 3.30GHz
+[qemu version] QEMU 2.5.0-rc2 (compiled from source, gcc 4.8.4)
+[host info]    Ubuntu 14.04.3, x86_64, 3.19.0-32-generic
+[guest info]   Ubuntu 14.04.3, x86_64, 3.19.0-28-generic
+[QEMU argument]
+x86_64-softmmu/qemu-system-x86_64 -hda /media/hdd/img/ubuntu1404.qcow2.5 \
+	-m 512 \
+	--usbdevice disk:format=qcow2:../usb.img.5 \
+	--enable-kvm
+
+
+
+Triaging old bug tickets ... can you still reproduce this issue with the latest version of QEMU (version 2.8)?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Using hypervisor fuzzer, hyfuzz, I found an assertion failure through nec-usb-xhci emulator.
+
+A malicious guest user/process could use this flaw to abort the QEMU process on the host, resulting in a denial of service.
+
+This was found in version 5.2.0 (master, 51db2d7cf26d05a961ec0ee0eb773594b32cc4a1)
+
+To reproduce the assertion failure, please run the QEMU with the following command line.
+
+```
+
+$ qemu-system-i386 -m 512 -drive file=./hyfuzz.img,index=0,media=disk,format=raw -drive if=none,id=stick,file=./usbdisk.img,format=raw -device nec-usb-xhci,id=usb -device usb-storage,bus=usb.0,drive=stick
+
+
+```
+
+
+```
+
+qemu-system-i386: ../hw/usb/dev-storage.c:454: void usb_msd_handle_data(USBDevice *, USBPacket *): Assertion `le32_to_cpu(s->csw.residue) == 0' failed.
+
+#0  0x00007ffff1a60fb7 in __GI_raise (sig=sig@entry=0x6) at ../sysdeps/unix/sysv/linux/raise.c:51
+#1  0x00007ffff1a62921 in __GI_abort () at abort.c:79
+#2  0x00007ffff1a5248a in __assert_fail_base (fmt=0x7ffff1bd9750 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=assertion@entry=0x555557518dc0 <.str.30> "le32_to_cpu(s->csw.residue) == 0", file=file@entry=0x5555575189e0 <.str.19> "../hw/usb/dev-storage.c", line=line@entry=0x1c6, function=function@entry=0x555557518e20 <__PRETTY_FUNCTION__.usb_msd_handle_data> "void usb_msd_handle_data(USBDevice *, USBPacket *)") at assert.c:92
+#3  0x00007ffff1a52502 in __GI___assert_fail (assertion=0x555557518dc0 <.str.30> "le32_to_cpu(s->csw.residue) == 0", file=0x5555575189e0 <.str.19> "../hw/usb/dev-storage.c", line=0x1c6, function=0x555557518e20 <__PRETTY_FUNCTION__.usb_msd_handle_data> "void usb_msd_handle_data(USBDevice *, USBPacket *)") at assert.c:101
+#4  0x0000555556299749 in usb_msd_handle_data (dev=<optimized out>, p=<optimized out>) at ../hw/usb/dev-storage.c:454
+#5  0x00005555563120b3 in usb_device_handle_data (dev=0x62300000a900, p=0x611001da3fc8) at ../hw/usb/bus.c:180
+#6  0x000055555610ac07 in usb_process_one (p=0x611001da3fc8) at ../hw/usb/core.c:406
+#7  0x0000555556109d8f in usb_handle_packet (dev=0x62300000a900, p=<optimized out>) at ../hw/usb/core.c:438
+#8  0x000055555687de55 in xhci_submit (xhci=<optimized out>, xfer=<optimized out>, epctx=<optimized out>) at ../hw/usb/hcd-xhci.c:1779
+#9  0x000055555687de55 in xhci_fire_transfer (xhci=<optimized out>, xfer=<optimized out>, epctx=<optimized out>) at ../hw/usb/hcd-xhci.c:1788
+#10 0x000055555687de55 in xhci_kick_epctx (epctx=<optimized out>, streamid=0x0) at ../hw/usb/hcd-xhci.c:1947
+#11 0x000055555688c7f6 in xhci_kick_ep (xhci=<optimized out>, slotid=<optimized out>, epid=<optimized out>, streamid=0x0) at ../hw/usb/hcd-xhci.c:1813
+#12 0x00005555568943b7 in xhci_doorbell_write (ptr=<optimized out>, reg=0x1, val=0x4, size=<optimized out>) at ../hw/usb/hcd-xhci.c:3114
+#13 0x0000555556c6617a in memory_region_write_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at ../softmmu/memory.c:491
+#14 0x0000555556c65d96 in access_with_adjusted_size (addr=<optimized out>, value=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=<optimized out>, mr=<optimized out>, attrs=...)
+    at ../softmmu/memory.c:552
+#15 0x0000555556c65d96 in memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=<optimized out>, op=<optimized out>, attrs=...) at ../softmmu/memory.c:1501
+#16 0x0000555556fb4b90 in flatview_write_continue (fv=0x6060002bf460, addr=0xfebf2004, attrs=..., ptr=<optimized out>, len=0x4, addr1=0x7fff775fa810, l=<optimized out>, mr=0x7fff74937610) at ../softmmu/physmem.c:2776
+#17 0x0000555556fb9e3d in flatview_write (fv=<optimized out>, addr=<optimized out>, attrs=..., len=0x4, buf=<optimized out>) at ../softmmu/physmem.c:2816
+#18 0x0000555556fb9e3d in subpage_write (opaque=<optimized out>, addr=<optimized out>, value=<optimized out>, len=<optimized out>, attrs=...) at ../softmmu/physmem.c:2482
+#19 0x0000555556c668ff in memory_region_write_with_attrs_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at ../softmmu/memory.c:511
+#20 0x0000555556c65de6 in access_with_adjusted_size (addr=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, mr=<optimized out>, attrs=..., value=<optimized out>, access_fn=<optimized out>)
+    at ../softmmu/memory.c:552
+#21 0x0000555556c65de6 in memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=<optimized out>, op=<optimized out>, attrs=...) at ../softmmu/memory.c:1508
+#22 0x0000555556cd2796 in io_writex (iotlbentry=<optimized out>, mmu_idx=<optimized out>, val=<optimized out>, addr=<optimized out>, retaddr=<optimized out>, op=4054192055, env=<optimized out>) at ../accel/tcg/cputlb.c:1425
+#23 0x0000555556cd2796 in store_helper (env=<optimized out>, addr=<optimized out>, val=0x4, oi=<optimized out>, retaddr=<optimized out>, op=MO_32) at ../accel/tcg/cputlb.c:2444
+#24 0x0000555556cd2796 in helper_le_stl_mmu (env=<optimized out>, addr=<optimized out>, val=0x1ca6828, oi=<optimized out>, retaddr=0x7fff97c4ce9f) at ../accel/tcg/cputlb.c:2510
+#25 0x00007fff97c4ce9f in code_gen_buffer ()
+#26 0x0000555556f3ea44 in cpu_tb_exec (cpu=0x62e000000400, itb=<optimized out>, tb_exit=0x7fff775fbf20) at ../accel/tcg/cpu-exec.c:191
+#27 0x0000555556f40cf4 in cpu_loop_exec_tb (tb=<optimized out>, tb_exit=<optimized out>, cpu=<optimized out>, last_tb=<optimized out>) at ../accel/tcg/cpu-exec.c:672
+#28 0x0000555556f40cf4 in cpu_exec (cpu=0x62e000000400) at ../accel/tcg/cpu-exec.c:797
+#29 0x0000555556c5cd73 in tcg_cpus_exec (cpu=0x62e000000400) at ../accel/tcg/tcg-accel-ops.c:60
+#30 0x0000555556cfd60d in mttcg_cpu_thread_fn (arg=0x62e000000400) at ../accel/tcg/tcg-accel-ops-mttcg.c:70
+#31 0x00005555573f75cf in qemu_thread_start (args=0x6030000d9870) at ../util/qemu-thread-posix.c:521
+#32 0x0000555556022f5f in __asan::AsanThread::ThreadStart(unsigned long, __sanitizer::atomic_uintptr_t*) ()
+#33 0x00007ffff243e6db in start_thread (arg=0x7fff775ff700) at pthread_create.c:463
+#34 0x00007ffff1b4371f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+
+```
+
+
+
+Looking at commit 0659879e6e5 ("usb-storage: remove MSDState->residue")
+this assert seems a left-over, CSW residue should be irrelevant in CBW
+path...
+Gerd, can we simply remove it?
+
+No, we can't.  csw.residue is non-zero if the request didn't complete yet (usb_msd_send_status clears it via memset).  We *really* should not be in USB_MSDM_CBW state with a non-zero residue.
+We need to figure how we end up with this inconsistency.  Possibly via usb_msd_handle_reset().
+
+https://gitlab.com/qemu-project/qemu/-/commit/39912c14da07a2d
+

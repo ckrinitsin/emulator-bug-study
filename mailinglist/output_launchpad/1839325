@@ -1,0 +1,100 @@
+Go programs crash on qemu-sh4 due to issues with atomics
+
+After #1738545 [1] was fixed, Go applications work fine on qemu-arm but still crash on qemu-sh4. From the backtrace, it looks like an issue with the atomics in qemu-sh4:
+
+(sid-sh4-sbuild)root@epyc:/# cat hello.go
+package main
+
+import "fmt"
+
+func main() {
+      fmt.Println("hello world")
+}
+
+(sid-sh4-sbuild)root@epyc:/# gccgo-9 hello.go -o hello
+(sid-sh4-sbuild)root@epyc:/# ./hello 
+panic: (        runtime runtime.errorString) (0x7f74527c,0x80a038)
+fatal error: panic on system stack
+panic: (        runtime runtime.errorString) (0x7f74527c,0x80a038)
+fatal error: panic on system stack
+
+runtime stack:
+runtime..z2finternal..z2fatomic.Load64
+        ../../../src/libgo/go/runtime/internal/atomic/atomic.c:37
+runtime_mstart
+        ../../../src/libgo/runtime/proc.c:596
+
+goroutine 1 [running]:
+        goroutine running on other thread; stack unavailable
+
+runtime stack:
+runtime..z2finternal..z2fatomic.Load64
+        ../../../src/libgo/go/runtime/internal/atomic/atomic.c:37
+runtime_mstart
+        ../../../src/libgo/runtime/proc.c:596
+(sid-sh4-sbuild)root@epyc:/#
+
+The same sample Go program runs fine on my SH7785LCR SH4 evaluation board:
+
+root@tirpitz:~> uname -a
+Linux tirpitz 3.16.7-ckt7 #8 PREEMPT Fri Oct 21 18:47:41 CEST 2016 sh4a GNU/Linux
+root@tirpitz:~> cat hello.go
+package main
+
+import "fmt"
+
+func main() {
+      fmt.Println("hello world")
+}
+
+root@tirpitz:~> gccgo-9 hello.go -o hello
+root@tirpitz:~> ./hello 
+hello world
+root@tirpitz:~>
+
+Please note: In order to be able to reproduce this, one also needs to revert commit 61dedf2af7 [2], otherwise the Go application crashes differently:
+
+(sid-sh4-sbuild)root@epyc:/# ./hello        
+Unhandled trap: 0x180
+pc=0x7e5f7f9e sr=0x00000000 pr=0x7ee3d582 fpscr=0x00080004
+spc=0x00000000 ssr=0x00000000 gbr=0x7e590480 vbr=0x00000000
+sgr=0x00000000 dbr=0x00000000 delayed_pc=0x7e5f7f60 fpul=0x00034f3b
+r0=0x008007d4 r1=0x00000000 r2=0xfffe0b2a r3=0x00000002
+r4=0x008006e4 r5=0x00872000 r6=0x00200000 r7=0x00000000
+r8=0x7f7bca7c r9=0x7fffebd4 r10=0x00800480 r11=0x7f7bc0f0
+r12=0x7f7a3fa4 r13=0x008004c0 r14=0x7f7b2238 r15=0x7fffebd0
+r16=0x00000000 r17=0x00000000 r18=0x00000000 r19=0x00000000
+r20=0x00000000 r21=0x00000000 r22=0x00000000 r23=0x00000000
+(sid-sh4-sbuild)root@epyc:/#
+
+> [1] https://bugs.launchpad.net/bugs/1738545
+> [2] https://bugs.launchpad.net/bugs/1796520
+
+The immediate cause of the crash here is that the runtime invokes the Load64() function on a pointer that isn't 8-aligned, which triggers a hand-coded check-and-panic in the libgo code. I haven't yet tracked down where that pointer came from.
+
+
+The non-8-aligned pointer is the runtime.work.empty field. The compilation that I have of this binary has put the 'runtime.work' struct at 0x6bfadc, which is only 4-aligned, and this won't work as the lfstack fields it starts with are supposed to be 8-aligned. So it looks to me like the compiler has miscompiled the binary somehow, and QEMU's actual execution of it is OK.
+
+I don't know if this is a general bug in the sh4 gccgo support (in which case we must be succeeding on the real hardware by accident, probably by finishing fast enough that the gc never kicks in), or if QEMU is mis-executing the compiler somehow and a build done on the real hardware puts the work struct at an 8-aligned address.
+
+
+I just did an objdump -x of the /usr/lib/sh4-linux-gnu/libgo.so.14, which will be the shipped version from the Debian package, and in the section header it has:
+
+ 24 .bss          000191f8  00fe74ec  00fe74ec  00fd74ec  2**2
+                  ALLOC
+
+and in the symbol table it has:
+
+00ff98f4 l     O .bss   00000104              runtime.work
+
+So the compiler has put the 'runtime.work' struct at a non-multiple-of-8 offset into the bss, and it's given the BSS alignment requirements that are only 4-aligned, not 8-aligned. That means it's random luck whether the struct gets 8-aligned or not.
+
+This looks to me like it's a bug in the sh4 gccgo -- https://go101.org/article/memory-layout.html says that the first word in a struct or variable is supposed to be guaranteed to be 8-aligned, so the compiler needs to align things more strictly than it is currently doing.
+
+
+Thanks. I will report this to Go/gcc upstream.
+
+I'm going to close this bug, since it's a problem with the gccgo codegen, not a QEMU bug. (I'm interested in any response you get from the go/gcc upstream folks, though.)
+
+
+

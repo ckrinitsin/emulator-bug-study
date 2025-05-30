@@ -1,0 +1,274 @@
+QEMU QCow Images grow dramatically
+
+I've recently migrated our VM infrastructure (~200 guest on 15 hosts) from vbox to Qemu (using KVM / libvirt). We have a master image (QEMU QCow v3) from which we spawn multiple instances (linked clones). All guests are being revert once per hour for security reasons.
+
+About 2 weeks after we successfully migrated to Qemu, we noticed that almost all disks went full across all 15 hosts. Our investigation showed that the initial qcow disk images blow up from a few gigabytes to 100GB and more. This should not happen, as we revert all VMs back to the initial snapshot once per hour and hence all changes that have been made to disks must be reverted too.
+
+We did an addition test with 24 hour time frame with which we could reproduce this bug as documented below.
+
+Initial disk image size (created on Jan 04):
+-rw-r--r-- 1 root root 7.1G Jan  4 15:59 W10-TS01-0.img
+-rw-r--r-- 1 root root 7.3G Jan  4 15:59 W10-TS02-0.img
+-rw-r--r-- 1 root root 7.4G Jan  4 15:59 W10-TS03-0.img
+-rw-r--r-- 1 root root 8.3G Jan  4 16:02 W10-CLIENT01-0.img
+-rw-r--r-- 1 root root 8.6G Jan  4 16:05 W10-CLIENT02-0.img
+-rw-r--r-- 1 root root 8.0G Jan  4 16:05 W10-CLIENT03-0.img
+-rw-r--r-- 1 root root 8.3G Jan  4 16:08 W10-CLIENT04-0.img
+-rw-r--r-- 1 root root 8.1G Jan  4 16:12 W10-CLIENT05-0.img
+-rw-r--r-- 1 root root 8.0G Jan  4 16:12 W10-CLIENT06-0.img
+-rw-r--r-- 1 root root 8.1G Jan  4 16:16 W10-CLIENT07-0.img
+-rw-r--r-- 1 root root 7.6G Jan  4 16:16 W10-CLIENT08-0.img
+-rw-r--r-- 1 root root 7.6G Jan  4 16:19 W10-CLIENT09-0.img
+-rw-r--r-- 1 root root 7.5G Jan  4 16:21 W10-ROUTER-0.img
+-rw-r--r-- 1 root root  18G Jan  4 16:25 W10-MASTER-IMG.qcow2
+
+Disk image size after 24 hours (printed on Jan 05):
+-rw-r--r-- 1 root root  13G Jan  5 15:07 W10-TS01-0.img
+-rw-r--r-- 1 root root 8.9G Jan  5 14:20 W10-TS02-0.img
+-rw-r--r-- 1 root root 9.0G Jan  5 15:07 W10-TS03-0.img
+-rw-r--r-- 1 root root  10G Jan  5 15:08 W10-CLIENT01-0.img
+-rw-r--r-- 1 root root  11G Jan  5 15:08 W10-CLIENT02-0.img
+-rw-r--r-- 1 root root  11G Jan  5 15:08 W10-CLIENT03-0.img
+-rw-r--r-- 1 root root  11G Jan  5 15:08 W10-CLIENT04-0.img
+-rw-r--r-- 1 root root  19G Jan  5 15:07 W10-CLIENT05-0.img
+-rw-r--r-- 1 root root  14G Jan  5 15:08 W10-CLIENT06-0.img
+-rw-r--r-- 1 root root 9.7G Jan  5 15:07 W10-CLIENT07-0.img
+-rw-r--r-- 1 root root  35G Jan  5 15:08 W10-CLIENT08-0.img
+-rw-r--r-- 1 root root 9.2G Jan  5 15:07 W10-CLIENT09-0.img
+-rw-r--r-- 1 root root  41G Jan  5 15:08 W10-ROUTER-0.img
+-rw-r--r-- 1 root root  18G Jan  4 16:25 W10-MASTER-IMG.qcow2
+
+You can reproduce this bug as follow:
+1) create an initial disk image
+2) create a linked clone
+3) create a snapshot of the linked clone
+4) revert the snapshot every X minutes / hours
+
+Due the described behavior / bug, our VM farm is completely down at the moment (as we run out of disk space on all host systems). A quick fix for this bug would be much appreciated.
+
+Host OS: Ubuntu 18.04.01 LTS
+Kernel: 4.15.0-43-generic
+Qemu: 3.1.0
+libvirt: 4.10.0
+Guest OS: Windows 10 64bit
+
+On 1/5/19 9:32 AM, Lenny Helpline wrote:
+
+> 
+> You can reproduce this bug as follow:
+> 1) create an initial disk image
+> 2) create a linked clone
+> 3) create a snapshot of the linked clone
+> 4) revert the snapshot every X minutes / hours
+
+Needs more details to reproduce.  What is the exact command you used for
+each of these steps?  For example, without that command, I can't tell if
+you are creating internal or external snapshots, and that drastically
+changes the approach for how to deal with reverting snapshots.
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+
+I don't have many commands handy, as we manage almost everything through libvirt manager.
+
+3) create a snapshot of the lined clone:
+
+virsh snapshot-create-as --domain <VMNAME> --name "test" --halt
+
+4) revert the snapshot every X minutes / hours:
+
+virsh destroy <VMNAME>
+virsh snapshot-revert --snapshotname test --running --force
+
+Does that help?
+
+On 1/8/19 2:30 AM, Lenny Helpline wrote:
+> I don't have many commands handy, as we manage almost everything through
+> libvirt manager.
+> 
+> 3) create a snapshot of the lined clone:
+> 
+> virsh snapshot-create-as --domain <VMNAME> --name "test" --halt
+> 
+> 4) revert the snapshot every X minutes / hours:
+> 
+> virsh destroy <VMNAME>
+> virsh snapshot-revert --snapshotname test --running --force
+> 
+> Does that help?
+
+Yes. It shows that you are taking internal snapshots, rather than
+external.  Note that merely reverting to an internal snapshot does not
+delete that snapshot, and also note that although qemu has code for
+deleting internal snapshots, I doubt that it currently reclaims the disk
+space that was previously in use by that snapshot but no longer needed.
+Internal snapshots do not get much attention these days, because most of
+our work is focused on external snapshots.
+
+If you were to use external snapshots, then every time you wanted to
+create a point in time that you might need to roll back to, you create a
+new external snapshot, turning:
+
+image1
+
+into
+
+image1 <- temp_overlay
+
+then, at the point when you are done with the work in temp_overlay2, you
+reset the domain back to using image1 and throw away the old
+temp_overlay (or, recreate temp_overlay to be blank, which is the same
+as going back to the state in image1); thus, the size of image1 never
+grows because you are doing all work in temp_overlay, and rolling back
+no longer keeps the changes that were done in a previous branch of work
+the way internal snapshots are doing.
+
+In libvirt terms, you could create an external snapshot by adding
+--diskspec $disk,snapshot=external for each $disk of your domain (virsh
+domblklist can be used to get the list of valid $disk names).  But
+libvirt support for reverting to external snapshots is still not
+completely rounded out, so you'll have to do a bit more leg work on your
+end to piece things back together.
+
+Asking on the libvirt list may give you better insights on how best to
+use libvirt to drive external snapshots to accomplish your setup of
+frequently reverting to older points in time.
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+
+Regarding snapshot deletion, QEMU does punch holes into the image file when deleting snapshots, so the space should effectively be freed, even if this isn't visible in the file size. To get actually meaningful numbers, you'd have to look at the allocated blocks rather than the file size (e.g. by using 'du -h' instead of 'ls -lh').
+
+A quick test with internal snapshots didn't show any increase of the used space for me. So the condition to trigger the problem must be a little more complicated than just saving, loading and deleting some snapshots. After some random manual testing, I wrote a small script to share the results with you:
+
+#!/bin/bash
+  
+./qemu-img create -f qcow2 /tmp/test.qcow2 64M
+./qemu-io -c 'write 16M 32M' /tmp/test.qcow2
+du /tmp/test.qcow2
+./qemu-img snapshot -c snap0 /tmp/test.qcow2
+./qemu-io -c 'write 0 32M' /tmp/test.qcow2
+./qemu-img snapshot -c snap1 /tmp/test.qcow2
+./qemu-io -c 'write 32M 32M' /tmp/test.qcow2
+./qemu-img snapshot -a snap0 /tmp/test.qcow2
+./qemu-img snapshot -d snap0 /tmp/test.qcow2
+./qemu-img snapshot -d snap1 /tmp/test.qcow2
+du /tmp/test.qcow2
+
+The result of this script is that both 'du' invocations show the same value for me, i.e. after taking two snapshots and making the image fully allocated, reverting to the first snapshot and deleting the snapshots gets the image back to the original 32 MB:
+
+Formatting '/tmp/test.qcow2', fmt=qcow2 size=67108864 cluster_size=65536 lazy_refcounts=off refcount_bits=16
+wrote 33554432/33554432 bytes at offset 16777216
+32 MiB, 1 ops; 0.0088 sec (3.520 GiB/sec and 112.6380 ops/sec)
+33028   /tmp/test.qcow2
+wrote 33554432/33554432 bytes at offset 0
+32 MiB, 1 ops; 0.0083 sec (3.739 GiB/sec and 119.6602 ops/sec)
+wrote 33554432/33554432 bytes at offset 33554432
+32 MiB, 1 ops; 0.0082 sec (3.785 GiB/sec and 121.1094 ops/sec)
+33028   /tmp/test.qcow2
+
+Maybe you can play a bit more with qemu-img and qemu-io and find a case where the image grows like you see on your VM? Once we got a reproducer, we can try and check where the growth comes from.
+
+We have played a bit around with external snapshots (as suggested by Eric Blake in post #3), however, it appears that external snapshots are not fully supported yet. While I can create external snapshots, I'm unable to revert to them using virt-manager (which we use for managing our VM farm):
+
+Error running snapshot 'test': unsupported configuration: revert to external snapshot not supported yet
+
+Traceback (most recent call last):
+  File "/usr/share/virt-manager/virtManager/asyncjob.py", line 89, in cb_wrapper
+    callback(asyncjob, *args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/asyncjob.py", line 125, in tmpcb
+    callback(*args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/libvirtobject.py", line 82, in newfn
+    ret = fn(self, *args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/domain.py", line 1225, in revert_to_snapshot
+    self._backend.revertToSnapshot(snap.get_backend())
+  File "/usr/lib/python2.7/dist-packages/libvirt.py", line 1945, in revertToSnapshot
+    if ret == -1: raise libvirtError ('virDomainRevertToSnapshot() failed', dom=self)
+libvirtError: unsupported configuration: revert to external snapshot not supported yet
+
+.... which means that using external snapshots is not an option for us.
+
+Kevin Wolf, over which time period did you run the VMs? Have you made any kind of i/o intensive stuff in the guest itself? e.g. user logon / logoff, serving the web, installing updates
+
+We continue to have big problems with the described issue, here's another example (23GB Vs. 41GB on disk):
+
+# ls -lah
+-rw-r--r-- 1 root root  41G Jan 18 10:57 W10-ROUTER-0.img
+
+# qemu-img info W10-ROUTER-0.img
+image: W10-ROUTER-0.img
+file format: qcow2
+virtual size: 320G (343597383680 bytes)
+disk size: 23G
+cluster_size: 65536
+backing file: /var/lib/libvirt/images/W10-MASTER-IMG.qcow2
+Snapshot list:
+ID        TAG                 VM SIZE                DATE       VM CLOCK
+1         1                      6.0G 2019-01-04 14:51:49   01:09:32.118
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+
+
+Looking at the file size isn't helpful. The 23 GB are the space that is actually used. You can use 'du -h' to confirm this, but I think it gets the number in the exact same way as qemu-img.
+
+> Looking at the file size isn't helpful. The 23 GB
+> are the space that is actually used. You can use 'du -h'
+> to confirm this, but I think it gets the number in the exact same way as qemu-img.
+
+Are you sure about that? My OS complains that the disk is full. I can't even start any VM anymore. That's the reason why I've opened this ticket. Otherwise I wouldn't care....
+
+$ df -h
+Filesystem                                                Size  Used Avail Use% Mounted on
+udev                                                       63G     0   63G   0% /dev
+tmpfs                                                      13G  164M   13G   2% /run
+/dev/md1                                                  455G  455G     0 100% /
+
+
+
+
+# du -sh W10-CLIENT01-0.img
+115G	 W10-CLIENT01-0.img
+
+
+Vs original file size:
+8GB	 W10-CLIENT01-0.img
+
+How's that possible?
+
+
+
+# qemu-img info W10-CLIENT01-0.img
+image: W10-CLIENT01-0.img
+file format: qcow2
+virtual size: 320G (343597383680 bytes)
+disk size: 114G
+cluster_size: 65536
+backing file: /var/lib/libvirt/images/W10-MASTER-IMG.qcow2
+Snapshot list:
+ID        TAG                 VM SIZE                DATE       VM CLOCK
+1         1                      6.4G 2019-01-04 14:33:47   01:14:37.729
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

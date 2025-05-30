@@ -1,0 +1,68 @@
+qemu/kvm hangs reading from serial console
+
+This is for a qemu-kvm running on RHEL 5, so it's pretty old,
+but i think the problem still exists in 1.2
+
+We have conman running on our hosts, connecting to the
+kvm/qemu's using
+    virsh console
+which just opens up the console /dev/pts/slave that qemu
+opens up when run with options
+    -nographic
+    -serial mon:pty
+
+Sometimes virsh console exits and then qemu locks up.
+My guess is that something like this happens:
+
+virsh console exits
+qemu does a select() on /dev/ptmx (and other FDs)
+select() returns the FD of /dev/ptmx in the read-fdset
+qemu does a read()
+read() returns -1 (EIO)
+qemu does other stuff for a while
+select() ... /dev/ptmx
+read() .. EIO
+other stuff
+select() ... read() ... select() ... read() ... select()
+conman starts a new virsh console that connects
+qemu does a read()
+read() blocks b/c there is now a writer on the tty slave
+
+So i don't see any way around this, given the sorta rudi-
+mentary semantics of TTY IO on Linux (not that i know of
+any platform that does it better ... ?), except ...
+
+maybe qemu should
+    fcntl(master_fd, F_SETFL, flags | O_NONBLOCK) 
+in qemu-char.c:qemu_char_open_pty()
+and be prepared to handle E_WOULDBLOCK|E_AGAIN in 
+qemu-char.c:fd_chr_read() ... ?
+
+--buck
+
+[*] i think, b/c in the old version we are running, sometimes
+    the guest spits out the
+        ^]
+    character to its console, and virsh console reads it and
+    doesn't check to see if its from stdin or the pty and exits, 
+    which, i think, can be fixed like this:
+
+--- libvirt-0.8.2/tools/console.c.ctrl_close_bracket_handling_fix       2012-09-06 10:30:43.606997191 -0400
++++ libvirt-0.8.2/tools/console.c       2012-09-06 10:34:52.154000464 -0400
+@@ -155,6 +155,7 @@ int vshRunConsole(const char *tty) {
+
+                 /* Quit if end of file, or we got the Ctrl-] key */
+                 if (!got ||
++                    fds[i].fd == STDIN_FILENO &&
+                     (got == 1 &&
+                      buf[0] == CTRL_CLOSE_BRACKET))
+                     goto done;
+
+Can you still reproduce this problem with the latest version of QEMU? There have been quite a bunch of fixes in this area in the latest versions...
+
+i don't use kvm/qemu any more and so don't have a means
+to determine if this is still an issue or not so please
+presume fixed, i guess
+
+OK, thanks for your answer!
+

@@ -1,0 +1,80 @@
+aarch64 SVE emulation breaks strnlen and strrchr
+
+arm optimized-routines have sve string functions with test code.
+
+the test worked up until recently: with qemu-5.2.0 i see
+
+$ qemu-aarch64 build/bin/test/strnlen
+PASS strnlen
+PASS __strnlen_aarch64
+__strnlen_aarch64_sve (0x490fa0, 32) len 32 returned 64, expected 32
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80"
+__strnlen_aarch64_sve (0x490fa0, 32) len 33 returned 64, expected 32
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80a"
+__strnlen_aarch64_sve (0x490fa0, 33) len 33 returned 64, expected 33
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80a"
+__strnlen_aarch64_sve (0x490fa0, 32) len 34 returned 64, expected 32
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80ab"
+__strnlen_aarch64_sve (0x490fa0, 33) len 34 returned 64, expected 33
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80ab"
+__strnlen_aarch64_sve (0x490fa0, 34) len 34 returned 64, expected 34
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80ab"
+__strnlen_aarch64_sve (0x490fa0, 32) len 35 returned 64, expected 32
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80a\x00c"
+__strnlen_aarch64_sve (0x490fa0, 33) len 35 returned 64, expected 33
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80ab\x00"
+__strnlen_aarch64_sve (0x490fa0, 34) len 35 returned 64, expected 34
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80abc"
+__strnlen_aarch64_sve (0x490fa0, 35) len 35 returned 64, expected 35
+input: "abcdefghijklmnopqrstuvwxyz\{|}~\x7f\x80abc"
+FAIL __strnlen_aarch64_sve
+
+however the test passes with
+
+qemu-aarch64 -cpu max,sve-max-vq=2
+
+there should be nothing vector length specific in the code.
+
+i haven't debugged it further, to reproduce the issue clone
+https://github.com/ARM-software/optimized-routines
+
+and run 'make build/bin/test/strnlen' with a config.mk like
+
+SUBS = string
+ARCH = aarch64
+CROSS_COMPILE = aarch64-none-linux-gnu-
+CC = $(CROSS_COMPILE)gcc
+CFLAGS = -std=c99 -pipe -O3
+CFLAGS += -march=armv8.2-a+sve
+EMULATOR = qemu-aarch64
+
+(native compilation works too, and you can run 'make check' to
+run all string tests) this will build a static linked executable
+into build/bin/test. if you want a smaller test case edit
+string/test/strnlen.c
+
+I don't know why the test worked previously, and I did not
+investigate, but as far as I can tell, the test is broken.
+
+The test is returning a value >= maxlen because it it using
+the wrong increment.  Fixed thus.
+
+
+
+FWIW, as I think on this further, this probably isn't the
+ideal fix -- I recall now that INCP is a "reduction" class
+instruction and thus its overhead is non-trivial.
+
+We could instead add an integer min operation at label 9,
+which is outside of the main loop.
+
+Bah.  The code at label 9 does not match the comment.
+Best fixed thus.
+
+... but you also mentioned strrchr, and there is a qemu bug there.  The REV (predicate) instruction doesn't seem to be doing the right thing -- input 0x1 -> output 0x80000000 which is not correct for the current vector length (64).
+
+Patch fixing strrchr:
+https://<email address hidden>/
+
+https://gitlab.com/qemu-project/qemu/-/commit/70acaafef2e053a3
+

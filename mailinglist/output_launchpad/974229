@@ -1,0 +1,127 @@
+qemu-kvm-1.0: segfault using vnc-console => not threadsafe!
+
+after failure using qemu-kvm-0.14.1 I've tried v1.0, but there's a problem if compiled with vnc-thread-support:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000000000 in ?? ()
+(gdb) bt
+#0  0x0000000000000000 in ?? ()
+#1  0x00007f3ac48ca10a in qemu_iohandler_poll (readfds=0x7fff12379ac0, writefds=0x7fff12379b40, xfds=0x7fff12379bc0, ret=3)
+    at iohandler.c:124
+#2  0x00007f3ac4964387 in main_loop_wait (nonblocking=0) at main-loop.c:463
+#3  0x00007f3ac4958fb1 in main_loop () at /opt/workspace/oneiric64/qemu-kvm-1.0/vl.c:1482
+#4  0x00007f3ac495e1ec in main (argc=68, argv=0x7fff1237a088, envp=0x7fff1237a2b0)
+    at /opt/workspace/oneiric64/qemu-kvm-1.0/vl.c:3523
+(gdb) up
+#1  0x00007f3ac48ca10a in qemu_iohandler_poll (readfds=0x7fff12379ac0, writefds=0x7fff12379b40, xfds=0x7fff12379bc0, ret=3)
+    at iohandler.c:124
+124	                ioh->fd_write(ioh->opaque);
+
+(gdb) print *ioh
+$4 = {fd = 29, fd_read_poll = 0, fd_read = 0x7f3ac49de158 <vnc_client_read>, fd_write = 0, deleted = 0, 
+  opaque = 0x7f3ac7978d50, next = {le_next = 0x7f3ac6add2e0, le_prev = 0x7f3ac52bde90}}
+
+
+ok, how could that happen?
+loooking deeper at the code and backtraces shows, that iohandler.c:124 is called within the main-loop, while iohandler.c:77 is called within the vnc-thread-loop
+
+mmmh, but where the hell is the threadsafe-locking of the ioh-structure????
+
+I didn't found anything...
+
+the resetting in line 77 is called from vnc_client_write_plain(), where following code can be found:
+
+===================
+   if (vs->output.offset == 0) {
+        qemu_set_fd_handler2(vs->csock, NULL, vnc_client_read, NULL, vs);
+    }
+===================
+
+why should the function-ptrs should be zeroed?
+
+further tracing shows, that the vnc-thread sometimes seems to exits normally and a new one is started (I haven't verified that), but this would be a reason for zeroing function-ptrs, which may point to code inside the thread, which will exit...
+
+but why should this be done? and why there's no threadsafe-modification of the structure?
+
+well: disabling vnc-thread at configure-state leads into a normal running machine, but threading would be nice here...
+
+so a quick fix could be, to drop the call above and make the vnc-thread staying for the whole session, but I don't know all mechanisms of vnc-support within kvm.
+but a better solution would be usage of clean locking-mechanisms
+
+Thanks for reporting this bug.
+
+Since vnc-thread-support is not compiled into the qemu-kvm package, the bug is invalid there.  I will mark it as affecting the upstream QEMU project.   Note you'll want to use git://git.qemu.org/qemu.git as the upstream code base.
+
+puh, it did take a while, but meanwhile another segfault has occured, which has nothing to do with the above one. due to the long time, it took to happen, it might not be as reproducible as needed for efficient debugging, at least I've currently no further time for this. I'll now try V0.15.1 and hope, it will work well for me.
+
+some gdb-info of the current segfault, if there's someone, who want to have a look at:
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fe086c46700 (LWP 30362)]
+0x00007fe08c0639fc in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+
+(gdb) thread apply all bt
+
+Thread 6 (Thread 0x7fdfa2ecf700 (LWP 30793)):
+#0  0x00007fe08c3963cb in pthread_cond_timedwait@@GLIBC_2.3.2 () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x00007fe08f581c79 in cond_timedwait (cond=0x7fe08fed6b20, mutex=0x7fe08fed6ae0, ts=0x7fdfa2ecee10)
+    at posix-aio-compat.c:104
+#2  0x00007fe08f5823f0 in aio_thread (unused=0x0) at posix-aio-compat.c:334
+#3  0x00007fe08c391efc in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#4  0x00007fe08c0cc59d in __cmsg_nxthdr () from /lib/x86_64-linux-gnu/libc.so.6
+#5  0x0000000000000000 in ?? ()
+
+Thread 5 (Thread 0x7fe087648700 (LWP 30361)):
+#0  0x00007fe08c399a73 in pwrite64 () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x00007fe08f58201f in handle_aiocb_rw_linear (aiocb=0x7fe093c98e50, 
+    buf=0x7fe093e05600 "\004\063\377\211t$\b\213\064$\213\034\272G\205\333\017\204\246") at posix-aio-compat.c:216
+#2  0x00007fe08f58212d in handle_aiocb_rw (aiocb=0x7fe093c98e50) at posix-aio-compat.c:251
+#3  0x00007fe08f582573 in aio_thread (unused=0x0) at posix-aio-compat.c:362
+#4  0x00007fe08c391efc in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#5  0x00007fe08c0cc59d in __cmsg_nxthdr () from /lib/x86_64-linux-gnu/libc.so.6
+#6  0x0000000000000000 in ?? ()
+
+Thread 4 (Thread 0x7fe086c46700 (LWP 30362)):
+#0  0x00007fe08c0639fc in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fe08c3851c0 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fe086c45990 in ?? ()
+#3  0x00007fe08c39bc20 in ?? () from /lib/x86_64-linux-gnu/libpthread.so.0
+#4  0x00007fe086c469c0 in ?? ()
+#5  0x0000000000000000 in ?? ()
+
+Thread 3 (Thread 0x7fe086445700 (LWP 30363)):
+#0  0x00007fe08c0c4747 in getmntent_r () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x0000000000000000 in ?? ()
+
+Thread 2 (Thread 0x7fdfa36d0700 (LWP 30388)):
+#0  0x00007fe08c3963cb in pthread_cond_timedwait@@GLIBC_2.3.2 () from /lib/x86_64-linux-gnu/libpthread.so.0
+#1  0x00007fe08f581c79 in cond_timedwait (cond=0x7fe08fed6b20, mutex=0x7fe08fed6ae0, ts=0x7fdfa36cfe10)
+    at posix-aio-compat.c:104
+#2  0x00007fe08f5823f0 in aio_thread (unused=0x0) at posix-aio-compat.c:334
+#3  0x00007fe08c391efc in start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#4  0x00007fe08c0cc59d in __cmsg_nxthdr () from /lib/x86_64-linux-gnu/libc.so.6
+#5  0x0000000000000000 in ?? ()
+
+Thread 1 (Thread 0x7fe08f3cd7a0 (LWP 30158)):
+#0  0x00007fe08c0c5613 in getttyent () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00000000000f4140 in ?? ()
+#2  0x00007fff62c7e3d0 in ?? ()
+#3  0x0000001d8f675e5c in ?? ()
+#4  0x00000000000003e8 in ?? ()
+#5  0x0000000062c7e3c0 in ?? ()
+#6  0x0000000062c7e440 in ?? ()
+#7  0x0000000162c7e4c0 in ?? ()
+#8  0x000000003c080980 in ?? ()
+#9  0x0000000000000000 in ?? ()
+(gdb) 
+
+all done on a ubuntu-11.10 64bit, last configure-options were:
+'./configure' '--target-list=x86_64-softmmu i386-softmmu x86_64-linux-user i386-linux-user' '--prefix=/usr' '--interp-prefix=/etc/qemu-binfmt/%M' '--disable-blobs' '--disable-strip' '--audio-drv-list=pa,alsa,sdl,oss' '--enable-vnc-sasl' '--enable-docs' '--enable-vhost-net' '--enable-attr'  '--enable-linux-aio' '--enable-uuid' '--enable-nptl' '--enable-kvm-device-assignment' '--enable-kvm-pit' '--enable-kvm' '--enable-curses' '--enable-vnc-png' '--enable-vnc-tls' '--audio-card-list=ac97,es1370,sb16,cs4231a,adlib,gus,hda' '--enable-user' '--enable-system' '--enable-linux-user' '--enable-bsd-user' '--enable-guest-base' '--enable-darwin-user' --enable-debug
+
+the segfault occures while installing a larger app within winxp+sp3 near the possible end of setup
+
+
+The QEMU versions mentioned in this ticket are quite old already ... can you still reproduce this with the latest version of QEMU? If so, please also provide the exact command line parameters that you used to start QEMU, and the steps you took afterwards to get to the crash? Thanks!
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,493 @@
+guest migration 100% cpu freeze bug
+
+# Investigate migration cpu hog(100%) bug
+
+I have some issues when migrating from kernel 4.14.63 running qemu 2.11.2 to kernel 4.19.43 running qemu 2.11.2.
+The hypervisors are running on debian jessie with libvirt v5.3.0.
+Linux, libvirt and qemu are all custom compiled.
+
+I migrated around 10.000 vms and every once in a while a vm is stuck at 100% cpu after what we can see right now is that the target hypervisor runs on linux 4.19.53. This happened with 4 vms so far. It is not that easy to debug, we found this out pretty quickly because we are running monitoring on frozen vms after migrations.
+
+Last year we were having the same "kind of" bug https://bugs.launchpad.net/qemu/+bug/1775555 when trying to upgrade qemu 2.6 to 2.11.
+This bug was fixed after applying the following patch: http://lists.nongnu.org/archive/html/qemu-devel/2018-04/msg00820.html
+
+This patch is still applied as you can see because of the available pre_load var on the kvmclock_vmsd struct:
+(gdb) ptype kvmclock_vmsd
+type = const struct VMStateDescription {
+    const char *name;
+    int unmigratable;
+    int version_id;
+    int minimum_version_id;
+    int minimum_version_id_old;
+    MigrationPriority priority;
+    LoadStateHandler *load_state_old;
+    int (*pre_load)(void *);                                                
+    int (*post_load)(void *, int);
+    int (*pre_save)(void *);
+    _Bool (*needed)(void *);
+    VMStateField *fields;
+    const VMStateDescription **subsections;
+}
+
+I attached gdb to a vcpu thread of one stuck vm, and a bt showed the following info:
+Thread 4 (Thread 0x7f3a431a4700 (LWP 37799)):
+#0  0x00007f3a576f5017 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x000055d84d15de57 in kvm_vcpu_ioctl (cpu=cpu@entry=0x55d84fca78d0, type=type@entry=44672) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x000055d84d15dfc6 in kvm_cpu_exec (cpu=cpu@entry=0x55d84fca78d0) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x000055d84d13ab64 in qemu_kvm_cpu_thread_fn (arg=0x55d84fca78d0) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1136
+#4  0x00007f3a579ba4a4 in start_thread (arg=0x7f3a431a4700) at pthread_create.c:456
+#5  0x00007f3a576fcd0f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+Thread 3 (Thread 0x7f3a439a5700 (LWP 37798)):
+#0  0x00007f3a576f5017 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x000055d84d15de57 in kvm_vcpu_ioctl (cpu=cpu@entry=0x55d84fc5cbb0, type=type@entry=44672) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x000055d84d15dfc6 in kvm_cpu_exec (cpu=cpu@entry=0x55d84fc5cbb0) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x000055d84d13ab64 in qemu_kvm_cpu_thread_fn (arg=0x55d84fc5cbb0) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1136
+#4  0x00007f3a579ba4a4 in start_thread (arg=0x7f3a439a5700) at pthread_create.c:456
+#5  0x00007f3a576fcd0f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+The ioctl call is a ioctl(18, KVM_RUN and it looks like it is looping inside the vm itself.
+
+I saved the state of the VM (with `virsh save`) after I found it was hanging on its vcpu threads. Then I restored this vm on a test environment running the same kernel, QEMU and libvirt version). After the restore the VM still was haning at 100% cpu usage on all the vcpus.
+I tried to use the perf kvm guest option to trace the guest vm with a copy of the kernel, modules and kallsyms files from inside the guest vm and I got to the following perf stat:
+
+ Event                                         Total %Total CurAvg/s
+ kvm_entry                                   5198993   23.1   277007
+ kvm_exit                                    5198976   23.1   277006
+ kvm_apic                                    1732103    7.7    92289
+ kvm_msr                                     1732101    7.7    92289
+ kvm_inj_virq                                1731904    7.7    92278
+ kvm_eoi                                     1731900    7.7    92278
+ kvm_apic_accept_irq                         1731900    7.7    92278
+ kvm_hv_timer_state                          1731780    7.7    92274
+ kvm_pv_eoi                                  1731701    7.7    92267
+ kvm_ple_window                                   36    0.0        2
+ Total                                      22521394         1199967
+
+We tried to run the crash tool against a dump of guest vm memory and that gave us the following backtrace:
+crash> bt
+PID: 0      TASK: ffffffff81610040  CPU: 0   COMMAND: "swapper/0"
+    [exception RIP: native_read_tsc+2]
+    RIP: ffffffff810146a9  RSP: ffff88003fc03df0  RFLAGS: 00000046
+    RAX: 000000008762c0fa  RBX: ffff88003fc13680  RCX: 0000000000000001
+    RDX: 0000000000fe4871  RSI: 0000000000000000  RDI: ffff88003fc13603
+    RBP: 000000000003052c   R8: 0000000000000200   R9: ffffffff8169b180
+    R10: 0000000000000020  R11: 0000000000000005  R12: 006a33290b40455c
+    R13: 00000000df1fd292  R14: 000000002ca284ff  R15: 00fe485f3febe21a
+    CS: 0010  SS: 0018
+ #0 [ffff88003fc03df0] pvclock_clocksource_read at ffffffff8102cbb3
+ #1 [ffff88003fc03e40] kvm_clock_read at ffffffff8102c2c9
+ #2 [ffff88003fc03e50] timekeeping_get_ns at ffffffff810691b0
+ #3 [ffff88003fc03e60] ktime_get at ffffffff810695c8
+ #4 [ffff88003fc03e90] sched_rt_period_timer at ffffffff8103e4f5
+ #5 [ffff88003fc03ee0] __run_hrtimer at ffffffff810652d3
+ #6 [ffff88003fc03f20] hrtimer_interrupt at ffffffff81065abd
+ #7 [ffff88003fc03f90] smp_apic_timer_interrupt at ffffffff81024ba8
+ #8 [ffff88003fc03fb0] apic_timer_interrupt at ffffffff813587e2
+--- <IRQ stack> ---
+ #9 [ffffffff81601e98] apic_timer_interrupt at ffffffff813587e2
+    [exception RIP: native_safe_halt+2]
+    RIP: ffffffff8102c360  RSP: ffffffff81601f40  RFLAGS: 00010246
+    RAX: 0000000000000000  RBX: ffffffff81601fd8  RCX: 00000000ffffffff
+    RDX: 00000000ffffffff  RSI: 0000000000000000  RDI: 0000000000000001
+    RBP: 0000000000000000   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000020  R11: 0000000000000005  R12: ffffffff816f5d80
+    R13: ffffffffffffffff  R14: 000000000008c800  R15: 0000000000000000
+    ORIG_RAX: ffffffffffffff10  CS: 0010  SS: 0018
+#10 [ffffffff81601f40] default_idle at ffffffff81014c35
+#11 [ffffffff81601f50] cpu_idle at ffffffff8100d258
+
+So it seems like the vm is reading its clock constantly trying to catch up some time after the migration.
+
+Last time it was a bug that was only triggered on newer Gold cpu hardware, but this time we also see this coming back on older Intel E5 cpus we tried to reproduce with a migrate loop of 3 days times between kernel 4.14.63 and 4.19.43 but this gave us no results. 
+
+The vms were running ubuntu 14.04, centos 7, debian 7, debian 8 these vms are running linux kernel 3.*.
+
+The thing is that we are out of ideas for reproducing this, it seems like it the same kind of bug we are hitting, just like last time the vm is basically only trying to read the clock. Perhaps we can try to read the clock data and also try to read what the guest is actually waiting for, which value of the counter does it want to reach.
+
+I am not sure how to pinpoint the cause of this issue, I would like some help and possible some extra tips on debugging.
+We are able to read the guests kernel which makes it a bit easier to debug, reproducing and finding the source of the problem is still something we are trying to figure out.
+
+A virsh dumpxml of one of the guests:
+
+<domain type='kvm' id='15'>
+  <name>vps12</name>
+  <uuid>xxxxxxxx-953c-d629-1276-00000616xxxx</uuid>
+  <memory unit='KiB'>4194304</memory>
+  <currentMemory unit='KiB'>4194304</currentMemory>
+  <vcpu placement='static'>2</vcpu>
+  <numatune>
+    <memory mode='interleave' nodeset='0-1'/>
+  </numatune>
+  <resource>
+    <partition>/machine</partition>
+  </resource>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-2.11'>hvm</type>
+    <boot dev='hd'/>
+    <boot dev='network'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <cpu mode='custom' match='exact' check='full'>
+    <model fallback='forbid'>Westmere</model>
+    <topology sockets='1' cores='2' threads='1'/>
+    <feature policy='require' name='vme'/>
+    <feature policy='require' name='pclmuldq'/>
+    <feature policy='require' name='x2apic'/>
+    <feature policy='require' name='hypervisor'/>
+    <feature policy='require' name='arat'/>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='hpet' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source file='/var/local/mnt/vps/vps12/vps12.raw'/>
+      <backingStore/>
+      <target dev='hda' bus='virtio'/>
+      <iotune>
+        <read_bytes_sec>734003200</read_bytes_sec>
+        <write_bytes_sec>576716800</write_bytes_sec>
+        <read_iops_sec>3500</read_iops_sec>
+        <write_iops_sec>2500</write_iops_sec>
+      </iotune>
+      <alias name='virtio-disk0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </disk>
+    <controller type='usb' index='0' model='piix3-uhci'>
+      <alias name='usb'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+    </controller>
+    <controller type='pci' index='0' model='pci-root'>
+      <alias name='pci.0'/>
+    </controller>
+    <interface type='bridge'>
+      <mac address='xx:xx:xx:xx:xx:xx'/>
+      <source bridge='brxx'/>
+      <target dev='vxxxx'/>
+      <model type='virtio'/>
+      <filterref filter='firewall-vps12'/>
+      <link state='up'/>
+      <alias name='net0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <input type='mouse' bus='ps2'>
+      <alias name='input0'/>
+    </input>
+    <input type='tablet' bus='usb'>
+      <alias name='input1'/>
+      <address type='usb' bus='0' port='1'/>
+    </input>
+    <input type='keyboard' bus='ps2'>
+      <alias name='input2'/>
+    </input>
+    <graphics type='vnc' port='5900' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>
+    <sound model='es1370'>
+      <alias name='sound0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+      <alias name='video0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <alias name='balloon0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+  <seclabel type='dynamic' model='dac' relabel='yes'>
+    <label>+997:+998</label>
+    <imagelabel>+997:+998</imagelabel>
+  </seclabel>
+</domain>
+
+
+Hi Dion,
+  Since you've got a crash dump, can you check the dmesg in the guest to see if there's any messages?
+
+
+Hi Alan,
+
+
+Dmesg shows nothing special:
+[29891577.708544] IPv6 addrconf: prefix with wrong length 48
+[29891580.650637] IPv6 addrconf: prefix with wrong length 48
+[29891582.013656] IPv6 addrconf: prefix with wrong length 48
+[29891583.753246] IPv6 addrconf: prefix with wrong length 48
+[29891585.397941] IPv6 addrconf: prefix with wrong length 48
+[29891587.031141] IPv6 addrconf: prefix with wrong length 48
+[29891588.991541] IPv6 addrconf: prefix with wrong length 48
+[29891590.162395] IPv6 addrconf: prefix with wrong length 48
+[29891592.681133] IPv6 addrconf: prefix with wrong length 48
+[29891593.418342] IPv6 addrconf: prefix with wrong length 48
+[29891596.491791] IPv6 addrconf: prefix with wrong length 48
+[29891597.262282] IPv6 addrconf: prefix with wrong length 48
+[29891600.116510] IPv6 addrconf: prefix with wrong length 48
+[29891600.987599] IPv6 addrconf: prefix with wrong length 48
+[29891603.954923] IPv6 addrconf: prefix with wrong length 48
+[29891604.554989] IPv6 addrconf: prefix with wrong length 48
+[29891607.641694] IPv6 addrconf: prefix with wrong length 48
+[29891607.855495] IPv6 addrconf: prefix with wrong length 48
+[29891611.128803] IPv6 addrconf: prefix with wrong length 48
+[29891611.293230] IPv6 addrconf: prefix with wrong length 48
+[29891615.011260] IPv6 addrconf: prefix with wrong length 48
+[29891615.182883] IPv6 addrconf: prefix with wrong length 48
+[29891618.577801] IPv6 addrconf: prefix with wrong length 48
+[29891619.146512] IPv6 addrconf: prefix with wrong length 48
+[29891622.250595] IPv6 addrconf: prefix with wrong length 48
+[29891623.051844] IPv6 addrconf: prefix with wrong length 48
+[29891625.642684] IPv6 addrconf: prefix with wrong length 48
+[29891626.457455] IPv6 addrconf: prefix with wrong length 48
+
+Crash shows me the uptime though which doesn't seem right:
+        DATE: Tue Nov 29 18:55:46 2603
+      UPTIME: 106751 days, 23:55:03
+Not sure if this is related to the amount of kvm clock calls.
+
+Interesting; I'd seen something similar - in rh https://bugzilla.redhat.com/show_bug.cgi?id=1538078
+and as well as the bogus date we'd had lots of log messages of the form:
+
+  CE: lapic increasing min_delta_ns to <very big number> nsec
+
+
+we were reckoning the clock jumped a bit during the migrate, and then triggered an old guest kernel bug, https://bugzilla.redhat.com/show_bug.cgi?id=1183773  - and we'd only ever triggered it on older distros (rhel6 etc), and think we backported two newer kernel patches:
+
+commit 80a05b9ffa7dc13f6693902dd8999a2b61a3a0d7
+Author: Thomas Gleixner <email address hidden>
+Date:   Fri Mar 12 17:34:14 2010 +0100
+
+    clockevents: Sanitize min_delta_ns adjustment and prevent overflows
+
+and:
+commit d1748302f70be7469809809283fe164156a34231
+Author: Martin Schwidefsky <email address hidden>
+Date:   Tue Aug 23 15:29:42 2011 +0200
+
+    clockevents: Make minimum delay adjustments configurable
+
+but if you're getting that symptom on a RHEL7 / newer than 2011 kernel then I'm worried that there's another case.
+
+This was a very difficult to reproduce last time I looked at the rh bz's above - the slightest change anywhere and it would go away.
+
+
+Is there a way that we can check that it indeed is the case that the clock jumped a bit, we can try to read some kernel variables.
+We just got another hung guest's crash dump working, this vm also shows a weird uptime
+        DATE: Fri Dec 23 09:06:16 2603
+        UPTIME: 106752 days, 00:10:35
+
+Till now we have only see this happening on guests with linux kernel 3.*.
+
+Again dmesg shows nothing.
+
+The only way this has yet happened was when the target hypervisor kernel was 4.19.
+So it seems that something changed over there, the only thing is it not quite a small diff ;) between 4.14 and 4.19. And because it only happens once every couple of thousand migrations with unknown conditions makes it a hard to bisect this.
+Source hypervisor kernel could be 4.14 and 4.19.
+
+If the clock did jump during the migration, is there something that we could do about that on source/target hypervisor, with a libvirt xml change, etc, to prevent it I mean.
+
+It seems like the patch is applied to the guests source kernel.
+
+crash> clock_event_device
+struct clock_event_device {
+    void (*event_handler)(struct clock_event_device *);
+    int (*set_next_event)(unsigned long, struct clock_event_device *);
+    int (*set_next_ktime)(ktime_t, struct clock_event_device *);
+    ktime_t next_event;
+    u64 max_delta_ns;
+    u64 min_delta_ns;
+    u32 mult;
+    u32 shift;
+    enum clock_event_mode mode;
+    unsigned int features;
+    unsigned long retries;
+    void (*broadcast)(const struct cpumask *);
+    void (*set_mode)(enum clock_event_mode, struct clock_event_device *);
+    void (*suspend)(struct clock_event_device *);
+    void (*resume)(struct clock_event_device *);
+    unsigned long min_delta_ticks;
+    unsigned long max_delta_ticks;
+    const char *name;
+    int rating;
+    int irq;
+    const struct cpumask *cpumask;
+    struct list_head list;
+    struct module *owner;
+}
+SIZE: 0xc0
+crash> clockevents_program_min_delta
+clockevents_program_min_delta = $2 = 
+ {int (struct clock_event_device *)} 0xffffffff810daa20 <clockevents_program_min_delta>
+ 
+
+You say it's only happened since 4.19 - that's possible - but since this bug is so tricky to trigger it's also possible that any slight change in 4.19.
+
+You could try disabling kvm_clock?
+
+Dave
+
+Hi,
+
+i suffer fro this bug too (or very similar) on 4.15.0-50-generic, without the patch mentionned earlier (i use this patch last year to migrate from previous qemu version).
+
+Jean-Philippe
+
+Hi Jean,
+
+Could you elaborate, is it the qemu patch that you applied and didn't apply that to the current qem u version you are running?
+
+Could you try to get a crash dump from a frozen vm working, see if you get the same kind of backtrace in there.
+
+Which specific qemu version are you running, which cpu are you migrating from/to, which kernel version are you running from/to?
+
+Could you dump the xml in this comment section from a defined guest that was frozen?
+
+Dion
+
+Hi David,
+
+I have digged further into our issue and we have seen issues only when migrating from servers that have a different tsc frequency.
+
+Example:
+Source (kernel 4.14.63)
+[    2.068227] tsc: Refined TSC clocksource calibration: 2593.906 MHz
+[    2.068373] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2563bf907c6, max_idle_ns: 440795319401 ns                                                                            
+[    4.908200] clocksource: Switched to clocksource tsc
+
+Destination (kernel 4.19.43):
+[    0.000000] tsc: Detected 2600.000 MHz processor
+[    3.647553] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x257a3c3232d, max_idle_ns: 440795236700 ns                                                                      
+[    4.421582] clocksource: Switched to clocksource tsc-early
+[    5.747791] tsc: Refined TSC clocksource calibration: 2593.904 MHz
+[    5.747952] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2563bd843df, max_idle_ns: 440795257314 ns                                                                            
+[    5.748261] clocksource: Switched to clocksource tsc
+
+Source (kernel 4.19.43):
+[    0.000000] tsc: Fast TSC calibration using PIT
+[    0.000000] tsc: Detected 2199.852 MHz processor
+[    4.041367] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x1fb5a71147a, max_idle_ns: 440795225528 ns                                                                      
+[    4.504477] clocksource: Switched to clocksource tsc-early
+[    6.231559] tsc: Refined TSC clocksource calibration: 2200.002 MHz
+[    6.231718] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x1fb634b8814, max_idle_ns: 440795202126 ns                                                                            
+[    6.801999] clocksource: Switched to clocksource tsc
+
+Destionation (kernel 4.19.43):
+[    0.000000] tsc: Fast TSC calibration using PIT
+[    0.000000] tsc: Detected 2394.538 MHz processor
+[    5.486287] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x22840fdedc8, max_idle_ns: 440795293830 ns                                                                      
+[    6.182944] clocksource: Switched to clocksource tsc-early
+[    7.596489] tsc: Refined TSC clocksource calibration: 2394.454 MHz
+[    7.596641] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2283c0783fd, max_idle_ns: 440795301468 ns                                                                            
+[    9.316929] clocksource: Switched to clocksource tsc
+
+Source (kernel 4.14.63):
+[    2.068227] tsc: Refined TSC clocksource calibration: 2593.906 MHz
+[    2.068373] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2563bf907c6, max_idle_ns: 440795319401 ns                                                                            
+[    4.908200] clocksource: Switched to clocksource tsc
+
+Destination (kernel 4.19.43):
+[    0.000000] tsc: Detected 2600.000 MHz processor
+[    3.661033] clocksource: tsc-early: mask: 0xffffffffffffffff max_cycles: 0x257a3c3232d, max_idle_ns: 440795236700 ns                                                                      
+[    4.435033] clocksource: Switched to clocksource tsc-early
+[    5.761251] tsc: Refined TSC clocksource calibration: 2593.905 MHz
+[    5.761412] clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0x2563be32fd6, max_idle_ns: 440795226961 ns                                                                            
+[    5.761731] clocksource: Switched to clocksource tsc
+
+And what I have seen from reading a bit about time  keeping(https://www.kernel.org/doc/Documentation/virtual/kvm/timekeeping.txt) and counters and the virtualisation of it, is that it is pretty difficult to get right, so it is already amazing that it goes alright most of the times.
+
+When diffing I stumbled upon this: https://lore.kernel.org/patchwork/patch/866471/
+And I was thinking about reverting those changes and then try another 10k of migrations see if that makes any difference as we still are not able to reproduce the issue.
+
+I could also try to prefer migrations from similiar refined TSC clocksource calibration HZes don't, which I would rather not do but I think I understand why having the exact same frequency is prefered, what is your thought on this matter?
+
+Disabling kvm-clock is not really an option as we don't want to restart and login on all of the running vms.
+
+Dion
+
+An update on our further research. We tried bumping the hypervisor kernel form 4.19.43 to 4.19.50 which included the following patch, which we hoped to be related to our issue:
+
+https://<email address hidden>/#t
+
+Sadly after a few thousand migrations we encountered two freezes again, and halted further migrations. Again the affected VMs seem to run pre-4.x kernels and all but one freezes occurred with Gold 6126 CPUs. 
+
+While analyzing memory dumps of the VMs with the crash utility we found a peculiar similarity. They all seem to have jumped ~584 years, which led me to this bug report from 2011: https://bugs.launchpad.net/ubuntu/+source/linux/+bug/805341 . Does this provide any insight into what the issue might be on host-level?
+
+It is very well possible that the issue lies in the guest kernel, but as the service we provide is unmanaged we have no control over it.
+
+Could you try running the guests without the TSC_DEADLINE CPUID flag set?
+
+This round we built 4.19.55, disabled the kvm_intel.preemption_timer parameter and ensured kvm.lapic_timer_advance_ns is 0, as advised by Paolo Bonzini. Sadly, yet again we encountered a freeze.
+
+Any other suggestions?
+
+Hi, this is an update after some extended tests and a fallback migration to 4.14.
+
+After doing another >10k migrations we are sure to say that we also encounter this issue on kernel 4.14.
+We migrate vpses from servers in serial (one after the other) mode. And we notice that on some servers we encounter multiple freezes within a short period. These cases often occur in succession from the same source hypervisor, which for most (if not all) we've seen has a Gold CPU. So it seems like we are facing the same issue we were facing before in https://bugs.launchpad.net/qemu/+bug/1775555
+
+The thing is though, we applied the patches that supposedly "fixed" it last time, except that right now it seems like the issue is still there and that after applying the previous patch we are still having issues running on the same kernel with the same qemu version (v2.11.2).
+
+Are there any other changes lately that could perhaps have fixed it which are worth trying?
+We noticed that some pre migration checks were added to libvirt which would let the migration go into error if there are any severe mismatches between 2 hypervisor (hardware/kernel) configurations. 
+
+We could try to run that and see if these throw more errors which could point us into some direction, is this something that you would recommend?
+
+
+We have found a vm that recovered from a freeze and it seems like it has jumped in time.
+Below I have pasted a dump of tty1, it is ocr'd though so some characters could have been misinterpreted.
+
+hild 
+[13198552.767867] le-rss:010 Killed process 10374 (crop) total,r,4376400, anon-rss,018, tl [13230065.246354] lid Out of memory: Kill process 2009 Icron) score 1 or sacrifice c [13230065.251227] le-rss:OkB Killed process 19050 (cron) total-am:437040B, anon-r=0,42, fi [13230065.378536] Out of memory: Kill process 2003 (cron) score 1 or sacrifice 1132 Killed process 19622 Icron) total-vM:4376400, anon-rss:018, fi 
+le-rss:OkB 
+[14071563.261117] Out of memory: Kill process 2083 (cron) score 1 or sacrifice child
+[14071563.263500] Killed process 20260 (cron) total-vM:4376400, anon-rss:000, fi le-rss:OkB 
+[9223372037.903009] BUG: soft lockup - CPU#0 stuck for 4281394478s! [screen:4843]
+[9223372037.983809] Stack: 
+[9223372037.983809] 
+[9223372037.903009] Call Trace:
+[9223372037.983809] <IRQ>
+[922337203].983809] <EOI> Code: 83 c4 58 5b 5d c9 90 90 to Of al 9e 19 c0 c9 9c 50 66 .6 90 66 90 c9 57 9E .6 90 c9 f0 BO 67 00 66 66 90 66 90 fd c9 40 c7 07 c9 fa 66 00 00 00 66 90 00 40 66 66 c7 47 90 c9 fb 66 66 90 00 066: 
+
+This is VM is running Debian 7, it was approximately frozen for around 2 hours and 25 minutes before spinning back into action.
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+Hi Thomas,
+
+We are still seeing this every once in a while. I can definitely tell you that it is connected to older Linux Guest kernels and we have not been able to identify a specific version which would make searching for a fix commit a bit easier.
+
+We are going to upgrade all our host kernels to 5.4 after which we will upgrade to a newer version of QEMU, temporarily working around this issue by selecting a specific set of hardware for migrations of older guest kernels.
+
+As time goes by the issue becomes less important as there will be less 3.* linux guest kernels running on our platform, but at the time of writing this is a significant amount.
+
+The guest kernels that we came across already had this patch applied: https://bugzilla.redhat.com/show_bug.cgi?id=1183773
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/223
+
+

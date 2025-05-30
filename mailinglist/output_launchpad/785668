@@ -1,0 +1,407 @@
+bonding inside a bridge does not update ARP correctly when bridged net accessed from within a VM
+
+Binary package hint: qemu-kvm
+
+Description: Ubuntu 10.4.2
+Release: 10.04
+
+
+When setting a KVM host with a bond0 interface made of eth0 and eth1 and using this bond0 interface for a bridge to KVM VMs, the ARP tables do not get updated correctly and
+
+Reproducible: 100%, with any of the load balancing mode
+
+How to reproduce the problem
+
+- Prerequisites:
+1 One KVM system with 10.04.02 server,  configured as a virtual host is needed. The following /etc/network/interfaces was used for the test :
+
+# grep  -v ^# /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+
+auto bond0
+iface bond0 inet manual
+	post-up ifconfig $IFACE up
+	pre-down ifconfig $IFACE down
+	bond-slaves none
+	bond_mode balance-rr
+	bond-downdelay 250
+	bond-updelay 120
+auto eth0
+allow-bond0 eth0
+iface eth0 inet manual
+	bond-master bond0
+auto eth1
+allow-bond0 eth1
+iface eth1 inet manual
+	bond-master bond0
+
+auto br0
+iface br0 inet dhcp
+	# dns-* options are implemented by the resolvconf package, if installed
+	bridge-ports bond0
+	bridge-stp off
+	bridge-fd 9
+	bridge-hello 2
+	bridge-maxage 12
+	bridge_max_wait 0
+
+One VM running Maverick 10.10 server, standard installation, using the following /etc/network/interfaces file :
+
+grep -v ^# /etc/network/interfaces
+
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+        address 10.153.107.92
+        netmask 255.255.255.0
+        network 10.153.107.0
+        broadcast 10.153.107.255
+
+--------------
+On a remote bridged network system :
+$ arp -an
+? (10.153.107.188) à 00:1c:c4:6a:c0:dc [ether] sur tap0
+? (16.1.1.1) à 00:17:33:e9:ee:3c [ether] sur wlan0
+? (10.153.107.52) à 00:1c:c4:6a:c0:de [ether] sur tap0
+
+On KVMhost
+$ arp -an
+? (10.153.107.80) at ee:99:73:68:f0:a5 [ether] on br0
+
+On VM
+$ arp -an
+? (10.153.107.61) at <incomplete> on eth0
+
+1) Test #1 : ping from VM (10.153.107.92) to remote bridged network system (10.153.107.80) :
+
+- On remote bridged network system :
+caribou@marvin:~$ arp -an
+? (10.153.107.188) à 00:1c:c4:6a:c0:dc [ether] sur tap0
+? (16.1.1.1) à 00:17:33:e9:ee:3c [ether] sur wlan0
+? (10.153.107.52) à 00:1c:c4:6a:c0:de [ether] sur tap0
+
+- On KVMhost
+ubuntu@VMhost:~$ arp -an
+? (10.153.107.80) at ee:99:73:68:f0:a5 [ether] on br0
+
+- On VM
+ubuntu@vm1:~$ ping 10.153.107.80
+PING 10.153.107.80 (10.153.107.80) 56(84) bytes of data.
+From 10.153.107.92 icmp_seq=1 Destination Host Unreachable
+From 10.153.107.92 icmp_seq=2 Destination Host Unreachable
+From 10.153.107.92 icmp_seq=3 Destination Host Unreachable
+^C
+--- 10.153.107.80 ping statistics ---
+4 packets transmitted, 0 received, +3 errors, 100% packet loss, time 3010ms
+pipe 3
+ubuntu@vm1:~$ arp -an
+? (10.153.107.61) at <incomplete> on eth0
+? (10.153.107.80) at <incomplete> on eth0
+
+2) Test #2 : ping from remote bridged network system (10.153.107.80) to VM (10.153.107.92) :
+
+- On remote bridged network system :
+$ ping 10.153.107.92
+PING 10.153.107.92 (10.153.107.92) 56(84) bytes of data.
+64 bytes from 10.153.107.92: icmp_req=1 ttl=64 time=327 ms
+64 bytes from 10.153.107.92: icmp_req=2 ttl=64 time=158 ms
+64 bytes from 10.153.107.92: icmp_req=3 ttl=64 time=157 ms
+^C
+--- 10.153.107.92 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 157.289/214.500/327.396/79.831 ms
+caribou@marvin:~$ arp -an
+? (10.153.107.188) à 00:1c:c4:6a:c0:dc [ether] sur tap0
+? (16.1.1.1) à 00:17:33:e9:ee:3c [ether] sur wlan0
+? (10.153.107.52) à 00:1c:c4:6a:c0:de [ether] sur tap0
+? (10.153.107.92) à 52:54:00:8c:e0:3c [ether] sur tap0
+
+- On KVMhost
+$ arp -an
+? (10.153.107.80) at ee:99:73:68:f0:a5 [ether] on br0
+
+- On VM
+arp -an
+? (10.153.107.61) at <incomplete> on eth0
+? (10.153.107.80) at ee:99:73:68:f0:a5 [ether] on eth0
+
+
+3) Test #3 : New ping from VM (10.153.107.92) to remote bridged network system (10.153.107.80) :
+- On remote bridged network system :
+$ arp -an
+? (10.153.107.188) à 00:1c:c4:6a:c0:dc [ether] sur tap0
+? (16.1.1.1) à 00:17:33:e9:ee:3c [ether] sur wlan0
+? (10.153.107.52) à 00:1c:c4:6a:c0:de [ether] sur tap0
+? (10.153.107.92) à 52:54:00:8c:e0:3c [ether] sur tap0
+
+- On KVMhost
+ubuntu@VMhost:~$ arp -an
+? (10.153.107.80) at ee:99:73:68:f0:a5 [ether] on br0
+
+- On VM
+ubuntu@vm1:~$ ping 10.153.107.80
+PING 10.153.107.80 (10.153.107.80) 56(84) bytes of data.
+64 bytes from 10.153.107.80: icmp_req=1 ttl=64 time=154 ms
+64 bytes from 10.153.107.80: icmp_req=2 ttl=64 time=170 ms
+64 bytes from 10.153.107.80: icmp_req=3 ttl=64 time=154 ms
+^C
+--- 10.153.107.80 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2003ms
+rtt min/avg/max/mdev = 154.072/159.465/170.058/7.504 ms
+
+tcpdump traces are available for those tests. Test system is available upon request.
+
+Workaround:
+
+Use the bonded device in "active-backup" mode
+
+ProblemType: Bug
+DistroRelease: Ubuntu 10.04.02
+Package: qemu-kvm-0.12.3+noroms-0ubuntu9.6
+Uname: Linux 2.6.35-25-serverr x86_64
+Architecture: amd64
+
+Thanks for reporting this bug and the detailed reproduction instructions.  I would mark it high, but since you offer a workaround I'll mark it medium instead.
+
+What does your /etc/modprobe.d/bonding show?
+
+I've not used this combination myself, but from those who have, a few things do appear fragile, namely:
+
+1. if you are using 802.3ad, you need trunking enabled on the physical switch
+
+2. some people find that turning stp on helps (http://www.linuxquestions.org/questions/linux-networking-3/bridging-a-bond-802-3ad-only-works-when-stp-is-enabled-741640/)
+
+But I'm actually wondering whether this patch:
+
+http://permalink.gmane.org/gmane.linux.network/159403
+
+may be needed.  If so, then even the natty kernel does not yet have that fix.
+
+I am marking this as affecting the kernel, since I believe that is where the bug lies.
+
+
+Actually, I may be wrong about this being a kernel issue.
+
+Are you always able to ping the remote host from the kvm host, even when you can't do so from the VM?
+
+In addition to kvmhost's /etc/modprove.d/bonding.conf, can you also please provide the configuration info for the KVM vm?  (If a libvirt host, then the network-related (or just all) xml info, or else the 'ps -ef | grep kvm' output).  Also the network configuration insid the KVM VM.  In particular, if the KVM VM has a bridge, that one would need to have stp turned on, but I doubt you have that.
+
+Yup, I can reproduce this 100%.
+
+I'm setting up networking as described above, and then starting virtual machines with:
+
+sudo tunctl -u 1000 -g 1000 -t tap0
+sudo /sbin/ifconfig $1 0.0.0.0 up
+sudo brctl addif br0 tap0
+
+kvm -drive file=disk.img,if=virtio,cache=none,boot=on -m 1024 -vnc :1 -net nic,model=virtio -net tap,script=no,ifname=tap0,downscript=no
+
+With mode=balance-rr, I can't run dhclient from the guest.  With either
+bond0 as active-backup, or without bond0 (with eth0 directly in br0),
+I can.
+
+
+Following the advice toward the bottom of
+
+http://forum.proxmox.com/archive/index.php/t-2676.html?s=e8a9cfc9a128659e4a61efec0b758d3e
+
+I was able to get this to work with balance-rr by changing a few bridge properties.  The following was my /etc/network/interfaces:
+
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto bond0
+iface bond0 inet manual
+ post-up ifconfig $IFACE up
+ pre-down ifconfig $IFACE down
+ bond-slaves none
+ bond_mode active-rr
+ bond-downdelay 250
+ bond-updelay 120
+auto eth0
+allow-bond0 eth0
+iface eth0 inet manual
+ bond-master bond0
+auto eth1
+allow-bond0 eth1
+iface eth1 inet manual
+ bond-master bond0
+
+auto br0
+iface br0 inet dhcp
+ # dns-* options are implemented by the resolvconf package, if installed
+ bridge-ports bond0
+# bridge-stp off
+# bridge-fd 9
+# bridge-hello 2
+# bridge-maxage 12
+# bridge_max_wait 0
+ bridge_stp on
+ bridge_maxwait 0
+ bridge_maxage 0
+ bridge_fd 0
+ bridge_ageing 0
+
+I don't know if this is acceptable to you since stp is on.  If not, is using balance-alb (which did also work for me) acceptable?
+
+Following your suggestions, I modified my /etc/network/interfaces & added the STP options to my test environment.  Following that, I am now able to ping to the remote system using the following bonding modes :
+
+* 802.3ad (4)
+* tlb (5)
+* alb (6)
+
+For unknown reasons, I'm still unable to use balance-rr unlike your setup.  But that might not be much of an issue as those modes listed above might be sufficient. I must go & check that.  And now, the two VMs are able to ping each other.
+
+One thing regarding your listed /etc/network/interfaces : I think that there is a typo as 'bond_mode active-rr' is not a support bonding mode.
+
+Regarding your request for /etc/modprove.d/bonding.conf, there is no such file on my test system. Let me know if you still require the xml dump of the VM.
+
+Quoting Louis Bouchard (<email address hidden>):
+> Regarding your request for /etc/modprove.d/bonding.conf, there is no
+> such file on my test system.
+
+Right, sorry, that's obsolete as of hardy, sorry.
+
+> Let me know if you still require the xml
+> dump of the VM.
+
+Thanks, no, as I'm able to reproduce that won't be necessary.
+
+
+I can reproduce this just using lxc, which simply attaches an endpoint of a veth tunnel to the bridge.  With balance-rr mode, i can't dhcp in the guest.  With balance-alb, I can.
+
+That means this is not actually qemu-kvm, but a bug in the kernel or (unlikely) ifenslave.
+
+My next steps will be to test on maverick and natty, look through linux-2.6/drivers/net/bonding and linux-2.6/net/bridge/ and perhaps go to the https://lists.linux-foundation.org/pipermail/bridge/2011-May/thread.html list to ask for help if it is still broken in natty.
+
+Maverick gives me the same result.  (Except I don't seem able, in maverick, to auto-setup the bond+bridge setup with /etc/network/interfaces, keep having to do it by hand.  Hoping I did something wrong myself,a nd it's not a maverick bug)
+
+Natty is still affected.
+
+Since qemu isn't needed to show the bug, you can now trivially test this inside a natty kvm container by giving it two NICs, setting up /etc/network interfaces as shown above, and using lxc as follows:
+
+   apt-get install lxc debootstrap
+   mkdir /cgroup
+   mount -t cgroup cgroup /cgroup
+   cat > /etc/lxc.conf << EOF
+   lxc.network.type=veth
+   lxc.network.link=br0
+   lxc.network.flags=up
+   EOF
+   lxc-create -t natty -n lxc -f /etc/lxc.conf
+   lxc-start -n lxc
+
+When not using balance-rr, the container's network is fine.  When using balance-rr, it can't get a dhcp address.
+
+Next step is probably to look at the hwaddr handling in the kernel source, and talk to upstream.
+
+
+I sent an email to bonding-devel, and got this response:
+
+http://sourceforge.net/mailarchive/forum.php?thread_name=21866.1306527811%40death&forum_name=bonding-devel
+
+Assuming that your switch is in fact set up for Etherchannel, can you go ahead and gather the tcpdump data?
+
+I read the mail and did a first round of test before I could check the setting of the switch.  Here are the transcript of the test with balance-rr.
+
+Container : LXC container with fixed IP
+VMhost : The host where the LXC container runs. configured with br0 & bond0
+remote_host : another host on the same bridged subnet
+
+Container : date;ping xxx.xxx.xxx.87
+Mon May 30 15:40:49 UTC 2011
+PING xxx.xxx.xxx.87 (xxx.xxx.xxx.87): 48 data bytes
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+^C--- xxx.xxx.xxx.87 ping statistics ---
+4 packets transmitted, 0 packets received, 100% packet loss
+
+
+VMhost : date;ping xxx.xxx.xxx.92
+Mon May 30 15:41:14 EDT 2011
+PING xxx.xxx.xxx.92 (xxx.xxx.xxx.92) 56(84) bytes of data.
+64 bytes from xxx.xxx.xxx.92: icmp_req=9 ttl=64 time=10.1 ms
+64 bytes from xxx.xxx.xxx.92: icmp_req=10 ttl=64 time=0.087 ms
+64 bytes from xxx.xxx.xxx.92: icmp_req=11 ttl=64 time=0.076 ms
+^C
+--- xxx.xxx.xxx.92 ping statistics ---
+11 packets transmitted, 3 received, 72% packet loss, time 10004ms
+rtt min/avg/max/mdev = 0.076/3.423/10.108/4.727 ms
+
+
+Container : date;ping xxx.xxx.xxx.87
+Mon May 30 15:41:41 UTC 2011
+PING xxx.xxx.xxx.87 (xxx.xxx.xxx.87): 48 data bytes
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+60 bytes from xxx.xxx.xxx.92: Destination Host Unreachable
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst Data
+ 4  5  00 4c00 0000   0 0040  40  01 cc4e xxx.xxx.xxx.92  xxx.xxx.xxx.87 
+^C--- xxx.xxx.xxx.87 ping statistics ---
+4 packets transmitted, 0 packets received, 100% packet loss
+
+
+remote_host : date;ping xxx.xxx.xxx.92
+lundi 30 mai 2011, 15:42:03 (UTC+0200)
+PING xxx.xxx.xxx.92 (xxx.xxx.xxx.92) 56(84) bytes of data.
+64 bytes from xxx.xxx.xxx.92: icmp_req=1 ttl=64 time=284 ms
+64 bytes from xxx.xxx.xxx.92: icmp_req=2 ttl=64 time=125 ms
+64 bytes from xxx.xxx.xxx.92: icmp_req=3 ttl=64 time=134 ms
+^C
+--- xxx.xxx.xxx.92 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 2002ms
+rtt min/avg/max/mdev = 125.282/181.561/284.952/73.204 ms
+
+
+Container : Mon May 30 15:42:24 UTC 2011
+PING xxx.xxx.xxx.87 (xxx.xxx.xxx.87): 48 data bytes
+56 bytes from xxx.xxx.xxx.87: icmp_seq=0 ttl=64 time=141.506 ms
+56 bytes from xxx.xxx.xxx.87: icmp_seq=1 ttl=64 time=153.311 ms
+56 bytes from xxx.xxx.xxx.87: icmp_seq=2 ttl=64 time=124.973 ms
+^C--- xxx.xxx.xxx.87 ping statistics ---
+3 packets transmitted, 3 packets received, 0% packet loss
+round-trip min/avg/max/stddev = 124.973/139.930/153.311/11.622 ms
+
+I will send you the dump data directly.  Now that I have full access to our switch, I will do more tests tomorrow.  As far as I know, the switch is doing automatic trunking so the switch should not be an issue.
+
+
+Hello,
+
+Now I am dazed and confused (and trying to continue) 
+
+I have tested most of the combination of bonding modes with appropriate switch settings and here is what I get :
+
+Bonding mode	switch configuration	        result(ping from Container)	With STP
+============	====================	======           				========
+balance-rr	         two port trunked	        OK
+balance-rr	         No trunking		                NOK		                 		OK
+balance-alb    	 No trunking		                OK
+balance-tlb	         No trunking		                OK
+802.3ad		         LACP dynamic trunk	        OK
+balance-xor	         two port trunked	        OK
+balance-xor	         No trunking		                NOK				                NOK
+
+I could swear that I had tested -alb and -tlb with negative results. So apparently, the STP workaround is not required with proper switch configuration.
+
+It looks like this has been fixed upstream.  I will close it.  If the problem still occurs, please reopen it. 
+
+

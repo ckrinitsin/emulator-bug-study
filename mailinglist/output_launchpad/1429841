@@ -1,0 +1,119 @@
+error "rom: requested regions overlap" for NOLOAD sections
+
+command line:
+qemu-system-arm -semihosting -nographic -monitor null -serial null -no-reboot -kernel build/fw/0HNFcomSLuP1_CUNIT.elf
+
+output:
+rom: requested regions overlap (rom phdr #6: build/fw/0HNFcomSLuP1_CUNIT.elf. free=0x8001effc, addr=0x8001c000)
+rom loading failed
+
+I checked the sections of the .elf file with arm-none-eabi-objdump -h:
+Sections:
+Idx Name          Size      VMA       LMA       File off  Algn
+...
+ 35 .marker_appli 00001000  801ae000  801ae000  00025000  2**0
+                  ALLOC
+ 36 .safe_data    00000014  80200000  8001b000  00020000  2**2
+                  CONTENTS, ALLOC, LOAD, DATA
+ 37 .safe_bss     00000488  80200020  8001b020  00020014  2**2
+                  ALLOC
+ 38 .marker_safe_data 00001000  80201000  8001c000  00029000  2**0
+                  ALLOC
+ 39 .data         000008cc  80202000  8001b600  00022000  2**3
+                  CONTENTS, ALLOC, LOAD, DATA
+ 40 .bss          0000312c  802028d0  8001bed0  000228cc  2**3
+                  ALLOC
+ 41 .marker_data  00001000  80206000  8001f600  00026000  2**0
+                  ALLOC
+ 42 .cunit        00010000  80300000  80119600  00028000  2**0
+                  ALLOC
+ 43 .marker_code  00001000  8001c000  8001c000  00024000  2**0
+                  ALLOC
+...
+
+So I had a look where the values in  the error message could come from:
+0x8001c000: is the "LMA" value of section .marker_safe_data
+0x8001effc: is "Size" + "LMA" of the .bss section (0x0000312c + 0x8001bed0)
+
+So it is correct that (regarding the "LMA" value) the .marker_safe_data section collides with .bss section.
+But actually these sections have no "LOAD" attribute, so I would guess that their "LMA" should not be used anyway.
+Those section should reside at their "VMA" addresses (0x802xxxxx) during runtime but they have no data to load.
+
+Or am I getting something completely wrong?
+Should I give an additional option to qemu?
+
+I got this error with 2.0.0+dfsg-2ubuntu1.10 and 1.0.50-2012.03-0ubuntu2.1
+I didn't get this error (but others) with 0.10.2
+
+
+
+I did a test (with version 2.2.0) to simply not fail out upon this error (removed the "return -1" in function rom_load_all() in file hw/core/loader.c).
+
+With that hack I got the elf file running I'll attach with *this* comment (note that attachment #1 won't run correctly but probably for some other reason as I never had this working anywhere).
+So when I run with my hack:
+qemu-system-arm  -M integratorcp -semihosting -nographic -monitor null -serial null -no-reboot -kernel 0MFWSL_EmoDatauP1_CUNIT.elf
+
+I get:
+rom: requested regions overlap (rom phdr #4: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000017ae0, addr=0x0000000000016aac)
+rom: requested regions overlap (rom phdr #5: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x00000000000185e8, addr=0x0000000000017e64) 
+
+     CUnit - A Unit testing framework for C - Version 2.1-0
+     http://cunit.sourceforge.net/
+
+
+Suite: MFWSL_EmoData
+  Test: MFWSL_EmoFileOpen		 ... passed
+  Test: MFWSL_ChkEmosSodHdr		 ... passed
+  Test: MFWSL_ChkEmosFileHdr	 ... passed
+  Test: MFWSL_ChkEmosSodSect	 ... passed
+  Test: MFWSL_ChkEmosFileSect	 ... passed
+  Test: MFWSL_AddEntryToCpyList	 ... passed
+  Test: MFWSL_EmosAvailableForSect ... passed
+  Test: MFWSL_CreateCpyListFromSect ... passed
+  Test: MFWSL_SodEmosActive		 ... passed
+  Test: MFWSL_CreateExtMoList	 ... passed
+  Test: MFWSL_ExtendedEmosActive ... passed
+
+--Run Summary: Type      Total     Ran  Passed  Failed
+               suites        1       1     n/a       0
+               tests        11      11      11       0
+               asserts    2854    2854    2854       0  
+
+...where the last part is the output I expected for a clean run.
+
+regarding the values in the error messages I it looks like:
+free=0x0000000000017ae0 = end of .safe_bss (0x16aac + 0x1034) which is NOLOAD
+addr=0x0000000000016aac = start of .data which is LOAD
+free=0x00000000000185e8 = end of .bss (0x17570 + 0x1078) which is NOLOAD
+addr=0x0000000000017e64 = start of .marker1 which is NOLOAD
+
+Any optinions?
+
+additional info:
+0MFWSL_EmoDatauP1_CUNIT.elf from previous post runs fine with 1.0.50 (Debian 1.0.50-2012.03-0ubuntu2.1) and 0.10.2
+
+To make things more easy I added some debug output to function rom_load_all().
+It prints infos for every rom section is processes:
+
+rom phdr #1: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000000000, size=0x000000000000003c, addr=0x0000000000000000)
+rom phdr #2: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x00000000000008a0, size=0x00000000000161c4, addr=0x000000000000003c)
+rom phdr #3: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000016a64, size=0x000000000000107c, addr=0x0000000000016a64)
+rom phdr #4: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000016aac, size=0x0000000000001b3c, addr=0x0000000000017ae0)
+rom: requested regions overlap (rom phdr #4: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000017ae0, addr=0x0000000000016aac, size=0x0000000000001b3c)
+rom phdr #5: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x0000000000017e64, size=0x0000000000000400, addr=0x00000000000185e8)
+rom: requested regions overlap (rom phdr #5: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x00000000000185e8, addr=0x0000000000017e64, size=0x0000000000000400)
+rom phdr #6: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x00000000001152ac, size=0x0000000000000400, addr=0x0000000000018264)
+rom phdr #7: 0MFWSL_EmoDatauP1_CUNIT.elf. free=0x00000000001a7000, size=0x0000000000000400, addr=0x00000000001156ac)
+
+Retest with qemu 2.7.0: issue still occours
+Same fix works for me: removed 'return -1;' in function rom_check_and_register_reset() (line 1030 of file hw/core/loader.c)
+
+This bug is fixed in QEMU master by commits bf1733392ca2 and f33e5e6299288c, which will be in the upcoming QEMU 2.11 release.
+
+(PS: the thing the loader cares about is not elf sections but elf segments in the program header, so the section table and its attributes isn't relevant here, only the program header. In any case your example ELF file loads OK with the bugfixes applied.)
+
+
+Just tested with QEMU 2.10.93 in cygwin: problem does not occour anymore!
+
+Thanks a lot!
+

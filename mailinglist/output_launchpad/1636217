@@ -1,0 +1,230 @@
+qemu-kvm 2.7 does not boot kvm VMs with virtio on top of VMware ESX
+
+After todays Proxmox update all my Linux VMs stopped booting.
+
+# How to reproduce
+- Have KVM on top of VMware ESX (I use VMware ESX 6)
+- Boot Linux VM with virtio Disk drive.
+
+
+# Result
+virtio based VMs do not boot anymore:
+
+root@demotuxdc:/etc/pve/nodes/demotuxdc/qemu-server# grep virtio0 100.conf 
+bootdisk: virtio0
+virtio0: pvestorage:100/vm-100-disk-1.raw,discard=on,size=20G
+
+(initially with cache=writethrough, but that doesn´t matter)
+
+What happens instead is:
+
+- BIOS displays "Booting from harddisk..."
+- kvm process of VM loops at about 140% of Intel(R) Core(TM) i5-6260U CPU @ 1.80GHz Skylake dual core CPU
+
+Disk of course has valid bootsector:
+
+root@demotuxdc:/srv/pvestorage/images/100# file -sk vm-100-disk-1.raw 
+vm-100-disk-1.raw: DOS/MBR boot sector DOS/MBR boot sector DOS executable (COM), boot code
+root@demotuxdc:/srv/pvestorage/images/100# head -c 2048 vm-100-disk-1.raw | hd | grep GRUB
+00000170  be 94 7d e8 2e 00 cd 18  eb fe 47 52 55 42 20 00  |..}.......GRUB .|
+
+
+# Workaround 1
+- Change disk from virtio0 to scsi0
+- Debian boots out of the box after this change
+- SLES 12 needs a rebuilt initrd
+- CentOS 7 too, but it seems that is not even enough and it still fails (even in hostonly="no" mode for dracut)
+
+
+# Workaround 2
+Downgrade pve-qemu-kvm 2.7.0-3 to 2.6.2-2.
+
+
+# Expected results
+Disk boots just fine via virtio like it did before.
+
+
+# Downstream bug report
+Downstream suggests an issue with upstream qemu-kvm:
+
+https://bugzilla.proxmox.com/show_bug.cgi?id=1181
+
+
+
+I traced this back to the switch to enabling virtio-1 mode by default in 2.7 in commit 9a4c0e220d8a4f82b5665d0ee95ef94d8e1509d5
+
+forcing the old behaviour with a 2.6 machine type works.
+
+I confirm that "qm set ID -machine pc-i440fx-2.6" on the machine in question lets it boot as a virtio machine again with Qemu 2.7.
+
+Adding Gerd, Marcel, and Kevin
+
+On 10/28/16 10:23, Fabian Grünbichler wrote:
+> I traced this back to the switch to enabling virtio-1 mode by default in
+> 2.7 in commit 9a4c0e220d8a4f82b5665d0ee95ef94d8e1509d5
+> 
+> forcing the old behaviour with a 2.6 machine type works.
+
+I think this issue is a duplicate of the following RHBZ:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1373154
+
+and the *SeaBIOS* commit that makes it all work again is:
+
+commit 0e21548b15e25e010c362ea13d170c61a3fcc899
+Author: Gerd Hoffmann <email address hidden>
+Date:   Fri Jul 3 11:07:05 2015 +0200
+
+    virtio: pci cfg access
+
+That SeaBIOS commit is part of the SeaBIOS 1.10.0 release.
+
+However, QEMU 2.7 shipped with bundled SeaBIOS 1.9.3 binaries. See QEMU
+commits 6e03a28e1cee (part of v2.7.0) and 6e99f5741ff1 (not part of any
+tagged release yet).
+
+The fix is probably the following:
+- backport SeaBIOS commit 0e21548b15e2 to the stable 1.9 branch, for
+  release 1.9.4
+- bundle SeaBIOS 1.9.4 binaries with QEMU v2.7.1.
+
+Thanks
+Laszlo
+
+
+unfortunately cherry-picking the SeaBIOS 1.10 binary update commit from qemu master (6e99f5741ff1) on top of v2.7.0 does not solve the issue (the only observable change is the version string that is displayed on booting, right when it hangs ;)).
+
+I can still give your suggested route a try if you think it is worth it, but since the 1.10 release contains your suggested commit, I doubt it will change anything..
+
+> However, QEMU 2.7 shipped with bundled SeaBIOS 1.9.3 binaries. See QEMU
+> commits 6e03a28e1cee (part of v2.7.0) and 6e99f5741ff1 (not part of any
+> tagged release yet).
+> 
+> The fix is probably the following:
+> - backport SeaBIOS commit 0e21548b15e2 to the stable 1.9 branch, for
+>   release 1.9.4
+> - bundle SeaBIOS 1.9.4 binaries with QEMU v2.7.1.
+
+I'd rather cherry-pick 6e99f5741ff1 into 2.7.1 ...
+
+cheers,
+  Gerd
+
+
+This problem still exists as of now on Debian sid. Qemu version is "QEMU emulator version 2.10.1(Debian 1:2.10.0+dfsg-2)".
+
+
+for "-machine type=pc-i440fx-x" where x > 2.6, all stuck at boot if the interface is virtio.
+
+I use nested virtualization where the first level is VMWARE FUSION (might not be the same as ESX), and the second is qemu-kvm.
+
+
+Hi,
+
+I have exactly the same problem.
+
+My stack:
+- macOS Sierra 10.12.6
+- VMware Fusion 10.1.1 (tried with 10.0.1 too)
+- Linux 4.9.78 (tried with 4.9.65 too)
+- Qemu 2.11.0 (tried with 2.10.1 too)
+
+All is working great with i440fx (or q35) <= 2.6 but it doesn't boot on >= 2.7 and QEMU takes all the CPU.
+
+It doesn't boot with the disk in virtio and scsci-virtio mode but boot in scsi.
+
+Exactly the same configuration on a baremetal (so no macOS and VMware) works great.
+
+So I assume it's a bug with VMware and virtio.
+
+we still meet similar issue on centos.7 (qemu 2.9.0-16.el7_4.5.1 + libvirt 3.2.0-14.el7_4.3)
+
+my workaround including:
+a) without kvm accel
+or 
+b) as comment #7 said "-machine type=pc-i440fx-x" where x <= 2.6
+or
+c) with pci device "disable-modern=on"
+
+i found the function _farcall16 in seabios was invoked (https://github.com/coreboot/seabios/blob/af0daeb2687ad2595482b8a71b02a082a5672ceb/src/stacks.c#L418)
+and failed when guest hang with 'Booting from hard disk'.
+
+the invoking sequence (in seabios rel-1.11.0-5-g14d91c3) like :
+src/boot.c line 614, call_boot_entry->
+src/stacks.c line 427, farcall16->
+src/stack.c line 411, _farcall16
+
+
+but the issue perform diff in our two clusters. 
+
+I just name them cluster A(6.0.0.0 3029758 E5 2640 v2,ststem x3650 M4) and cluster B (6.0.0.0 3029758 E5 2620 v4,system x3650 M5)for easy.
+
+This issue in cluster B not be reproduced in cluster A(same qemu/libvirt/esxi)
+
+my command:
+/usr/libexec/qemu-kvm  -machine pc-i440fx-rhel7.3.0 \
+-m 256 -drive file=centos.qcow2,if=none,id=drive-virtio-disk0 \
+-device virtio-blk-pci,disable-modern=on,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0 \
+-vnc :1 -chardev stdio,id=seabios -device isa-debugcon,iobase=0x402,chardev=seabios
+
+hope the above info can help fix the bug.
+
+
+I'd like to share some other available workarounds:
+
+1. Use "-machine type=pc-i440fx-x" where x <= 2.6
+2. Add "disable-modern=on" option for all virtio block devices
+3. Add "-global virtio-blk-pci.disable-modern=on"
+3. Use software acceleration for virtual appliances ("-machine accel=tcg")
+
+Hi Mykola. Thanks you for this information. Any idea about advantages / disadvantages of the different work-arounds? Thanks.
+
+Well, it appeared that it is not enough to set "disable-modern=on" for virtio-blk-pci devices. You have to do the same for virtio-scsi-pci, and may be for other virtio devices you are using to disable virtio 1.0. But VM will hangs latter on during boot process if you use virtio-rng-pci.
+
+"-machine accel=tcg" will work but in cost of performance penalty due to software virtualization.
+
+So I found "-machine type=pc-i440fx-x" where x <= 2.6 the only reliable workaround.
+
+This is a KVM bug.  It has been fixed in mainstream Linux in
+
+commit d391f1207067268261add0485f0f34503539c5b0
+Author: Vitaly Kuznetsov <email address hidden>
+Date:   Thu Jan 25 16:37:07 2018 +0100
+
+    x86/kvm/vmx: do not use vm-exit instruction length for fast MMIO when running nested
+    
+    I was investigating an issue with seabios >= 1.10 which stopped working
+    for nested KVM on Hyper-V. The problem appears to be in
+    handle_ept_violation() function: when we do fast mmio we need to skip
+    the instruction so we do kvm_skip_emulated_instruction(). This, however,
+    depends on VM_EXIT_INSTRUCTION_LEN field being set correctly in VMCS.
+    However, this is not the case.
+    
+    Intel's manual doesn't mandate VM_EXIT_INSTRUCTION_LEN to be set when
+    EPT MISCONFIG occurs. While on real hardware it was observed to be set,
+    some hypervisors follow the spec and don't set it; we end up advancing
+    IP with some random value.
+    
+    I checked with Microsoft and they confirmed they don't fill
+    VM_EXIT_INSTRUCTION_LEN on EPT MISCONFIG.
+    
+    Fix the issue by doing instruction skip through emulator when running
+    nested.
+    
+    Fixes: 68c3b4d1676d870f0453c31d5a52e7e65c7448ae
+    Suggested-by: Radim Krčmář <email address hidden>
+    Suggested-by: Paolo Bonzini <email address hidden>
+    Signed-off-by: Vitaly Kuznetsov <email address hidden>
+    Acked-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Radim Krčmář <email address hidden>
+
+
+Although the commit mentions Hyper-V as L0 hypervisor, the same problem
+pertains to ESXi.
+
+The commit is included in v4.16.
+
+That is great news. Thanks for sharing!
+
+Marking as fixed, according to comment #13
+

@@ -1,0 +1,420 @@
+Git version: Build process is broken in block_curl.c.o
+
+Gcc version: 10.2.0
+Glusterfs: 8.1
+Libguestfs: 1.42
+
+Configure options used:
+
+configure \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --localstatedir=/var \
+    --libexecdir=/usr/lib/qemu \
+    --extra-ldflags="$LDFLAGS" \
+    --smbd=/usr/bin/smbd \
+    --enable-modules \
+    --enable-sdl \
+    --disable-werror \
+    --enable-slirp=system \
+    --enable-xfsctl \
+    --audio-drv-list="pa alsa sdl"
+    
+Error log attached. Here is the beginning:
+
+/usr/bin/ld: /usr/lib/gcc/x86_64-pc-linux-gnu/10.2.0/../../../../lib/Scrt1.o: in function `_start':
+(.text+0x24): undefined reference to `main'
+/usr/bin/ld: libblock-curl.a(block_curl.c.o): in function `curl_block_init':
+
+
+
+Please give more info on your host OS build environment, and most importantly confirm that you have tried doing a build from a *completely* clean git checkout. Recent build system changes introduced risk of problems if you have not done a full clean. "git clean -f -x -d" will delete every file in your git checkout that is not committed, ensuring you are starting from a pristine checkout.
+
+I'm using Archlinux. Trying right now a build from scratch and I will report asap. Keeping fingers crossed.
+
+Build process is still broken even with a blank new version of git source code.
+
+
+Once again, everything start while processing block_curl.so.
+
+Here is the beginning of the error log:
+
+Linking target block-curl.so
+/usr/bin/ld: /usr/lib/gcc/x86_64-pc-linux-gnu/10.2.0/../../../../lib/Scrt1.o: in function `_start':
+(.text+0x24): undefined reference to `main'
+/usr/bin/ld: libblock-curl.a(block_curl.c.o): in function `curl_block_init':
+
+
+Curl version: 7.72.0 if it matters.
+
+Attaching error log.
+
+
+
+Can you attach the full build log, including all the "configure" output, and ideally pass  "V=1" as an arg to 'make'
+
+Full build log from start to crash.
+
+Nothing looks especially unusual there, but clear it is failing to link the block-curl.so as a library and is instead linking it as an executable and thus failing to find "main". I can't explain why that would be the case.
+
+From log:
+> The Meson build system
+> Version: 0.55.3
+
+Perhaps a(nother) problem with meson?
+
+Try "meson=git"
+
+Added Paolo for his Meson expertize in case he can spot the flaw
+
+Tried meson-git, and it is still breaking on the same file. No luck here.
+
+Can you do the build using  "make V=1" so that we actually see the compiler command lines used in the log file.
+
+Log with make V=1 as requested.
+
+cc  -o block-curl.so  -Wl,--as-needed -Wl,--allow-shlib-undefined -shared -fPIC -Wl,--start-group -Wl,-soname,block-curl.so -Wl,--whole-archive libblock-curl.a -Wl,--no-whole-archive -Wl,--warn-common -Wl,-z,relro -Wl,-z,now -m64 -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now -fstack-protector-strong -O2 -g -fPIE -DPIE -std=gnu99 -Wall -g -pie -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now libmodule-common.a -lcurl -Wl,--export-dynamic -pthread -lgmodule-2.0 -lglib-2.0 -lglib-2.0 -Wl,--end-group
+
+It could be because of -pie overriding -shared.  You wrote that you have --extra-ldflags="$LDFLAGS" but what is $LDFLAGS?
+
+When I looked at /etc/makepkg.conf on my Archlinux, I found; LDFLAGS="-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now"
+
+
+Please attach config-host.mak and config.log.  Hopefully that is enough to blame one of you, :) configure, meson.build or Meson itself.
+
+
+
+
+
+The problem is caused by the extra flags you're forcing on the compiler:
+
+Using 'CFLAGS' from environment with value: '-O2 -g -fPIE -DPIE -std=gnu99 -Wall'
+Using 'LDFLAGS' from environment with value: '-g -pie -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now'
+Using 'CPPFLAGS' from environment with value: '-D_FORTIFY_SOURCE=2'
+
+Most particularly the "-pie" in LDFLAGS.  This is only valid for executables, not shared libraries, and thus it breaks the build.
+
+I used these settings until Qemu 5.1.0 was released and it worked. These flags are used by archlinux for stable qemu release packaging.
+
+See https://github.com/archlinux/svntogit-packages/blob/packages/qemu/trunk/PKGBUILD
+
+Since qemu moved to meson, it breaks. I don't know why it used to work before. Thanks for your answer anyway.
+
+ 
+
+FYI, QEMU automatically enables PIC/PIE as needed, so there's no need to set it via these flags. 
+
+In fact everything in your $CFLAGS is already set by QEMU out of the box too.
+
+For LDFLAGS you can cull the -g and -pie
+
+Before the meson port, the  "-pie" arg was on the CLI *before* the "-shared" arg so the "-shared" wins and results in a shared library.
+
+After the meson port, "-shared" appears first, and so "-pie" wins and tries to create an executable.
+
+IOW, this passing of -pie was always wrong, and it was only by luck that it didn't break the build before.
+
+So, I'll try to tweak LDFLAGS and if it doesn't work, well... That's life. Thanks for the infos.
+
+Even with LDFLAGS tweaking, it breaks. Anyway, thanks for your help here.
+
+What's your new configure command line? Attach the config.log and make V=1
+log again please.
+
+That said, I noticed that the flags were included twice in the linker
+command line so maybe you've only removed them in one place.
+
+Il ven 18 set 2020, 18:20 Frederic Bezies <email address hidden> ha
+scritto:
+
+> Even with LDFLAGS tweaking, it breaks. Anyway, thanks for your help
+> here.
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1896096
+>
+> Title:
+>   Git version: Build process is broken in block_curl.c.o
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1896096/+subscriptions
+>
+>
+
+
+FWIW, I reproduced the original failure using your LDFLAGS, and tested that removing '-pie' made it work
+
+Configure line: configure \
+    --prefix=/usr \
+    --sysconfdir=/etc \
+    --localstatedir=/var \
+    --libexecdir=/usr/lib/qemu \
+    --smbd=/usr/bin/smbd \
+    --extra-ldflags="-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now" \
+    --enable-modules \
+    --enable-sdl \
+    --disable-werror \
+    --enable-slirp=system \
+    --enable-xfsctl \
+    --audio-drv-list="pa alsa sdl"
+
+And qemu log build using make -V=1.
+
+Hope it helps.
+
+You have to unset LDFLAGS, or remove -pie. Specifying --extra-ldflags is
+useless because Meson already obeys the LDFLAGS environment variable.
+
+Il ven 18 set 2020, 19:11 Frederic Bezies <email address hidden> ha
+scritto:
+
+> And qemu log build using make -V=1.
+>
+> Hope it helps.
+>
+> ** Attachment added: "qemuv1-2.log"
+>
+> https://bugs.launchpad.net/qemu/+bug/1896096/+attachment/5412260/+files/qemuv1-2.log
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1896096
+>
+> Title:
+>   Git version: Build process is broken in block_curl.c.o
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1896096/+subscriptions
+>
+>
+
+
+Chiming in here as the user who initially suggested Arch use this:
+
+--extra-ldflags="$LDFLAGS"
+
+qemu-5.0.0 introduced a breaking change whereby LDFLAGS from the environment were ignored. For Arch, this resulted in exclusion of `--as-needed' from the link, which naturally caused dependency chaos.
+
+The Arch Build System globally sets CFLAGS and LDFLAGS in the build environment to try and ensure all pkgs are built to distro standards. The build systems for most pkgs in the distro respect FLAGS from the environment.
+
+When qemu-5.2.0 is released, Arch will obviously need to adapt to account for Meson changes.
+
+
+
+Huh. I thought we ignored the environment LDFLAGS/CFLAGS from much earlier than 5.0 and was about to ask if honouring it was a change introduced with the Meson switch! My (not necessarily very considered) opinion is that generally it's better not to honour the environment CFLAGS and LDFLAGS because they can have all sorts of random stuff in them that just doesn't work in complicated cases like QEMU, as in this example where they included "-pie". --extra-ldflags has the semantics of "add these on top of whatever the standard set of QEMU build flags is" so the user doesn't need to try to specify absolutely everything, and it's clear from the configure line that extra non-default options are being added.
+
+
+Just for your information, I added this before configure and it is still broken: export LDFLAGS="-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now"
+
+
+I think I'll wait until Qemu 5.2.0 is released to see how Archlinux will fix this annoying behaviour.
+
+You can include the output of the build to help debugging this further failure.
+
+LDFLAGS has legitimate used but I think it would make sense to fail configure if LDFLAGS contains -pie. Perhaps Meson could do so as well.
+
+Building log while settings LDFLAGS as is:  export LDFLAGS="-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now"
+
+Nope, something is overriding your LDFLAGS and adding -pie back. Please
+open a bug on Arch, if they want to enable PIE by default they can do it in
+gcc and binutils.
+
+Adding -pie to LDFLAGS is as nonsensical as adding -shared.
+
+
+Well, I'll wait until qemu 5.2.0 is released to see how archlinux work around this problem. Thanks anyway for your help.
+
+Looking deeper into this... I believe there are indeed qemu bugs here.
+
+It's actually the qemu configure script which is adding `-pie'
+
+$ echo $LDFLAGS
+-Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now
+
+Yet meson-logs/meson-log.txt tells me that:
+
+Using 'LDFLAGS' from environment with value: '-g -pie -Wl,-O1,--sort-common,--as-needed,-z,relro,-z,now'
+
+Where did the `-pie' come from? Answer: the qemu configure script!
+
+https://git.qemu.org/?p=qemu.git;a=blob;f=configure;h=756447900855e0b886ec6eb4e6b6aecf48c20a97;hb=HEAD#l2250
+
+Simply unsetting LDFLAGS allows the build to complete successfully.
+
+Not only that, qemu is now ignoring my user supplied CFLAGS from the environment. I haven't analysed this one yet but I'm starting to realise this hybrid meson/configure script approach is quite complicated.
+
+
+
+
+
+
+
+
+
+
+Il dom 20 set 2020, 00:40 Toolybird <email address hidden> ha scritto:
+
+> Looking deeper into this... I believe there are indeed qemu bugs here.
+>
+
+You're right.
+
+$ cat test
+#! /bin/sh
+echo before
+env | grep LDFLAGS
+LDFLAGS="-pie $LDFLAGS"
+echo after
+env | grep LDFLAGS
+
+$ ./test
+before
+after
+
+$ LDFLAGS='-Wl,--as-needed' ./test before
+LDFLAGS=-Wl,--as-needed
+after
+LDFLAGS=-pie -Wl,--as-needed
+
+Because changes to environment variables propagate without having to export
+them again.
+
+So we need to unset CFLAGS and LDFLAGS in the configure script.
+
+Paolo
+
+
+> So we need to unset CFLAGS and LDFLAGS in the configure script.
+
+Yes, but is this what you really want? It seems to go against standard practice. The usual expectation is even documented in Meson docs:
+
+https://mesonbuild.com/howtox.html#set-extra-compiler-and-linker-flags-from-the-outside-when-eg-building-distro-packages
+
+Yes, qemu is a complex beast and I understand why you want full control over the build. But it certainly will make life harder for downstream distros/users who like to build pkgs with their own preferred options.
+
+BTW, --extra-ldflags="my additional linker option" seems to work.
+But --extra-cflags="my additional compiler switch" seems to also add it to the link line which seems a bit odd?
+
+From configure script:
+
+--extra-cflags=*) QEMU_CFLAGS="$QEMU_CFLAGS $optarg"
+                  QEMU_LDFLAGS="$QEMU_LDFLAGS $optarg"
+
+The whole conversion to Meson is clearly a massive effort and deserves big praise :) But as a clueless end user, I wonder why you didn't just bite the bullet and go full Meson (à la Libvirt) and get rid of the configure script completely?
+
+> But --extra-cflags="my additional compiler switch" seems to
+> also add it to the link line which seems a bit odd?
+
+That's due to LTO.  IIRC autotools do the same (after all
+the linking step is a "cc" invocation), but I may be wrong.
+
+> I wonder why you didn't just bite the bullet and go full Meson
+> (à la Libvirt) and get rid of the configure script completely?
+
+Because that would have been 8000 more lines to convert and
+more bugs that would not have been caught before the merge.
+The problem with having custom Makefiles is that some rebases
+were horrible.  When going from 4.2 to 5.1, there were a couple
+merge commits that took me one day each!  In addition, compared
+to Libvirt adding new source files seemed much more common in QEMU.
+
+Basically the conversion was merged in the "worst possible
+state that can already be considered an improvement", in order
+to focus on fixing bugs and progressing in the conversion,
+rather than on rebases.  I must admit it was a bit worse than
+expected, but as long as maintainers have not been blocked in
+their work it's still more or less going according to plan.
+
+Posted "[PATCH 0/4] configure: bugfixes and cleanups for CFLAGS".
+
+> Posted "[PATCH 0/4] configure: bugfixes and cleanups for CFLAGS".
+
+(sorry for delay)
+
+Thanks for the patches. They seem to fix the Arch case i.e. build succeeds without hacks and FLAGS in the build env are being respected.
+
+However, I tested the "unset FLAGS" case and patch 4/4 seems to cause a weird failure I don't understand:
+
+../qemu/meson.build:1:0: ERROR: Unable to determine dynamic linker
+
+A full log can be found at /build/qemu-git/src/build-full/meson-logs/meson-log.txt
+
+ERROR: meson setup failed
+
+There is nothing in meson-log to indicate the failure reason. Any ideas?
+
+
+
+Yes that's a silly mistake that invokes the linker with a dummy empty
+argument. I'll fix it and repost, thanks for testing on Arch!
+
+Paolo
+
+Il mar 22 set 2020, 23:41 Toolybird <email address hidden> ha scritto:
+
+> ** Attachment added: "meson-log.txt"
+>
+> https://bugs.launchpad.net/qemu/+bug/1896096/+attachment/5413347/+files/meson-log.txt
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1896096
+>
+> Title:
+>   Git version: Build process is broken in block_curl.c.o
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1896096/+subscriptions
+>
+>
+
+
+v2 patches appear to work fine in both test scenarios. Thanks again.
+
+Just asking: any hope to see this patch added to qemu git source code?
+
+Yes, of course.
+
+Il mer 30 set 2020, 21:25 Frederic Bezies <email address hidden> ha
+scritto:
+
+> Just asking: any hope to see this patch added to qemu git source code?
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1896096
+>
+> Title:
+>   Git version: Build process is broken in block_curl.c.o
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1896096/+subscriptions
+>
+>
+
+
+Hi Paolo,
+
+The CFLAGS patches seem to have missed your last big pull req:
+
+[PULL v8 00/86] Misc QEMU patches for 2020-09-24
+
+Apparently disappeared between v3 and v4. Oversight or intentional? Thanks.
+
+
+
+Intentional because they possibly broke one of the build scenarios that are tested pre-pull (even though the GitLab CI was fine, it does not yet cover everything).
+
+The plan is to flush my queue until there's only the current 5 pending meson patches, and then submit those in isolation.
+
+New version of the patches posted:
+
+[PATCH 0/4] Convert remaining submodules to meson, cleanup env var handling
+
+This will sidestep the issue that broke in the Sep 24 pull request.
+

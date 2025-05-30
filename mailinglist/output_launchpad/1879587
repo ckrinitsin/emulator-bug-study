@@ -1,0 +1,100 @@
+Register number in ESR is incorrect for certain banked registers when switching from AA32 to AA64
+
+I am running into a situation where I have:
+- A hypervisor running in EL2, AA64
+- A guest running in EL1, AA32
+
+We trap certain accesses to special registers such as DACR (via HCR.TVM). One instruction that is trapped is:
+
+ee03ef10  ->	mcr	15, 0, lr, cr3, cr0, {0}
+
+The guest is running in SVC mode. So, LR should refer to LR_svc there. LR_svc is mapped to X18 in AA64. So, ESR should reflect that. However, the actual ESR value is: 0xfe00dc0
+
+If we decode the 'rt':
+>>> (0xfe00dc0 >> 5) & 0x1f
+14
+
+My understanding is that 14 is incorrect in the context of AA64. rt should be set to 18. The current mode being SVC, LR refers to LR_svc not LR_usr. In other words, the mapping between registers in AA64 and AA32 doesn't seem to be accounted for. I've tested this with Qemu 5.0.0
+
+Let me know if that makes sense and if you would like more info. I am also happy to test patches.
+Thanks for all the great work on Qemu!
+
+This is with qemu-system-aarch64 - forgot to mention it explicitly. So, it will only affect qemu for ARM 64-bit.
+
+Thanks for the bug report; I think this patch should fix it:
+
+https://<email address hidden>/
+
+Any chance you could test it?
+
+
+Of course. I just tested the patch (used the branch from https://github.com/patchew-project/qemu) and it didn't seem to help. Could that be linked to the fact that the translation is only in the SMC exception path? It should probably target the MSR exception path also (and probably others too). It's just a guess as I am not very familiar with the code. If that's enough info, do let me know how to gather more useful information.
+
+Maybe it's covered by EXCP_HYP_TRAP already...
+
+Hmm, that's odd. The switch statement fall-throughs and case labels mean that that code should be executed for all exceptions taken to AArch64 except for IRQ/FIQ/VIRQ/VFIQ. (You could probably confirm that by running QEMU under a debugger and putting in suitable breakpoints.)
+
+Do you have a test case image/command line I could use to reproduce the issue ?
+
+
+Unfortunately, I won't be able to send the code or binary for the hypervisor as of now (it will become available at some point in the future though). I've done a bit of debugging on the QEMU code and it seems like the approach you are taking works fine in general but the register mapping code doesn't seem quite right. Applying this patch (on top of yours):
+
+From e2182581dcdeedc2cb88cd21b88b4db744677737 Mon Sep 17 00:00:00 2001
+From: Julien Freche <email address hidden>
+Date: Tue, 4 Aug 2020 11:54:49 -0700
+Subject: [PATCH] Possible fix
+
+---
+ target/arm/helper.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 60b80228fd..455c92b891 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -9619,17 +9619,16 @@ static int aarch64_regnum(CPUARMState *env, int aarch32_reg)
+         switch (mode) {
+         case ARM_CPU_MODE_USR:
+         case ARM_CPU_MODE_SYS:
+-            return 14;
+         case ARM_CPU_MODE_HYP:
+-            return 16;
++            return 14;
+         case ARM_CPU_MODE_IRQ:
+-            return 18;
++            return 16;
+         case ARM_CPU_MODE_SVC:
+-            return 20;
++            return 18;
+         case ARM_CPU_MODE_ABT:
+-            return 22;
++            return 20;
+         case ARM_CPU_MODE_UND:
+-            return 24;
++            return 22;
+         case ARM_CPU_MODE_FIQ:
+             return 30;
+         default:
+-- 
+2.28.0
+
+Based on the ARM documentation, I would think that LR_svc maps to X18, not X20. I fixed the ones that seemed wrong but I haven't check every possible case so you may want to double check this. With the patch I was able to boot Linux correctly.
+
+Let me know if that makes sense
+
+
+Whoops, yes. I somehow misread that table (I think I failed to spot that there is no LR_hyp and it just shares r14 with usr/sys, so I did a cut-n-paste of the SP cases to LR, which isn't right). I think your adjustment to the patch is correct. I'll do a v2 patch for you to test, but it will just be those fixes applied to v1.
+
+
+v2 is here https://patches.linaro.org/patch/247434/ -- hoping to put that in master today...
+
+
+
+It seems like this is your patch plus my fixup so this is good to me and already tested locally. Thanks again.
+
+Hey Julien, what fixup do you need on top of Peter's v2?
+
+Peter's v2 already includes the fixup (update #6)
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=a65dabf71a9f9b949
+

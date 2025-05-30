@@ -1,0 +1,83 @@
+QEMU arm virt machine was stopped by STMFD command while debug process
+
+Hello, i have a big problem with QEMU arm virtual machine. So...
+I run QEMU machine with bare-metal ThreadX fullflash from Texet TM-333 phone  (Spreadtrum platform)
+[CODE]qemu-system-arm -S -gdb tcp::1234,ipv4 -drive file=C:\cygwin64\home\flash.bin,if=mtd,format=raw -M palmetto-bmc -cpu arm926 -m 64M[/CODE]
+I use palmetto-bmc platform because it have ARM926EJ-S core and support SPI Flash.
+Then, i attach to gdb qemu process from IDA and run code step-by-step.
+[IMG]https://pp.userapi.com/c847218/v847218546/13ec1c/iSIcre5-js4.jpg[/IMG]
+
+When the IDA run 00032534 STR R11, [R10] command
+[IMG]https://pp.userapi.com/c846416/v846416708/133f60/GQzxORvf4Tg.jpg[/IMG]
+
+instead of store R11 on R10 adress, it jump 000328DC STMFD SP!, {R0-R12,LR} instruction...
+[IMG]https://pp.userapi.com/c847218/v847218546/13ec26/32A0VcaJywg.jpg[/IMG]
+and virt machine not execute new instruction... 
+[IMG]https://pp.userapi.com/c850624/v850624111/528f3/N7FTpgloWVU.jpg[/IMG]
+
+and why i did not change flash from n25q256a to n25q032a11 in aspeed.c without rebuild qemu?
+
+
+
+In your "before the STR" image the guest CPU is in mode 0x13, which is Supervisor. In the image afterwards, it is in Abort mode (0x17). I think therefore that what has happened is that the memory address the code is trying to store to is not accessible, and the guest has taken a Data Abort exception, so in the second image you are looking at your guest's exception handler code for the data abort.
+
+There is a long-standing bug where singlestepping an insn which takes an exception results in our stepping the insn at the exception vector entry point and then stopping, rather than stopping on the entry point, which may be confusing you here. (That's LP:757702.)
+
+
+As a more general note, you can't expect to be able to run a flash image from one Arm system (your phone) on a different Arm system. All Arm boards are completely different in their memory layout, where they put devices, what devices are present, and so on. Trying to run an image for the wrong machine will result in it crashing very early on, when the guest tries to read a device or RAM which isn't where it expects to be. The palmetto-bmc machine will only run code that's built for that system.
+
+
+Okey, thank you for attentioned me to arm mode.
+The STR instruction is STR R11, [0x82000012]. Can I set rule for qemu to write RAM from 0x80000000 to 0x8FFFFFFF for execute basic arm instruction, Or need fix source and rebuild qemu?
+
+I have experience to rebuild source qemu for change spi flash from n25q256a to n25q032a11. Do you include to wishlist change flash-chip function?
+
+You would need to write a model of the hardware you're trying to emulate. That would require documentation of it and quite a lot of time (it's about equivalent in effort to writing a Linux port to the hardware, as a rule of thumb).
+
+I'm not sure what your suggestion about the SPI flash is: I assume that what we have for the aspeed boards is correct for that hardware.
+
+
+Maybe this is correct for palmetto-board, but qemu user should be able to debug any basic arm instructions for generic arm board with general purpose SPI, I2C etc... My SPI Flash has 4 Mb, and RAM adress may start from 0x400000, This is impossible for 256 Mb Flash. It would be great, if qemu can build general arm device with var ram adr, cpu core and block dev.
+
+No, that is not something that QEMU supports. There is no such thing as a "generic arm board". All arm boards are different hardware, and we model only a few boards. We don't provide "put together your own model from building blocks" functionality, I'm afraid, and it's unlikely we ever will in future.
+
+
+Hm, I am create a new machine based on palmetto-bmc 
+static const AspeedBoardConfig aspeed_boards[] = ...{
+        .name      = MACHINE_TYPE_NAME("texet-tm-333"),
+        .desc      = "Spreadtrum teXet TM-333 (ARM926EJ-S)",
+        .soc_name  = "ast2500-a1",                         
+        .hw_strap1 = SPREADTRUM_BMC_HW_STRAP1,
+        .fmc_model = "n25q032a11",h
+        .spi_model = "mx25l3205d",
+        .num_cs    = 1,
+        .i2c_init  = spreadtrum_bmc_i2c_init,
+    },...
+
+and change soc_name to the ast2500-a1, because #define AST2500_SDRAM_BASE 0x80000000 on the aspeed_soc.c also i change flash for my 4Mb fullflash image. Building qemu and this is work fine!
+The STR command work correctly and STMFD/PUSH/POP also work fine. (The SP register was equal 0 in past bug) 
+
+    /*
+     * Allocate RAM after the memory controller has checked the size
+     * was valid. If not, a default value is used.
+     */
+    ram_size = object_property_get_uint(OBJECT(&bmc->soc), "ram-size", &error_abort);
+
+    memory_region_allocate_system_memory(&bmc->ram1, NULL, "ram1", ram_size);
+    memory_region_allocate_system_memory(&bmc->ram2, NULL, "ram2", ram_size);
+    memory_region_allocate_system_memory(&bmc->ram3, NULL, "ram3", ram_size);
+
+      memory_region_add_subregion(get_system_memory(), sc->info->sdram_base[1], &bmc->ram1);
+      memory_region_add_subregion(get_system_memory(), sc->info->sdram_base[0], &bmc->ram2);
+      memory_region_add_subregion(get_system_memory(), sc->info->sdram_base[2], &bmc->ram3);
+
+    object_property_add_const_link(OBJECT(&bmc->soc), "ram1", OBJECT(&bmc->ram1), &error_abort);
+    object_property_add_const_link(OBJECT(&bmc->soc), "ram2", OBJECT(&bmc->ram2), &error_abort);
+    object_property_add_const_link(OBJECT(&bmc->soc), "ram3", OBJECT(&bmc->ram3), &error_abort);
+
+And I can create 3 RAM section for avoid exeption handler! Maybe any devices from this adress does not appear in qemu...
+
+
+I think there isn't a QEMU bug to address here, so I'm going to close this bug. Please let us know if there's anything we've missed.
+
+

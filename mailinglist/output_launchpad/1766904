@@ -1,0 +1,47 @@
+Creating high hdd load (with constant fsyncs) on a SATA disk leads to freezes and errors in guest dmesg
+
+After upgrading from qemu 2.10.0+dfsg-2 to 2.12~rc3+dfsg-2 (on debian sid host), centos 7 guest started to show freezes and ata errors in dmesg during hdd workloads with writing many small files and repeated fsyncs.
+
+Host kernel 4.15.0-3-amd64.
+Guest kernel 3.10.0-693.21.1.el7.x86_64 (slightly older guest kernel was tested too with same result).
+
+Script that reproduces the bug (first run usualy goes smooth, second and later runs result in dmesg errors and freezes):
+
+http://paste.debian.net/hidden/472fb220/
+
+Sample of error messages in guest dmesg:
+
+http://paste.debian.net/hidden/8219e234/
+
+A workaround that I am using right now: I have detached this SATA storage and reattached the same .qcow2 file as SCSI - this has fixed the issue for me.
+
+Copying command line into bug so we don't lose it:
+
+LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin QEMU_AUDIO_DRV=spice /usr/bin/kvm -name guest=myvm.local,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-3-myvm.local/master-key.aes -machine pc-i440fx-2.8,accel=kvm,usb=off,vmport=off,dump-guest-core=off -cpu IvyBridge -m 2048 -realtime mlock=off -smp 2,sockets=2,cores=1,threads=1 -uuid b10ea3d4-410c-4dc3-b9b0-818d43314323 -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/domain-3-myvm.local/monitor.sock,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc,driftfix=slew -global kvm-pit.lost_tick_policy=delay -no-hpet -no-shutdown -global PIIX4_PM.disable_s3=1 -global PIIX4_PM.disable_s4=1 -boot strict=on -device ich9-usb-ehci1,id=usb,bus=pci.0,addr=0x5.0x7 -device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pci.0,multifunction=on,addr=0x5 -device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pci.0,addr=0x5.0x1 -device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pci.0,addr=0x5.0x2 -device ahci,id=sata0,bus=pci.0,addr=0x7 -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x6 -drive file=/home/user/data/work/virt-images/myvm.local.qcow2,format=qcow2,if=none,id=drive-sata0-0-0 -device ide-hd,bus=sata0.0,drive=drive-sata0-0-0,id=sata0-0-0,bootindex=1 -netdev tap,fd=26,id=hostnet0,vhost=on,vhostfd=29 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=52:54:00:39:66:3c,bus=pci.0,addr=0x3 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -chardev socket,id=charchannel0,path=/var/lib/libvirt/qemu/channel/target/domain-3-myvm.local/org.qemu.guest_agent.0,server,nowait -device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=org.qemu.guest_agent.0 -chardev spicevmc,id=charchannel1,name=vdagent -device virtserialport,bus=virtio-serial0.0,nr=2,chardev=charchannel1,id=channel1,name=com.redhat.spice.0 -device usb-tablet,id=input0,bus=usb.0,port=1 -spice port=5900,addr=127.0.0.1,disable-ticketing,image-compression=off,seamless-migration=on -device qxl-vga,id=video0,ram_size=67108864,vram_size=67108864,vram64_size_mb=0,vgamem_mb=16,max_outputs=1,bus=pci.0,addr=0x2 -device intel-hda,id=sound0,bus=pci.0,addr=0x4 -device hda-duplex,id=sound0-codec0,bus=sound0.0,cad=0 -chardev spicevmc,id=charredir0,name=usbredir -device usb-redir,chardev=charredir0,id=redir0,bus=usb.0,port=2 -chardev spicevmc,id=charredir1,name=usbredir -device usb-redir,chardev=charredir1,id=redir1,bus=usb.0,port=3 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x8 -msg timestamp=on
+
+and ccing in jsnow
+
+Relevant bits appear to be:
+
+-M pc-i1440fx-2.8
+-cpu IvyBridge
+-m 2048 
+-realtime mlock=off 
+-smp 2,sockets=2,cores=1,threads=1
+-device ahci,id=sata0,bus=pci.0,addr=0x7 
+-drive file=/home/user/data/work/virt-images/myvm.local.qcow2,format=qcow2,if=none,id=drive-sata0-0-0 
+-device ide-hd,bus=sata0.0,drive=drive-sata0-0-0,id=sata0-0-0,bootindex=1 
+
+So this is a 2.8 PC machine that we've configured to use AHCI instead. I see some blips about CHS being zero, but that's expected in response to a (successful) flush (0xE7) command, so it looks like it's stalling out. I'll have to try to reproduce and see if I can trigger the hang.
+
+
+I am getting the exact same issue. The freeze occurred when I tried to install Ubuntu 18.04 with qemu-2.12. However, it seems to be working just fine with qemu-2.11.1. So it seems that something in between 2.11.1 and 2.12 is the culprit.
+
+It's still possible to reproduce this issue with qemu-master (a3ac12fba028df90f7b3dbec924995c126c41022).
+
+Jake, can you try the fix I posted in https://bugs.launchpad.net/qemu/+bug/1769189 ? I'm not actually confident it's the same bug, but it might be worth a shot. It fixes a bug that was made more prominent inbetween 2.11 and 2.12, so it fits the timeline presented here.
+
+@John Snow Thanks! After applying that patch, I couldn't reproduce this anymore. At least for me it seems that these two issues refer to the same bug.
+
+Great, thank you so much for helping!
+

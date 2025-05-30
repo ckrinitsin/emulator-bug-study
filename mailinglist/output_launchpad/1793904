@@ -1,0 +1,141 @@
+files are randomly overwritten by Zero Bytes
+
+Hello together, 
+
+I am currently tracking down a "Hard to reproduce" bug on my systems that I first discovered during gitlab installation: 
+
+
+Here is the Text from the Gitlab Bug https://gitlab.com/gitlab-org/gitlab-ce/issues/51023
+----------------------------------------------------------------------------------------------
+
+Steps to reproduce
+
+I still do not have all the steps together to reproduce, so far it is:
+apt install gitlab-ce and
+gitlab-rake backup:recovery
+Then it works for some time before it fails.
+
+What is the current bug behavior?
+
+I have a 12 hour old Installation of gitlab ce 11.2.3-ce.0 for debian stretch on a fresh debian stretch system together with our imported data. However it turns out that some gitlab related files contain Zero bytes instead of actual data.
+
+root@gitlab:~# xxd -l 16 /opt/gitlab/bin/gitlab-ctl
+00000000: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+
+This behaviour is somewhat strange because it was working for a few minutes/hours. I did write a shell script to find out which files are affected of this memory loss. It turns out that only files located under /opt/gitlab are affected, if I rule out files like /var/log/faillog and some postgresql table files.
+
+What I find even stranger is that it does not seem to affect Logfiles/databases/git_repositorys but application files, like .rb scripts. and not all of them. No non gitlab package is affected.
+
+What is the expected correct behavior?
+Binarys and .rb files should stay as they are.
+
+Possible fixes
+
+I am still investigating, I hope that it is not an infrastructure problem (libvirt/qemu/glusterfs) it can still be one but the point that files of /opt/gitlab are affected and not any logfile and that we to not have similar problems with any other system leads me to the application for now.
+If I would have used docker the same problem might have caused a reboot of the container.
+But for the Debian package it is a bit of work to recover. That is all a workaround, however.
+---------------------------------------------------------------------------------------------
+
+I do have found 2 more systems having the same problem with different software: 
+
+root@erp:~# xxd -l 16 /usr/share/perl/5.26.2/constant.pm
+00000000: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+
+The Filesize itself is, compared with another machine 00001660 Bytes for both the corrupted and the intact file. It looks to me from the outside that if some data in the qcow2 file is written too many bytes get written so it sometimes overwites data of existing files located right after the position in memory where the write goes to.  
+
+I would like to rule out Linux+Ext4 filesystems because I find it highly unlikely that such an error keeps undiscovered in that part of the environment for long. I think the same might go for qemu. 
+
+Which leaves qemu, gemu+gluster:// mount, qcow2 volumes, glusterfs, network. So I am now going to check if I can find any system which gets its volumes via fusermount instead of gluster:// path if the error is gone there. This may take a while. 
+
+
+----- some software versions---------------
+
+QEMU emulator version 2.12.0 (Debian 1:2.12+dfsg-3)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+
+libvirt-daemon-driver-storage-gluster/testing,unstable,now 4.6.0-2 amd64 [installed]
+
+ii  glusterfs-client   4.1.3-1        amd64
+
+Update: I do have changed all important vms to a fuserfs image mount. 
+
+The problem seems to occur when you write a lot of smaller files in a short period of time on the VMs ext4 filesystem. The best way for me to reproduce that is by doing an "apt upgrade" (see attachment) 
+
+This particular VM is configured with a virtio storage device (vda) with the following URL (resolved via /etc/hosts): gluster://this.virt.local:24007/images/conesphere_oldschool_testerp.qcow2
+
+The gluster volume images has a 2 replica 1 arbiter layout. and is located on one physical vlan which is spread via  a fibre optics link between 2 datacenters. All Gigabit all TCP. 
+
+I could not reproduce the behaviour when I did mount the glusterfs volume via fuse into /var/lib/libvirt/images and started my machine from there. So this might be a suitable workaround despite of the performance loss.  
+
+As far as I can see from here, direct access from qemu on 'glusterfs://' storage is seriously broken the moment and no one should use it until it is fixed.
+
+
+Looks like you've narrowed it down to QEMU's usage of gluster, but some additional details might still be nice just to be sure:
+
+Can you produce the command-line for QEMU so we can see the configuration you're running?
+
+I believe on Debian that QEMU makes use of the glusterfs-common package, can you post that version too?
+
+Once you are witnessing files coming back as zeroes, if you shut the VM down (cleanly if at all possible), are you able to run qemu-img check on the qcow2 file? Do you see any errors?
+
+And, as a debugging step, are you able to test with a raw file over gluster:// to see if you can reproduce that way? I'm wondering if there's an interaction with qcow2 and gluster that can maybe be eliminated or highlighted here. (qcow2 might drive gluster in ways differently than raw does, which might help narrow down the problem one way or the other.)
+
+--js
+
+
+
+Hi John, 
+
+
+As for your second question: 
+ii  glusterfs-comm 4.1.3-1      amd64        GlusterFS common libraries and tr
+
+
+As for the other parts:  I was playing with this one ealier, therefore this is not completely relieable: 
+
+qemu-img check images/conesphere_internet_meeting1.qcow2 
+No errors were found on the image.
+143086/491520 = 29.11% allocated, 7.72% fragmented, 0.00% compressed clusters
+Image end offset: 9379708928
+
+
+I will try to reproduce  your Ideas as soon as I can. :)
+
+
+
+I will have to put more efford into that: The bug applies to oVirt 4.3 too which seems to use a fuse filesystem.
+
+I did some undocumented testing to circle the issue down: It seems to affect Files that are stored as sparsed files either raw or qcow2. 
+
+There was a big event and I had the chance to find some people using glusterfs with qemu, too. the biggest difference as far as I could see was that they all where using xfs based backends while I am using ext4.
+
+I have to fix a few more issues in Production this week, then I will run more tests. 
+
+Please note the updates on: 
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1701736
+
+It turns out that you can reproduce the broken images on glusterfs fuse mounts by using:
+
+                aio=native
+                cache=none,
+                write-cache=on
+
+
+I have a set of vms running here on my fedora 29 desktop providing a test glusterfs and a vm to reproduce the bug, at least for the current ovirt case. 
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

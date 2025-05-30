@@ -1,0 +1,1277 @@
+qemu can no longer boot NetBSD/sparc
+
+Booting NetBSD/sparc in qemu no longer works.  It broke between qemu version 5.0.0 and 5.1.0, and a bisection identified the following as the offending commit:
+
+  [5d971f9e672507210e77d020d89e0e89165c8fc9] memory: Revert "memory: accept mismatching sizes in memory_region_access_valid"
+
+It's still broken as of 7fd51e68c34fcefdb4d6fd646ed3346f780f89f4.
+
+To reproduce, run
+
+  wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-9.0/images/NetBSD-9.0-sparc.iso
+  qemu-system-sparc -nographic -cdrom NetBSD-9.0-sparc.iso -boot d
+
+The expected behavior is that the guest boots to the prompt
+
+  Installation medium to load the additional utilities from:
+
+The observed behavior is a panic:
+
+  [   1.0000050] system[0]: trap 0x29: pc=0xf0046b14 sfsr=0xb6 sfva=0x54000000
+  [   1.0000050] cpu0: data fault: pc=0xf0046b14 addr=0x54000000 sfsr=0xb6<PERR=0x0,LVL=0x0,AT=0x5,FT=0x5,FAV,OW>
+  [   1.0000050] panic: kernel fault
+  [   1.0000050] halted
+
+This happens because openbios accesses unassigned memory during the SBus scan:
+
+Probing SBus slot 0 offset 0
+invalid accepts: (null)  addr 20000000 size: 1
+Probing SBus slot 1 offset 0
+invalid accepts: (null)  addr 30000000 size: 1
+Probing SBus slot 2 offset 0
+invalid accepts: (null)  addr 40000000 size: 1
+Probing SBus slot 3 offset 0
+Probing SBus slot 4 offset 0
+invalid accepts: (null)  addr 60000000 size: 1
+Probing SBus slot 5 offset 0
+
+Thread 4 "qemu-system-spa" hit Breakpoint 1, memory_region_access_valid (mr=0x555555df20c0 <io_mem_unassigned>, 
+    addr=536870912, size=1, is_write=<optimized out>, attrs=...)
+    at .../softmmu/memory.c:1358
+1358	        return false;
+
+(gdb) list
+
+1355	    if (mr->ops->valid.accepts
+1356	        && !mr->ops->valid.accepts(mr->opaque, addr, size, is_write, attrs)) {
+1357	        fprintf(stderr, "invalid accepts: %s  addr %"PRIx64 " size: %d\n", mr->name, addr, size);
+1358	        return false;
+1359	    }
+
+(gdb) p mr->ops->valid.accepts
+$1 = (_Bool (*)(void *, hwaddr, unsigned int, _Bool, MemTxAttrs)) 0x555555736f10 <unassigned_mem_accepts>
+
+(gdb) list unassigned_mem_accepts
+1271
+1272	static bool unassigned_mem_accepts(void *opaque, hwaddr addr,
+1273	                                   unsigned size, bool is_write,
+1274	                                   MemTxAttrs attrs)
+1275	{
+1276	    return false;
+1277	}
+
+
+
+The S24/TCX datasheet is listed as "Unable to locate" on [1].
+
+However the NetBSD revision 1.32 of the driver introduced
+64-bit accesses to the stippler and blitter [2]. It is safe
+to assume these memory regions are 64-bit accessible.
+QEMU implementation is 32-bit, so fill the 'impl' fields.
+
+[1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+[2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+
+Reported-by: Andreas Gustafsson <email address hidden>
+Buglink: https://bugs.launchpad.net/bugs/1892540
+Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+ hw/display/tcx.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index 1fb45b1aab8..96c6898b149 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -548,20 +548,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_stip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rstip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_rstip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+@@ -650,10 +658,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_rblit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static void tcx_invalidate_cursor_position(TCXState *s)
+-- 
+2.26.2
+
+
+
+The S24/TCX datasheet is listed as "Unable to locate" on [1].
+
+However the NetBSD revision 1.32 of the driver introduced
+64-bit accesses to the stippler and blitter [2]. It is safe
+to assume these memory regions are 64-bit accessible.
+QEMU implementation is 32-bit, so fill the 'impl' fields.
+
+[1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+[2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+
+Reported-by: Andreas Gustafsson <email address hidden>
+Buglink: https://bugs.launchpad.net/bugs/1892540
+Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Since v1:
+- added missing uncommitted staged changes... (tcx_blit_ops)
+---
+ hw/display/tcx.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index 1fb45b1aab8..96c6898b149 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -548,20 +548,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_stip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rstip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_rstip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+@@ -650,10 +658,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_rblit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static void tcx_invalidate_cursor_position(TCXState *s)
+-- 
+2.26.2
+
+
+
+Le sam. 29 août 2020 18:14, Michael <email address hidden> a écrit :
+
+> Hello,
+>
+> since I wrote the NetBSD code in question, here are my 2 cent:
+>
+> On Sat, 29 Aug 2020 08:41:43 -0700
+> Richard Henderson <email address hidden> wrote:
+>
+> > On 8/22/20 7:21 AM, Philippe Mathieu-Daudé wrote:
+> > > The S24/TCX datasheet is listed as "Unable to locate" on [1].
+>
+> I don't have it either, but someone did a lot of reverse engineering
+> and gave me his notes. The hardware isn't that complicated, but quite
+> weird.
+>
+> > > However the NetBSD revision 1.32 of the driver introduced
+> > > 64-bit accesses to the stippler and blitter [2]. It is safe
+> > > to assume these memory regions are 64-bit accessible.
+> > > QEMU implementation is 32-bit, so fill the 'impl' fields.
+>
+> IIRC the real hardware *requires* 64bit accesses for stipple and
+> blitter operations to work. For stipples you write a 64bit word into
+> STIP space, the address defines where in the framebuffer you want to
+> draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+> BLIT space works similarly, the 64bit word contains an offset were to
+> read pixels from, and how many you want to copy.
+>
+
+Thanks Michael for this information!
+If you don't mind I'll amend it to the commit description so there is a
+reference for posterity.
+
+I'm waiting for *Andreas Gustafsson to test it then will repost.*
+
+
+> have fun
+> Michael
+>
+
+
+On Sat, Aug 22, 2020 at 02:21:27PM -0000, Philippe Mathieu-DaudÃ© wrote:
+> The S24/TCX datasheet is listed as "Unable to locate" on [1].
+> 
+> However the NetBSD revision 1.32 of the driver introduced
+> 64-bit accesses to the stippler and blitter [2]. It is safe
+> to assume these memory regions are 64-bit accessible.
+> QEMU implementation is 32-bit, so fill the 'impl' fields.
+> 
+> [1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+> [2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+> 
+> Reported-by: Andreas Gustafsson <email address hidden>
+> Buglink: https://bugs.launchpad.net/bugs/1892540
+> Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+> Signed-off-by: Philippe Mathieu-DaudÃ© <email address hidden>
+
+Philippe, did you submit the patch on the mailing list
+normally too? I don't seem to see it there.
+
+the patch seems to work for me:
+
+Tested-by: Michael S. Tsirkin <email address hidden>
+
+
+CC Nathan who reported a similar failure.
+
+Nathan, does the patch below fix the issue for you?
+
+> ---
+> Since v1:
+> - added missing uncommitted staged changes... (tcx_blit_ops)
+> ---
+ hw/display/tcx.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index 1fb45b1aab8..96c6898b149 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -548,20 +548,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_stip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rstip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_rstip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+@@ -650,10 +658,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_rblit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static void tcx_invalidate_cursor_position(TCXState *s)
+
+
+-----------------------------------------------------------
+
+I think you shouldn't specify .min_access_size in impl, since
+that also allows 1 and 2 byte accesses from guest.
+
+
+
+> -- 
+> 2.26.2
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1892540
+> 
+> Title:
+>   qemu can no longer boot NetBSD/sparc
+> 
+> Status in QEMU:
+>   New
+> 
+> Bug description:
+>   Booting NetBSD/sparc in qemu no longer works.  It broke between qemu
+>   version 5.0.0 and 5.1.0, and a bisection identified the following as
+>   the offending commit:
+> 
+>     [5d971f9e672507210e77d020d89e0e89165c8fc9] memory: Revert "memory:
+>   accept mismatching sizes in memory_region_access_valid"
+> 
+>   It's still broken as of 7fd51e68c34fcefdb4d6fd646ed3346f780f89f4.
+> 
+>   To reproduce, run
+> 
+>     wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-9.0/images/NetBSD-9.0-sparc.iso
+>     qemu-system-sparc -nographic -cdrom NetBSD-9.0-sparc.iso -boot d
+> 
+>   The expected behavior is that the guest boots to the prompt
+> 
+>     Installation medium to load the additional utilities from:
+> 
+>   The observed behavior is a panic:
+> 
+>     [   1.0000050] system[0]: trap 0x29: pc=0xf0046b14 sfsr=0xb6 sfva=0x54000000
+>     [   1.0000050] cpu0: data fault: pc=0xf0046b14 addr=0x54000000 sfsr=0xb6<PERR=0x0,LVL=0x0,AT=0x5,FT=0x5,FAV,OW>
+>     [   1.0000050] panic: kernel fault
+>     [   1.0000050] halted
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1892540/+subscriptions
+
+
+
+Philippe Mathieu-Daudé wrote:
+> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+> index 1fb45b1aab8..96c6898b149 100644
+
+With this patch, the kernel boots successfully for me.
+-- 
+Andreas Gustafsson, <email address hidden>
+
+
+On 29/08/2020 17:45, Philippe Mathieu-Daudé wrote:
+
+> Le sam. 29 août 2020 18:14, Michael <<email address hidden>
+> <mailto:<email address hidden>>> a écrit :
+> 
+>     Hello,
+> 
+>     since I wrote the NetBSD code in question, here are my 2 cent:
+> 
+>     On Sat, 29 Aug 2020 08:41:43 -0700
+>     Richard Henderson <<email address hidden>
+>     <mailto:<email address hidden>>> wrote:
+> 
+>     > On 8/22/20 7:21 AM, Philippe Mathieu-Daudé wrote:
+>     > > The S24/TCX datasheet is listed as "Unable to locate" on [1].
+> 
+>     I don't have it either, but someone did a lot of reverse engineering
+>     and gave me his notes. The hardware isn't that complicated, but quite
+>     weird.
+> 
+>     > > However the NetBSD revision 1.32 of the driver introduced
+>     > > 64-bit accesses to the stippler and blitter [2]. It is safe
+>     > > to assume these memory regions are 64-bit accessible.
+>     > > QEMU implementation is 32-bit, so fill the 'impl' fields.
+> 
+>     IIRC the real hardware *requires* 64bit accesses for stipple and
+>     blitter operations to work. For stipples you write a 64bit word into
+>     STIP space, the address defines where in the framebuffer you want to
+>     draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+>     BLIT space works similarly, the 64bit word contains an offset were to
+>     read pixels from, and how many you want to copy.
+> 
+> 
+> Thanks Michael for this information! 
+> If you don't mind I'll amend it to the commit description so there is a reference for
+> posterity. 
+> 
+> I'm waiting for /Andreas Gustafsson to test it then will repost.
+
+Hi Philippe,
+
+Thanks for coming up with this patch! Looks fine to me, just wondering if it should
+have a "Fixes: 5d971f9e67 ("memory: Revert "memory: accept mismatching sizes in
+memory_region_access_valid"") tag rather than the original commit since that's how
+other bugs exposed by that commit have been tagged?
+
+
+ATB,
+
+Mark.
+
+
+On 8/30/20 8:59 AM, Andreas Gustafsson wrote:
+> Philippe Mathieu-Daudé wrote:
+>> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+>> index 1fb45b1aab8..96c6898b149 100644
+> 
+> With this patch, the kernel boots successfully for me.
+
+Thanks, can I add "Tested-by: Andreas Gustafsson <email address hidden>"
+to the patch?
+
+
+On 8/30/20 8:18 AM, <email address hidden> wrote:
+> On Sat, Aug 22, 2020 at 02:21:27PM -0000, Philippe Mathieu-DaudÃƒÆ’Ã‚Â© wrote:
+>> The S24/TCX datasheet is listed as "Unable to locate" on [1].
+>>
+>> However the NetBSD revision 1.32 of the driver introduced
+>> 64-bit accesses to the stippler and blitter [2]. It is safe
+>> to assume these memory regions are 64-bit accessible.
+>> QEMU implementation is 32-bit, so fill the 'impl' fields.
+>>
+>> [1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+>> [2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+>>
+>> Reported-by: Andreas Gustafsson <email address hidden>
+>> Buglink: https://bugs.launchpad.net/bugs/1892540
+>> Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+>> Signed-off-by: Philippe Mathieu-DaudÃƒÆ’Ã‚Â© <email address hidden>
+> 
+> Philippe, did you submit the patch on the mailing list
+> normally too? I don't seem to see it there.
+
+Yes, Message-id: <email address hidden>
+https://<email address hidden>/msg732515.html
+
+> 
+> the patch seems to work for me:
+> 
+> Tested-by: Michael S. Tsirkin <email address hidden>
+
+Thanks!
+
+> 
+> 
+> CC Nathan who reported a similar failure.
+> 
+> Nathan, does the patch below fix the issue for you?
+> 
+>> ---
+>> Since v1:
+>> - added missing uncommitted staged changes... (tcx_blit_ops)
+>> ---
+>  hw/display/tcx.c | 18 +++++++++++++++---
+>  1 file changed, 15 insertions(+), 3 deletions(-)
+> 
+> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+> index 1fb45b1aab8..96c6898b149 100644
+> --- a/hw/display/tcx.c
+> +++ b/hw/display/tcx.c
+> @@ -548,20 +548,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+>      .read = tcx_stip_readl,
+>      .write = tcx_stip_writel,
+>      .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>          .min_access_size = 4,
+>          .max_access_size = 4,
+>      },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>  };
+>  
+>  static const MemoryRegionOps tcx_rstip_ops = {
+>      .read = tcx_stip_readl,
+>      .write = tcx_rstip_writel,
+>      .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>          .min_access_size = 4,
+>          .max_access_size = 4,
+>      },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>  };
+>  
+>  static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+> @@ -650,10 +658,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+>      .read = tcx_blit_readl,
+>      .write = tcx_rblit_writel,
+>      .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>          .min_access_size = 4,
+>          .max_access_size = 4,
+>      },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>  };
+>  
+>  static void tcx_invalidate_cursor_position(TCXState *s)
+> 
+> 
+> -----------------------------------------------------------
+> 
+> I think you shouldn't specify .min_access_size in impl, since
+> that also allows 1 and 2 byte accesses from guest.
+> 
+> 
+> 
+>> -- 
+>> 2.26.2
+>>
+>> -- 
+>> You received this bug notification because you are subscribed to the bug
+>> report.
+>> https://bugs.launchpad.net/bugs/1892540
+>>
+>> Title:
+>>   qemu can no longer boot NetBSD/sparc
+>>
+>> Status in QEMU:
+>>   New
+>>
+>> Bug description:
+>>   Booting NetBSD/sparc in qemu no longer works.  It broke between qemu
+>>   version 5.0.0 and 5.1.0, and a bisection identified the following as
+>>   the offending commit:
+>>
+>>     [5d971f9e672507210e77d020d89e0e89165c8fc9] memory: Revert "memory:
+>>   accept mismatching sizes in memory_region_access_valid"
+>>
+>>   It's still broken as of 7fd51e68c34fcefdb4d6fd646ed3346f780f89f4.
+>>
+>>   To reproduce, run
+>>
+>>     wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-9.0/images/NetBSD-9.0-sparc.iso
+>>     qemu-system-sparc -nographic -cdrom NetBSD-9.0-sparc.iso -boot d
+>>
+>>   The expected behavior is that the guest boots to the prompt
+>>
+>>     Installation medium to load the additional utilities from:
+>>
+>>   The observed behavior is a panic:
+>>
+>>     [   1.0000050] system[0]: trap 0x29: pc=0xf0046b14 sfsr=0xb6 sfva=0x54000000
+>>     [   1.0000050] cpu0: data fault: pc=0xf0046b14 addr=0x54000000 sfsr=0xb6<PERR=0x0,LVL=0x0,AT=0x5,FT=0x5,FAV,OW>
+>>     [   1.0000050] panic: kernel fault
+>>     [   1.0000050] halted
+>>
+>> To manage notifications about this bug go to:
+>> https://bugs.launchpad.net/qemu/+bug/1892540/+subscriptions
+> 
+> 
+
+
+
+Philippe Mathieu-Daudé wrote:
+> Thanks, can I add "Tested-by: Andreas Gustafsson <email address hidden>"
+> to the patch?
+
+Fine by me.
+-- 
+Andreas Gustafsson, <email address hidden>
+
+
+On 01/09/2020 11:04, Andreas Gustafsson wrote:
+
+> Philippe Mathieu-Daudé wrote:
+>> Thanks, can I add "Tested-by: Andreas Gustafsson <email address hidden>"
+>> to the patch?
+> 
+> Fine by me.
+
+I've added the above Tested-by tag (and also that from MST) and applied this to my 
+qemu-sparc branch.
+
+
+ATB,
+
+Mark.
+
+
+The S24/TCX datasheet is listed as "Unable to locate" on [1].
+
+However the NetBSD revision 1.32 of the driver introduced
+64-bit accesses to the stippler and blitter [2]. It is safe
+to assume these memory regions are 64-bit accessible.
+QEMU implementation is 32-bit, so fill the 'impl' fields.
+
+Michael Lorenz (author of the NetBSD code [2]) provided us with more
+information in [3]:
+
+> IIRC the real hardware *requires* 64bit accesses for stipple and
+> blitter operations to work. For stipples you write a 64bit word into
+> STIP space, the address defines where in the framebuffer you want to
+> draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+> BLIT space works similarly, the 64bit word contains an offset were to
+> read pixels from, and how many you want to copy.
+>
+> One more thing since there seems to be some confusion - 64bit accesses
+> on the framebuffer are fine as well. TCX/S24 is *not* an SBus device,
+> even though its node says it is.
+> S24 is a card that plugs into a special slot on the SS5 mainboard,
+> which is shared with an SBus slot and looks a lot like a horizontal
+> UPA slot. Both S24 and TCX are accessed through the Micro/TurboSPARC's
+> AFX bus which is 64bit wide and intended for graphics.
+> Early FFB docs even mentioned connecting to both AFX and UPA,
+> no idea if that was ever realized in hardware though.
+
+[1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+[2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+[3] https://<email address hidden>/msg734928.html
+
+Reported-by: Andreas Gustafsson <email address hidden>
+Buglink: https://bugs.launchpad.net/bugs/1892540
+Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+Tested-by: Michael S. Tsirkin <email address hidden>
+Reviewed-by: Richard Henderson <email address hidden>
+Tested-by: Andreas Gustafsson <email address hidden>
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Since v2:
+- added Michael's memories
+- added R-b/T-b tags
+
+Since v1:
+- added missing uncommitted staged changes... (tcx_blit_ops)
+---
+ hw/display/tcx.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index c9d5e45cd1f..878ecc8c506 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -549,20 +549,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_stip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rstip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_rstip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+@@ -651,10 +659,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_rblit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static void tcx_invalidate_cursor_position(TCXState *s)
+-- 
+2.26.2
+
+
+
+On 8/30/20 9:32 AM, Mark Cave-Ayland wrote:
+> On 29/08/2020 17:45, Philippe Mathieu-Daudé wrote:
+> 
+>> Le sam. 29 août 2020 18:14, Michael <<email address hidden>
+>> <mailto:<email address hidden>>> a écrit :
+>>
+>>      Hello,
+>>
+>>      since I wrote the NetBSD code in question, here are my 2 cent:
+>>
+>>      On Sat, 29 Aug 2020 08:41:43 -0700
+>>      Richard Henderson <<email address hidden>
+>>      <mailto:<email address hidden>>> wrote:
+>>
+>>      > On 8/22/20 7:21 AM, Philippe Mathieu-Daudé wrote:
+>>      > > The S24/TCX datasheet is listed as "Unable to locate" on [1].
+>>
+>>      I don't have it either, but someone did a lot of reverse engineering
+>>      and gave me his notes. The hardware isn't that complicated, but quite
+>>      weird.
+>>
+>>      > > However the NetBSD revision 1.32 of the driver introduced
+>>      > > 64-bit accesses to the stippler and blitter [2]. It is safe
+>>      > > to assume these memory regions are 64-bit accessible.
+>>      > > QEMU implementation is 32-bit, so fill the 'impl' fields.
+>>
+>>      IIRC the real hardware *requires* 64bit accesses for stipple and
+>>      blitter operations to work. For stipples you write a 64bit word into
+>>      STIP space, the address defines where in the framebuffer you want to
+>>      draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+>>      BLIT space works similarly, the 64bit word contains an offset were to
+>>      read pixels from, and how many you want to copy.
+>>
+>>
+>> Thanks Michael for this information!
+>> If you don't mind I'll amend it to the commit description so there is a reference for
+>> posterity.
+>>
+>> I'm waiting for /Andreas Gustafsson to test it then will repost.
+> 
+> Hi Philippe,
+> 
+> Thanks for coming up with this patch! Looks fine to me, just wondering if it should
+> have a "Fixes: 5d971f9e67 ("memory: Revert "memory: accept mismatching sizes in
+> memory_region_access_valid"") tag rather than the original commit since that's how
+> other bugs exposed by that commit have been tagged?
+
+I don't think so, the bug was present (hidden) *before* 5d971f9e67 and
+we were incorrectly modelling it. I just posted a v3 including Michael
+valuable memories :)
+
+> 
+> 
+> ATB,
+> 
+> Mark.
+> 
+
+
+On 24/10/2020 21:51, Philippe Mathieu-Daudé wrote:
+
+> The S24/TCX datasheet is listed as "Unable to locate" on [1].
+> 
+> However the NetBSD revision 1.32 of the driver introduced
+> 64-bit accesses to the stippler and blitter [2]. It is safe
+> to assume these memory regions are 64-bit accessible.
+> QEMU implementation is 32-bit, so fill the 'impl' fields.
+> 
+> Michael Lorenz (author of the NetBSD code [2]) provided us with more
+> information in [3]:
+> 
+>> IIRC the real hardware *requires* 64bit accesses for stipple and
+>> blitter operations to work. For stipples you write a 64bit word into
+>> STIP space, the address defines where in the framebuffer you want to
+>> draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+>> BLIT space works similarly, the 64bit word contains an offset were to
+>> read pixels from, and how many you want to copy.
+>>
+>> One more thing since there seems to be some confusion - 64bit accesses
+>> on the framebuffer are fine as well. TCX/S24 is *not* an SBus device,
+>> even though its node says it is.
+>> S24 is a card that plugs into a special slot on the SS5 mainboard,
+>> which is shared with an SBus slot and looks a lot like a horizontal
+>> UPA slot. Both S24 and TCX are accessed through the Micro/TurboSPARC's
+>> AFX bus which is 64bit wide and intended for graphics.
+>> Early FFB docs even mentioned connecting to both AFX and UPA,
+>> no idea if that was ever realized in hardware though.
+> 
+> [1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+> [2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+> [3] https://<email address hidden>/msg734928.html
+> 
+> Reported-by: Andreas Gustafsson <email address hidden>
+> Buglink: https://bugs.launchpad.net/bugs/1892540
+> Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+> Tested-by: Michael S. Tsirkin <email address hidden>
+> Reviewed-by: Richard Henderson <email address hidden>
+> Tested-by: Andreas Gustafsson <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+> Since v2:
+> - added Michael's memories
+> - added R-b/T-b tags
+> 
+> Since v1:
+> - added missing uncommitted staged changes... (tcx_blit_ops)
+> ---
+>   hw/display/tcx.c | 18 +++++++++++++++---
+>   1 file changed, 15 insertions(+), 3 deletions(-)
+> 
+> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+> index c9d5e45cd1f..878ecc8c506 100644
+> --- a/hw/display/tcx.c
+> +++ b/hw/display/tcx.c
+> @@ -549,20 +549,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+>       .read = tcx_stip_readl,
+>       .write = tcx_stip_writel,
+>       .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>           .min_access_size = 4,
+>           .max_access_size = 4,
+>       },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>   };
+>   
+>   static const MemoryRegionOps tcx_rstip_ops = {
+>       .read = tcx_stip_readl,
+>       .write = tcx_rstip_writel,
+>       .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>           .min_access_size = 4,
+>           .max_access_size = 4,
+>       },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>   };
+>   
+>   static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+> @@ -651,10 +659,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+>       .read = tcx_blit_readl,
+>       .write = tcx_rblit_writel,
+>       .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>           .min_access_size = 4,
+>           .max_access_size = 4,
+>       },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>   };
+>   
+>   static void tcx_invalidate_cursor_position(TCXState *s)
+
+I'd already queued v2 of this patch (see my earlier email) with the intent to send a 
+PR today, however I'll replace it with this v3 instead.
+
+
+ATB,
+
+Mark.
+
+
+On 10/25/20 11:55 AM, Mark Cave-Ayland wrote:
+> On 24/10/2020 21:51, Philippe Mathieu-Daudé wrote:
+> 
+>> The S24/TCX datasheet is listed as "Unable to locate" on [1].
+>>
+>> However the NetBSD revision 1.32 of the driver introduced
+>> 64-bit accesses to the stippler and blitter [2]. It is safe
+>> to assume these memory regions are 64-bit accessible.
+>> QEMU implementation is 32-bit, so fill the 'impl' fields.
+>>
+>> Michael Lorenz (author of the NetBSD code [2]) provided us with more
+>> information in [3]:
+>>
+>>> IIRC the real hardware *requires* 64bit accesses for stipple and
+>>> blitter operations to work. For stipples you write a 64bit word into
+>>> STIP space, the address defines where in the framebuffer you want to
+>>> draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+>>> BLIT space works similarly, the 64bit word contains an offset were to
+>>> read pixels from, and how many you want to copy.
+>>>
+>>> One more thing since there seems to be some confusion - 64bit accesses
+>>> on the framebuffer are fine as well. TCX/S24 is *not* an SBus device,
+>>> even though its node says it is.
+>>> S24 is a card that plugs into a special slot on the SS5 mainboard,
+>>> which is shared with an SBus slot and looks a lot like a horizontal
+>>> UPA slot. Both S24 and TCX are accessed through the Micro/TurboSPARC's
+>>> AFX bus which is 64bit wide and intended for graphics.
+>>> Early FFB docs even mentioned connecting to both AFX and UPA,
+>>> no idea if that was ever realized in hardware though.
+>>
+>> [1] 
+>> http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home 
+>>
+>> [2] 
+>> http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32 
+>>
+>> [3] https://<email address hidden>/msg734928.html
+>>
+>> Reported-by: Andreas Gustafsson <email address hidden>
+>> Buglink: https://bugs.launchpad.net/bugs/1892540
+>> Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+>> Tested-by: Michael S. Tsirkin <email address hidden>
+>> Reviewed-by: Richard Henderson <email address hidden>
+>> Tested-by: Andreas Gustafsson <email address hidden>
+>> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+>> ---
+>> Since v2:
+>> - added Michael's memories
+>> - added R-b/T-b tags
+>>
+>> Since v1:
+>> - added missing uncommitted staged changes... (tcx_blit_ops)
+>> ---
+>>   hw/display/tcx.c | 18 +++++++++++++++---
+>>   1 file changed, 15 insertions(+), 3 deletions(-)
+>>
+>> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+>> index c9d5e45cd1f..878ecc8c506 100644
+>> --- a/hw/display/tcx.c
+>> +++ b/hw/display/tcx.c
+>> @@ -549,20 +549,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+>>       .read = tcx_stip_readl,
+>>       .write = tcx_stip_writel,
+>>       .endianness = DEVICE_NATIVE_ENDIAN,
+>> -    .valid = {
+>> +    .impl = {
+>>           .min_access_size = 4,
+>>           .max_access_size = 4,
+>>       },
+>> +    .valid = {
+>> +        .min_access_size = 4,
+>> +        .max_access_size = 8,
+>> +    },
+>>   };
+>>   static const MemoryRegionOps tcx_rstip_ops = {
+>>       .read = tcx_stip_readl,
+>>       .write = tcx_rstip_writel,
+>>       .endianness = DEVICE_NATIVE_ENDIAN,
+>> -    .valid = {
+>> +    .impl = {
+>>           .min_access_size = 4,
+>>           .max_access_size = 4,
+>>       },
+>> +    .valid = {
+>> +        .min_access_size = 4,
+>> +        .max_access_size = 8,
+>> +    },
+>>   };
+>>   static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+>> @@ -651,10 +659,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+>>       .read = tcx_blit_readl,
+>>       .write = tcx_rblit_writel,
+>>       .endianness = DEVICE_NATIVE_ENDIAN,
+>> -    .valid = {
+>> +    .impl = {
+>>           .min_access_size = 4,
+>>           .max_access_size = 4,
+>>       },
+>> +    .valid = {
+>> +        .min_access_size = 4,
+>> +        .max_access_size = 8,
+>> +    },
+>>   };
+>>   static void tcx_invalidate_cursor_position(TCXState *s)
+> 
+> I'd already queued v2 of this patch (see my earlier email) with the 
+> intent to send a PR today, however I'll replace it with this v3 instead.
+
+Thanks! Since there is no code change with v2, I assumed it wouldn't be
+a problem to replace it, without having to re-run your tests.
+
+> 
+> 
+> ATB,
+> 
+> Mark.
+> 
+
+
+From: Philippe Mathieu-Daudé <email address hidden>
+
+The S24/TCX datasheet is listed as "Unable to locate" on [1].
+
+However the NetBSD revision 1.32 of the driver introduced
+64-bit accesses to the stippler and blitter [2]. It is safe
+to assume these memory regions are 64-bit accessible.
+QEMU implementation is 32-bit, so fill the 'impl' fields.
+
+Michael Lorenz (author of the NetBSD code [2]) provided us with more
+information in [3]:
+
+> IIRC the real hardware *requires* 64bit accesses for stipple and
+> blitter operations to work. For stipples you write a 64bit word into
+> STIP space, the address defines where in the framebuffer you want to
+> draw, the data contain a 32bit bitmask, foreground colour and a ROP.
+> BLIT space works similarly, the 64bit word contains an offset were to
+> read pixels from, and how many you want to copy.
+>
+> One more thing since there seems to be some confusion - 64bit accesses
+> on the framebuffer are fine as well. TCX/S24 is *not* an SBus device,
+> even though its node says it is.
+> S24 is a card that plugs into a special slot on the SS5 mainboard,
+> which is shared with an SBus slot and looks a lot like a horizontal
+> UPA slot. Both S24 and TCX are accessed through the Micro/TurboSPARC's
+> AFX bus which is 64bit wide and intended for graphics.
+> Early FFB docs even mentioned connecting to both AFX and UPA,
+> no idea if that was ever realized in hardware though.
+
+[1] http://web.archive.org/web/20111209011516/http://wikis.sun.com/display/FOSSdocs/Home
+[2] http://cvsweb.netbsd.org/bsdweb.cgi/src/sys/dev/sbus/tcx.c.diff?r1=1.31&r2=1.32
+[3] https://<email address hidden>/msg734928.html
+
+Cc: <email address hidden>
+Reported-by: Andreas Gustafsson <email address hidden>
+Buglink: https://bugs.launchpad.net/bugs/1892540
+Fixes: 55d7bfe2293 ("tcx: Implement hardware acceleration")
+Tested-by: Michael S. Tsirkin <email address hidden>
+Reviewed-by: Richard Henderson <email address hidden>
+Tested-by: Andreas Gustafsson <email address hidden>
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+Message-Id: <email address hidden>
+Signed-off-by: Mark Cave-Ayland <email address hidden>
+---
+ hw/display/tcx.c | 18 +++++++++++++++---
+ 1 file changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index c9d5e45cd1..878ecc8c50 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -549,20 +549,28 @@ static const MemoryRegionOps tcx_stip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_stip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rstip_ops = {
+     .read = tcx_stip_readl,
+     .write = tcx_rstip_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static uint64_t tcx_blit_readl(void *opaque, hwaddr addr,
+@@ -651,10 +659,14 @@ static const MemoryRegionOps tcx_rblit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_rblit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static void tcx_invalidate_cursor_position(TCXState *s)
+-- 
+2.20.1
+
+
+
+Commit ae5643ecc6 "hw/display/tcx: Allow 64-bit accesses to framebuffer stippler
+and blitter" enabled 64-bit access for the TCX framebuffer stippler and blitter
+but missed applying the change to one of the blitter MemoryRegions.
+
+Whilst the original change works for me on my local NetBSD test image, the latest
+NetBSD ISO panics on startup without this fix.
+
+Signed-off-by: Mark Cave-Ayland <email address hidden>
+Fixes: ae5643ecc6 ("hw/display/tcx: Allow 64-bit accesses to framebuffer stippler and blitter")
+Buglink: https://bugs.launchpad.net/bugs/1892540
+---
+ hw/display/tcx.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+index 878ecc8c50..3799d29b75 100644
+--- a/hw/display/tcx.c
++++ b/hw/display/tcx.c
+@@ -649,10 +649,14 @@ static const MemoryRegionOps tcx_blit_ops = {
+     .read = tcx_blit_readl,
+     .write = tcx_blit_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid = {
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
+ };
+ 
+ static const MemoryRegionOps tcx_rblit_ops = {
+-- 
+2.20.1
+
+
+
+On 11/20/20 9:17 AM, Mark Cave-Ayland wrote:
+> Commit ae5643ecc6 "hw/display/tcx: Allow 64-bit accesses to framebuffer stippler
+> and blitter" enabled 64-bit access for the TCX framebuffer stippler and blitter
+> but missed applying the change to one of the blitter MemoryRegions.
+> 
+> Whilst the original change works for me on my local NetBSD test image, the latest
+> NetBSD ISO panics on startup without this fix.
+> 
+> Signed-off-by: Mark Cave-Ayland <email address hidden>
+> Fixes: ae5643ecc6 ("hw/display/tcx: Allow 64-bit accesses to framebuffer stippler and blitter")
+> Buglink: https://bugs.launchpad.net/bugs/1892540
+> ---
+>  hw/display/tcx.c | 6 +++++-
+>  1 file changed, 5 insertions(+), 1 deletion(-)
+
+Reviewed-by: Philippe Mathieu-Daudé <email address hidden>
+
+
+Is this bug now fixed, or are there still more patches not yet in master?
+
+
+On 21/11/2020 23:46, Peter Maydell wrote:
+
+> Is this bug now fixed, or are there still more patches not yet in
+> master?
+
+The additional for-5.2 patch above is still needed: I've just submitted it to 
+Travis-CI, and assuming it passes I'll send a PR later.
+
+
+ATB,
+
+Mark.
+
+
+On 20/11/2020 08:17, Mark Cave-Ayland wrote:
+
+> Commit ae5643ecc6 "hw/display/tcx: Allow 64-bit accesses to framebuffer stippler
+> and blitter" enabled 64-bit access for the TCX framebuffer stippler and blitter
+> but missed applying the change to one of the blitter MemoryRegions.
+> 
+> Whilst the original change works for me on my local NetBSD test image, the latest
+> NetBSD ISO panics on startup without this fix.
+> 
+> Signed-off-by: Mark Cave-Ayland <email address hidden>
+> Fixes: ae5643ecc6 ("hw/display/tcx: Allow 64-bit accesses to framebuffer stippler and blitter")
+> Buglink: https://bugs.launchpad.net/bugs/1892540
+> ---
+>   hw/display/tcx.c | 6 +++++-
+>   1 file changed, 5 insertions(+), 1 deletion(-)
+> 
+> diff --git a/hw/display/tcx.c b/hw/display/tcx.c
+> index 878ecc8c50..3799d29b75 100644
+> --- a/hw/display/tcx.c
+> +++ b/hw/display/tcx.c
+> @@ -649,10 +649,14 @@ static const MemoryRegionOps tcx_blit_ops = {
+>       .read = tcx_blit_readl,
+>       .write = tcx_blit_writel,
+>       .endianness = DEVICE_NATIVE_ENDIAN,
+> -    .valid = {
+> +    .impl = {
+>           .min_access_size = 4,
+>           .max_access_size = 4,
+>       },
+> +    .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+>   };
+>   
+>   static const MemoryRegionOps tcx_rblit_ops = {
+
+Adding CC to qemu-stable so that this follow-up fix also gets applied to 5.1.1.
+
+
+ATB,
+
+Mark.
+
+
+This should now be fixed in master as of 48e5c7f34c "hw/display/tcx: add missing 64-bit access for framebuffer blitter".
+
+
+ATB,
+
+Mark.
+
+
+Seems to at least do the innital part of the boot ok.
+I got to shell at least: not sure how far I'm supposed to get
+or which options to choose.
+
+
+
+Released with QEMU v5.2.0.
+

@@ -1,0 +1,259 @@
+qemu 2.4.0 hangs using vfio for pci passthrough of graphics card
+
+2.3.0 (manjaro distro package) works fine. 2.4.0 (manjaro or the arch vanilla one) hangs on the SeaBIOS screen when saying "Press F12 for boot menu". All tested with the same hardware, OS, command and configuration. It also starts without the GPU passed through, even with the USB passed through. I am using the latest SeaBIOS 1.8.2.
+
+The release notes say:
+ VFIO
+    Support for resetting AMD Bonaire and Hawaii GPUs
+    Platform device passthrough support for Calxeda xgmac devices 
+    
+So maybe something there broke it.
+    
+I am using the arch qemu 2.4.0 PKGBUILD (modified to have make -j8 and removed iscsi, gluster, ceph, etc.), which uses vanilla sources and no patches. https://projects.archlinux.org/svntogit/packages.git/tree/trunk?h=packages/qemu
+
+I am not using a frontend. I am using a script I wrote that generates the command below.
+
+Guest OS here would be 64 bit windows 7, but it didn't start so that's not relevant. Also a Manjaro Linux VM won't start. 
+
+CPU is AMD FX-8150; board is Gigabyte GA-990FXA-UD5 (990FX chipset).
+
+full command line (without the \ after each line) is:
+
+qemu-system-x86_64
+    -enable-kvm
+    -M q35
+    -m 3584
+    -cpu host
+    -boot c
+    -smp 7,sockets=1,cores=7,threads=1
+    -vga none
+    -device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1
+    -device vfio-pci,host=04:00.0,bus=root.1,multifunction=on,x-vga=on,addr=0.0,romfile=Sapphire.R7260X.1024.131106.rom
+    -device vfio-pci,host=00:14.2,bus=pcie.0
+    -device vfio-pci,host=00:16.0,bus=root.1
+    -device vfio-pci,host=00:16.2,bus=root.1
+    -usb
+    -device ahci,bus=pcie.0,id=ahci
+    -drive file=/dev/data/vm1,id=disk1,format=raw,if=virtio,index=0,media=disk,discard=on
+    -drive media=cdrom,id=cdrom,index=5,media=cdrom
+    -netdev type=tap,id=net0,ifname=tap-vm1
+    -device virtio-net-pci,netdev=net0,mac=00:01:02:03:04:05
+    -monitor stdio
+    -boot menu=on
+
+
+$ lspci -nn | grep -E "04:00.0|00:14.2|00:16.0|00:16.2"
+00:14.2 Audio device [0403]: Advanced Micro Devices, Inc. [AMD/ATI] SBx00 Azalia (Intel HDA) [1002:4383] (rev 40)
+00:16.0 USB controller [0c03]: Advanced Micro Devices, Inc. [AMD/ATI] SB7x0/SB8x0/SB9x0 USB OHCI0 Controller [1002:4397]
+00:16.2 USB controller [0c03]: Advanced Micro Devices, Inc. [AMD/ATI] SB7x0/SB8x0/SB9x0 USB EHCI Controller [1002:4396]
+04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Bonaire XTX [Radeon R7 260X] [1002:6658]
+
+
+Also I have this one that also hangs:
+05:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Juniper XT [Radeon HD 6770] [1002:68ba]
+
+I ran a bisect, and here's the result:
+
+
+b8eb5512fd8a115f164edbbe897cdf8884920ccb is the first bad commit
+commit b8eb5512fd8a115f164edbbe897cdf8884920ccb
+Author: Nadav Amit <email address hidden>
+Date:   Mon Apr 13 02:32:08 2015 +0300
+
+    target-i386: disable LINT0 after reset
+    
+    Due to old Seabios bug, QEMU reenable LINT0 after reset. This bug is long gone
+    and therefore this hack is no longer needed.  Since it violates the
+    specifications, it is removed.
+    
+    Signed-off-by: Nadav Amit <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+:040000 040000 a8ec76841b8d4e837c2cd0d0b82e08c0717a0ec6 d33744231c98c9f588cefbc92f416183f639706f M      hw
+
+
+$ git diff 7398dfc7799a50097803db4796c7edb6cd7d47a1 b8eb5512fd8a115f164edbbe897cdf8884920ccb
+
+diff --git a/hw/intc/apic_common.c b/hw/intc/apic_common.c
+index 042e960..d38d24b 100644
+--- a/hw/intc/apic_common.c
++++ b/hw/intc/apic_common.c
+@@ -243,15 +243,6 @@ static void apic_reset_common(DeviceState *dev)
+     info->vapic_base_update(s);
+ 
+     apic_init_reset(dev);
+-
+-    if (bsp) {
+-        /*
+-         * LINT0 delivery mode on CPU #0 is set to ExtInt at initialization
+-         * time typically by BIOS, so PIC interrupt can be delivered to the
+-         * processor when local APIC is enabled.
+-         */
+-        s->lvt[APIC_LVT_LINT0] = 0x700;
+-    }
+ }
+ 
+ /* This function is only used for old state version 1 and 2 */
+
+
+And then to confirm it:
+
+git checkout v2.4.0
+git revert b8eb5512fd8a115f164edbbe897cdf8884920ccb
+
+
+
+And this build works. :)
+
+Hi,
+
+proxmox users report same bug here with qemu 2.4:
+
+http://forum.proxmox.com/threads/23346-Proxmox-4b1-q35-machines-failing-to-reboot-problems-with-PCI-passthrough
+
+we are going to test with reverting the commit to see if it's help.
+
+
+----- Mail original -----
+De: "Peter Maloney" <email address hidden>
+À: "qemu-devel" <email address hidden>
+Envoyé: Mercredi 26 Août 2015 21:48:16
+Objet: [Qemu-devel] [Bug 1488363] Re: qemu 2.4.0 hangs using vfio for pci passthrough of graphics card
+
+I ran a bisect, and here's the result: 
+
+
+b8eb5512fd8a115f164edbbe897cdf8884920ccb is the first bad commit 
+commit b8eb5512fd8a115f164edbbe897cdf8884920ccb 
+Author: Nadav Amit <email address hidden> 
+Date: Mon Apr 13 02:32:08 2015 +0300 
+
+target-i386: disable LINT0 after reset 
+
+Due to old Seabios bug, QEMU reenable LINT0 after reset. This bug is long gone 
+and therefore this hack is no longer needed. Since it violates the 
+specifications, it is removed. 
+
+Signed-off-by: Nadav Amit <email address hidden> 
+Message-Id: <email address hidden> 
+Signed-off-by: Paolo Bonzini <email address hidden> 
+
+:040000 040000 a8ec76841b8d4e837c2cd0d0b82e08c0717a0ec6 
+d33744231c98c9f588cefbc92f416183f639706f M hw 
+
+
+$ git diff 7398dfc7799a50097803db4796c7edb6cd7d47a1 b8eb5512fd8a115f164edbbe897cdf8884920ccb 
+
+diff --git a/hw/intc/apic_common.c b/hw/intc/apic_common.c 
+index 042e960..d38d24b 100644 
+--- a/hw/intc/apic_common.c 
++++ b/hw/intc/apic_common.c 
+@@ -243,15 +243,6 @@ static void apic_reset_common(DeviceState *dev) 
+info->vapic_base_update(s); 
+
+apic_init_reset(dev); 
+- 
+- if (bsp) { 
+- /* 
+- * LINT0 delivery mode on CPU #0 is set to ExtInt at initialization 
+- * time typically by BIOS, so PIC interrupt can be delivered to the 
+- * processor when local APIC is enabled. 
+- */ 
+- s->lvt[APIC_LVT_LINT0] = 0x700; 
+- } 
+} 
+
+/* This function is only used for old state version 1 and 2 */ 
+
+
+And then to confirm it: 
+
+git checkout v2.4.0 
+git revert b8eb5512fd8a115f164edbbe897cdf8884920ccb 
+
+
+And this build works. :) 
+
+-- 
+You received this bug notification because you are a member of qemu- 
+devel-ml, which is subscribed to QEMU. 
+https://bugs.launchpad.net/bugs/1488363 
+
+Title: 
+qemu 2.4.0 hangs using vfio for pci passthrough of graphics card 
+
+Status in QEMU: 
+New 
+
+Bug description: 
+2.3.0 (manjaro distro package) works fine. 2.4.0 (manjaro or the arch 
+vanilla one) hangs on the SeaBIOS screen when saying "Press F12 for 
+boot menu". All tested with the same hardware, OS, command and 
+configuration. It also starts without the GPU passed through, even 
+with the USB passed through. I am using the latest SeaBIOS 1.8.2. 
+
+The release notes say: 
+VFIO 
+Support for resetting AMD Bonaire and Hawaii GPUs 
+Platform device passthrough support for Calxeda xgmac devices 
+
+So maybe something there broke it. 
+
+I am using the arch qemu 2.4.0 PKGBUILD (modified to have make -j8 and removed iscsi, gluster, ceph, etc.), which uses vanilla sources and no patches. https://projects.archlinux.org/svntogit/packages.git/tree/trunk?h=packages/qemu 
+
+I am not using a frontend. I am using a script I wrote that generates 
+the command below. 
+
+Guest OS here would be 64 bit windows 7, but it didn't start so that's 
+not relevant. Also a Manjaro Linux VM won't start. 
+
+CPU is AMD FX-8150; board is Gigabyte GA-990FXA-UD5 (990FX chipset). 
+
+full command line (without the \ after each line) is: 
+
+qemu-system-x86_64 
+-enable-kvm 
+-M q35 
+-m 3584 
+-cpu host 
+-boot c 
+-smp 7,sockets=1,cores=7,threads=1 
+-vga none 
+-device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1 
+-device vfio-pci,host=04:00.0,bus=root.1,multifunction=on,x-vga=on,addr=0.0,romfile=Sapphire.R7260X.1024.131106.rom 
+-device vfio-pci,host=00:14.2,bus=pcie.0 
+-device vfio-pci,host=00:16.0,bus=root.1 
+-device vfio-pci,host=00:16.2,bus=root.1 
+-usb 
+-device ahci,bus=pcie.0,id=ahci 
+-drive file=/dev/data/vm1,id=disk1,format=raw,if=virtio,index=0,media=disk,discard=on 
+-drive media=cdrom,id=cdrom,index=5,media=cdrom 
+-netdev type=tap,id=net0,ifname=tap-vm1 
+-device virtio-net-pci,netdev=net0,mac=00:01:02:03:04:05 
+-monitor stdio 
+-boot menu=on 
+
+
+$ lspci -nn | grep -E "04:00.0|00:14.2|00:16.0|00:16.2" 
+00:14.2 Audio device [0403]: Advanced Micro Devices, Inc. [AMD/ATI] SBx00 Azalia (Intel HDA) [1002:4383] (rev 40) 
+00:16.0 USB controller [0c03]: Advanced Micro Devices, Inc. [AMD/ATI] SB7x0/SB8x0/SB9x0 USB OHCI0 Controller [1002:4397] 
+00:16.2 USB controller [0c03]: Advanced Micro Devices, Inc. [AMD/ATI] SB7x0/SB8x0/SB9x0 USB EHCI Controller [1002:4396] 
+04:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Bonaire XTX [Radeon R7 260X] [1002:6658] 
+
+
+Also I have this one that also hangs: 
+05:00.0 VGA compatible controller [0300]: Advanced Micro Devices, Inc. [AMD/ATI] Juniper XT [Radeon HD 6770] [1002:68ba] 
+
+To manage notifications about this bug go to: 
+https://bugs.launchpad.net/qemu/+bug/1488363/+subscriptions 
+
+
+Version 2.4.1 is affected too, but regression mentioned by Peter Maloney solve this problem.
+
+This still affects the distro proxmox 4.0 and many users are affected "http://forum.proxmox.com/threads/24362-PCIe-passthrough-does-not-work" , is there any detail you guys need to fix this?
+
+With seabios 1.9.1-1 and qemu 2.5.0-1 manjaro packages (which as far as I know have no patches), it seems to work now.
+
+With U14.04_64 and qemu-2.5.0 complied from http://wiki.qemu.org/Download this is a problem unless I use linux-generic-lts-xenial (4.4.0.13.7) so it seems there's a kernel issue here
+

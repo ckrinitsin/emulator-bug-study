@@ -1,0 +1,316 @@
+QEMU v5.1.0-rc0/rc1 hang with nested virtualization
+
+We're running Kata Containers using QEMU and with v5.1.0rc0 and rc1 have noticed a problem at startup where QEMu appears to hang. We are not seeing this problem on our bare metal nodes and only on a VSI that supports nested virtualization.
+
+We unfortunately see nothing at all in the QEMU logs to help understand the problem and a hung process is just a guess at this point.
+
+Using git bisect we first see the problem with...
+
+---
+
+f19bcdfedd53ee93412d535a842a89fa27cae7f2 is the first bad commit
+commit f19bcdfedd53ee93412d535a842a89fa27cae7f2
+Author: Jason Wang <email address hidden>
+Date:   Wed Jul 1 22:55:28 2020 +0800
+
+    virtio-pci: implement queue_enabled method
+    
+    With version 1, we can detect whether a queue is enabled via
+    queue_enabled.
+    
+    Signed-off-by: Jason Wang <email address hidden>
+    Signed-off-by: Cindy Lu <email address hidden>
+    Message-Id: <email address hidden>
+    Reviewed-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Michael S. Tsirkin <email address hidden>
+    Acked-by: Jason Wang <email address hidden>
+
+ hw/virtio/virtio-pci.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+---
+
+Reverting this commit seems to work and prevent the hanging.
+
+---
+
+Here's how kata ends up launching qemu in our environment -- 
+/opt/kata/bin/qemu-system-x86_64 -name sandbox-849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f -uuid 6bec458e-1da7-4847-a5d7-5ab31d4d2465 -machine pc,accel=kvm,kernel_irqchip -cpu host,pmu=off -qmp unix:/run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/qmp.sock,server,nowait -m 4096M,slots=10,maxmem=30978M -device pci-bridge,bus=pci.0,id=pci-bridge-0,chassis_nr=1,shpc=on,addr=2,romfile= -device virtio-serial-pci,disable-modern=true,id=serial0,romfile= -device virtconsole,chardev=charconsole0,id=console0 -chardev socket,id=charconsole0,path=/run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/console.sock,server,nowait -device virtio-scsi-pci,id=scsi0,disable-modern=true,romfile= -object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-pci,rng=rng0,romfile= -device virtserialport,chardev=charch0,id=channel0,name=agent.channel.0 -chardev socket,id=charch0,path=/run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/kata.sock,server,nowait -chardev socket,id=char-396c5c3e19e29353,path=/run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/vhost-fs.sock -device vhost-user-fs-pci,chardev=char-396c5c3e19e29353,tag=kataShared,romfile= -netdev tap,id=network-0,vhost=on,vhostfds=3:4,fds=5:6 -device driver=virtio-net-pci,netdev=network-0,mac=52:ac:2d:02:1f:6f,disable-modern=true,mq=on,vectors=6,romfile= -global kvm-pit.lost_tick_policy=discard -vga none -no-user-config -nodefaults -nographic -daemonize -object memory-backend-file,id=dimm1,size=4096M,mem-path=/dev/shm,share=on -numa node,memdev=dimm1 -kernel /opt/kata/share/kata-containers/vmlinuz-5.7.9-74 -initrd /opt/kata/share/kata-containers/kata-containers-initrd_alpine_1.11.2-6_agent.initrd -append tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k console=hvc0 console=hvc1 iommu=off cryptomgr.notests net.ifnames=0 pci=lastbus=0 debug panic=1 nr_cpus=4 agent.use_vsock=false scsi_mod.scan=none init=/usr/bin/kata-agent -pidfile /run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/pid -D /run/vc/vm/849df14c6065931adedb9d18bc9260a6d896f1814a8c5cfa239865772f1b7a5f/qemu.log -smp 2,cores=1,threads=1,sockets=4,maxcpus=4
+
+---
+
+Seems an odd one to be the culprit? Still lets ask Jason.
+Can you just clarify; is this qemu 5.1.0-rc on both the host and the kata, or are you just changing to using qemu 5.1 as the host, and you're sticking with the existing kata qemu?
+
+Which host CPU have you got?
+
+I believe the VSI itself is QEMU based but don't know the version or details but suspect it's 4.1 based. We compile our own QEMU version for use with Kata and that's where we're now using 5.1.0-rc1 with the above commit reverted.
+
+Host Kernel is ... 4.15.0-101-generic if that helps
+
+re: cpu -- four of these...
+```
+processor	: 0
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 61
+model name	: Intel Core Processor (Broadwell, IBRS)
+stepping	: 2
+microcode	: 0x1
+cpu MHz		: 2095.148
+cache size	: 16384 KB
+physical id	: 0
+siblings	: 4
+core id		: 0
+cpu cores	: 2
+apicid		: 0
+initial apicid	: 0
+fpu		: yes
+fpu_exception	: yes
+cpuid level	: 13
+wp		: yes
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology cpuid tsc_known_freq pni pclmulqdq vmx ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch cpuid_fault invpcid_single pti ssbd ibrs ibpb tpr_shadow vnmi flexpriority ept vpid fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm rdseed adx smap xsaveopt arat md_clear
+bugs		: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf mds swapgs taa itlb_multihit
+bogomips	: 4190.29
+clflush size	: 64
+cache_alignment	: 64
+address sizes	: 40 bits physical, 48 bits virtual
+power management:
+```
+ 
+
+Hi:
+
+It's not clear to me:
+
+- Is the hang happen on the host or L1 guest?
+- Is qemu 5.1-rc0 used on the host or L1 guest?
+- When did you see the hung, just after launching the guest?
+- Can you use gdb to get a calltrace of qemu when you see the hang?
+- What's the version of kernel in L1 and L2 guest?
+
+Thanks
+
+Simon: Please answer Jason's questions
+
+But my reading is; I don't know what a VSI is but I'm guessing it's the host and he doesn't know the host qemu; so the 5.1is the qemu that kata is running?
+
+It perhaps would make more sense if this has nothing to do with nesting, and more to do with Kata's virtio setup;  I've just tried virtio-fs on current head (outside kata) and it seems OK from a quick test.
+
+:) Sorry a VSI is a virtual server instance e.g a VM vs. a bare metal server. 
+
+I'm using IBM Cloud IKS which is a managed Kubernetes Service. I'm installing QEMU 5.1.x on the worker nodes. It is this instance of QEMU -- e.g. /opt/kata/bin/qemu-system-x86_64 -- that is hanging. The Kernel version at this level is... 4.15.0-101-generic. I don't know the QEMU or kernel version in the L0 host.
+
+FWIW the exact same setup with the identical OS, Kernel version, Kata runtime, QEMU etc. is working on a bare metal host.
+
+
+
+It hangs (still guessing here) immediately -- before anything is logged. I'll try to get you a calltrace but have to figure out how to do that first ;) Any pointers appreciated.
+
+Yon can get the calltrace by:
+
+1) compile the qemu with --enable-debug
+2) using gdb -p $pid_of_qemu when you see the hang
+3) thread apply all bt
+
+Thanks
+
+Thanks Jason,
+Ok will do... gimme a day and I'll post what I see.
+
+
+```
+(gdb) thread apply all bt
+
+Thread 5 (LWP 211759):
+#0  0x00007ff56a9988d8 in g_str_hash ()
+#1  0x00007ff56a997a0c in g_hash_table_lookup ()
+#2  0x00007ff56a6c528f in type_table_lookup (name=0x7ff56ac9a9dd "virtio-bus") at qom/object.c:84
+#3  type_get_by_name (name=0x7ff56ac9a9dd "virtio-bus") at qom/object.c:171
+#4  object_class_dynamic_cast (class=class@entry=0x555556d92ac0, typename=typename@entry=0x7ff56ac9a9dd "virtio-bus") at qom/object.c:879
+#5  0x00007ff56a6c55b5 in object_class_dynamic_cast_assert (class=0x555556d92ac0, typename=typename@entry=0x7ff56ac9a9dd "virtio-bus", file=file@entry=0x7ff56aca60b8 "/root/qemu/hw/virtio/virtio.c", line=line@entry=3290, 
+    func=func@entry=0x7ff56aca6c30 <__func__.31954> "virtio_queue_enabled") at qom/object.c:935
+#6  0x00007ff56a415842 in virtio_queue_enabled (vdev=0x555557ed9be0, n=0) at /root/qemu/hw/virtio/virtio.c:3290
+#7  0x00007ff56a5c0837 in vhost_net_start_one (dev=0x555557ed9be0, net=0x555556f99ca0) at hw/net/vhost_net.c:259
+#8  vhost_net_start (dev=dev@entry=0x555557ed9be0, ncs=0x555557eef030, total_queues=total_queues@entry=2) at hw/net/vhost_net.c:351
+#9  0x00007ff56a3f2d98 in virtio_net_vhost_status (status=<optimized out>, n=0x555557ed9be0) at /root/qemu/hw/net/virtio-net.c:268
+#10 virtio_net_set_status (vdev=0x555557ed9be0, status=<optimized out>) at /root/qemu/hw/net/virtio-net.c:349
+#11 0x00007ff56a413bdb in virtio_set_status (vdev=vdev@entry=0x555557ed9be0, val=val@entry=7 '\a') at /root/qemu/hw/virtio/virtio.c:1956
+#12 0x00007ff56a65bdf0 in virtio_ioport_write (val=7, addr=18, opaque=0x555557ed1a50) at hw/virtio/virtio-pci.c:331
+#13 virtio_pci_config_write (opaque=0x555557ed1a50, addr=18, val=<optimized out>, size=<optimized out>) at hw/virtio/virtio-pci.c:455
+#14 0x00007ff56a46eb2a in memory_region_write_accessor (attrs=..., mask=255, shift=<optimized out>, size=1, value=0x7ff463ffd5f8, addr=<optimized out>, mr=0x555557ed2340) at /root/qemu/softmmu/memory.c:483
+#15 access_with_adjusted_size (attrs=..., mr=0x555557ed2340, access_fn=<optimized out>, access_size_max=<optimized out>, access_size_min=<optimized out>, size=1, value=0x7ff463ffd5f8, addr=18)
+    at /root/qemu/softmmu/memory.c:544
+#16 memory_region_dispatch_write (mr=mr@entry=0x555557ed2340, addr=<optimized out>, data=<optimized out>, op=<optimized out>, attrs=..., attrs@entry=...) at /root/qemu/softmmu/memory.c:1465
+#17 0x00007ff56a3a94b2 in flatview_write_continue (fv=0x7ff45426a7c0, addr=addr@entry=53394, attrs=..., attrs@entry=..., ptr=ptr@entry=0x7ff5687eb000, len=len@entry=1, addr1=<optimized out>, l=<optimized out>, 
+    mr=0x555557ed2340) at /root/qemu/include/qemu/host-utils.h:164
+#18 0x00007ff56a3adc4d in flatview_write (len=1, buf=0x7ff5687eb000, attrs=..., addr=53394, fv=<optimized out>) at /root/qemu/exec.c:3216
+#19 address_space_write (len=1, buf=0x7ff5687eb000, attrs=..., addr=53394, as=0x7ff5687eb000) at /root/qemu/exec.c:3307
+#20 address_space_rw (as=as@entry=0x7ff56b444d60 <address_space_io>, addr=addr@entry=53394, attrs=attrs@entry=..., buf=0x7ff5687eb000, len=len@entry=1, is_write=is_write@entry=true) at /root/qemu/exec.c:3317
+#21 0x00007ff56a3cdd5f in kvm_handle_io (count=1, size=1, direction=<optimized out>, data=<optimized out>, attrs=..., port=53394) at /root/qemu/accel/kvm/kvm-all.c:2262
+#22 kvm_cpu_exec (cpu=cpu@entry=0x555556ffaea0) at /root/qemu/accel/kvm/kvm-all.c:2508
+#23 0x00007ff56a46503c in qemu_kvm_cpu_thread_fn (arg=0x555556ffaea0) at /root/qemu/softmmu/cpus.c:1188
+#24 qemu_kvm_cpu_thread_fn (arg=arg@entry=0x555556ffaea0) at /root/qemu/softmmu/cpus.c:1160
+#25 0x00007ff56a7d0f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#26 0x00007ff56ab95109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#27 0x00007ff56ac43353 in clone ()
+
+Thread 4 (LWP 211758):
+#0  0x00007ff56ac3eebb in ioctl ()
+#1  0x00007ff56a3cd98b in kvm_vcpu_ioctl (cpu=cpu@entry=0x555556fb4ac0, type=type@entry=44672) at /root/qemu/accel/kvm/kvm-all.c:2631
+#2  0x00007ff56a3cdac5 in kvm_cpu_exec (cpu=cpu@entry=0x555556fb4ac0) at /root/qemu/accel/kvm/kvm-all.c:2468
+#3  0x00007ff56a46503c in qemu_kvm_cpu_thread_fn (arg=0x555556fb4ac0) at /root/qemu/softmmu/cpus.c:1188
+#4  qemu_kvm_cpu_thread_fn (arg=arg@entry=0x555556fb4ac0) at /root/qemu/softmmu/cpus.c:1160
+#5  0x00007ff56a7d0f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#6  0x00007ff56ab95109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#7  0x00007ff56ac43353 in clone ()
+
+Thread 3 (LWP 211757):
+#0  0x00007ff56ac3dd0f in poll ()
+#1  0x00007ff56a9aa5de in g_main_context_iterate.isra () at pthread_create.c:679
+#2  0x00007ff56a9aa963 in g_main_loop_run () at pthread_create.c:679
+#3  0x00007ff56a4a5b71 in iothread_run (opaque=opaque@entry=0x555556e0c800) at iothread.c:82
+#4  0x00007ff56a7d0f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#5  0x00007ff56ab95109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#6  0x00007ff56ac43353 in clone ()
+
+Thread 2 (LWP 211752):
+#0  0x00007ff56ac4007d in syscall ()
+#1  0x00007ff56a7d1e32 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /root/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait () at util/qemu-thread-posix.c:460
+#3  0x00007ff56a7dc0f2 in call_rcu_thread () at util/rcu.c:258
+#4  0x00007ff56a7d0f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#5  0x00007ff56ab95109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#6  0x00007ff56ac43353 in clone ()
+
+Thread 1 (LWP 211751):
+#0  __lll_lock_wait (futex=futex@entry=0x7ff56b447980 <qemu_global_mutex>, private=0) at lowlevellock.c:52
+#1  0x00007ff56ab97263 in __pthread_mutex_lock (mutex=mutex@entry=0x7ff56b447980 <qemu_global_mutex>) at ../nptl/pthread_mutex_lock.c:80
+#2  0x00007ff56a7d1087 in qemu_mutex_lock_impl (mutex=0x7ff56b447980 <qemu_global_mutex>, file=0x7ff56adcf1e3 "util/main-loop.c", line=238) at util/qemu-thread-posix.c:79
+#3  0x00007ff56a466f8e in qemu_mutex_lock_iothread_impl (file=file@entry=0x7ff56adcf1e3 "util/main-loop.c", line=line@entry=238) at /root/qemu/softmmu/cpus.c:1782
+#4  0x00007ff56a7e909d in os_host_main_loop_wait (timeout=951196740) at util/main-loop.c:238
+#5  main_loop_wait (nonblocking=nonblocking@entry=0) at util/main-loop.c:516
+#6  0x00007ff56a47876e in qemu_main_loop () at /root/qemu/softmmu/vl.c:1676
+#7  0x00007ff56a3a5b52 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /root/qemu/softmmu/main.c:49
+```
+
+Here's what I get with 5.1.0-rc2
+
+```
+(gdb) thread apply all bt
+
+Thread 5 (LWP 23730):
+#0  0x00007f9ae6040ebb in ioctl ()
+#1  0x00007f9ae57cf98b in kvm_vcpu_ioctl (cpu=cpu@entry=0x555557539ea0, type=type@entry=44672) at /root/qemu/accel/kvm/kvm-all.c:2631
+#2  0x00007f9ae57cfac5 in kvm_cpu_exec (cpu=cpu@entry=0x555557539ea0) at /root/qemu/accel/kvm/kvm-all.c:2468
+#3  0x00007f9ae586703c in qemu_kvm_cpu_thread_fn (arg=0x555557539ea0) at /root/qemu/softmmu/cpus.c:1188
+#4  qemu_kvm_cpu_thread_fn (arg=arg@entry=0x555557539ea0) at /root/qemu/softmmu/cpus.c:1160
+#5  0x00007f9ae5bd2f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#6  0x00007f9ae5f97109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#7  0x00007f9ae6045353 in clone ()
+
+Thread 4 (LWP 23729):
+#0  0x00007f9ae5fed337 in __strcmp_sse2 ()
+#1  0x00007f9ae5d9a8ad in g_str_equal () at pthread_create.c:679
+#2  0x00007f9ae5d99a9d in g_hash_table_lookup () at pthread_create.c:679
+#3  0x00007f9ae5ac728f in type_table_lookup (name=0x7f9ae609c9dd "virtio-bus") at qom/object.c:84
+#4  type_get_by_name (name=0x7f9ae609c9dd "virtio-bus") at qom/object.c:171
+#5  object_class_dynamic_cast (class=class@entry=0x5555572d1ac0, typename=typename@entry=0x7f9ae609c9dd "virtio-bus") at qom/object.c:879
+#6  0x00007f9ae5ac75b5 in object_class_dynamic_cast_assert (class=0x5555572d1ac0, typename=typename@entry=0x7f9ae609c9dd "virtio-bus", file=file@entry=0x7f9ae60a80b8 "/root/qemu/hw/virtio/virtio.c", line=line@entry=3290, 
+    func=func@entry=0x7f9ae60a8c30 <__func__.31954> "virtio_queue_enabled") at qom/object.c:935
+#7  0x00007f9ae5817842 in virtio_queue_enabled (vdev=0x555558418be0, n=0) at /root/qemu/hw/virtio/virtio.c:3290
+#8  0x00007f9ae59c2837 in vhost_net_start_one (dev=0x555558418be0, net=0x5555574d8ca0) at hw/net/vhost_net.c:259
+#9  vhost_net_start (dev=dev@entry=0x555558418be0, ncs=0x55555842e030, total_queues=total_queues@entry=2) at hw/net/vhost_net.c:351
+#10 0x00007f9ae57f4d98 in virtio_net_vhost_status (status=<optimized out>, n=0x555558418be0) at /root/qemu/hw/net/virtio-net.c:268
+#11 virtio_net_set_status (vdev=0x555558418be0, status=<optimized out>) at /root/qemu/hw/net/virtio-net.c:349
+#12 0x00007f9ae5815bdb in virtio_set_status (vdev=vdev@entry=0x555558418be0, val=val@entry=7 '\a') at /root/qemu/hw/virtio/virtio.c:1956
+#13 0x00007f9ae5a5ddf0 in virtio_ioport_write (val=7, addr=18, opaque=0x555558410a50) at hw/virtio/virtio-pci.c:331
+#14 virtio_pci_config_write (opaque=0x555558410a50, addr=18, val=<optimized out>, size=<optimized out>) at hw/virtio/virtio-pci.c:455
+#15 0x00007f9ae5870b2a in memory_region_write_accessor (attrs=..., mask=255, shift=<optimized out>, size=1, value=0x7f99dfffd5f8, addr=<optimized out>, mr=0x555558411340) at /root/qemu/softmmu/memory.c:483
+#16 access_with_adjusted_size (attrs=..., mr=0x555558411340, access_fn=<optimized out>, access_size_max=<optimized out>, access_size_min=<optimized out>, size=1, value=0x7f99dfffd5f8, addr=18)
+    at /root/qemu/softmmu/memory.c:544
+#17 memory_region_dispatch_write (mr=mr@entry=0x555558411340, addr=<optimized out>, data=<optimized out>, op=<optimized out>, attrs=..., attrs@entry=...) at /root/qemu/softmmu/memory.c:1465
+#18 0x00007f9ae57ab4b2 in flatview_write_continue (fv=0x7f99d007ef80, addr=addr@entry=53394, attrs=..., attrs@entry=..., ptr=ptr@entry=0x7f9ae43f1000, len=len@entry=1, addr1=<optimized out>, l=<optimized out>, 
+    mr=0x555558411340) at /root/qemu/include/qemu/host-utils.h:164
+#19 0x00007f9ae57afc4d in flatview_write (len=1, buf=0x7f9ae43f1000, attrs=..., addr=53394, fv=<optimized out>) at /root/qemu/exec.c:3216
+#20 address_space_write (len=1, buf=0x7f9ae43f1000, attrs=..., addr=53394, as=0x7f9ae43f1000) at /root/qemu/exec.c:3307
+#21 address_space_rw (as=as@entry=0x7f9ae6846d60 <address_space_io>, addr=addr@entry=53394, attrs=attrs@entry=..., buf=0x7f9ae43f1000, len=len@entry=1, is_write=is_write@entry=true) at /root/qemu/exec.c:3317
+#22 0x00007f9ae57cfd5f in kvm_handle_io (count=1, size=1, direction=<optimized out>, data=<optimized out>, attrs=..., port=53394) at /root/qemu/accel/kvm/kvm-all.c:2262
+#23 kvm_cpu_exec (cpu=cpu@entry=0x5555574f3ac0) at /root/qemu/accel/kvm/kvm-all.c:2508
+#24 0x00007f9ae586703c in qemu_kvm_cpu_thread_fn (arg=0x5555574f3ac0) at /root/qemu/softmmu/cpus.c:1188
+#25 qemu_kvm_cpu_thread_fn (arg=arg@entry=0x5555574f3ac0) at /root/qemu/softmmu/cpus.c:1160
+#26 0x00007f9ae5bd2f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#27 0x00007f9ae5f97109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#28 0x00007f9ae6045353 in clone ()
+
+Thread 3 (LWP 23728):
+#0  0x00007f9ae603fd0f in poll ()
+#1  0x00007f9ae5dac5de in g_main_context_iterate.isra () at pthread_create.c:679
+#2  0x00007f9ae5dac963 in g_main_loop_run () at pthread_create.c:679
+#3  0x00007f9ae58a7b71 in iothread_run (opaque=opaque@entry=0x55555734b800) at iothread.c:82
+#4  0x00007f9ae5bd2f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#5  0x00007f9ae5f97109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#6  0x00007f9ae6045353 in clone ()
+
+Thread 2 (LWP 23723):
+#0  0x00007f9ae604207d in syscall ()
+#1  0x00007f9ae5bd3e32 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /root/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait () at util/qemu-thread-posix.c:460
+#3  0x00007f9ae5bde0f2 in call_rcu_thread () at util/rcu.c:258
+#4  0x00007f9ae5bd2f13 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#5  0x00007f9ae5f97109 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#6  0x00007f9ae6045353 in clone ()
+---Type <return> to continue, or q <return> to quit---
+
+Thread 1 (LWP 23722):
+#0  __lll_lock_wait (futex=futex@entry=0x7f9ae6849980 <qemu_global_mutex>, private=0) at lowlevellock.c:52
+#1  0x00007f9ae5f99263 in __pthread_mutex_lock (mutex=mutex@entry=0x7f9ae6849980 <qemu_global_mutex>) at ../nptl/pthread_mutex_lock.c:80
+#2  0x00007f9ae5bd3087 in qemu_mutex_lock_impl (mutex=0x7f9ae6849980 <qemu_global_mutex>, file=0x7f9ae61d11e3 "util/main-loop.c", line=238) at util/qemu-thread-posix.c:79
+#3  0x00007f9ae5868f8e in qemu_mutex_lock_iothread_impl (file=file@entry=0x7f9ae61d11e3 "util/main-loop.c", line=line@entry=238) at /root/qemu/softmmu/cpus.c:1782
+#4  0x00007f9ae5beb09d in os_host_main_loop_wait (timeout=940584562) at util/main-loop.c:238
+#5  main_loop_wait (nonblocking=nonblocking@entry=0) at util/main-loop.c:516
+#6  0x00007f9ae587a76e in qemu_main_loop () at /root/qemu/softmmu/vl.c:1676
+#7  0x00007f9ae57a7b52 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /root/qemu/softmmu/main.c:49
+```
+
+
+Thanks for the information.
+
+It could be fixed by this commit upstream.
+
+
+a48aaf882b100b30111b5c7c75e1d9e83fe76cfd ("virtio-pci: fix wrong index in virtio_pci_queue_enabled")
+
+Please try.
+
+Thanks
+
+Hi Jason,
+See Comment#10 for trace -- 5.1.0-rc2 includes that fix... https://github.com/qemu/qemu/commit/a48aaf882b100b30111b5c7c75e1d9e83fe76cfd
+
+... so hang is still happening.
+
+Is there anything more I could do to help track this down?
+
+If even with that fix it's failing =and giving a similar back trace, then:
+
+Thread 4 (LWP 23729):
+#0 0x00007f9ae5fed337 in __strcmp_sse2 ()
+#1 0x00007f9ae5d9a8ad in g_str_equal () at pthread_create.c:679
+#2 0x00007f9ae5d99a9d in g_hash_table_lookup () at pthread_create.c:679
+#3 0x00007f9ae5ac728f in type_table_lookup (name=0x7f9ae609c9dd "virtio-bus") at qom/object.c:84
+#4 type_get_by_name (name=0x7f9ae609c9dd "virtio-bus") at qom/object.c:171
+#5 object_class_dynamic_cast (class=class@entry=0x5555572d1ac0, typename=typename@entry=0x7f9ae609c9dd "virtio-bus") at qom/object.c:879
+
+seems weird to me - why would you be stuck in a g_str_equal for any length of time (yet 2 of your backtraces both have it); yet the filename and symbol name don't really look like they're matching so I'm suspicious.
+Have you got a minimal non-kata way to reproduce this?
+
+
+Not currently, but let me try and setup just a simple qemu test
+
+This problem no longer occurs. I suspect it was an issue in my environment or possibly with the options I compiled QEMU with. This big/issue should be closed.
+
+er... This bug/issue should be closed.
+
+
+

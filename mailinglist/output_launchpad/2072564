@@ -1,0 +1,327 @@
+qemu-aarch64-static segfaults running ldconfig.real (amd64 host)
+
+This affects the qemu-user-static 1:8.2.2+ds-0ubuntu1 package on Ubuntu 24.04, running on a amd64 host.
+
+When running docker containers with Ubuntu 22.04 in them, emulating arm64 with qemu-aarch64-static, invocations of ldconfig (actually ldconfig.real) segfault. For example:
+
+$ docker run -ti --platform linux/arm64/v8 ubuntu:22.04 
+root@8861ff640a1c:/# /sbin/ldconfig.real
+Segmentation fault
+
+If you copy the ldconfig.real binary to the host, and run it directly via qemu-aarch64-static:
+
+$ gdb --args qemu-aarch64-static ./ldconfig.real 
+GNU gdb (Ubuntu 15.0.50.20240403-0ubuntu1) 15.0.50.20240403-git
+Copyright (C) 2024 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+    <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from qemu-aarch64-static...
+Reading symbols from /home/dim/.cache/debuginfod_client/86579812b213be0964189499f62f176bea817bf2/debuginfo...
+(gdb) r
+Starting program: /usr/bin/qemu-aarch64-static ./ldconfig.real
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7ffff76006c0 (LWP 28378)]
+
+Thread 1 "qemu-aarch64-st" received signal SIGSEGV, Segmentation fault.
+0x00007fffe801645b in ?? ()
+(gdb) disassemble 
+No function contains program counter for selected frame.
+
+It looks like this is a known qemu regression after v8.1.1:
+https://gitlab.com/qemu-project/qemu/-/issues/1913
+
+Downgrading the package to qemu-user-static_8.0.4+dfsg-1ubuntu3_amd64.deb fixes the segfault.
+
+I can confirm that reverting https://gitlab.com/qemu-project/qemu/-/commit/aec338d63bc28f1f13d5e64c561d7f1dd0e4b07e, as described in https://gitlab.com/qemu-project/qemu/-/issues/1913, solves the issue.
+
+
+Thank you for taking the time to report a bug.
+
+It seems that the discussion about whether that specific commit should be reverted is still ongoing.  As such, I don't feel confident in backporting any fixes that have not been accepted by upstream, and I would like to wait for their solution to the problem.
+
+I will mark the bug as Triaged, but let's wait until there's a decision upstream on what to do with the issue.
+
+Thanks.
+
+For the moment, the problem can be worked around by installing older packages, but it is not really a supported configuration: the older package was built for Ubuntu 22.04.
+
+I agree that upstream should make a decision first, but it seems that they are not yet convinced whether reverting will cause other issues.
+
+Indeed it looks like /sbin/ldconfig is a bit of a special case, and the versions shipped in some Ubuntu releases work, while others segfault (the permission error is fine, as my non-privileged user cannot write /etc):
+
+ldconfig.real.focal     ldconfig.real.focal: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.groovy    ldconfig.real.groovy: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.hirsute   Segmentation fault (core dumped)
+ldconfig.real.impish    Segmentation fault (core dumped)
+ldconfig.real.jammy     Segmentation fault (core dumped)
+ldconfig.real.kinetic   ldconfig.real.kinetic: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.lunar     ldconfig.real.lunar: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.mantic    ldconfig.real.mantic: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.noble     ldconfig.real.noble: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+ldconfig.real.oracular  ldconfig.real.oracular: Can't create temporary cache file /etc/ld.so.cache~: Permission denied
+
+So the 'window' of bad ldconfig versions is from hirsute (21.04) through jammy (22.04). After that, the problem seems to disappear.
+
+
+I'm using quemu to tweak Armbian Jammy images for Raspberry Pi 5 (so it would have ldconfig from 22.04) and I have signal 11 when libc reconfiguration is triggered by apt.
+
+What you may find interesting running the same process of updates on the same base image on Ubuntu 22.04 (which has qemu 6.2) works fine.
+
+My googling around "libc signal 11 quemu" lead to a lot of people reporting problems with docker buildx with qemu predating 7.0. This smells kind of regression in 8.2 used in 24.04. Then the issue linked above says affected ldconfigs are 2.33 to 2.35...
+
+Does Ubuntu really need to wait for upstream to deal with this? It's a huge slap in the face for everyone on 24.04 needing to meddle 22.04 ARM64 images.
+
+FWIW, I left a comment on the bug report asking for guidance, because it seems to me that just reverting the commit mentioned above isn't the right solution (as we'd be reintroducing the bug fixed by the commit).
+
+Hi, this issue also happens when I try to run debootstrap for Jammy arm64 on a Noble amd64 host. At the moment I use the workaround to use ubuntu:jammy workers instead of ubunut:latest. It would be great if this issue can be fixed soon.
+
+Hi,
+this came up in our dormant bugs checker ...
+There was no reply from upstream yet, but I agree that a blunt revert might be wrong unless they agree.
+Sergio reached out, but probably needs to kindly ask again with some extra noise.
+
+Upstream has committed https://gitlab.com/qemu-project/qemu/-/commit/4b7b20a3 which fixes the segfaults. A prerequisite for the qemu 8.2.2 package in Ubuntu 24.04 is https://gitlab.com/qemu-project/qemu/-/commit/c81d1faf, so here is a patch that includes both.
+
+
+Thank you!
+Adding to plucky soon and then planning SRUs as the queue gets freed of the former one in flight.
+
+The attachment "Fix qemu-aarch64-static segfaults" seems to be a patch.  If it isn't, please remove the "patch" flag from the attachment, remove the "patch" tag, and if you are a member of the ~ubuntu-reviewers, unsubscribe the team.
+
+[This is an automated message performed by a Launchpad user owned by ~brian-murray, for any issues please contact him.]
+
+This bug was fixed in the package qemu - 1:9.2.1+ds-1ubuntu3
+
+---------------
+qemu (1:9.2.1+ds-1ubuntu3) plucky; urgency=medium
+
+  * Fix qemu-aarch64-static segfaults running ldconfig.real (LP: #2072564)
+    - lp-2072564-elfload-Fix-alignment-when-unmapping-excess-reservat.patch
+    Thanks to Dimitry Andric for identifying the fix.
+
+ -- Lukas Märdian <email address hidden>  Wed, 26 Feb 2025 09:56:38 +0100
+
+That's 1.9.x line - is it going to be backported to Noble? That's LTS we plan to use for next couple of years and this qemu problem is hitting us hard.
+
+If you look at the top of this bug, you can see the two merge requests put in by Lukas, one for noble and one for oracular:
+* https://code.launchpad.net/~slyon/ubuntu/+source/qemu/+git/qemu/+merge/481940
+* https://code.launchpad.net/~slyon/ubuntu/+source/qemu/+git/qemu/+merge/481943
+
+My guess is that the noble-devel and oracular-devel branches are the places where the proposed update packages are built from, which will eventually end up in the regular updates. But no idea how long that usually takes.
+
+
+Given this possible regression:
+
+   * This changes the alignment of sections in the ELF binary via QEMUs elfloader, if something goes wrong 
+     with this change, it could lead to all kind of crashes (segfault) of any emulated binaries.
+
+Is there something we could do to mitigate it? Perhaps a quick similar ldconfig test in other emulated scenarios?
+
+
+Hello Dimitry, or anyone else affected,
+
+Accepted qemu into oracular-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:9.0.2+ds-4ubuntu5.3 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-oracular to verification-done-oracular. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-oracular. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+Hello Dimitry, or anyone else affected,
+
+Accepted qemu into noble-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:8.2.2+ds-0ubuntu1.7 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-noble to verification-done-noble. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-noble. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+All autopkgtests for the newly accepted qemu (1:9.0.2+ds-4ubuntu5.3) for oracular have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+casper/1.502 (amd64)
+glance/2:29.0.0-0ubuntu1 (amd64)
+nova/unknown (s390x)
+sbuild/0.85.10ubuntu1 (ppc64el)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/oracular/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+All autopkgtests for the newly accepted qemu (1:8.2.2+ds-0ubuntu1.7) for noble have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+glance/2:28.1.0-0ubuntu1 (amd64, arm64, ppc64el)
+livecd-rootfs/24.04.87 (s390x)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/noble/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+I've tested https://launchpad.net/ubuntu/+source/qemu/1:8.2.2+ds-0ubuntu1.7/+build/30620359/+files/qemu-user-static_8.2.2+ds-0ubuntu1.7_amd64.deb, and it solves the problem for me.
+
+With 8.2.2+ds-0ubuntu1.6, running a Docker container with Ubuntu 22.04, targeting arm64 on an amd64 host, and upgrading the libc package results in:
+
+124.7 Processing triggers for libc-bin (2.35-0ubuntu3.9) ...
+124.8 Segmentation fault
+124.8 Segmentation fault
+124.8 dpkg: error processing package libc-bin (--configure):
+124.8  installed libc-bin package post-installation script subprocess returned error exit status 139
+
+With 8.2.2+ds-0ubuntu1.7, this problem does not appear, and building the container works fine.
+
+
+I verified qemu-user-static 1:9.0.2+ds-4ubuntu5.3 from oracular-proposed. Looking good!
+
+
+$ lxc launch --vm ubuntu-daily:oracular lp2072564-oo
+$ lxc shell lp2072564-oo
+
+root@lp2072564-oo:~# sudo apt install qemu-user-static  # the old, non-proposed version (1:9.0.2+ds-4ubuntu5.2) to confirm the issue
+[...]
+root@lp2072564-oo:~# sudo snap install docker
+2025-04-16T09:00:43Z INFO Waiting for automatic snapd restart...
+docker 27.5.1 from Canonical✓ installed
+root@lp2072564-oo:~# docker run -ti --platform linux/arm64/v8 ubuntu:22.04
+Unable to find image 'ubuntu:22.04' locally
+22.04: Pulling from library/ubuntu
+7b76bc00f23a: Pull complete 
+Digest: sha256:d80997daaa3811b175119350d84305e1ec9129e1799bba0bd1e3120da3ff52c3
+Status: Downloaded newer image for ubuntu:22.04
+root@3516ec56fbf6:/# sbin/ldconfig.real
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault (core dumped)
+
+=> I can reproduce the issue on the old version
+
+root@lp2072564-oo:~# vim /etc/apt/sources.list.d/ubuntu.sources  # enable -proposed
+root@lp2072564-oo:~# apt update
+[...]
+root@lp2072564-oo:~# apt install -t oracular-proposed qemu-user-static
+[...]
+Get:1 http://archive.ubuntu.com/ubuntu oracular-proposed/universe amd64 qemu-user-static amd64 1:9.0.2+ds-4ubuntu5.3 [16.7 MB]
+[...]
+root@lp2072564-oo:~# docker run -ti --platform linux/arm64/v8 ubuntu:22.04
+root@d31821abb9c9:/# /sbin/ldconfig.real
+root@d31821abb9c9:/# echo $?
+0
+
+=> Issue is fixed! \o/
+
+
+
+
+I verified qemu-user-static 1:8.2.2+ds-0ubuntu1.7 from noble-proposed. Looking good!
+
+$ lxc launch --vm ubuntu-daily:noble lp2072564-nn
+$ lxc shell lp2072564-nn
+
+root@lp2072564-nn:~# sudo apt install qemu-user-static # the old, non-proposed version (1:8.2.2+ds-0ubuntu1.6) to confirm the issue
+[...]
+root@lp2072564-nn:~# sudo snap install docker
+2025-04-16T09:00:47Z INFO Waiting for automatic snapd restart...
+docker 27.5.1 from Canonical✓ installed
+root@lp2072564-nn:~# docker run -ti --platform linux/arm64/v8 ubuntu:22.04
+Unable to find image 'ubuntu:22.04' locally
+22.04: Pulling from library/ubuntu
+7b76bc00f23a: Pull complete 
+Digest: sha256:d80997daaa3811b175119350d84305e1ec9129e1799bba0bd1e3120da3ff52c3
+Status: Downloaded newer image for ubuntu:22.04
+root@5de9734cef3a:/# sbin/ldconfig.real
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault (core dumped)
+
+=> I can reproduce the issue on the old version.
+
+root@lp2072564-nn:~# vim /etc/apt/sources.list.d/ubuntu.sources # enable -proposed
+root@lp2072564-nn:~# apt update
+[...]
+root@lp2072564-nn:~# apt install -t noble-proposed qemu-user-static
+[...]
+Get:1 http://archive.ubuntu.com/ubuntu noble-proposed/universe amd64 qemu-user-static amd64 1:8.2.2+ds-0ubuntu1.7 [14.7 MB]
+[...]
+root@lp2072564-nn:~# docker run -ti --platform linux/arm64/v8 ubuntu:22.04
+root@77be7c8cfd66:/# /sbin/ldconfig.real
+root@77be7c8cfd66:/# echo $?
+0
+
+=> Issue is fixed! \o/
+
+This bug was fixed in the package qemu - 1:9.0.2+ds-4ubuntu5.3
+
+---------------
+qemu (1:9.0.2+ds-4ubuntu5.3) oracular; urgency=medium
+
+  * d/p/u/lp2049698/*: Add full boot order support on s390x (LP: #2049698)
+  * Cherry-pick prerequisite for above backport (to avoid FTBFS):
+    - d/p/u/lp2049698/0-hw-s390x-sclp.c-include-s390-virtio-ccw.h-to-make.patch
+  * d/qemu-system-data.links: symlink s390-netboot.img -> s390-ccw.img for
+    backwards compatibility, as the code is now combined.
+  * Fix qemu-aarch64-static segfaults running ldconfig.real (LP: #2072564)
+    - lp-2072564-01-linux-user-Honor-elf-alignment-when-placing-images.patch
+    - lp-2072564-02-elfload-Fix-alignment-when-unmapping-excess-reservat.patch
+    Thanks to Dimitry Andric for identifying the fix.
+
+ -- Lukas Märdian <email address hidden>  Thu, 13 Mar 2025 17:18:50 +0100
+
+The verification of the Stable Release Update for qemu has completed successfully and the package is now being released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+Great, I hope the fix lands in noble too, soon.
+
+
+This bug was fixed in the package qemu - 1:8.2.2+ds-0ubuntu1.7
+
+---------------
+qemu (1:8.2.2+ds-0ubuntu1.7) noble; urgency=medium
+
+  * d/p/u/lp2049698/*: Add full boot order support on s390x (LP: #2049698)
+  * Cherry-pick prerequisite for above backport (to avoid FTBFS):
+    - d/p/u/lp2049698/0-hw-s390x-sclp.c-include-s390-virtio-ccw.h-to-make.patch
+  * d/qemu-system-data.links: symlink s390-netboot.img -> s390-ccw.img for
+    backwards compatibility, as the code is now combined.
+
+  [ Michael Tokarev ]
+  * d/rules: run ./configure in arch-indep build and build some roms from there.
+    After adding just a few more build-deps to common Build-Depends,
+    it is now possible to run ./configure in arch-indep step too.
+    Run ./configure, and switch s390-ccw and vof.bin builds from
+    ad-hoc instructions to using the regular qemu makefiles.
+    Move python3-venv dependency from Build-Depend-Arch to Build-Depend
+    so that ./configure can be run.
+    [cherry-pick https://salsa.debian.org/qemu-team/qemu/-/commit/5b5a97b]
+
+  * Fix qemu-aarch64-static segfaults running ldconfig.real (LP: #2072564)
+    - lp-2072564-01-linux-user-Honor-elf-alignment-when-placing-images.patch
+    - lp-2072564-02-elfload-Fix-alignment-when-unmapping-excess-reservat.patch
+    Thanks to Dimitry Andric for identifying the fix.
+
+ -- Lukas Märdian <email address hidden>  Thu, 13 Mar 2025 17:15:00 +0100
+

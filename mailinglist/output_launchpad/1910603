@@ -1,0 +1,221 @@
+[OSS-Fuzz] Issue 29174 sb16: Abrt in audio_bug
+
+=== Reproducer ===
+cat << EOF | ../build-system/qemu-system-i386 \
+-machine q35 -device sb16,audiodev=snd0 \
+-audiodev none,id=snd0 -nographic -nodefaults \
+-qtest stdio
+outw 0x22c 0x41
+outb 0x22c 0x0
+outw 0x22c 0x1004
+outw 0x22c 0x1c
+EOF
+
+=== Stack Trace ===
+A bug was just triggered in audio_calloc
+Save all your work and restart without audio
+I am sorry
+Context:
+Aborted
+
+#0 raise
+#1 abort
+#2 audio_bug /src/qemu/audio/audio.c:119:9
+#3 audio_calloc /src/qemu/audio/audio.c:154:9
+#4 audio_pcm_sw_alloc_resources_out /src/qemu/audio/audio_template.h:116:15
+#5 audio_pcm_sw_init_out /src/qemu/audio/audio_template.h:175:11
+#6 audio_pcm_create_voice_pair_out /src/qemu/audio/audio_template.h:410:9
+#7 AUD_open_out /src/qemu/audio/audio_template.h:503:14
+#8 continue_dma8 /src/qemu/hw/audio/sb16.c:216:20
+#9 dma_cmd8 /src/qemu/hw/audio/sb16.c:276:5
+#10 command /src/qemu/hw/audio/sb16.c:0
+#11 dsp_write /src/qemu/hw/audio/sb16.c:949:13
+#12 portio_write /src/qemu/softmmu/ioport.c:205:13
+#13 memory_region_write_accessor /src/qemu/softmmu/memory.c:491:5
+#14 access_with_adjusted_size /src/qemu/softmmu/memory.c:552:18
+#15 memory_region_dispatch_write /src/qemu/softmmu/memory.c:0:13
+#16 flatview_write_continue /src/qemu/softmmu/physmem.c:2759:23
+#17 flatview_write /src/qemu/softmmu/physmem.c:2799:14
+#18 address_space_write /src/qemu/softmmu/physmem.c:2891:18
+#19 cpu_outw /src/qemu/softmmu/ioport.c:70:5
+
+
+OSS-Fuzz Report:
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=29174
+
+This is still reproducible with the current version of QEMU. Marking this as "Confirmed"
+
+While the SB16 seems to work up to 48000 Hz, the "Sound Blaster Series
+Hardware Programming Guide" limit the sampling range from 4000 Hz to
+44100 Hz (Section 3-9, 3-10: Digitized Sound I/O Programming, tables
+3-2 and 3-3).
+
+Later, section 6-15 (DSP Commands) is more specific regarding the 41h /
+42h registers (Set digitized sound output sampling rate):
+
+  Valid sampling rates range from 5000 to 45000 Hz inclusive.
+
+There is no comment regarding error handling if the register is filled
+with an out-of-range value.  (See also section 3-28 "8-bit or 16-bit
+Auto-initialize Transfer"). Assume limits are enforced in hardware.
+
+This fixes triggering an assertion in audio_calloc():
+
+  #1 abort
+  #2 audio_bug audio/audio.c:119:9
+  #3 audio_calloc audio/audio.c:154:9
+  #4 audio_pcm_sw_alloc_resources_out audio/audio_template.h:116:15
+  #5 audio_pcm_sw_init_out audio/audio_template.h:175:11
+  #6 audio_pcm_create_voice_pair_out audio/audio_template.h:410:9
+  #7 AUD_open_out audio/audio_template.h:503:14
+  #8 continue_dma8 hw/audio/sb16.c:216:20
+  #9 dma_cmd8 hw/audio/sb16.c:276:5
+  #10 command hw/audio/sb16.c:0
+  #11 dsp_write hw/audio/sb16.c:949:13
+  #12 portio_write softmmu/ioport.c:205:13
+  #13 memory_region_write_accessor softmmu/memory.c:491:5
+  #14 access_with_adjusted_size softmmu/memory.c:552:18
+  #15 memory_region_dispatch_write softmmu/memory.c:0:13
+  #16 flatview_write_continue softmmu/physmem.c:2759:23
+  #17 flatview_write softmmu/physmem.c:2799:14
+  #18 address_space_write softmmu/physmem.c:2891:18
+  #19 cpu_outw softmmu/ioport.c:70:5
+
+[*] http://www.baudline.com/solutions/full_duplex/sb16_pci/index.html
+
+Fixes: 85571bc7415 ("audio merge (malc)")
+Buglink: https://bugs.launchpad.net/bugs/1910603
+OSS-Fuzz Report: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=29174
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+ hw/audio/sb16.c              | 14 ++++++++++
+ tests/qtest/fuzz-sb16-test.c | 52 ++++++++++++++++++++++++++++++++++++
+ MAINTAINERS                  |  1 +
+ tests/qtest/meson.build      |  1 +
+ 4 files changed, 68 insertions(+)
+ create mode 100644 tests/qtest/fuzz-sb16-test.c
+
+diff --git a/hw/audio/sb16.c b/hw/audio/sb16.c
+index 8b207004102..5cf121fe363 100644
+--- a/hw/audio/sb16.c
++++ b/hw/audio/sb16.c
+@@ -115,6 +115,9 @@ struct SB16State {
+     PortioList portio_list;
+ };
+ 
++#define SAMPLE_RATE_MIN 5000
++#define SAMPLE_RATE_MAX 45000
++
+ static void SB_audio_callback (void *opaque, int free);
+ 
+ static int magic_of_irq (int irq)
+@@ -241,6 +244,17 @@ static void dma_cmd8 (SB16State *s, int mask, int dma_len)
+         int tmp = (256 - s->time_const);
+         s->freq = (1000000 + (tmp / 2)) / tmp;
+     }
++    if (s->freq < SAMPLE_RATE_MIN) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "sampling range too low: %d, increasing to %u\n",
++                      s->freq, SAMPLE_RATE_MIN);
++        s->freq = SAMPLE_RATE_MIN;
++    } else if (s->freq > SAMPLE_RATE_MAX) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "sampling range too high: %d, decreasing to %u\n",
++                      s->freq, SAMPLE_RATE_MAX);
++        s->freq = SAMPLE_RATE_MAX;
++    }
+ 
+     if (dma_len != -1) {
+         s->block_size = dma_len << s->fmt_stereo;
+diff --git a/tests/qtest/fuzz-sb16-test.c b/tests/qtest/fuzz-sb16-test.c
+new file mode 100644
+index 00000000000..51030cd7dc4
+--- /dev/null
++++ b/tests/qtest/fuzz-sb16-test.c
+@@ -0,0 +1,52 @@
++/*
++ * QTest fuzzer-generated testcase for sb16 audio device
++ *
++ * Copyright (c) 2021 Philippe Mathieu-Daudé <email address hidden>
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include "qemu/osdep.h"
++#include "libqos/libqtest.h"
++
++/*
++ * This used to trigger the assert in audio_calloc
++ * https://bugs.launchpad.net/qemu/+bug/1910603
++ */
++static void test_fuzz_sb16_0x1c(void)
++{
++    QTestState *s = qtest_init("-M q35 -display none "
++                               "-device sb16,audiodev=snd0 "
++                               "-audiodev none,id=snd0");
++    qtest_outw(s, 0x22c, 0x41);
++    qtest_outb(s, 0x22c, 0x00);
++    qtest_outw(s, 0x22c, 0x1004);
++    qtest_outw(s, 0x22c, 0x001c);
++    qtest_quit(s);
++}
++
++static void test_fuzz_sb16_0x91(void)
++{
++    QTestState *s = qtest_init("-M pc -display none "
++                               "-device sb16,audiodev=none "
++                               "-audiodev id=none,driver=none");
++    qtest_outw(s, 0x22c, 0xf141);
++    qtest_outb(s, 0x22c, 0x00);
++    qtest_outb(s, 0x22c, 0x24);
++    qtest_outb(s, 0x22c, 0x91);
++    qtest_quit(s);
++}
++
++int main(int argc, char **argv)
++{
++    const char *arch = qtest_get_arch();
++
++    g_test_init(&argc, &argv, NULL);
++
++   if (strcmp(arch, "i386") == 0) {
++        qtest_add_func("fuzz/test_fuzz_sb16/1c", test_fuzz_sb16_0x1c);
++        qtest_add_func("fuzz/test_fuzz_sb16/91", test_fuzz_sb16_0x91);
++   }
++
++   return g_test_run();
++}
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 5f55404f2fa..7edb26d2293 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -2213,6 +2213,7 @@ F: qapi/audio.json
+ F: tests/qtest/ac97-test.c
+ F: tests/qtest/es1370-test.c
+ F: tests/qtest/intel-hda-test.c
++F: tests/qtest/fuzz-sb16-test.c
+ 
+ Block layer core
+ M: Kevin Wolf <email address hidden>
+diff --git a/tests/qtest/meson.build b/tests/qtest/meson.build
+index c3a223a83d6..b03e8541700 100644
+--- a/tests/qtest/meson.build
++++ b/tests/qtest/meson.build
+@@ -20,6 +20,7 @@
+ qtests_generic = \
+   (config_all_devices.has_key('CONFIG_MEGASAS_SCSI_PCI') ? ['fuzz-megasas-test'] : []) + \
+   (config_all_devices.has_key('CONFIG_VIRTIO_SCSI') ? ['fuzz-virtio-scsi-test'] : []) + \
++  (config_all_devices.has_key('CONFIG_SB16') ? ['fuzz-sb16-test'] : []) + \
+   [
+   'cdrom-test',
+   'device-introspect-test',
+-- 
+2.26.3
+
+
+
+OSS-Fuzz confirms this is fixed: https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=30574#c4
+
+Fixed by:
+https://gitlab.com/qemu-project/qemu/-/commit/a2cd86a94a881b38a7d8bb67c619
+

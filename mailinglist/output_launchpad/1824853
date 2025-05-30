@@ -1,0 +1,80 @@
+4.0.0-rc3 crashes with tcg/tcg.c:3952: tcg_gen_code: Assertion `s->gen_insn_end_off[num_insns] == off' failed
+
+I tried to bootstrap and regtested gcc trunk (gcc svn rev 270278, datestamp 20190411) inside my arm64-gentoo installation under qemu-system-aarch64.
+
+Qemu version was 4.0.0-rc3 and -cpu cortex-a57. Qemu configured with only --target-list=aarch64-softmmu,aarch64-linux-user and compiled using gcc "version 5.5.0 20171010 (Ubuntu 5.5.0-12ubuntu1~16.04)".
+
+Executable created from gcc/testsuite/gcc.target/aarch64/advsimd-intrinsics/vldX.c compiled with -O2 crashed the whole qemu-system.
+
+To investigate a bit I also manually run
+~/gcc/inst/trunk/bin/gcc ~/gcc/src/trunk/gcc/testsuite/gcc.target/aarch64/advsimd-intrinsics/vldX.c
+with different options like:
+-O0 -lm -o d0.exe
+-O1 -lm -o d1.exe
+-O2 -lm -o d2.exe
+-O0 -static -lm -o s0.exe
+-O1 -static -lm -o s1.exe
+-O2 -static -lm -o s2.exe
+
+So, now I have 6 different arm64 executables created with different optimization levels. O0 and O1 versions run ok.
+Three sN.exe static executables I've also tried in qemu user mode (with same -cpu), no issue in user mode.
+
+And inside qemu-system I can see that
+running "d2.exe" (attached) gives:
+tcg/tcg.c:3952: tcg_gen_code: Assertion `s->gen_insn_end_off[num_insns] == off' failed.
+
+And running "s2.exe" gives:
+tcg/tcg.c:320: set_jmp_reset_offset: Assertion `s->tb_jmp_reset_offset[which] == off' failed.
+
+It seems like this test is an counter-example for logic that "tcg_ctx->nb_ops < 4000" implies tcg will fit into 16-bit signed size (see tcg_op_buf_full comments).
+
+Richard's changes in abebf92597186 and 9f754620651d were not enough, translation block must be smaller, or we have to find some proper way to bail out when buffer overflows.
+I don't know why this situation is not caught by code_gen_highwater logic in tcg.c
+
+I've also tried this "bail out" patch
+
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -3949,7 +3949,8 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb)
+                 size_t off = tcg_current_code_size(s);
+                 s->gen_insn_end_off[num_insns] = off;
+                 /* Assert that we do not overflow our stored offset.  */
+-                assert(s->gen_insn_end_off[num_insns] == off);
++                if (s->gen_insn_end_off[num_insns] != off)
++                  return -1;
+             }
+             num_insns++;
+             for (i = 0; i < TARGET_INSN_START_WORDS; ++i) {
+
+But then running "d2.exe" just hangs the whole qemu-system. It seems that when tcg_gen_code return -1 (like in highwater logic mentioned before), we just re-call it again and again.
+
+
+
+Also attaching static-compiled executable "s2.exe".
+
+Returning -1 does not help because all that signals that the buffer is full.
+We then flush the buffer and try again, assuming the at the buffer will not fill.
+Given that the buffer is usually many megabytes, this is reasonable.
+
+We need something different to signal that the buffer is not full, but that
+another offset has overflowed.
+
+Patch set posted:
+https://patchwork.ozlabs.org/project/qemu-devel/list/?series=102978
+
+
+
+Richard, thank you for solving this so fast!
+I certainly can confirm attached executables work fine for me on patched version.
+
+I'll also re-run full gcc regtest a bit later, but it runs for a rather long time, not sure this result will be important next week.
+
+Hopefully, patchset will be included into 4 release.
+
+Unfortunately the fix is too big for this point in the 4.0 release cycle; it'll go into 4.1.
+
+
+The fix should now be in git master (commits 8b86d6d25807e13a6 and 6e6c4efed995d9ec), so it will be in the 4.1 release.
+
+

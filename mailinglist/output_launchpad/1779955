@@ -1,0 +1,92 @@
+qemu linux-user requires read permissions on memory passed to syscalls that should only need write access
+
+When read() function takes an mmap'ed address as output buffer, it returns EFAULT. The expected behavior is it should just work.
+
+The following code works for qemu-system-arm, but not for qemu-arm-static.
+
+
+
+Steps to reproduce (please substitute /path/to/qemu-arm-static with the path of the binary, and /tmp/a.cpp with the example source code attached):
+
+# First register binfmt_misc
+[hidden]$ docker run --rm --privileged multiarch/qemu-user-static:register --reset
+
+# Compile the code and run
+[hidden]$ docker run --rm -it -v /tmp/a.cpp:/tmp/a.cpp -v /path/to/qemu-arm-static:/usr/bin/qemu-arm-static arm32v7/ubuntu:18.04 bash -c '{ apt update -y && apt install -y g++; } >& /dev/null && g++ -std=c++14 /tmp/a.cpp -o /tmp/a.out && echo hehe > /tmp/haha.txt && /tmp/a.out'
+ofd=3
+ftruncate=0
+mmap=0xff3f5000
+fd=4
+0xff3f5023 -1 14
+
+
+
+The expected result in qemu-system-arm as well as natively on x86_64 host:
+hidden$ ./a.out                                                                                                                                                     
+ofd=3                                                                                                                
+ftruncate=0                                                                                                          
+mmap=0xb6fb7000                                                                                                          
+fd=4                                                                                                                                    
+0xb6fb7023 5 0
+
+
+
+The problem here is not the mmap(), it is that you are mapping it as only PROT_WRITE and not also PROT_READ. With the native kernel, syscalls which only write to a buffer and do not read from it (like read(2)) only require write permissions on that memory. QEMU's implementation requires both write and read permission.
+
+This is a QEMU bug, but not a major one, because in practice no guest binaries set up memory that is only writable and can't be read (what would they do with the data that they wrote into that memory?). You can work around it in your test program by using mmap(..., PROT_READ | PROT_WRITE, ...), which will allow it to work in QEMU.
+
+(Technical QEMU internal notes for other developers: the issue here is that we do permissions checks in syscall.c using lock_user(VERIFY_WRITE, ...) etc, but in access_ok() we treat VERIFY_WRITE as "implies read access" when we're choosing the permissions flags to pass to page_check_range(). To fix this we would have to check all the places we use VERIFY_WRITE to identify which should be "only need write" and which are "need both read and write".)
+
+
+Thanks Peter for your information.
+
+I was hit by the bug when trying to compile bazel (a build system open-sourced by Google: https://bazel.build) and the code is at https://github.com/bazelbuild/bazel/blob/master/third_party/ijar/mapped_file_unix.cc#L116
+
+Of course I can send PR to fix that in bazel source, but I would say it is not true that "in practice no guest binaries set up memory that is only writable and can't be read". It is legitimate requirement and coding practice.
+
+Oh, yes, I see -- it's mmapping the file specifically in order to write the data to the file system. Yes, I agree that's a reasonable thing to do.
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Still a bug.
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/470
+
+

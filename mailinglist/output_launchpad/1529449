@@ -1,0 +1,195 @@
+serial is required for -device nvme
+
+I am not exactly sure if this is a bug, but I don't see why the option "serial" is required for -device nvme like drive. Truth is it seem to accept random string as its value anyway, if that's the case, couldn't qemu just generate one for it when it's not specified?
+
+On Mon, Jan 11, 2016 at 05:35:50PM +0100, Markus Armbruster wrote:
+> Tom Yan <email address hidden> writes:
+> > Public bug reported:
+> >
+> > I am not exactly sure if this is a bug, but I don't see why the option
+> > "serial" should be required for -device nvme like the option "drive".
+> > Truth is it seem to accept random string as its value anyway, if that's
+> > the case, couldn't qemu just generate one for it when it's not
+> > specified?
+>
+> You should've included a reproducer.  Here are mine:
+> 
+> 1. Bad error reporting on missing drive:
+> 
+>      $ upstream-qemu -nodefaults -device nvme
+>      upstream-qemu: -device nvme: Device initialization failed
+> 
+>    Expected: error reported like for other devices, e.g.
+> 
+>      $ upstream-qemu -nodefaults -device virtio-blk
+>      upstream-qemu: -device virtio-blk: drive property not set
+> 
+> 2. Bad error reporting on empty drive:
+> 
+>      $ upstream-qemu -nodefaults -drive if=none,id=foo -device nvme,drive=foo
+>      upstream-qemu: -device nvme,drive=foo: Device initialization failed
+> 
+>    Expected: error is reported like for other devices, e.g.
+> 
+>      $ upstream-qemu -nodefaults -drive if=none,id=foo -device virtio-blk,drive=foo
+>      upstream-qemu: -device virtio-blk,drive=foo: Device needs media, but drive is empty
+> 
+> 3. Bad handling of missing serial:
+> 
+>       $ upstream-qemu -nodefaults -drive if=none,id=foo,file=tmp.qcow2 -device nvme,drive=foo
+>       upstream-qemu: -device nvme,drive=foo: Device initialization failed
+> 
+>    Expected: either default the serial number, like some other devices
+>    do, or a decent error message.
+> 
+> I recommend to convert the device to realize(), and add the missing
+> error_setg().  Keith?
+
+Requiring a serial was a concious choice to push that responsibility
+on the user, but I don't see a problem having the code provide default
+serial string if the user does not over ride it.
+
+If you've multiple nvme devices in your guest, creating the same serial
+could cause problems with multipathing if they're basing end device
+uniqueness on the serial (some do). If we have the code provide the
+serial, perhaps it would be best to make each unique. That's easy enough
+to append an incrementing number to the end of the serial.
+
+
+Instead of requiring a serial of arbitrary length/format, I think a WWN/EUI-64 is more useful/important, not to mention that the WWN/EUI-64 can pretty much always be used as the serial at the same time.
+
+Unlike Linux, Windows consider the WWN/EUI-64 as the "serial":
+
+"C:\Windows\system32>sg_vpd -i PD1
+Device Identification VPD page:
+  Addressed logical unit:
+    designator type: SCSI name string,  code set: UTF-8
+      SCSI name string:
+      8086QEMU NVMe Ctrl                          00012BDAC262CF831698
+
+C:\Windows\system32>sg_vpd -p sn PD1
+Unit serial number VPD page:
+  Unit serial number: 0000_0000_0000_0000."
+
+(https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650553/+files/02.PNG)
+
+UEFI also makes use of the WWN/EUI-64 to generate boot entries for NVMe devices:
+https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650554/+files/03.png
+https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650555/+files/04.png
+
+
+On 04/28/16 20:07, Tom Yan wrote:
+> Instead of requiring a serial of arbitrary length/format, I think a
+> WWN/EUI-64 is more useful/important,
+
+WWN/EUI-64 is not "more important". Section "7.9 Unique Identifier" in
+the NVMe spec (Revision 1.2a, October 23, 2015) says that the serial
+number is mandatory, while implementing an EUI-64 is optional. Let me
+quote it all (emphases mine):
+
+> 7.9 Unique Identifier
+>
+> Information is returned in the Identify Controller data structure that
+> may be used to construct a unique identifier. Specifically, the PCI
+> Vendor ID, *Serial Number*, and Model Number fields when combined
+> shall form a globally unique value that identifies the NVM subsystem.
+> The mechanism used by the vendor to assign Serial Number and Model
+> Number values to ensure uniqueness is *outside the scope* of this
+> specification.
+>
+> An NVM subsystem may contain multiple controllers. All of the
+> controllers that make up an NVM subsystem share the same NVM subsystem
+> identifier (i.e., PCI Vendor ID, Serial Number, and Model Number). The
+> Controller ID (CNTLID) value returned in the Identify Controller data
+> structure may be used to uniquely identify a controller within an NVM
+> subsystem. The Controller ID value when combined with the NVM
+> subsystem identifier forms a globally unique value that identifies the
+> controller. The mechanism used by the vendor to assign Controller ID
+> values is outside the scope of this specification.
+>
+> The Identify Namespace data structure contains the IEEE Extended
+> Unique Identifier (EUI64) and the Namespace Globally Unique Identifier
+> (NGUID) fields. EUI64 is an 8-byte EUI-64 identifier and NGUID is a
+> 16-byte identifier based on EUI-64. When creating a namespace, the
+> controller specifies a globally unique value in the EUI64 or NGUID
+> field (the controller may optionally specify a globally unique value
+> in both fields). In cases where the 64-bit EUI64 field is unable to
+> ensure a globally unique namespace identifier, the EUI64 field shall
+> be cleared to 0h. *When not implemented*, these fields contain a value
+> of 0h.
+
+The QEMU device model conforms to this:
+
+- The serial number is mandatory, and its generation is unspecified.
+(First paragraph quoted.) Accordingly, QEMU forces the user to generate
+and provide a serial number.
+
+- The EUI64 is optional (third paragraph); it shall be zero-filled when
+not implemented. QEMU conforms.
+
+> not to mention that the WWN/EUI-64
+> can pretty much always be used as the serial at the same time.
+> 
+> Unlike Linux, Windows consider the WWN/EUI-64 as the "serial":
+
+That's Windows's problem. Not the first (and not the last) occasion
+where Microsoft interpret a specification creatively.
+
+> "C:\Windows\system32>sg_vpd -i PD1
+> Device Identification VPD page:
+>   Addressed logical unit:
+>     designator type: SCSI name string,  code set: UTF-8
+>       SCSI name string:
+>       8086QEMU NVMe Ctrl                          00012BDAC262CF831698
+> 
+> C:\Windows\system32>sg_vpd -p sn PD1
+> Unit serial number VPD page:
+>   Unit serial number: 0000_0000_0000_0000."
+> 
+> (https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650553/+files/02.PNG)
+> 
+> UEFI also makes use of the WWN/EUI-64 to generate boot entries for NVMe devices:
+> https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650554/+files/03.png
+> https://bugs.launchpad.net/qemu/+bug/1576347/+attachment/4650555/+files/04.png
+
+The UEFI specification (version 2.6, January 2016) says in "9.3.5.22 NVM
+Express namespace messaging device path node":
+
+  Mnemonic:    IEEE Extended Unique Identifier
+  Byte Offset: 8
+  Byte Length: 8
+  Description: This field contains the IEEE Extended Unique
+               Identifier (EUI-64). Devices without an EUI-64 value
+               must initialize this field with a value of 0.
+
+QEMU conforms.
+
+The device paths visible on your OVMF screenshots are distinguishable
+from each other by their Pci() device path nodes. There is no collision.
+
+I recommend reviewing the following commits:
+
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=a907ec52cc1a
+https://github.com/tianocore/edk2/commit/d7c0dfaef26c
+
+The point being: if QEMU grows a capability to store a nonzero EUI64,
+and that EUI64 is reflected in the OpenFirmware device path that is
+placed into the "bootorder" fw_cfg file, then OVMF will parse it just
+fine. However, QEMU is not required to grow such a capability, according
+to the NVMe and UEFI specifications. In practice, multiple NVMe devices
+can be distinguished from each other by their different PCI B/D/F locations.
+
+Thanks,
+Laszlo
+
+
+Since both "drive=" and "serial=" expects an arbitrary string (while the value for "drive=" must be unique since it's the "id=" of a "-drive"), why not use the same string from "drive=" as the value of "serial=" when it's not specified explicitly?
+
+Apparently "-device scsi-hd" has already been doing that (although it does not create the "sn" VPD when a serial is not explicitly specified).
+
+
+
+
+
+No new developments for 4+ years, closing as invalid (I'd prefer "wontfix due to lack of resources", but I'm unable to pick that resolution).
+

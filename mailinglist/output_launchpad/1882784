@@ -1,0 +1,65 @@
+Legacy IGD passthrough in QEMU 5 disabled
+
+Bug with tag v5.0.0, or commit fdd76fecdde1ad444ff4deb7f1c4f7e4a1ef97d6
+
+As of QEMU 5 Legacy IGD PT is no longer working.
+
+Host is a Xeon E3-1226 v3 and my method to test is to run the following:
+
+./qemu-system-x86_64 \
+  -device 'pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1f' \
+  -device 'vfio-pci,host=00:02.0,addr=02.0' \
+  -L '/usr/share/kvm' \
+  -nographic \
+  -vga none \
+  -nodefaults
+
+in the hope of seeing a "IGD device 0000:00:02.0 cannot support legacy mode due to existing devices at address 1f.0" error.
+
+The culprit appears to be this commit:
+
+https://github.com/qemu/qemu/commit/29d62771c81d8fd244a67c14a1d968c268d3fb19
+
+Specifically the following block in pci-quirks.c:
+
+#ifdef CONFIG_VFIO_IGD
+    vfio_probe_igd_bar4_quirk(vdev, nr);
+#endif
+
+as the kconfig variable CONFIG_VFIO_IGD doesn't appear to be available outside of makefiles as described here: https://qemu.weilnetz.de/doc/devel/kconfig.html. I can confirm that the igd code is being pulled in as removing this check, as would defining the variable I presume, makes Legacy IGD PT work again (ie I see the expected "existing devices" error).
+
+I first spotted this in Proxmox, but have confirmed the bug by building QEMU sources.
+
+Hi! That info in kconfig.html is not up to date anymore, we are generating now #defines for the Kconfig switches. And in my build tree, I can see:
+
+$ grep CONFIG_VFIO_IGD *-softmmu/*.h
+x86_64-softmmu/config-devices.h:#define CONFIG_VFIO_IGD 1
+
+... what's missing in that file is simply a "#include "config-devices.h" ... sorry, that fell somehow through the cracks. I'll prepare a patch for that.
+
+Looks similar to https://bugs.launchpad.net/qemu/+bug/1879175
+
+Looks the same, although the title was misleading so I missed it.
+
+@Thomas, I used the same patch and verified that it works (I know you don't pick up patches here but I presume you have your own):
+
+diff --git a/hw/vfio/pci-quirks.c b/hw/vfio/pci-quirks.c
+index 2d348f8237..a633df965e 100644
+--- a/hw/vfio/pci-quirks.c
++++ b/hw/vfio/pci-quirks.c
+@@ -25,6 +25,7 @@
+ #include "hw/qdev-properties.h"
+ #include "pci.h"
+ #include "trace.h"
++#include "config-devices.h"
+
+ /*
+  * List of device ids/vendor ids for which to disable
+
+
+Patch is on the list now:
+https://lists.gnu.org/archive/html/qemu-devel/2020-06/msg02567.html
+
+Patch has been included:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=643a4eacef87a318c
+

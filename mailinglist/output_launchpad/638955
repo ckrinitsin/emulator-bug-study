@@ -1,0 +1,1104 @@
+emulated netcards don't work with recent sunos kernel
+
+hi there,
+
+i'm using qemu-kvm backend in version: # qemu-kvm -version
+QEMU PC emulator version 0.12.5 (qemu-kvm-0.12.5), Copyright (c) 2003-2008 Fabrice Bellard
+
+and there are just *not working any of model=$type with combinations of recent sunos (solaris, openindiana, opensolaris, ..) ..
+
+you can download for testing purposes iso from here: http://dlc-origin.openindiana.org/isos/147/ or from here: http://genunix.org/distributions/indiana/ << osol and oi are also bubuntu-like *live cds, so no need to bother with installing
+
+behaviour is as follows:
+e1000 - receiving doesn't work, transmitting works .. dladm (tool for handle ethers) shows that is all ok, correct mode is loaded up, it just seems like this driver works at 100% but ..
+
+rtl8169|pcnet - works in 10Mbit mode with several other issues like high cpu utilization and so .. dladm is unable to recognize options for this kind of -nic
+
+others - just don't work
+
+.. i experienced this issue several times in past .. woraround was, that rtl8169 worked so-so .. with recent sunos kernel it doesn't.
+
+it's easy to reproduce, this is why i'm not putting here more then launching script for my virtual machine:
+
+# cat openindiana.sh
+qemu-kvm -hda /home/kvm/openindiana/openindiana.img -m 2048 -localtime -cdrom /home/kvm/+images/oi-dev-147-x86.iso -boot d \
+-vga std -vnc :9 -k en-us -monitor unix:/home/kvm/openindiana/instance,server,nowait \
+-net nic,model=e1000,vlan=1 -net tap,ifname=oi0,script=no,vlan=1 &
+
+sleep 2;
+ip l set oi0 up;
+ip a a 192.168.99.9/24 dev oi0;
+
+regards by daniel
+
+reproduced with latest vanilla qemu-kvm ..
+
+i've just build it without any optimalizations like this: `./configure --prefix=$HOME/chroot/opt/qemu-kvm-0.13rc1; make`
+
+
+(qemu) info version
+info version
+0.12.91 (qemu-kvm-0.13.0-rc1)
+
+it acts just same .. i'm trying at first to hunt down what has happend in sunos kernel .. well, i hope that we'll be able to fix it as soon as possible because it's just very miserable that we're unable to use the best (in my opinion) virtualization platform ..
+
+regards, daniel
+
+added a output from `kstat -p e1000*` ..
+
+call for more info if needed ..
+regards by daniel
+
+ps. summary: everything seems fine (link statistics and so) but receiving just doesn't work .. transmitting works
+
+On Sat, Sep 18, 2010 at 09:43:45PM +0100, Stefan Hajnoczi wrote:
+> The OpenIndiana (Solaris) e1000g driver drops frames that are too long
+> or too short.  It expects to receive frames of at least the Ethernet
+> minimum size.  ARP requests in particular are small and will be dropped
+> if they are not padded appropriately, preventing a Solaris VM from
+> becoming visible on the network.
+> 
+> Signed-off-by: Stefan Hajnoczi <email address hidden>
+> ---
+>  hw/e1000.c |   10 ++++++++++
+>  1 files changed, 10 insertions(+), 0 deletions(-)
+> 
+> diff --git a/hw/e1000.c b/hw/e1000.c
+> index 7d7d140..bc983f9 100644
+> --- a/hw/e1000.c
+> +++ b/hw/e1000.c
+> @@ -55,6 +55,7 @@ static int debugflags = DBGBIT(TXERR) | DBGBIT(GENERAL);
+>  
+>  #define IOPORT_SIZE       0x40
+>  #define PNPMMIO_SIZE      0x20000
+> +#define MIN_BUF_SIZE      60
+>  
+>  /*
+>   * HW models:
+> @@ -635,10 +636,19 @@ e1000_receive(VLANClientState *nc, const uint8_t *buf, size_t size)
+>      uint32_t rdh_start;
+>      uint16_t vlan_special = 0;
+>      uint8_t vlan_status = 0, vlan_offset = 0;
+> +    uint8_t min_buf[MIN_BUF_SIZE];
+>  
+>      if (!(s->mac_reg[RCTL] & E1000_RCTL_EN))
+>          return -1;
+>  
+> +    /* Pad to minimum Ethernet frame length */
+> +    if (size < sizeof(min_buf)) {
+> +        memcpy(min_buf, buf, size);
+> +        memset(&min_buf[size], 0, sizeof(min_buf) - size);
+> +        buf = min_buf;
+> +        size = sizeof(min_buf);
+> +    }
+> +
+
+Hi,
+
+This doesn't look right. AFAIK, MAC's dont pad on receive.
+
+IMO this kind of padding should somehow be done by the bridge that forwards
+packets into the qemu vlan (e.g slirp or the generic tap bridge).
+
+Cheers
+
+On Sun, Sep 19, 2010 at 01:18:01PM +0200, Michael S. Tsirkin wrote:
+> On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+> > On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> > <email address hidden> wrote:
+> > > This doesn't look right. AFAIK, MAC's dont pad on receive.
+> > 
+> > I agree.  NICs that do padding will do it on transmit, not receive.
+> > Anything coming in on the wire should already have the minimum length.
+> > 
+> > In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> > ne2000 already do this same padding.  This patch is the smallest
+> > change to cover e1000.
+> > 
+> > > IMO this kind of padding should somehow be done by the bridge that forwards
+> > > packets into the qemu vlan (e.g slirp or the generic tap bridge).
+> > 
+> > That should work and we can then drop the padding code from existing
+> > NICs.  I'll take a look.
+> > 
+> > Stefan
+> 
+> Not all nic devices have to be emulate ethernet, so not all devices want
+> the padding, e.g. virtio does not.
+
+Right, ethernet behaviour should obviously not be applied unconditionally for
+all net devices.
+
+
+> It's also easy to imagine an
+> ethernet device that strips the padding: would be silly to add it
+> just to have it stripped.
+
+I dont beleive that is possible. The FCS comes last, so an ethernet MAC
+would have to do really silly things to differentiate between padding and
+real payload.
+
+
+> If we really want to do this generically, we could implement a function dealing
+> with the padding, and call it from relevant devices.
+
+Another way is to have network devices register their link types so that the
+generic bridge can apply whatever link specific fixups that may be needed.
+
+I would prefer to have the padding of bridged frames decoupled from the
+device models, but I cant say I feel very strongly about this.
+
+Cheers
+
+well, feel free to request whichever information you could need or consider as a helpful ..
+
+just for your information after ping via e1000 adapter i can see `arp -n` entry in target system and icmp packets are delivered ok. i'd like to presume that there is some little issue because e1000 driver is really just one taken from sunos kernel the best (althought that we've issue with receiving) .. all others work like trash (no statistic, no available modes, ..)
+
+but as i said, i have *nothing indicating a problem in logs, i already put here a kernel statistic for this driver in attachment ..
+
+regards, daniel
+
+On Mon, Sep 20, 2010 at 10:42:31AM +0200, Kevin Wolf wrote:
+> Am 18.09.2010 23:12, schrieb Stefan Hajnoczi:
+> > On Sat, Sep 18, 2010 at 9:57 PM, Hervé Poussineau <email address hidden> wrote:
+> >> Another patch creating ARP replies at least 64 bytes long has been
+> >> committed:
+> >> http://git.savannah.gnu.org/cgit/qemu.git/commit/?id=dbf3c4b4baceb91eb64d09f787cbe92d65188813
+> >>
+> >> Does it fix your issue?
+> > 
+> > No I don't think so.  This is an e1000 issue, it will happen if you
+> > use tap networking too.  The commit you linked to only affects slirp
+> > and pads its ARP code.
+> > 
+> > I think there are two places where the minimum frame length can be enforced:
+> > 1. The NIC emulation code.  This is currently how rtl8139, pcnet, and
+> > ne2000 do it.  My patch adds the same for e1000.
+> > 2. The net layer.  If we're emulating Ethernet then it would be
+> > possible to pad to minimum frame length in common networking code
+> > (net.c).
+> 
+> 3. The sender. I think it should be the sender's decision which packet
+> he sends and there's no reason to manipulate it on its way to the guest.
+> If the sender sends too short packets, this is where the bug is.
+
+Yes, but when using tap, the ethernet sender is QEMU itself. Tap doesn't
+have the same requirements as ethernet so the original sender has no
+reason to pad.
+
+Internally in QEMU, there is code that picks up tap packets and
+forwards them to the emulated ethernet links, this is were padding
+should be done IMO. Not in the device models receive path.
+
+The bridge that forwards frames from tap into emulated links must
+also handle different kinds of link types, as all emulated network
+devices are not necessarily ethernet.
+
+Cheers
+
+On Mon, Sep 20, 2010 at 10:50:40AM +0200, Kevin Wolf wrote:
+> Am 19.09.2010 08:36, schrieb Stefan Hajnoczi:
+> > On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> > <email address hidden> wrote:
+> >> This doesn't look right. AFAIK, MAC's dont pad on receive.
+> > 
+> > I agree.  NICs that do padding will do it on transmit, not receive.
+> > Anything coming in on the wire should already have the minimum length.
+> > 
+> > In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> > ne2000 already do this same padding.  This patch is the smallest
+> > change to cover e1000.
+> 
+> What's the reason that it isn't true in QEMU today? Shouldn't we fix
+> these problems rather than making device emulations incorrect to
+> compensate for it?
+
+Yes we should, I agree.
+
+Cheers
+
+Daniel,
+Does the following qemu.git patch solve the problem?
+http://patchwork.ozlabs.org/patch/65137/raw/
+
+Sorry about the partially mirrored mailing list thread.  I expected Launchpad to show the entire discussion but it seems to whitelist only registered users' emails.
+
+Stefan
+
+On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+> On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+>    
+>> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+>> <email address hidden>  wrote:
+>>      
+>>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+>>>        
+>> I agree.  NICs that do padding will do it on transmit, not receive.
+>> Anything coming in on the wire should already have the minimum length.
+>>      
+> QEMU never gets access to the wire.
+> Our APIs do not really pass complete ethernet packets:
+> we forward packets without checksum and padding.
+>
+> I think it makes complete sense to keep this and
+> handle padding in devices because we
+> have devices that pass the frame to guest without padding and checksum.
+> It should be easy to replace padding code in devices that
+> need it with some kind of macro.
+>    
+
+Would this not also address the problem?  It sounds like the root cause 
+is the tap code, not the devices..
+
+Regards,
+
+Anthony Liguori
+
+>    
+>> In QEMU that isn't true today and that's why rtl8139, pcnet, and
+>> ne2000 already do this same padding.  This patch is the smallest
+>> change to cover e1000.
+>>
+>>      
+>>> IMO this kind of padding should somehow be done by the bridge that forwards
+>>> packets into the qemu vlan (e.g slirp or the generic tap bridge).
+>>>        
+>> That should work and we can then drop the padding code from existing
+>> NICs.  I'll take a look.
+>>
+>> Stefan
+>>      
+>    
+
+
+
+On Mon, Sep 20, 2010 at 03:31:32PM -0500, Anthony Liguori wrote:
+> On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+> > On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+> >    
+> >> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> >> <email address hidden>  wrote:
+> >>      
+> >>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+> >>>        
+> >> I agree.  NICs that do padding will do it on transmit, not receive.
+> >> Anything coming in on the wire should already have the minimum length.
+> >>      
+> > QEMU never gets access to the wire.
+> > Our APIs do not really pass complete ethernet packets:
+> > we forward packets without checksum and padding.
+> >
+> > I think it makes complete sense to keep this and
+> > handle padding in devices because we
+> > have devices that pass the frame to guest without padding and checksum.
+> > It should be easy to replace padding code in devices that
+> > need it with some kind of macro.
+> >    
+> 
+> Would this not also address the problem?  It sounds like the root cause 
+> is the tap code, not the devices..
+> 
+> Regards,
+> 
+> Anthony Liguori
+> 
+> >    
+> >> In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> >> ne2000 already do this same padding.  This patch is the smallest
+> >> change to cover e1000.
+> >>
+> >>      
+> >>> IMO this kind of padding should somehow be done by the bridge that forwards
+> >>> packets into the qemu vlan (e.g slirp or the generic tap bridge).
+> >>>        
+> >> That should work and we can then drop the padding code from existing
+> >> NICs.  I'll take a look.
+> >>
+> >> Stefan
+> >>      
+> >    
+> 
+
+> From f77c3143f3fbefdfa2f0cc873c2665b5aa78e8c9 Mon Sep 17 00:00:00 2001
+> From: Anthony Liguori <email address hidden>
+> Date: Mon, 20 Sep 2010 15:29:31 -0500
+> Subject: [PATCH] tap: make sure packets are at least 40 bytes long
+> 
+> This is required by ethernet drivers but not enforced in the Linux tap code so
+> we need to fix it up ourselves.
+
+
+This enforces ethernet semantics on the internal links (which is probably
+not good), but it's IMO much better than changing the devices. It also
+moves the workaround closer to the root of the problem. IMO, it's a step
+in the right direction.
+
+Acked-by: Edgar E. Iglesias <email address hidden>
+
+
+> Signed-off-by: Anthony Liguori <email address hidden>
+> 
+> diff --git a/net/tap.c b/net/tap.c
+> index 4afb314..822241a 100644
+> --- a/net/tap.c
+> +++ b/net/tap.c
+> @@ -179,7 +179,13 @@ static int tap_can_send(void *opaque)
+>  #ifndef __sun__
+>  ssize_t tap_read_packet(int tapfd, uint8_t *buf, int maxlen)
+>  {
+> -    return read(tapfd, buf, maxlen);
+> +    ssize_t len;
+> +
+> +    len = read(tapfd, buf, maxlen);
+> +    if (len > 0) {
+> +        len = MAX(MIN(maxlen, 40), len);
+> +    }
+> +    return len;
+>  }
+>  #endif
+>  
+> -- 
+> 1.7.0.4
+> 
+
+
+On Mon, Sep 20, 2010 at 03:31:32PM -0500, Anthony Liguori wrote:
+> On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+> > On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+> >    
+> >> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> >> <email address hidden>  wrote:
+> >>      
+> >>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+> >>>        
+> >> I agree.  NICs that do padding will do it on transmit, not receive.
+> >> Anything coming in on the wire should already have the minimum length.
+> >>      
+> > QEMU never gets access to the wire.
+> > Our APIs do not really pass complete ethernet packets:
+> > we forward packets without checksum and padding.
+> >
+> > I think it makes complete sense to keep this and
+> > handle padding in devices because we
+> > have devices that pass the frame to guest without padding and checksum.
+> > It should be easy to replace padding code in devices that
+> > need it with some kind of macro.
+> >    
+> 
+> Would this not also address the problem?  It sounds like the root cause 
+> is the tap code, not the devices..
+> 
+> Regards,
+> 
+> Anthony Liguori
+> 
+> >    
+> >> In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> >> ne2000 already do this same padding.  This patch is the smallest
+> >> change to cover e1000.
+> >>
+> >>      
+> >>> IMO this kind of padding should somehow be done by the bridge that forwards
+> >>> packets into the qemu vlan (e.g slirp or the generic tap bridge).
+> >>>        
+> >> That should work and we can then drop the padding code from existing
+> >> NICs.  I'll take a look.
+> >>
+> >> Stefan
+> >>      
+> >    
+> 
+
+> From f77c3143f3fbefdfa2f0cc873c2665b5aa78e8c9 Mon Sep 17 00:00:00 2001
+> From: Anthony Liguori <email address hidden>
+> Date: Mon, 20 Sep 2010 15:29:31 -0500
+> Subject: [PATCH] tap: make sure packets are at least 40 bytes long
+> 
+> This is required by ethernet drivers but not enforced in the Linux tap code so
+> we need to fix it up ourselves.
+> 
+> Signed-off-by: Anthony Liguori <email address hidden>
+> 
+> diff --git a/net/tap.c b/net/tap.c
+> index 4afb314..822241a 100644
+> --- a/net/tap.c
+> +++ b/net/tap.c
+> @@ -179,7 +179,13 @@ static int tap_can_send(void *opaque)
+>  #ifndef __sun__
+>  ssize_t tap_read_packet(int tapfd, uint8_t *buf, int maxlen)
+>  {
+> -    return read(tapfd, buf, maxlen);
+> +    ssize_t len;
+> +
+> +    len = read(tapfd, buf, maxlen);
+> +    if (len > 0) {
+> +        len = MAX(MIN(maxlen, 40), len);
+
+
+A small detail :)
+40 -> 64 (including a dummy FCS).
+
+
+> +    }
+> +    return len;
+>  }
+>  #endif
+>  
+> -- 
+> 1.7.0.4
+> 
+
+
+On 09/20/2010 03:44 PM, Michael S. Tsirkin wrote:
+>>>  From f77c3143f3fbefdfa2f0cc873c2665b5aa78e8c9 Mon Sep 17 00:00:00 2001
+>>> From: Anthony Liguori<email address hidden>
+>>> Date: Mon, 20 Sep 2010 15:29:31 -0500
+>>> Subject: [PATCH] tap: make sure packets are at least 40 bytes long
+>>>
+>>> This is required by ethernet drivers but not enforced in the Linux tap code so
+>>> we need to fix it up ourselves.
+>>>        
+>>
+>> This enforces ethernet semantics on the internal links (which is probably
+>> not good),
+>>      
+> Plus plus ungood.
+> When we do add e.g. ipoib support, we'll have to go and hunt these bugs down again.
+> Also will make it impossible to implement any devices that pass in guest buffers
+> without FCS and padding.
+>    
+
+That's actually a good point which strongly is in favor of making the 
+devices do the padding themselves.
+
+Regards,
+
+Anthony Liguori
+
+
+On Mon, Sep 20, 2010 at 10:44:34PM +0200, Michael S. Tsirkin wrote:
+> On Mon, Sep 20, 2010 at 10:40:35PM +0200, Edgar E. Iglesias wrote:
+> > On Mon, Sep 20, 2010 at 03:31:32PM -0500, Anthony Liguori wrote:
+> > > On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+> > > > On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+> > > >    
+> > > >> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> > > >> <email address hidden>  wrote:
+> > > >>      
+> > > >>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+> > > >>>        
+> > > >> I agree.  NICs that do padding will do it on transmit, not receive.
+> > > >> Anything coming in on the wire should already have the minimum length.
+> > > >>      
+> > > > QEMU never gets access to the wire.
+> > > > Our APIs do not really pass complete ethernet packets:
+> > > > we forward packets without checksum and padding.
+> > > >
+> > > > I think it makes complete sense to keep this and
+> > > > handle padding in devices because we
+> > > > have devices that pass the frame to guest without padding and checksum.
+> > > > It should be easy to replace padding code in devices that
+> > > > need it with some kind of macro.
+> > > >    
+> > > 
+> > > Would this not also address the problem?  It sounds like the root cause 
+> > > is the tap code, not the devices..
+> > > 
+> > > Regards,
+> > > 
+> > > Anthony Liguori
+> > > 
+> > > >    
+> > > >> In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> > > >> ne2000 already do this same padding.  This patch is the smallest
+> > > >> change to cover e1000.
+> > > >>
+> > > >>      
+> > > >>> IMO this kind of padding should somehow be done by the bridge that forwards
+> > > >>> packets into the qemu vlan (e.g slirp or the generic tap bridge).
+> > > >>>        
+> > > >> That should work and we can then drop the padding code from existing
+> > > >> NICs.  I'll take a look.
+> > > >>
+> > > >> Stefan
+> > > >>      
+> > > >    
+> > > 
+> > 
+> > > From f77c3143f3fbefdfa2f0cc873c2665b5aa78e8c9 Mon Sep 17 00:00:00 2001
+> > > From: Anthony Liguori <email address hidden>
+> > > Date: Mon, 20 Sep 2010 15:29:31 -0500
+> > > Subject: [PATCH] tap: make sure packets are at least 40 bytes long
+> > > 
+> > > This is required by ethernet drivers but not enforced in the Linux tap code so
+> > > we need to fix it up ourselves.
+> > 
+> > 
+> > This enforces ethernet semantics on the internal links (which is probably
+> > not good),
+> 
+> Plus plus ungood.
+> When we do add e.g. ipoib support, we'll have to go and hunt these bugs down again.
+> Also will make it impossible to implement any devices that pass in guest buffers
+> without FCS and padding.
+
+If we dont remove the padding from the device models rx paths, we
+will continue with code that relies on it and it is IMO wrong.
+Ethernet MAC's don't padd nor append checksum on receive.
+
+I agree with you that it's not great that the internal link
+protocol has to be strictly ethernet but it seems to me like
+if that is reality today, with or without Anthonys patch.
+slirp and tap both require ethernet semantics (except possibly
+padding and FCS). The addressing and packet headers are ethernet.
+
+In the long run, I'd rather see a more flexible internal interconnect
+that supports mutiple heterogenous link types. In the meantime, I
+think Anthonys patch is a better workaround than patching the
+device models.
+
+> > but it's IMO much better than changing the devices.
+> 
+> How much better?
+
+OK, s/much better/better/ :)
+
+> 
+> > It also
+> > moves the workaround closer to the root of the problem.
+> > IMO, it's a step in the right direction.
+> > 
+> > Acked-by: Edgar E. Iglesias <email address hidden>
+> > 
+> > 
+> > > Signed-off-by: Anthony Liguori <email address hidden>
+> > > 
+> > > diff --git a/net/tap.c b/net/tap.c
+> > > index 4afb314..822241a 100644
+> > > --- a/net/tap.c
+> > > +++ b/net/tap.c
+> > > @@ -179,7 +179,13 @@ static int tap_can_send(void *opaque)
+> > >  #ifndef __sun__
+> > >  ssize_t tap_read_packet(int tapfd, uint8_t *buf, int maxlen)
+> > >  {
+> > > -    return read(tapfd, buf, maxlen);
+> > > +    ssize_t len;
+> > > +
+> > > +    len = read(tapfd, buf, maxlen);
+> > > +    if (len > 0) {
+> > > +        len = MAX(MIN(maxlen, 40), len);
+> > > +    }
+> 
+> Let's at least add a comment explaining what does this do?
+> Also - does tcp backend need this as well? Other backends?
+
+A comment sounds good.
+
+Cheers,
+Edgar
+
+
+http://patchwork.ozlabs.org/patch/65137/raw/
+
+well, this *fixed a issue .. it's very good that we (sunos guys) can now use the best virt platform (kvm - IMO) ..
+
+regards and thanks folks
+ave, daniel
+
+On Mon, Sep 20, 2010 at 9:31 PM, Anthony Liguori <email address hidden> wrote:
+> On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+>>
+>> On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+>>
+>>>
+>>> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+>>> <email address hidden>  wrote:
+>>>
+>>>>
+>>>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+>>>>
+>>>
+>>> I agree.  NICs that do padding will do it on transmit, not receive.
+>>> Anything coming in on the wire should already have the minimum length.
+>>>
+>>
+>> QEMU never gets access to the wire.
+>> Our APIs do not really pass complete ethernet packets:
+>> we forward packets without checksum and padding.
+>>
+>> I think it makes complete sense to keep this and
+>> handle padding in devices because we
+>> have devices that pass the frame to guest without padding and checksum.
+>> It should be easy to replace padding code in devices that
+>> need it with some kind of macro.
+>>
+>
+> Would this not also address the problem?  It sounds like the root cause is
+> the tap code, not the devices..
+
+This won't work when s->has_vnet_hdr is 1 because the virtio-net
+header consumes buffer space and reduces the amount we pad.  The
+padding size should be 60 + (s->has_vnet_hdr ? sizeof(struct
+virtio_net_hdr) : 0).
+
+Adjusting the length without clearing the untouched buffer space is
+probably fine.  I'm trying to think of a scenario where this becomes
+an information leak (security issue).  Perhaps if the guest has vlans
+enabled and allows different users to sniff traffic only on their
+vlans?  Then you may be able to read part of another vlan's traffic by
+sending short packets to your vlan and gathering the padding data.
+This is pretty contrived but doing a <60 byte memset would prevent the
+issue for sure.
+
+Stefan
+
+On Tue, Sep 21, 2010 at 11:17:07AM +0200, Michael S. Tsirkin wrote:
+> On Mon, Sep 20, 2010 at 10:51:36PM +0200, Edgar E. Iglesias wrote:
+> > On Mon, Sep 20, 2010 at 03:31:32PM -0500, Anthony Liguori wrote:
+> > > On 09/20/2010 05:42 AM, Michael S. Tsirkin wrote:
+> > > > On Sun, Sep 19, 2010 at 07:36:51AM +0100, Stefan Hajnoczi wrote:
+> > > >    
+> > > >> On Sat, Sep 18, 2010 at 10:27 PM, Edgar E. Iglesias
+> > > >> <email address hidden>  wrote:
+> > > >>      
+> > > >>> This doesn't look right. AFAIK, MAC's dont pad on receive.
+> > > >>>        
+> > > >> I agree.  NICs that do padding will do it on transmit, not receive.
+> > > >> Anything coming in on the wire should already have the minimum length.
+> > > >>      
+> > > > QEMU never gets access to the wire.
+> > > > Our APIs do not really pass complete ethernet packets:
+> > > > we forward packets without checksum and padding.
+> > > >
+> > > > I think it makes complete sense to keep this and
+> > > > handle padding in devices because we
+> > > > have devices that pass the frame to guest without padding and checksum.
+> > > > It should be easy to replace padding code in devices that
+> > > > need it with some kind of macro.
+> > > >    
+> > > 
+> > > Would this not also address the problem?  It sounds like the root cause 
+> > > is the tap code, not the devices..
+> > > 
+> > > Regards,
+> > > 
+> > > Anthony Liguori
+> > > 
+> > > >    
+> > > >> In QEMU that isn't true today and that's why rtl8139, pcnet, and
+> > > >> ne2000 already do this same padding.  This patch is the smallest
+> > > >> change to cover e1000.
+> > > >>
+> > > >>      
+> > > >>> IMO this kind of padding should somehow be done by the bridge that forwards
+> > > >>> packets into the qemu vlan (e.g slirp or the generic tap bridge).
+> > > >>>        
+> > > >> That should work and we can then drop the padding code from existing
+> > > >> NICs.  I'll take a look.
+> > > >>
+> > > >> Stefan
+> > > >>      
+> > > >    
+> > > 
+> > 
+> > > From f77c3143f3fbefdfa2f0cc873c2665b5aa78e8c9 Mon Sep 17 00:00:00 2001
+> > > From: Anthony Liguori <email address hidden>
+> > > Date: Mon, 20 Sep 2010 15:29:31 -0500
+> > > Subject: [PATCH] tap: make sure packets are at least 40 bytes long
+> > > 
+> > > This is required by ethernet drivers but not enforced in the Linux tap code so
+> > > we need to fix it up ourselves.
+> > > 
+> > > Signed-off-by: Anthony Liguori <email address hidden>
+> > > 
+> > > diff --git a/net/tap.c b/net/tap.c
+> > > index 4afb314..822241a 100644
+> > > --- a/net/tap.c
+> > > +++ b/net/tap.c
+> > > @@ -179,7 +179,13 @@ static int tap_can_send(void *opaque)
+> > >  #ifndef __sun__
+> > >  ssize_t tap_read_packet(int tapfd, uint8_t *buf, int maxlen)
+> > >  {
+> > > -    return read(tapfd, buf, maxlen);
+> > > +    ssize_t len;
+> > > +
+> > > +    len = read(tapfd, buf, maxlen);
+> > > +    if (len > 0) {
+> > > +        len = MAX(MIN(maxlen, 40), len);
+> > 
+> > 
+> > A small detail :)
+> > 40 -> 64 (including a dummy FCS).
+> 
+> I don't think so: e1000 at least has code to tack the FCS on,
+> so we'll end up with a 68 bytes.
+
+And at the moment e1000 also has padding, both padding
+and FCS appending should go away from ethernet models before
+this goes in.
+
+Anyway, if you guys maintaining the networking parts are in
+agreement that padding and FCS appending should be done in
+the device models (at least for the moment), I'll accept
+that and back-off. In that case, I think your suggestion
+of hiding things behind some kind of generic macro or
+function would be good. At least it will clarify things.
+
+Cheers
+
+well, i did some more investigations and here come a results ..
+
+this patch http://patchwork.ozlabs.org/patch/65137/raw/ solves problem partially .. NICs are working with that but after a deeper look, connection is lost when the netstack is flooded with higher traffic ..
+
+i can connect with ssh|telnet from qemu-kvm host to sunos machines, but when i type dmesg for example (or anything else which does for a moment a higher traffic), the connection freezes ..
+
+when i bind both tap ifaces under one bridge, access each machine via theirs /dev/console, conection to neighboring guest seems like works as expected, so this issue only affects connection between kvm host and guests ..
+
+sorry for my very plain description of problem, but it's again easy to reproduce ..
+
+so once more in short:
+
+two machines with following settings:
+-net nic,model=e1000,macaddr="00:50:56:ba:5e:74",vlan=1 \
+-net tap,ifname=oi0,script=no,vlan=1 & ## openindiana
+
+-net nic,model=e1000,macaddr="00:50:56:ba:6e:74",vlan=1 \
+-net tap,ifname=solaris0,script=no,vlan=1 & ## solaris
+
+1) ping over directly assigned address on oi0|solaris0 works, connection is lost when invoked higher trafic aka - ssh|telnet in there and then typed dmesg command or whatever else which floods /dev/stdin and invokes due to the that higher traffic
+
+2) when created bridge (brctl addbr br0; brctl addif br0 oi0 solaris0) and assigned address it behaves same way with exception, that when used /dev/console on each of them for connection to second machine, netstack seems like working there okay ..
+
+regards, daniel
+
+On Sat, Oct 2, 2010 at 8:23 PM, daniel pecka <email address hidden> wrote:
+> well, i did some more investigations and here come a results ..
+>
+> this patch http://patchwork.ozlabs.org/patch/65137/raw/ solves problem
+> partially .. NICs are working with that but after a deeper look,
+> connection is lost when the netstack is flooded with higher traffic ..
+
+I haven't looked more into this but noticed an e1000 patch from
+Anthony Perard which may improve the Solaris experience:
+http://patchwork.ozlabs.org/patch/67594/
+
+Stefan
+
+is this issue dead ?? can i do something for help to fix it?
+
+regards, daniel
+
+On Mon, Jan 3, 2011 at 1:40 PM, daniel pecka <email address hidden> wrote:
+> is this issue dead ?? can i do something for help to fix it?
+
+I believe no one has investigated this issue since my last comment.
+Someone with time and interest in Solaris needs to step up to debug
+this problem.
+
+DTrace inside the guest and QEMU tracing (see docs/tracing.txt) are
+good tools for figuring out what is going on in the Solaris device
+driver and QEMU's hardware emulation, respectively.
+
+If you know a previous QEMU version where a network device works under
+Solaris you could use git-bisect(1) to find the commit that broke
+Solaris.  From what you've said though, it seems the issue is with new
+Solaris kernels rather than changes in QEMU.
+
+Stefan
+
+okay Stefan ..
+
+thanks, i poked several people and trying to learn up how netstack works .. i have no experience with programming drivers .. i hope that we'll fix it soon cuz it's very bad that we're unable to use kvm|qemu
+
+regards, daniel
+
+Hi Daniel,
+
+I just tried a newer version of the indiana iso image
+(http://dlc-origin.openindiana.org/isos/148/oi-dev-148-x86.iso) with
+latest qemu (not qemu-kvm) on a debian amd64 linux host, and I had no problems
+with networking (ssh from qemu's emulated indiana host to physical linux host).
+
+Tested with e1000 and i82559c, both work.
+
+Does the error only occur with the older iso image?
+Or is it caused by qemu-kvm?
+
+Regards,
+Stefan
+
+I can confirm this. Just spent hours studying my network configuration in OpenIndiana b148 running in Qemu KVM and figuring out what's wrong... Everything's OK, network is up but I won't even ping the gateway.
+Please fix this soon!
+
+
+Hi all,
+I can confirm this bug,
+on latest openindiana-148 and qemu-kvm 0.13.0 you cannot even ping the virtualization host.
+With qemu-kvm-0.14.0 (just released!) you CAN ping the host: this is already an improvement.
+HOWEVER 
+biggest bug is still there: if you log in to the openindiana machine via ssh and do "dmesg" or "netstat" or some other command which ouptuts a lot of text, the tcp socket will hang (well say it hangs once every 3 attempts) forever.
+
+Going with tcpdump -e from within the guest, I have identified that the problem is when a big enough packet is outputed.
+I tried a few times with dmesg, and as soon as the tcp packet reaches the following length:
+
+18:38:28.340097 52:54:69:b5:89:11 (oui Unknown) > 00:19:b9:81:2c:52 (oui Unknown), ethertype IPv4 (0x0800), length 1514: 192.168.7.38.ssh > 192.168.7.52.59008: Flags [.], ack 2824, win 64436, options [nop,nop,TS val 27488132 ecr 6063255], length 1448
+
+it cannot get through. Then the IP stack tries and retries to send the same identical packet, but there will never be any reply from the other side. Finally the socket is torn down.
+
+I have bridged networking for the VM. My bridge is a normal linux bridge br0 with MTU 1500.
+Has MTU anything to do with all this?
+Is it a linux-bridge bug or a qemu-kvm bug?
+
+Please fix this, solaris is important for its ZFS.
+Thank you
+
+On Mon, Feb 28, 2011 at 7:06 PM, geppz <email address hidden> wrote:
+> Going with tcpdump -e from within the guest, I have identified that the problem is when a big enough packet is outputed.
+> I tried a few times with dmesg, and as soon as the tcp packet reaches the following length:
+>
+> 18:38:28.340097 52:54:69:b5:89:11 (oui Unknown) > 00:19:b9:81:2c:52 (oui
+> Unknown), ethertype IPv4 (0x0800), length 1514: 192.168.7.38.ssh >
+> 192.168.7.52.59008: Flags [.], ack 2824, win 64436, options [nop,nop,TS
+> val 27488132 ecr 6063255], length 1448
+>
+> it cannot get through. Then the IP stack tries and retries to send the
+> same identical packet, but there will never be any reply from the other
+> side. Finally the socket is torn down.
+>
+> I have bridged networking for the VM. My bridge is a normal linux bridge br0 with MTU 1500.
+> Has MTU anything to do with all this?
+> Is it a linux-bridge bug or a qemu-kvm bug?
+
+Excellent, thanks for posting these details.  The bug is probably in
+the NIC hardware emulation and I think we can track this one down
+fairly easily.
+
+Can you please post your qemu-kvm command-line including the NIC model
+that you are using?
+
+Stefan
+
+
+Emulated NIC is e1000.
+
+I found out that if one reduces the MTU on the client like "ifconfig eth0 mtu 300" it seems ssh hangs much more rarely (but still hangs, at 300).
+Reducing it on the virtualization host bridge is not enough though (unless you are initiating ssh from the virtualization host itself)
+To trigger the hang, do:
+while true ; do dmesg ; done
+The higher the allowed MTU, the quicker the hang, e.g. MTU 500 hangs within one minute. 1500 hangs instantly.
+
+
+Command line is the following. Excuse the length... it's a libvirt
+
+LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/sbin:/bin QEMU_AUDIO_DRV=none /usr/local/qemu-kvm-0.14.0/bin/qemu-system-x86_64 -S -M pc-0.14 -enable-kvm -m 2048 -smp 2,sockets=2,cores=1,threads=1 -name openindiana1 -uuid ed0b8483-d186-1f39-39ef-97194a1f02bf -nodefconfig -nodefaults -chardev socket,id=monitor,path=/var/lib/libvirt/qemu/openindiana1.monitor,server,nowait -mon chardev=monitor,mode=readline -rtc base=utc -no-acpi -boot c -drive if=none,media=cdrom,id=drive-ide0-1-0,readonly=on,format=raw -device ide-drive,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0 -drive file=/dev/mapper/datavg1-openindiana1,if=none,id=drive-ide0-0-0,boot=on,format=raw,cache=none -device ide-drive,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0 -netdev tap,fd=54,id=hostnet0 -device e1000,netdev=hostnet0,id=net0,mac=52:54:69:b5:89:11,bus=pci.0,addr=0x3 -usb -vnc 127.0.0.1:0 -vga cirrus -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x4 
+
+I'm available to try patches for a while if somebody can spot the problem... the host is still not in production.
+
+Thanks for your work
+
+I was able to reproduce this problem with qemu.git running OpenIndiana 148 with tap and bridge on the host.  I did not see an issue with the userspace network stack - seems to manifest itself as a checksum error in transmitted packets.
+
+Here is the host tcpdump during a TCP stall with mtu 1500:
+
+19:47:54.601950 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 6949:7509, ack 3545, win 64436, options [nop,nop,TS val 24455 ecr 111832709], length 560
+19:47:54.601966 IP 192.168.122.1.40611 > 192.168.122.33.22: Flags [.], ack 7509, win 163, options [nop,nop,TS val 111832710 ecr 24455], length 0
+19:47:54.602312 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 7509:8069, ack 3545, win 64436, options [nop,nop,TS val 24455 ecr 111832709], length 560
+19:47:54.602325 IP 192.168.122.1.40611 > 192.168.122.33.22: Flags [.], ack 8069, win 171, options [nop,nop,TS val 111832710 ecr 24455], length 0
+
+Everything went fine up to here but now the stall shows up...
+
+19:47:54.602594 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 8069:8629, ack 3545, win 64436, options [nop,nop,TS val 24455 ecr 111832709], length 560
+19:47:54.602831 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 8629:9189, ack 3545, win 64436, options [nop,nop,TS val 24455 ecr 111832709], length 560
+19:47:54.602847 IP 192.168.122.1.40611 > 192.168.122.33.22: Flags [.], ack 8069, win 171, options [nop,nop,TS val 111832710 ecr 24455,nop,nop,sack 1 {8629:9189}], length 0
+
+Notice that only seq up to 8069 was acked by the host and this is a duplicate ack.  I think it's prodding the guest to transmit from 8069 again.
+
+19:47:54.603447 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 9189:9749, ack 3545, win 64436, options [nop,nop,TS val 24456 ecr 111832710], length 560
+19:47:54.603459 IP 192.168.122.1.40611 > 192.168.122.33.22: Flags [.], ack 8069, win 171, options [nop,nop,TS val 111832710 ecr 24455,nop,nop,sack 1 {8629:9749}], length 0
+19:47:54.603734 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 9749:10309, ack 3545, win 64436, options [nop,nop,TS val 24456 ecr 111832710], length 560
+19:47:54.603751 IP 192.168.122.1.40611 > 192.168.122.33.22: Flags [.], ack 8069, win 171, options [nop,nop,TS val 111832710 ecr 24455,nop,nop,sack 1 {8629:10309}], length 0
+19:47:54.603882 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [P.], seq 8069:8629, ack 3545, win 64436, options [nop,nop,TS val 24456 ecr 111832710], length 560
+19:47:55.021608 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [.], seq 8069:9517, ack 3545, win 64436, options [nop,nop,TS val 24498 ecr 111832710], length 1448
+19:47:55.578667 STP 802.1d, Config, Flags [none], bridge-id 8000.da:7b:46:27:8c:aa.8001, length 35
+19:47:55.851350 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [.], seq 8069:9517, ack 3545, win 64436, options [nop,nop,TS val 24581 ecr 111832710], length 1448
+19:47:57.577496 STP 802.1d, Config, Flags [none], bridge-id 8000.da:7b:46:27:8c:aa.8001, length 35
+19:47:57.625504 IP 192.168.122.33.22 > 192.168.122.1.40611: Flags [.], seq 8069:9517, ack 3545, win 64436, options [nop,nop,TS val 24745 ecr 111832710], length 1448
+
+Resends and more duplicate acks up to 8069.  The host is not responding to the guest transmitted packets.  Wireshark shows checksum errors for guest transmitted frames when the stall occurs.
+
+I added instrumentation to hw/e1000.c and get the following information about transmitted frames:
+
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0x3 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0xdcf7
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0x3 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0xde66
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x77ca
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0x3 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0xf7a1
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0x3 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0xfe9d
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0x3 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x50b9
+tp 0x7fd6a8eef3a0 frames 0 size 626 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x77ca
+tp 0x7fd6a8eef3a0 frames 0 size 1514 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x7b42
+tp 0x7fd6a8eef3a0 frames 0 size 1514 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x7b42
+tp 0x7fd6a8eef3a0 frames 0 size 1514 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x7b42
+tp 0x7fd6a8eef3a0 frames 0 size 1514 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x7b42
+tp 0x7fd6a8eef3a0 frames 0 size 1514 vlan_needed 0 sum_needed 0 ip 0 tcp 0
+tucso 0x32 tcp/udp checksum 0x7b42
+
+Perhaps there is a e1000 emulation bug here that causes us to miss the sum_needed bits and an invalid checksum ends up being transmitted.  Need to investigate this more.
+
+Here is the patch in case you want to confirm my results so far:
+http://repo.or.cz/w/qemu/stefanha.git/commitdiff/fa963c73b254af2e43a9a45ff5cceb2c42519f55
+
+Please test this patch:
+http://repo.or.cz/w/qemu/stefanha.git/commitdiff/c405d1b66e045bce1c53a30f9ad840c6f19eca57
+
+QEMU loads checksum offload flags from every tx data descriptor.  When a
+multi-descriptor packet is sent, Solaris will only mark the first
+descriptor with checksum offload flags.  Therefore QEMU fails to perform
+checksum offload resulting in corrupted packets that will be discarded
+by the receiver.
+
+I'll try to come up with a proper fix that can be submitted to QEMU.
+
+The PCI/PCI-X Family of Gigabit Ethernet Controllers Software
+Developer’s Manual states the following about the POPTS field:
+
+  Provides a number of options which control the handling of this
+  packet.  This field is ignored except on the first data descriptor of
+  a packet.
+
+The current implementation always loads the field and its checksum
+offload flags.  This patch uses only the first descriptor's POPTS field
+in order to comply with the specification.
+
+When Solaris sends multi-descriptor packets it fills in POPTS for the
+first descriptor only.  Therefore this patch is necessary in order to
+perform checksum offload correctly for multi-descriptor packets.
+
+Reported-by: Daniel Pecka <email address hidden>
+Reported-by: geppz <email address hidden>
+Signed-off-by: Stefan Hajnoczi <email address hidden>
+---
+ hw/e1000.c |    4 +++-
+ 1 files changed, 3 insertions(+), 1 deletions(-)
+
+diff --git a/hw/e1000.c b/hw/e1000.c
+index 0a4574c..2a4d5c7 100644
+--- a/hw/e1000.c
++++ b/hw/e1000.c
+@@ -446,7 +446,9 @@ process_tx_desc(E1000State *s, struct e1000_tx_desc *dp)
+         return;
+     } else if (dtype == (E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D)) {
+         // data descriptor
+-        tp->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
++        if (tp->size == 0) {
++            tp->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
++        }
+         tp->cptse = ( txd_lower & E1000_TXD_CMD_TSE ) ? 1 : 0;
+     } else {
+         // legacy descriptor
+-- 
+1.7.2.3
+
+
+
+Stefan, thanks for your work.
+
+I tested your patch in comment #29 and it does seem to solve the problem for me for latest openindiana and also for latest nexenta core. 
+
+Also I checked vanilla rtl8139 and it seems to work for openindiana on qemu-kvm-0.14.0 (with 0.13.0 I think I had problems).
+
+Thanks for putting me as reported-by on the patch, but that's not my real name or address I'd like to be on the patch... actually I thought I had set launchpad to keep me anonymous and keep email address hidden (where's that option now...) 
+
+I have just sent an email at your linux.vnet address with real data. If you can, please use that during official submission of the patch. Thank you.
+
+The PCI/PCI-X Family of Gigabit Ethernet Controllers Software
+Developer’s Manual states the following about the POPTS field:
+
+  Provides a number of options which control the handling of this
+  packet.  This field is ignored except on the first data descriptor of
+  a packet.
+
+The current implementation always loads the field and its checksum
+offload flags.  This patch uses only the first descriptor's POPTS field
+in order to comply with the specification.
+
+When Solaris sends multi-descriptor packets it fills in POPTS for the
+first descriptor only.  Therefore this patch is necessary in order to
+perform checksum offload correctly for multi-descriptor packets.
+
+Reported-by: Daniel Pecka <email address hidden>
+Reported-by: Gabriele A. Trombetti <email address hidden>
+Signed-off-by: Stefan Hajnoczi <email address hidden>
+---
+v2:
+ * Fix Reported-by: details
+
+ hw/e1000.c |    4 +++-
+ 1 files changed, 3 insertions(+), 1 deletions(-)
+
+diff --git a/hw/e1000.c b/hw/e1000.c
+index 0a4574c..2a4d5c7 100644
+--- a/hw/e1000.c
++++ b/hw/e1000.c
+@@ -446,7 +446,9 @@ process_tx_desc(E1000State *s, struct e1000_tx_desc *dp)
+         return;
+     } else if (dtype == (E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D)) {
+         // data descriptor
+-        tp->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
++        if (tp->size == 0) {
++            tp->sum_needed = le32_to_cpu(dp->upper.data) >> 8;
++        }
+         tp->cptse = ( txd_lower & E1000_TXD_CMD_TSE ) ? 1 : 0;
+     } else {
+         // legacy descriptor
+-- 
+1.7.2.3
+
+
+
+I have this problem (as describe in OP) on a Solaris 11.2 install using the text iso.  Archlinux Qemu 2.1.0.  It appears that the above patch has been applied to qemu for some time now (its also in my version).
+
+Are there any new workarounds?
+
+On Sun, Oct 5, 2014 at 9:57 PM, dblade <email address hidden> wrote:
+> I have this problem (as describe in OP) on a Solaris 11.2 install using
+> the text iso.  Archlinux Qemu 2.1.0.  It appears that the above patch
+> has been applied to qemu for some time now (its also in my version).
+>
+> Are there any new workarounds?
+
+Hi,
+It's been a long time since that fix was developed.
+
+At this point it would be necessary to debug the problem from scratch.
+I don't have time to work on this in the near future, sorry.
+
+Maybe someone else wants to figure out what is wrong.
+
+Stefan
+
+
+apparently it has something to do with x2apic.  simply refining my cpu line to be -cpu kvm64,-x2apic leads to a working network.
+
+source of inspiration: http://forum.proxmox.com/threads/15850-Solaris-10-Guest-no-network-traffic-after-upgrade-to-proxmox-3-1
+
+
+
+
+See also bug #1395217
+
+See the following bug report for a working Solaris 10 KVM guest configuration:
+https://bugzilla.redhat.com/show_bug.cgi?id=1262093
+
+Based on comment #30, it sounds like the original problem of this bug has been fixed, and since the remaining apic-related problem is tracked in ticket #1395217 already, I think we can close this bug now (if you don't agree, feel free to open this ticket again).
+

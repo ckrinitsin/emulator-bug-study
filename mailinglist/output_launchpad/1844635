@@ -1,0 +1,143 @@
+qemu bug where load linux kernel
+
+i found a qemu bug ,when the qemu start and parse the kernel file .
+
+This vulnerability can be exploited.
+
+thanks
+
+/****
+
+
+(gdb) set args -nodefaults -device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 -vnc none -serial stdio -device pci-testdev -machine accel=kvm -m 2048  -smp 2 -cpu host -machine kernel_irqchip=split -kernel poc1
+(gdb) r
+Starting program: /usr/bin/qemu-system-x86_64 -nodefaults -device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 -vnc none -serial stdio -device pci-testdev -machine accel=kvm -m 2048  -smp 2 -cpu host -machine kernel_irqchip=split -kernel ./poc/poc1
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7fffe9a03700 (LWP 30066)]
+[New Thread 0x7fffe9202700 (LWP 30068)]
+[New Thread 0x7fffe8a01700 (LWP 30069)]
+
+Thread 1 "qemu-system-x86" received signal SIGSEGV, Segmentation fault.
+__memmove_avx_unaligned_erms () at ../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:249
+249	../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S: No such file or directory.
+(gdb) bt
+#0  0x00007ffff2390b1f in __memmove_avx_unaligned_erms () at ../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:249
+#1  0x00005555559ebdcf in rom_copy ()
+#2  0x00005555558dd1b3 in load_multiboot ()
+#3  0x00005555558de1c3 in  ()
+#4  0x00005555558e19d1 in pc_memory_init ()
+#5  0x00005555558e4ee3 in  ()
+#6  0x00005555559e8500 in machine_run_board_init ()
+#7  0x0000555555834959 in main ()
+(gdb) c
+Continuing.
+Couldn't get registers: No such process.
+Couldn't get registers: No such process.
+(gdb) [Thread 0x7fffe8a01700 (LWP 30069) exited]
+[Thread 0x7fffe9202700 (LWP 30068) exited]
+[Thread 0x7fffe9a03700 (LWP 30066) exited]
+
+Program terminated with signal SIGSEGV, Segmentation fault.
+The program no longer exists.
+
+***/
+
+
+
+bug reason and how to fix it
+/*
+ * Copies memory from registered ROMs to dest. Any memory that is contained in
+ * a ROM between addr and addr + size is copied. Note that this can involve
+ * multiple ROMs, which need not start at addr and need not end at addr + size.
+ */
+int rom_copy(uint8_t *dest, hwaddr addr, size_t size)
+{
+    hwaddr end = addr + size;
+    uint8_t *s, *d = dest;
+    size_t l = 0;
+    Rom *rom;
+
+    QTAILQ_FOREACH(rom, &roms, next) {
+        if (rom->fw_file) {
+            continue;
+        }
+        if (rom->mr) {
+            continue;
+        }
+        if (rom->addr + rom->romsize < addr) {
+            continue;
+        }
+        if (rom->addr > end) {
+            break;
+        }
+
+        d = dest + (rom->addr - addr);
+        s = rom->data;
+        l = rom->datasize;
+
+        if ((d + l) > (dest + size)) {
+            l = dest - d;
+        }
+
+        if (l > 0) {
+            memcpy(d, s, l);  //*****crash here  how to fix check the size l.******//
+        }
+
+        if (rom->romsize > rom->datasize) {
+            /* If datasize is less than romsize, it means that we didn't
+             * allocate all the ROM because the trailing data are only zeros.
+             */
+
+            d += l;
+            l = rom->romsize - rom->datasize;
+
+            if ((d + l) > (dest + size)) {
+                /* Rom size doesn't fit in the destination area. Adjust to avoid
+                 * overflow.
+                 */
+                l = dest - d;
+            }
+
+            if (l > 0) {
+                memset(d, 0x0, l);
+            }
+        }
+    }
+
+    return (d + l) - dest;
+}
+
+I can't reproduce the issue with your "poc" binary here. Which version of QEMU were you exactly using? Can you reproduce it with the latest version from the master branch?
+
+Also there is already a size check some lines earlier:
+
+        if ((d + l) > (dest + size)) {
+            l = dest - d;
+        }
+
+Isn't that sufficient?
+
+Also please explain how this vulnerability could be exploited? The code patch is not triggered by the guest, is it?
+
+hi ,
+
+        if ((d + l) > (dest + size)) {
+            l = dest - d;
+        }
+the l will be a very big Unsigned number.
+ 
+the check was bypassed,try the new poc . i  reproduce it with the latest
+version on ubuntu . (apt install qemu , i got the latest version)
+
+hi Thomas,please try the new poc.
+thanks 
+
+Thanks a lot! With the new poc, I was able to reproduce the crash.
+I've forwarded the information to the QEMU security team (next time, it would be great if you could do that directly, see https://wiki.qemu.org/SecurityProcess for details), and after some discussion about the severity of the bug, I've now posted a patch to the mailing:
+
+ https://lists.gnu.org/archive/html/qemu-devel/2019-09/msg05960.html
+
+Fix has been merged:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=e423455c4f23a1a8
+

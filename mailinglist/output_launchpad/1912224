@@ -1,0 +1,371 @@
+qemu may freeze during drive-mirroring on fragmented FS
+
+
+We have odd behavior in operation where qemu freeze during long
+seconds, We started an thread about that issue here:
+https://lists.gnu.org/archive/html/qemu-devel/2020-11/msg05623.html
+
+It happens at least during openstack nova snapshot (qemu blockdev-mirror)
+or live block migration(which include network copy of disk).
+
+After further troubleshoots, it seems related to FS fragmentation on host.
+
+reproducible at least on:
+Ubuntu 18.04.3/4.18.0-25-generic/qemu-4.0
+Ubuntu 16.04.6/5.10.6/qemu-5.2.0-rc2
+
+# Lets create a dedicated file system on a SSD/Nvme 60GB disk in my case:
+$sudo mkfs.ext4 /dev/sda3
+$sudo mount /dev/sda3 /mnt
+$df -h /mnt
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda3         59G   53M   56G   1% /mnt
+
+#Create a fragmented disk on it using 2MB Chunks (about 30min):
+$sudo python3 create_fragged_disk.py /mnt 2
+Filling up FS by Creating chunks files in:  /mnt/chunks
+We are probably full as expected!!:  [Errno 28] No space left on device
+Creating fragged disk file:  /mnt/disk
+
+$ls -lhs 
+59G -rw-r--r-- 1 root root 59G Jan 15 14:08 /mnt/disk
+
+$ sudo e4defrag -c /mnt/disk
+ Total/best extents                             41971/30
+ Average size per extent                        1466 KB
+ Fragmentation score                            2
+ [0-30 no problem: 31-55 a little bit fragmented: 56- needs defrag]
+ This file (/mnt/disk) does not need defragmentation.
+ Done.
+
+# the tool^^^ says it is not enough fragmented to be able to defrag.
+
+#Inject an image on fragmented disk
+sudo chown ubuntu /mnt/disk
+wget https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
+qemu-img convert -O raw  bionic-server-cloudimg-amd64.img \
+                         bionic-server-cloudimg-amd64.img.raw
+dd conv=notrunc iflag=fullblock if=bionic-server-cloudimg-amd64.img.raw \
+                of=/mnt/disk bs=1M
+virt-customize -a /mnt/disk --root-password password:xxxx
+
+# logon run console activity ex: ping -i 0.3 127.0.0.1
+$qemu-system-x86_64 -m 2G -enable-kvm  -nographic \
+    -chardev socket,id=test,path=/tmp/qmp-monitor,server,nowait \
+    -mon chardev=test,mode=control \
+    -drive file=/mnt/disk,format=raw,if=none,id=drive-virtio-disk0,cache=none,discard\
+    -device virtio-blk-pci,scsi=off,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on
+
+$sync
+$echo 3 | sudo tee -a /proc/sys/vm/drop_caches
+
+#start drive-mirror via qmp on another SSD/nvme partition
+nc -U /tmp/qmp-monitor
+{"execute":"qmp_capabilities"}
+{"execute":"drive-mirror","arguments":{"device":"drive-virtio-disk0","target":"/home/ubuntu/mirror","sync":"full","format":"qcow2"}}
+^^^ qemu console may start to freeze at this step.
+
+NOTE:
+ - smaller chunk sz and bigger disk size the worst it is.
+   In operation we also have issue on 400GB disk size with average 13MB/extent
+ - Reproducible also on xfs
+
+
+Expected behavior:
+-------------------
+QEMU should remain steady, eventually only have decrease storage Performance
+or mirroring, because of fragmented fs.
+
+Observed behavior:
+-------------------
+Perf of mirroring is still quite good even on fragmented FS,
+but it breaks qemu.
+
+
+######################  create_fragged_disk.py ############
+import sys
+import os
+import tempfile
+import glob
+import errno
+
+MNT_DIR = sys.argv[1]
+CHUNK_SZ_MB = int(sys.argv[2])
+CHUNKS_DIR = MNT_DIR + '/chunks'
+DISK_FILE = MNT_DIR + '/disk'
+
+if not os.path.exists(CHUNKS_DIR):
+    os.makedirs(CHUNKS_DIR)
+
+with open("/dev/urandom", "rb") as f_rand:
+     mb_rand=f_rand.read(1024 * 1024)
+
+print("Filling up FS by Creating chunks files in: ",CHUNKS_DIR)
+try:
+    while True:
+        tp = tempfile.NamedTemporaryFile(dir=CHUNKS_DIR,delete=False)
+        for x in range(CHUNK_SZ_MB):
+            tp.write(mb_rand)
+        os.fsync(tp)
+        tp.close()
+except Exception as ex:
+    print("We are probably full as expected!!: ",ex)
+
+chunks = glob.glob(CHUNKS_DIR + '/*')
+
+print("Creating fragged disk file: ",DISK_FILE)
+with open(DISK_FILE, "w+b") as f_disk:
+    for chunk in chunks:
+        try:
+            os.unlink(chunk)
+            for x in range(CHUNK_SZ_MB):
+                f_disk.write(mb_rand)
+            os.fsync(f_disk)
+        except IOError as ex:
+            if ex.errno != errno.ENOSPC:
+                raise
+###########################################################3
+
+
+Seems a regression introduce in commit : (2.7.0)
+
+commit 0965a41e998ab820b5d660c8abfc8c819c97bc1b
+Author: Vladimir Sementsov-Ogievskiy <email address hidden>
+Date:   Thu Jul 14 20:19:01 2016 +0300
+
+	mirror: double performance of the bulk stage if the disc is full
+    
+	Mirror can do up to 16 in-flight requests, but actually on full copy
+	(the whole source disk is non-zero) in-flight is always 1. This happens
+	as the request is not limited in size: the data occupies maximum available
+	capacity of s->buf.
+    
+	The patch limits the size of the request to some artificial constant
+	(1 Mb here), which is not that big or small. This effectively enables
+	back parallelism in mirror code as it was designed.
+    
+	The result is important: the time to migrate 10 Gb disk is reduced from
+	~350 sec to 170 sec.
+
+If I revert this commit on master on top of (fef80ea073c48) (minor conflicts) issue disappears.
+
+on a fragmented file (average size per exent 2125 KB) of 58GB:
+upstream             207s (285 MB/s) instance is broken during mirroring
+upstream with revert 225s (262 MB/s) instance is fine.
+
+not fully tested, but the patch probably improve perf in other cases
+(as disccuss in git message), maybe just need to improve to avoid the freeze?
+
+Another test that confirm the perf drop after the revert,
+
+live-migration of disk of 51GB (raw written data, without hole)
+between two host with nvme disk, 10Gb/s connectivity:
+
+master qemu                     1m14s  (737 MB/s)
+master qemu with reverted patch 2m30s  (353 MB/s)
+
+I think the issue come from  SEEK_HOLE call.
+SEEK_HOLE is fine until we find a hole close to the offset,
+It becomes a very expensive call when the HOLE is at the
+end of file of a big file (or smaller fragmented file 
+because there is a lot of FS extent the driver should check.)
+
+When we run a mirror on a 400GB raw file fully written (not fragmented):
+for each 1MB chunk we do:
+ mirror_iteration(MirrorBlockJob *s)
+   -> bdrv_block_status_above(..)
+      ... -> find_allocation (file-posix.c)
+	 -> offs = lseek(s->fd, start, SEEK_HOLE);
+
+In strace this result like this:
+[pid 105339] 17:41:05.548334 lseek(38, 0, SEEK_HOLE) = 429496729600 <0.015172>
+[pid 105339] 17:41:05.564798 lseek(38, 1048576, SEEK_HOLE) = 429496729600 <0.008762>
+[pid 105339] 17:41:05.576223 lseek(38, 2097152, SEEK_HOLE) = 429496729600 <0.006250>
+[pid 105339] 17:41:05.583299 lseek(38, 3145728, SEEK_HOLE) = 429496729600 <0.005511>
+[pid 105339] 17:41:05.589771 lseek(38, 4194304, SEEK_HOLE) = 429496729600 <0.005181>
+[pid 105339] 17:41:05.596390 lseek(38, 5242880, SEEK_HOLE) = 429496729600 <0.005829>
+[pid 105339] 17:41:05.603473 lseek(38, 6291456, SEEK_HOLE) = 429496729600 <0.005276>
+[pid 105339] 17:41:05.609833 lseek(38, 7340032, SEEK_HOLE) = 429496729600 <0.006089>
+
+^^ for each MB FS driver is going accross all file extent till the end of the file,
+ the qemu unstability comes from that.
+
+Maybe one way to fix that is to not run SEEK_HOLE at each iteration
+but run it only when needed.
+Some thing like adding a property in MirrorBlockJob like hole_offest,
+that store where is the last known offset where there is a hole.
+And pass it on find_allocation and evaluate the need
+to run SEEK_HOLE or not.
+
+Like this:
+typedef struct MirrorBlockJob {
+...
+   int64_t hole_offset; /* last known hole_offset during migration */
+}
+
+mirror_iteration(MirrorBlockJob *s)
+ -> bdrv_block_status_above(...., &s->hole_offset)
+   ...   
+   -> find_allocation (...., hole_offest)
+        evaluate offset and  hole_offest to run or not SEEK_HOLE.
+
+Note this involve adding an additional arg to bdrv_block_status_above(), and we need to update
+code for all driver.
+
+Is there a better way to fix that issue ?
+
+
+Hi,
+
+As I said on IRC, I’m not sure this additional block_status argument would be good, because the hole offset needs to be reset when the file is written to (at least on zero writes; if we additionally stored a data offset, then that would need to be reset on all writes).  Technically, mirror can do that, because all writes should go through it, but it doesn’t seem the right place to cache it there.  Furthermore, depending on how often writes occur, this cache may end up not doing much.
+
+We could place it in file-posix instead (i.e., it would store the last offset where SEEK_HOLE/DATA was invoked and the last offset that they returned, so if a block_status request comes in in that range, it can be answered without doing a SEEK_HOLE/DATA), but that might suffer from the same problem of having to invalidate the cache too often.
+
+Though OTOH, as I also admitted on IRC, perhaps we should just try and see what happens.
+
+
+As an afterthought, it might be cool to have file-posix use bitmaps to cache this status.  In the simplest case, we could have one bitmaps that tells whether the block status is known (0 = known, 1 = unknown); this bitmap is active, so that writes would automatically invalidate the affected blocks.  And then we have another bitmap that for the blocks of known status tells us whether they contain data or only zeroes.  This solution wouldn’t suffer from a complete cache invalidation on every write.
+
+(Fine-tuning it, we could instead have both bitmaps be inactive, so that file-posix itself needs to update them on writes, so that all writes would give their respective blocks a known status, with data writes making them contain data, and zero writes making them contain zeroes.)
+
+(Perhaps we could consider offering this as a GSoC project?)
+
+By the way, as a side note: I see you’re using raw, but qcow2 tries to avoid deferring the block-status call to file-posix (i.e., it tries to avoid SEEK_HOLE/DATA calls), because in most cases it knows from its own metadata which block are zero. So I would guess that with qcow2, the problem would not occur. Do you have any data on that?
+
+We don't have currently issue with qcow2 for now,
+In code it goes on different path:
+
+block/file-posix.c:3219:1:    .bdrv_co_block_status = raw_co_block_status,
+block/qcow2.c:5892:1: .bdrv_co_block_status = qcow2_co_block_status			 
+
+But when I run strace on qcow2 live migration I also see SEEK_HOLE/DATA
+I will do more test in same condition than raw instances.
+
+
+I’ve attached a patch to make file-posix cache the information about the last queried hole, does it help?
+
+It helps a lot, and it goes fast !
+
+live block migration of 400GB raw disk:
+master      1130s (362MB/s) qemu  unstable/frozen
+master+fix  445s  (920MB/s) qemu  stable
+
+Thanks Max, It will be nice to have this one merged.
+
+Some more data for Qcow2,
+
+Qcow2 format is not impacted by the issue because it
+does not do SEEK_DATA/HOLE at all, because as you said it knows
+from its own metadata.
+But qcow2 instances with a RAW backing file does..
+So qcow2 instances laverage also benefit of the patch,
+if they have big RAW backing file (or smaller but fragmented).
+Openstack default is RAW backing file for qcow2
+instance images_type.
+
+I made others test on local mirror:
+*57 GiB disk in on ssd, mirror file is on a nvme device
+*the disk is on fragmented file
+ (Average size per extent 2125 KB, nb_extent: 28495, ext4)
+*both qcow2 and raw test are run on the same fragmented file,
+ only content change(format/data).
+
+RESULTS
+master____ RAW_________ 203s 291MB/s qemu freeze
+master-fix RAW_________ 113s 523MB/s qemu stable (+56% perf)
+
+master____ QCOW2_______ 115s 505MB/s qemu stable
+master-fix QCOW2_______ 116s 505MB/s qemu stable
+
+master____ QCOW2-SML_BF 113s 523MB/s qemu stable (1)
+master-fix QCOW2-SML_BF 113s 523MB/s qemu stable (1)
+
+master____ QCOW2-BIG_BF 201s 294MB/s qemu freeze (2)
+master-fix QCOW2-BIG_BF 112s 523MB/s qemu stable (2) (+56% perf)
+
+
+(1) qcow2 disk with small RAW backing file (1.5GB)
+    big part of data are in qcow2 format
+
+(2) qcow2 disk with all data in RAW backing file (57GiB)
+
+Here are some stap metrics during test:
+(see script at the end)
+
+find_allocation: total count of qemu find_allocation calls
+iomap_seek_hole: count SEEK_HOLE (fs/iomap.c)
+iomap_apply: count file extent iomap (fs/iomap.c) 
+
+iomap_seek_hole loop iomap_apply calls on all file extent until
+it finds a hole or EOF, it can be 1 up to 28495 in worst case
+in the test file.
+
+
+master____ RAW_________ 203s 291MB/s qemu freeze
+find_allocation: 59139
+iomap_seek_hole: 59139 (each find_allocation call SEEK_HOLE)
+iomap_apply: 843330989 (this breaks qemu)
+master-fix RAW_________ 113s 523MB/s qemu stable (+56% perf)
+find_allocation: 59167
+iomap_seek_hole: 4 (hole cache hit 99.993%) 
+iomap_apply: 113286 (avg iomap_apply call per SEEK_HOLE: 28321)
+
+master____ QCOW2_______ 115s 505MB/s qemu stable
+find_allocation: 0
+iomap_seek_hole: 0
+iomap_apply: 0
+master-fix QCOW2_______ 116s 505MB/s qemu stable
+find_allocation: 0
+iomap_seek_hole: 0
+iomap_apply: 0
+
+master____ QCOW2-SML_BF 113s 523MB/s qemu stable (1)
+find_allocation: 1418
+iomap_seek_hole: 1297
+iomap_apply: 7297
+master-fix QCOW2-SML_BF 113s 523MB/s qemu stable (1)
+find_allocation: 1418
+iomap_seek_hole: 145  (hole cache hit 0.898%)
+iomap_apply: 794
+
+master____ QCOW2-BIG_BF 201s 294MB/s qemu freeze (2)
+find_allocation: 59133
+iomap_seek_hole: 59133
+iomap_apply: 843172534
+master-fix QCOW2-BIG_BF 112s 523MB/s qemu stable (2) (+56% perf)
+find_allocation: 59130
+iomap_seek_hole: 1 (hole cache hit 0.999%)
+iomap_apply: 28494
+
+################# seek_hole.stp ###############################
+global iomap_apply, iomap_seek_hole, find_allocation
+probe kernel.function("iomap_seek_hole").call {
+  if (pid() == target()) {
+    iomap_seek_hole ++
+  }
+}
+probe kernel.function("iomap_apply").call {
+  if (pid() == target()) {
+  iomap_apply  ++
+  }
+}
+probe process("/usr/bin/qemu-system-x86_64").function("find_allocation").call {
+  if (pid() == target()) {
+      find_allocation ++
+  }
+}
+probe end {
+ printf ("find_allocation: %d\niomap_seek_hole: %d\niomap_apply: %d\n",find_allocation, iomap_seek_hole, iomap_apply)
+}
+
+
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/307
+
+

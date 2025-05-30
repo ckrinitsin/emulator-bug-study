@@ -1,0 +1,339 @@
+[Bug Report][RFC PATCH 0/1] block: fix failing assert on paused VM migration
+
+There's a bug (failing assert) which is reproduced during migration of
+a paused VM.  I am able to reproduce it on a stand with 2 nodes and a common
+NFS share, with VM's disk on that share.
+
+root@fedora40-1-vm:~# virsh domblklist alma8-vm
+ Target   Source
+------------------------------------------
+ sda      /mnt/shared/images/alma8.qcow2
+
+root@fedora40-1-vm:~# df -Th /mnt/shared
+Filesystem          Type  Size  Used Avail Use% Mounted on
+127.0.0.1:/srv/nfsd nfs4   63G   16G   48G  25% /mnt/shared
+
+On the 1st node:
+
+root@fedora40-1-vm:~# virsh start alma8-vm ; virsh suspend alma8-vm
+root@fedora40-1-vm:~# virsh migrate --compressed --p2p --persistent 
+--undefinesource --live alma8-vm qemu+ssh://fedora40-2-vm/system
+
+Then on the 2nd node:
+
+root@fedora40-2-vm:~# virsh migrate --compressed --p2p --persistent 
+--undefinesource --live alma8-vm qemu+ssh://fedora40-1-vm/system
+error: operation failed: domain is not running
+
+root@fedora40-2-vm:~# tail -3 /var/log/libvirt/qemu/alma8-vm.log
+2024-09-19 13:53:33.336+0000: initiating migration
+qemu-system-x86_64: ../block.c:6976: int 
+bdrv_inactivate_recurse(BlockDriverState *): Assertion `!(bs->open_flags & 
+BDRV_O_INACTIVE)' failed.
+2024-09-19 13:53:42.991+0000: shutting down, reason=crashed
+
+Backtrace:
+
+(gdb) bt
+#0  0x00007f7eaa2f1664 in __pthread_kill_implementation () at /lib64/libc.so.6
+#1  0x00007f7eaa298c4e in raise () at /lib64/libc.so.6
+#2  0x00007f7eaa280902 in abort () at /lib64/libc.so.6
+#3  0x00007f7eaa28081e in __assert_fail_base.cold () at /lib64/libc.so.6
+#4  0x00007f7eaa290d87 in __assert_fail () at /lib64/libc.so.6
+#5  0x0000563c38b95eb8 in bdrv_inactivate_recurse (bs=0x563c3b6c60c0) at 
+../block.c:6976
+#6  0x0000563c38b95aeb in bdrv_inactivate_all () at ../block.c:7038
+#7  0x0000563c3884d354 in qemu_savevm_state_complete_precopy_non_iterable 
+(f=0x563c3b700c20, in_postcopy=false, inactivate_disks=true)
+    at ../migration/savevm.c:1571
+#8  0x0000563c3884dc1a in qemu_savevm_state_complete_precopy (f=0x563c3b700c20, 
+iterable_only=false, inactivate_disks=true) at ../migration/savevm.c:1631
+#9  0x0000563c3883a340 in migration_completion_precopy (s=0x563c3b4d51f0, 
+current_active_state=<optimized out>) at ../migration/migration.c:2780
+#10 migration_completion (s=0x563c3b4d51f0) at ../migration/migration.c:2844
+#11 migration_iteration_run (s=0x563c3b4d51f0) at ../migration/migration.c:3270
+#12 migration_thread (opaque=0x563c3b4d51f0) at ../migration/migration.c:3536
+#13 0x0000563c38dbcf14 in qemu_thread_start (args=0x563c3c2d5bf0) at 
+../util/qemu-thread-posix.c:541
+#14 0x00007f7eaa2ef6d7 in start_thread () at /lib64/libc.so.6
+#15 0x00007f7eaa373414 in clone () at /lib64/libc.so.6
+
+What happens here is that after 1st migration BDS related to HDD remains
+inactive as VM is still paused.  Then when we initiate 2nd migration,
+bdrv_inactivate_all() leads to the attempt to set BDRV_O_INACTIVE flag
+on that node which is already set, thus assert fails.
+
+Attached patch which simply skips setting flag if it's already set is more
+of a kludge than a clean solution.  Should we use more sophisticated logic
+which allows some of the nodes be in inactive state prior to the migration,
+and takes them into account during bdrv_inactivate_all()?  Comments would
+be appreciated.
+
+Andrey
+
+Andrey Drobyshev (1):
+  block: do not fail when inactivating node which is inactive
+
+ block.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+-- 
+2.39.3
+
+Instead of throwing an assert let's just ignore that flag is already set
+and return.  We assume that it's going to be safe to ignore.  Otherwise
+this assert fails when migrating a paused VM back and forth.
+
+Ideally we'd like to have a more sophisticated solution, e.g. not even
+scan the nodes which should be inactive at this point.
+
+Signed-off-by: Andrey Drobyshev <andrey.drobyshev@virtuozzo.com>
+---
+ block.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/block.c b/block.c
+index 7d90007cae..c1dcf906d1 100644
+--- a/block.c
++++ b/block.c
+@@ -6973,7 +6973,15 @@ static int GRAPH_RDLOCK 
+bdrv_inactivate_recurse(BlockDriverState *bs)
+         return 0;
+     }
+ 
+-    assert(!(bs->open_flags & BDRV_O_INACTIVE));
++    if (bs->open_flags & BDRV_O_INACTIVE) {
++        /*
++         * Return here instead of throwing assert as a workaround to
++         * prevent failure on migrating paused VM.
++         * Here we assume that if we're trying to inactivate BDS that's
++         * already inactive, it's safe to just ignore it.
++         */
++        return 0;
++    }
+ 
+     /* Inactivate this node */
+     if (bs->drv->bdrv_inactivate) {
+-- 
+2.39.3
+
+[add migration maintainers]
+
+On 24.09.24 15:56, Andrey Drobyshev wrote:
+Instead of throwing an assert let's just ignore that flag is already set
+and return.  We assume that it's going to be safe to ignore.  Otherwise
+this assert fails when migrating a paused VM back and forth.
+
+Ideally we'd like to have a more sophisticated solution, e.g. not even
+scan the nodes which should be inactive at this point.
+
+Signed-off-by: Andrey Drobyshev <andrey.drobyshev@virtuozzo.com>
+---
+  block.c | 10 +++++++++-
+  1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/block.c b/block.c
+index 7d90007cae..c1dcf906d1 100644
+--- a/block.c
++++ b/block.c
+@@ -6973,7 +6973,15 @@ static int GRAPH_RDLOCK 
+bdrv_inactivate_recurse(BlockDriverState *bs)
+          return 0;
+      }
+-    assert(!(bs->open_flags & BDRV_O_INACTIVE));
++    if (bs->open_flags & BDRV_O_INACTIVE) {
++        /*
++         * Return here instead of throwing assert as a workaround to
++         * prevent failure on migrating paused VM.
++         * Here we assume that if we're trying to inactivate BDS that's
++         * already inactive, it's safe to just ignore it.
++         */
++        return 0;
++    }
+/* Inactivate this node */
+if (bs->drv->bdrv_inactivate) {
+I doubt that this a correct way to go.
+
+As far as I understand, "inactive" actually means that "storage is not belong to 
+qemu, but to someone else (another qemu process for example), and may be changed 
+transparently". In turn this means that Qemu should do nothing with inactive disks. So the 
+problem is that nobody called bdrv_activate_all on target, and we shouldn't ignore that.
+
+Hmm, I see in process_incoming_migration_bh() we do call bdrv_activate_all(), 
+but only in some scenarios. May be, the condition should be less strict here.
+
+Why we need any condition here at all? Don't we want to activate block-layer on 
+target after migration anyway?
+
+--
+Best regards,
+Vladimir
+
+On 9/30/24 12:25 PM, Vladimir Sementsov-Ogievskiy wrote:
+>
+[add migration maintainers]
+>
+>
+On 24.09.24 15:56, Andrey Drobyshev wrote:
+>
+> [...]
+>
+>
+I doubt that this a correct way to go.
+>
+>
+As far as I understand, "inactive" actually means that "storage is not
+>
+belong to qemu, but to someone else (another qemu process for example),
+>
+and may be changed transparently". In turn this means that Qemu should
+>
+do nothing with inactive disks. So the problem is that nobody called
+>
+bdrv_activate_all on target, and we shouldn't ignore that.
+>
+>
+Hmm, I see in process_incoming_migration_bh() we do call
+>
+bdrv_activate_all(), but only in some scenarios. May be, the condition
+>
+should be less strict here.
+>
+>
+Why we need any condition here at all? Don't we want to activate
+>
+block-layer on target after migration anyway?
+>
+Hmm I'm not sure about the unconditional activation, since we at least
+have to honor LATE_BLOCK_ACTIVATE cap if it's set (and probably delay it
+in such a case).  In current libvirt upstream I see such code:
+
+>
+/* Migration capabilities which should always be enabled as long as they
+>
+>
+* are supported by QEMU. If the capability is supposed to be enabled on both
+>
+>
+* sides of migration, it won't be enabled unless both sides support it.
+>
+>
+*/
+>
+>
+static const qemuMigrationParamsAlwaysOnItem qemuMigrationParamsAlwaysOn[] =
+>
+{
+>
+>
+{QEMU_MIGRATION_CAP_PAUSE_BEFORE_SWITCHOVER,
+>
+>
+QEMU_MIGRATION_SOURCE},
+>
+>
+>
+>
+{QEMU_MIGRATION_CAP_LATE_BLOCK_ACTIVATE,
+>
+>
+QEMU_MIGRATION_DESTINATION},
+>
+>
+};
+which means that libvirt always wants LATE_BLOCK_ACTIVATE to be set.
+
+The code from process_incoming_migration_bh() you're referring to:
+
+>
+/* If capability late_block_activate is set:
+>
+>
+* Only fire up the block code now if we're going to restart the
+>
+>
+* VM, else 'cont' will do it.
+>
+>
+* This causes file locking to happen; so we don't want it to happen
+>
+>
+* unless we really are starting the VM.
+>
+>
+*/
+>
+>
+if (!migrate_late_block_activate() ||
+>
+>
+(autostart && (!global_state_received() ||
+>
+>
+runstate_is_live(global_state_get_runstate())))) {
+>
+>
+/* Make sure all file formats throw away their mutable metadata.
+>
+>
+>
+* If we get an error here, just don't restart the VM yet. */
+>
+>
+bdrv_activate_all(&local_err);
+>
+>
+if (local_err) {
+>
+>
+error_report_err(local_err);
+>
+>
+local_err = NULL;
+>
+>
+autostart = false;
+>
+>
+}
+>
+>
+}
+It states explicitly that we're either going to start VM right at this
+point if (autostart == true), or we wait till "cont" command happens.
+None of this is going to happen if we start another migration while
+still being in PAUSED state.  So I think it seems reasonable to take
+such case into account.  For instance, this patch does prevent the crash:
+
+>
+diff --git a/migration/migration.c b/migration/migration.c
+>
+index ae2be31557..3222f6745b 100644
+>
+--- a/migration/migration.c
+>
++++ b/migration/migration.c
+>
+@@ -733,7 +733,8 @@ static void process_incoming_migration_bh(void *opaque)
+>
+*/
+>
+if (!migrate_late_block_activate() ||
+>
+(autostart && (!global_state_received() ||
+>
+-            runstate_is_live(global_state_get_runstate())))) {
+>
++            runstate_is_live(global_state_get_runstate()))) ||
+>
++         (!autostart && global_state_get_runstate() == RUN_STATE_PAUSED)) {
+>
+/* Make sure all file formats throw away their mutable metadata.
+>
+* If we get an error here, just don't restart the VM yet. */
+>
+bdrv_activate_all(&local_err);
+What are your thoughts on it?
+
+Andrey
+

@@ -1,0 +1,171 @@
+Passing a directory to (eg.) -cdrom results in misleading error message
+
+For example:
+
+    qemu-system-x86_64 -cdrom /path/to/directory
+
+Results in:
+
+    Could not read image for determining its format: File too large
+
+Yep, can repeat it here, it seems pretty random which error it gives:
+
+[dgilbert@dgilbert-t530 try]$ ./x86_64-softmmu/qemu-system-x86_64 -cdrom /tmp
+qemu-system-x86_64: -cdrom /tmp: Could not refresh total sector count: Invalid argument
+[dgilbert@dgilbert-t530 try]$ ./x86_64-softmmu/qemu-system-x86_64 -cdrom /var
+qemu-system-x86_64: -cdrom /var: Could not read image for determining its format: File too large
+
+
+
+
+On 12/20/2017 05:31 AM, Dr. David Alan Gilbert wrote:
+> Yep, can repeat it here, it seems pretty random which error it gives:
+> 
+> [dgilbert@dgilbert-t530 try]$ ./x86_64-softmmu/qemu-system-x86_64 -cdrom /tmp
+> qemu-system-x86_64: -cdrom /tmp: Could not refresh total sector count: Invalid argument
+> [dgilbert@dgilbert-t530 try]$ ./x86_64-softmmu/qemu-system-x86_64 -cdrom /var
+> qemu-system-x86_64: -cdrom /var: Could not read image for determining its format: File too large
+> 
+> 
+> ** Changed in: qemu
+>        Status: New => Confirmed
+> 
+
+Looks like directories play funny games.
+
+Probably seems to be ultimately that bs->total_sectors gets set to a
+very silly and large value, which later on will fail the format probing
+because bdrv_getlength refuses to play nice with such a stupidly large
+value:
+
+    ret = ret > INT64_MAX / BDRV_SECTOR_SIZE ? -EFBIG : ret;
+    return ret < 0 ? ret : ret * BDRV_SECTOR_SIZE;
+
+but the real villain is down here, when we add the "file" to to a raw
+posix file bs for the hopes of probing it.
+
+#0  0x0000555555be7e2e in raw_getlength (bs=0x555556b23bb0) at
+/home/bos/jhuston/src/qemu/block/file-posix.c:1964
+#1  0x0000555555b81630 in refresh_total_sectors (bs=0x555556b23bb0,
+hint=0) at /home/bos/jhuston/src/qemu/block.c:733
+#2  0x0000555555b82490 in bdrv_open_driver (bs=0x555556b23bb0,
+drv=0x555556541420 <bdrv_file>, node_name=0x0, options=0x555556b28090,
+open_flags=16384, errp=0x7fffffffda80) at
+/home/bos/jhuston/src/qemu/block.c:1162
+#3  0x0000555555b82d67 in bdrv_open_common (bs=0x555556b23bb0, file=0x0,
+options=0x555556b28090, errp=0x7fffffffda80)
+    at /home/bos/jhuston/src/qemu/block.c:1404
+#4  0x0000555555b8578f in bdrv_open_inherit (filename=0x555556b143a0
+"/media/ext/", reference=0x0, options=0x555556b28090, flags=32768,
+parent=0x555556b1d6b0, child_role=0x5555563b04a0 <child_file>,
+errp=0x7fffffffdbe0) at /home/bos/jhuston/src/qemu/block.c:2628
+#5  0x0000555555b84d10 in bdrv_open_child_bs (filename=0x555556b143a0
+"/media/ext/", options=0x555556b21a60, bdref_key=0x555555e55712 "file",
+parent=0x555556b1d6b0, child_role=0x5555563b04a0 <child_file>,
+allow_none=true, errp=0x7fffffffdbe0) at
+/home/bos/jhuston/src/qemu/block.c:2324
+#6  0x0000555555b85594 in bdrv_open_inherit (filename=0x555556b143a0
+"/media/ext/", reference=0x0, options=0x555556b21a60, flags=0,
+parent=0x0, child_role=0x0, errp=0x7fffffffdef0) at
+/home/bos/jhuston/src/qemu/block.c:2576
+#7  0x0000555555b85b10 in bdrv_open (filename=0x555556b143a0
+"/media/ext/", reference=0x0, options=0x555556b1b280, flags=0,
+errp=0x7fffffffdef0)
+    at /home/bos/jhuston/src/qemu/block.c:2710
+#8  0x0000555555bdd428 in blk_new_open (filename=0x555556b143a0
+"/media/ext/", reference=0x0, options=0x555556b1b280, flags=0,
+errp=0x7fffffffdef0) at /home/bos/jhuston/src/qemu/block/block-backend.c:323
+#9  0x0000555555911a60 in blockdev_init (file=0x555556b143a0
+"/media/ext/", bs_opts=0x555556b1b280, errp=0x7fffffffdef0)
+    at /home/bos/jhuston/src/qemu/blockdev.c:587
+
+
+specifically:
+
+(gdb) s
+1963	    size = lseek(s->fd, 0, SEEK_END);
+(gdb) s
+1964	    if (size < 0) {
+(gdb) print size
+$37 = 9223372036854775807
+
+cool, cool, cool. This value is 0x7fffffffffffffff and errno isn't set.
+cool and good function.
+
+so, lseek on a folder returns crazy nonsense. Perhaps we ought to
+actually specifically disallow folders, we don't appear to.
+
+Learned something today.
+
+--js
+
+
+
+
+On 01/31/2018 01:36 PM, Michal Suchánek wrote:
+> On Wed, 20 Dec 2017 21:57:00 -0500
+> John Snow <email address hidden> wrote:
+> 
+>> On 12/20/2017 05:31 AM, Dr. David Alan Gilbert wrote:
+>>> Yep, can repeat it here, it seems pretty random which error it
+>>> gives:
+>>>
+>>> [dgilbert@dgilbert-t530 try]$ ./x86_64-softmmu/qemu-system-x86_64
+>>> -cdrom /tmp qemu-system-x86_64: -cdrom /tmp: Could not refresh
+>>> total sector count: Invalid argument [dgilbert@dgilbert-t530
+>>> try]$ ./x86_64-softmmu/qemu-system-x86_64 -cdrom /var
+>>> qemu-system-x86_64: -cdrom /var: Could not read image for
+>>> determining its format: File too large
+>>>
+>>>
+>>> ** Changed in: qemu
+>>>        Status: New => Confirmed
+>>>   
+>>
+>> Looks like directories play funny games.
+>>
+> 
+> ...
+> 
+>> specifically:
+>>
+>> (gdb) s
+>> 1963	    size = lseek(s->fd, 0, SEEK_END);
+>> (gdb) s
+>> 1964	    if (size < 0) {
+>> (gdb) print size
+>> $37 = 9223372036854775807
+>>
+>> cool, cool, cool. This value is 0x7fffffffffffffff and errno isn't
+>> set. cool and good function.
+> 
+> Indeed: The behavior of lseek() on devices which are incapable of
+> seeking is implementation-defined.
+> 
+>>
+>> so, lseek on a folder returns crazy nonsense. Perhaps we ought to
+>> actually specifically disallow folders, we don't appear to.
+> 
+> It probably returns -1 which it is supposed to do on error. It should
+> also set errno in that case, though.
+> 
+> So this is probably bug in the error handling code in lseek.
+> 
+> Thanks
+> 
+> Michal
+> 
+
+Thanks. It looks like we can't make stronger guarantees about the
+behavior of lseek, so I submitted a patch to ratchet down QEMU's
+acceptable file types:
+
+https://lists.gnu.org/archive/html/qemu-devel/2018-01/msg05055.html
+
+Thanks,
+--John
+
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=230ff73904e72dde2d7718c2
+

@@ -1,0 +1,157 @@
+qemu/kvm locks up when run 32bit userspace with 64bit kernel
+
+Applies to both qemu and qemu-kvm 1.0, but only when kernel is 64bit and userspace is 32bit, on x86.  Did not happen with previous released versions, such as 0.15.  Not all guests triggers this issue - so far, only (32bit) windows 7 guest shows it, but does that quite reliable: first boot of an old guest with new qemu (or qemu-kvm), windows finds a new CPU and suggests rebooting - hit "Reboot" and in a few seconds it will be locked up (including the monitor), with 100% CPU usage.  Killable with -9.
+
+Actually after trying to do lots of experiments and finally a git bisection, it turned out that the issue only affects qemu-kvm, not upstream qemu.  Bisection between qemu-kvm 0.15.0 and 1.0 lead to this commit:
+
+commit 145e11e840500e04a4d0a624918bb17596be19e9
+Merge: ce967f6 b195043
+Author: Avi Kivity <email address hidden>
+Date:   Wed Aug 10 12:06:58 2011 +0300
+
+    Merge commit 'b195043003d90ea4027ea01cc7a6c974ac915108' into upstream-merge
+    
+    * commit 'b195043003d90ea4027ea01cc7a6c974ac915108': (130 commits)
+   ...
+
+After which I'm stuck... ;)
+
+And some more info.  Debugging with gdb shows this:
+
+(gdb) info threads
+  Id   Target Id         Frame 
+  2    Thread 0xf6d4eb70 (LWP 28697) "qemu-system-x86" 0xf7711425 in __kernel_vsyscall ()
+* 1    Thread 0xf6f50700 (LWP 28694) "qemu-system-x86" 0xf7711425 in __kernel_vsyscall ()
+(gdb) bt
+#0  0xf7711425 in __kernel_vsyscall ()
+#1  0xf76d620a in __pthread_cond_wait (cond=0x840fa60, mutex=0x89e82f0)
+    at pthread_cond_wait.c:153
+#2  0x080e8bb5 in qemu_cond_wait (cond=0x840fa60, mutex=0x89e82f0)
+    at /build/kvm/git/qemu-thread-posix.c:113
+#3  0x08050c2e in run_on_cpu (env=0x9466460, 
+    func=0x8083ad0 <do_kvm_cpu_synchronize_state>, data=0x9466460)
+    at /build/kvm/git/cpus.c:715
+#4  0x08083b63 in kvm_cpu_synchronize_state (env=0x9466460)
+    at /build/kvm/git/kvm-all.c:927
+#5  0x0804faaa in cpu_synchronize_state (env=0x9466460)
+    at /build/kvm/git/kvm.h:173
+#6  0x0804fc3a in cpu_synchronize_all_states () at /build/kvm/git/cpus.c:94
+#7  0x080647ec in main_loop () at /build/kvm/git/vl.c:1421
+#8  0x0806974d in main (argc=17, argv=0xff996e04, envp=0xff996e4c)
+    at /build/kvm/git/vl.c:3395
+(gdb) frame 2
+#2  0x080e8bb5 in qemu_cond_wait (cond=0x840fa60, mutex=0x89e82f0)
+    at /build/kvm/git/qemu-thread-posix.c:113
+113	    err = pthread_cond_wait(&cond->cond, &mutex->lock);
+(gdb) 
+(gdb) thread 2
+[Switching to thread 2 (Thread 0xf6d4eb70 (LWP 28697))]
+#0  0xf7711425 in __kernel_vsyscall ()
+(gdb) bt
+#0  0xf7711425 in __kernel_vsyscall ()
+#1  0xf727ac89 in ioctl () at ../sysdeps/unix/syscall-template.S:82
+#2  0x08084004 in kvm_vcpu_ioctl (env=0x9466460, type=44672)
+    at /build/kvm/git/kvm-all.c:1090
+#3  0x08083cd8 in kvm_cpu_exec (env=0x9466460) at /build/kvm/git/kvm-all.c:976
+#4  0x08050f44 in qemu_kvm_cpu_thread_fn (arg=0x9466460)
+    at /build/kvm/git/cpus.c:806
+#5  0xf76d1c39 in start_thread (arg=0xf6d4eb70) at pthread_create.c:304
+#6  0xf728296e in clone () at ../sysdeps/unix/sysv/linux/i386/clone.S:130
+Backtrace stopped: Not enough registers or memory available to unwind further
+
+which is not entirely interesting, but:
+
+when exiting gdb (I attached it to a running process), the whole thing unfreezes and continue its work as usual, if no lockup ever occured -- ie, it is enough to attach gdb to a locked up process and quit gdb - enough to unfreeze it.  Also, when running under gdb, the lockup does not occur - I can reboot the guest at will any times, it all goes fine.  Once gdb is detached, reboot immediately results in a lockup again - which - again - can be "cured" by attaching and detaching gdb to the process.
+
+And one more correction for the original report.  When locked up, it does NOT use 100% CPU - CPU is 100% _idle_.
+
+On 12/04/2011 07:45 PM, Michael Tokarev wrote:
+> Actually after trying to do lots of experiments and finally a git
+> bisection, it turned out that the issue only affects qemu-kvm, not
+> upstream qemu.  Bisection between qemu-kvm 0.15.0 and 1.0 lead to this
+> commit:
+>
+> commit 145e11e840500e04a4d0a624918bb17596be19e9
+> Merge: ce967f6 b195043
+> Author: Avi Kivity <email address hidden>
+> Date:   Wed Aug 10 12:06:58 2011 +0300
+>
+>     Merge commit 'b195043003d90ea4027ea01cc7a6c974ac915108' into upstream-merge
+>     
+>     * commit 'b195043003d90ea4027ea01cc7a6c974ac915108': (130 commits)
+>    ...
+>
+> After which I'm stuck... ;)
+>
+
+32-on-64 doesn't build on Fedora due to glib2-devel.i686 conflicting
+with its x86_64 cousin, so I can't reproduce this.  Can you try
+bisecting this further?
+
+$ git tag M b195043003d90ea4027ea01cc7a6c974ac915108
+$ git bisect start M M^
+...
+$ git merge --no-commit M^
+[build and test]
+$ git merge --abort (or git checkout -f)
+$ git bisect [good|bad]
+
+if it happens that M^2 was the bad commit, you'll get a merge conflict. 
+In that case do
+
+$ git merge --abort
+$ git merge M
+
+(you'll just be testing M again, but it's good to verify)
+
+-- 
+error compiling committee.c: too many arguments to function
+
+
+
+I tried bisecting it today, again.  I think you did mean 145e11e840500e04a4d0a624918bb17596be19e9 as the "M" point (the large merge), not b195043003d90ea4027ea01cc7a6c974ac915108 (which is the first commit in that merge) ;)  Actually I did the same already, just didn't post to the bugreport.  But anyway.
+
+The first bad commit inside the merge which shows the bad behavour is:
+
+commit 68d100e905453ebbeea8e915f4f18a2bd4339fe8
+Author: Kevin Wolf <email address hidden>
+Date:   Thu Jun 30 17:42:09 2011 +0200
+
+    qcow2: Use coroutines
+
+Note: the issue happens only with qcow2 being in use so far, directly or indirectly with -snapshot.
+
+Also note that it only happens within kvm tree, ie:
+
+ git checkout 68d100e905453ebbeea8e915f4f18a2bd4339fe8
+ git merge --no-commit 145e11e840500e04a4d0a624918bb17596be19e9^  # the pre-merge point
+
+I tried to debug it further but without much success.
+
+I'm attaching an strace the above source (with a few debug fprintf(stderr)s added into qcow2 source around lock/unlock calls) running winXP guest from point where I hit "Reboot" button and up to the point where it stalls.  Search for "qcow2: mutex_unlock" from the _end_ of the file.
+
+What I also observed is -- it looks like it merely loses an interrupt somewere, it is enough to Ctrl+Z/fg it or to attach/detach strace to the process for it to "unstuck" and continue executing.  Attaching gdb also makes it unstuck as demonstrated initially.
+
+This qcow2 commit may actually be innocent: it just started using coroutines, and that's where the bug/problem might be, say, 64bit kernel gets confused by the process switching stack for example?  I dunno.
+
+Note again that switching to alternative coroutine implementations makes the issue go away.  Ie, it only happens with mkcontext&Co coroutine implementation, and the commit which git bisect found to be "guilty" is the one which makes usage of coroutines.
+
+
+After some more digging I found out that qemu also has this very issue, but it happens a bit differently.  In particular, this very same winXP test guest freezes in upstream qemu with -enable-kvm on _shutdown_, not on restart.  In qemu-kvm it happens on restart but not on shutdown.
+
+And bisecting plain qemu leads to this commit:
+
+commit 12d4536f7d911b6d87a766ad7300482ea663cea2
+Author: Anthony Liguori <email address hidden>
+Date:   Mon Aug 22 08:24:58 2011 -0500
+
+    main: force enabling of I/O thread
+    
+As far as I remember, qemu-kvm always had iothread enabled, that's why the bug initially was only reproducible on qemu-kvm.
+
+Forgot to mention: tcg appears to be unaffected - so far anyway.
+
+The bug in Debian has been marked as "Fix released", so I assume this has been fixed in upstream QEMU, too? Or is there still anything left to do here?
+
+Since the debian bug has been marked as fixed and there wasn't any response to the question in my last comment, I assume this has been fixed in upstream QEMU, too. So closing this ticket accordingly...
+

@@ -1,0 +1,164 @@
+qemu-user-static for armhf: segfault in threaded code
+
+
+Currently running QEMU from git (fedf2de31023) and running the armhf version of qemu-user-static which I have renamed qemu-armhf-static to follow the naming convention used in Debian.
+
+The host systems is a Debian testing x86_64-linux and I have an Debian testing armhf chroot which I invoke using schroot.
+
+Majority of program in the armhf chroot run fine, but I'm getting qemu segfaults in multi-threaded programs.
+
+As an example, I've grabbed the threads demo program here:
+
+    https://computing.llnl.gov/tutorials/pthreads/samples/dotprod_mutex.c
+
+and changed NUMTHRDS from 4 to 10. I compile it as (same compile command on both x86_64 host and armhf guest):
+
+    gcc -Wall -lpthread dotprod_mutex.c -o dotprod_mutex
+
+When compiled for x86_64 host it runs perfectly and even under Valgrind displays no errors whatsoever.
+
+However, when I compile the program in my armhs chroot and run it it usually (but not always) segaults or hangs or crashes. Example output:
+
+
+    (armhf) $ ./dotprod_mutex
+    Thread 1 did 100000 to 200000:  mysum=100000.000000 global sum=100000.000000
+    Thread 0 did 0 to 100000:  mysum=100000.000000 global sum=200000.000000
+    TCG temporary leak before f6731ca0
+    qemu-arm-static: /home/erikd/Git/qemu-posix-timer-hacking/Upstream/tcg/tcg-op.h:2371:
+    tcg_gen_goto_tb: Assertion `(tcg_ctx.goto_tb_issue_mask & (1 << idx)) == 0' failed.
+
+
+    (armhf) $ ./dotprod_mutex
+    qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+    Segmentation fault
+
+    (armhf) $ ./dotprod_mutex
+    qemu-arm-static: /home/erikd/Git/qemu-posix-timer-hacking/Upstream/tcg/tcg.c:519:
+    tcg_temp_free_internal: Assertion `idx >= s->nb_globals && idx < s->nb_temps' failed.
+
+
+    (armhf) $ ./dotprod_mutex
+    Thread 1 did 100000 to 200000:  mysum=100000.000000 global sum=100000.000000
+    qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+    Segmentation fault
+
+I can also comple a purely static version of the test program in the armhf chroot using:
+
+    gcc -Wall -static -pthread dotprod_mutex.c -o dotprod-mutex-static
+
+and then run it simply using:
+
+    qemu-arm-static dotprod-mutex-static
+
+which fails just like it does in the chroot.
+
+Begining to think this is memory corruption because of the number of different failure modes. In addition to the crashes in the initial report I have also seen the following:
+
+
+    qemu: uncaught target signal 4 (Illegal instruction) - core dumped
+
+    More temporaries freed than allocated!
+    TCG temporary leak before 0001d1dc
+    
+    qemu-arm-static: /home/erikd/Git/qemu-pthread-hacking/tcg/tcg.c:1888: tcg_reg_alloc_op:
+    Assertion `ts->val_type == 1' failed.
+
+    /home/erikd/Git/qemu-pthread-hacking/tcg/tcg.c:149: tcg fatal error
+
+
+What's the best way to debug the qemu user space emulation? I read this:
+
+    http://wiki.qemu.org/Documentation/Debugging
+
+but that seems to mainly refer to the qemu machine emulation.
+
+I added -ggdb to QEMU_CFLAGS in config-host.mak so it builds with debug symbols but gdb still doesn't provide any useful information beyond the following:
+
+    Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+    [New Thread 0x7ffefdb6b700 (LWP 11210)]
+    [New Thread 0x7ffefdaf5700 (LWP 11211)]
+    [New Thread 0x7ffefda7f700 (LWP 11212)]
+    [New Thread 0x7ffefda09700 (LWP 11213)]
+    [New Thread 0x7ffefd993700 (LWP 11214)]
+
+    Program received signal SIGSEGV, Segmentation fault.
+    [Switching to Thread 0x7ffefdaf5700 (LWP 11211)]
+    0x0000000060363b58 in static_code_gen_buffer ()
+    (gdb) bt
+    #0  0x0000000060363b58 in static_code_gen_buffer ()
+    #1  0x00000000f50ba518 in ?? ()
+    #2  0x00000000624a9360 in ?? ()
+    #3  0x00007ffefdaf4b80 in ?? ()
+    #4  0x326cebdf4a8e4700 in ?? ()
+    #5  0x00007ffe00000000 in ?? ()
+    #6  0x0000000000000000 in ?? ()
+
+and valgrind doesn't help either.
+
+Yes, multithreaded guests are liable to crash; where they work they generally work more by luck than design. There is some discussion in LP:668799 of one of the known problems (whose symptoms are usually crashes or hangs).
+
+
+At the top of function  cpu_unlink_tb() in translate-all.c:
+
+  /* FIXME: TB unchaining isn't SMP safe.  For now just ignore the
+       problem and hope the cpu will stop of its own accord.  For userspace
+       emulation this often isn't actually as bad as it sounds.  Often
+       signals are used primarily to interrupt blocking syscalls.  */
+
+
+The class of bugs exemplified by the symptoms described here are those where the multithreaded guest program causes QEMU to misbehave because we are sharing the code-translation globals (eg the generated code buffer) between multiple threads and they trod on each others' toes.
+
+(The race described in the comment in cpu_unlink_tb() has been fixed under LP:668799.)
+
+I also experimented the bug.
+It may SIGSEGV or hang. Or it may work, very rarely.
+
+But I cannot reproduce it at all if change my app to stay on a single CPU:
+
+int
+main(int argc, char * argv[] )
+{
+
+#ifdef QEMU
+    cpu_set_t cpuSet;
+    CPU_ZERO(&cpuSet);
+    CPU_SET(0,&cpuSet);
+    if (sched_setaffinity(getpid(), sizeof(cpu_set_t), &cpuSet) !=0)
+    	cerr << "sched_setaffinity failed" << endl;
+#endif /* QEMU */
+
+./build/buildd/qemu-linaro-1.5.0-2013.06/tcg/tcg.c:149: tcg fatal error
+/build/buildd/qemu-linaro-1.5.0-2013.06/tcg/tcg.c:149: tcg fatal error
+
+same for me
+
+Same problem for me when executing msgmerge in qemu-arm-static.
+
+https://launchpadlibrarian.net/181070813/buildlog_ubuntu-utopic-armhf.hedgewars_0.9.21~alpha~7716~ubuntu14.10.1_FAILEDTOBUILD.txt.gz
+
+this started happening after the new deploy of trusty in buildds
+
+Also happening when manually built from the 2.1.2 release codebase.  In my case it impacts the llvm-3.5.0 "make check" testsuite running an an armhf-emulated chroot--it immediately gets SIGSEGV and SIGILL as soon as it starts running tests.
+
+I cannot make dotprod_mutex.c to crash with the current master (git 8ffe756d). I've tried both linux-arm and linux-arm-static, the latter running under chroot.
+
+I've tried on three different machines, and have tested with different thread counts: 4, 10, 16, 64 (one of the machines has 64 cores).
+I completed 1000 successive runs on each.
+
+Can you please retest on the current master? I certainly could trigger the bug on the qemu-arm-static that is packaged with Ubuntu 14.04, so it is possible that since then changes in qemu have at least made it harder to trigger the bug.
+
+
+
+I can confirm that building QEMU 2.5.0 from source, all the multi-thread issues seem to be fixed.
+
+Specifically, the mentioned dotprod_mutex.c example, even when modified to use 100 threads, is always running in the qemu-arm User mode emulator.
+
+Tested in Ubuntu 14.04 x86_64, with all the updates installed.
+
+Note that instead the QEMU 2.0.0 from the Ubuntu 14.04 repository is having issues even when using workarounds like running it with "taskset 0x1" to force the execution to a single CPU.
+
+
+
+We think we've fixed the multithreading issues in QEMU linux-user (in particular the test case that started this bug report works). If there are still problems with a QEMU version later than 2.10, please open fresh bug reports for specific guest programs that fail, giving detailed how-to-reproduce instructions.
+
+

@@ -1,0 +1,375 @@
+FP exception reporting not working on NetBSD host
+
+I recognize that NetBSD is not one of the officially supported host OS.  However, qemu 0.13.0 is available in the NetBSD pkgsrc collection, and works quite well.  Well, with one exception (pun intended): It seems that Floating Point exceptions don't get reported properly.
+
+The following code-snippet demonstrates the problem:
+
+
+volatile int flt_signal = 0;
+
+static sigjmp_buf sigfpe_flt_env;
+static void
+sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+{
+        flt_signal++;
+}
+
+void trigger(void)
+{               
+        struct sigaction sa;
+        double d = strtod("0", NULL);
+        
+        if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+                sa.sa_flags = SA_SIGINFO;
+                sa.sa_sigaction = sigfpe_flt_action;
+                sigemptyset(&sa.sa_mask);
+                sigaction(SIGFPE, &sa, NULL);
+                fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+                printf("%g\n", 1 / d);
+        }
+        printf("FPE signal handler invoked %d times.\n");
+}
+
+On Mon, Jan 3, 2011 at 12:14 PM, Paul Goyette <email address hidden>wrote:
+
+> Public bug reported:
+>
+> I recognize that NetBSD is not one of the officially supported host OS.
+> However, qemu 0.13.0 is available in the NetBSD pkgsrc collection, and
+> works quite well.  Well, with one exception (pun intended): It seems
+> that Floating Point exceptions don't get reported properly.
+>
+> The following code-snippet demonstrates the problem:
+>
+>
+> volatile int flt_signal = 0;
+>
+> static sigjmp_buf sigfpe_flt_env;
+> static void
+> sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+> {
+>        flt_signal++;
+> }
+>
+> void trigger(void)
+> {
+>        struct sigaction sa;
+>        double d = strtod("0", NULL);
+>
+>        if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+>                sa.sa_flags = SA_SIGINFO;
+>                sa.sa_sigaction = sigfpe_flt_action;
+>                sigemptyset(&sa.sa_mask);
+>                sigaction(SIGFPE, &sa, NULL);
+>                fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+>                printf("%g\n", 1 / d);
+>        }
+>        printf("FPE signal handler invoked %d times.\n");
+>
+
+this printf() does miss an argument :-)
+
+
+> }
+>
+> ** Affects: qemu
+>     Importance: Undecided
+>         Status: New
+>
+> --
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/696834
+>
+> Title:
+>  FP exception reporting not working on NetBSD host
+>
+> Status in QEMU:
+>  New
+>
+> Bug description:
+>  I recognize that NetBSD is not one of the officially supported host OS.
+>  However, qemu 0.13.0 is available in the NetBSD pkgsrc collection, and
+> works quite well.  Well, with one exception (pun intended): It seems that
+> Floating Point exceptions don't get reported properly.
+>
+> The following code-snippet demonstrates the problem:
+>
+>
+> volatile int flt_signal = 0;
+>
+> static sigjmp_buf sigfpe_flt_env;
+> static void
+> sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+> {
+>        flt_signal++;
+> }
+>
+> void trigger(void)
+> {
+>        struct sigaction sa;
+>        double d = strtod("0", NULL);
+>
+>        if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+>                sa.sa_flags = SA_SIGINFO;
+>                sa.sa_sigaction = sigfpe_flt_action;
+>                sigemptyset(&sa.sa_mask);
+>                sigaction(SIGFPE, &sa, NULL);
+>                fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+>                printf("%g\n", 1 / d);
+>        }
+>        printf("FPE signal handler invoked %d times.\n");
+>
+
+this printf() does miss an argument :-)
+
+
+> }
+>
+>
+>
+>
+
+
+On Mon, 3 Jan 2011, Paulo Cezar A Junior wrote:
+
+<snip>
+
+>>        printf("FPE signal handler invoked %d times.\n");
+>
+> this printf() does miss an argument :-)
+
+Yes, it does.  The signal handler is also missing a line:
+
+ 	siglongjmp(sigfpe_flt_env, 1);
+
+That's what I get for extracting bits&pieces of the larger test program. 
+:)
+
+
+The following is a complete, standalone test program:
+
+ 	#include <ieeefp.h>
+ 	#include <setjmp.h>
+ 	#include <signal.h>
+ 	#include <stdio.h>
+
+ 	volatile int flt_signal = 0;
+
+ 	static sigjmp_buf sigfpe_flt_env;
+ 	static void
+ 	sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+ 	{
+
+ 		flt_signal++;
+ 		siglongjmp(sigfpe_flt_env, 1);
+ 	}
+ 	int main(int argc, void *argv[])
+ 	{
+ 		struct sigaction sa;
+ 		double d;
+
+ 		printf("Start\n");
+ 		if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+ 			sa.sa_flags = SA_SIGINFO;
+ 			sa.sa_sigaction = sigfpe_flt_action;
+ 			sigemptyset(&sa.sa_mask);
+ 			sigaction(SIGFPE, &sa, NULL);
+ 			fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+ 			d = 1.0 / strtod("0", NULL);
+ 		}
+ 		printf("FPE signal handler invoked %d times.\n");
+ 	}
+
+Executing the program gives the following results:
+
+ 	# cc -o test test.c
+ 	# ./test
+ 	Start
+ 	FPE signal handler invoked 0 times.
+ 	#
+
+On "real" hardware,
+
+ 	{225} cc -o test test.c
+ 	{226} ./test
+ 	Start
+ 	FPE signal handler invoked 1 times.
+ 	{227}
+
+
+-------------------------------------------------------------------------
+| Paul Goyette     | PGP Key fingerprint:     | E-mail addresses:       |
+| Customer Service | FA29 0E3B 35AF E8AE 6651 | paul at whooppee.com    |
+| Network Engineer | 0786 F758 55DE 53BA 7731 | pgoyette at juniper.net |
+| Kernel Developer |                          | pgoyette at netbsd.org  |
+-------------------------------------------------------------------------
+
+On Mon, 3 Jan 2011, Paul Goyette wrote:
+
+> The following is a complete, standalone test program:
+>
+> 	#include <ieeefp.h>
+> 	#include <setjmp.h>
+> 	#include <signal.h>
+> 	#include <stdio.h>
+>
+>        volatile int flt_signal = 0;
+>
+> 	static sigjmp_buf sigfpe_flt_env;
+> 	static void
+> 	sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+> 	{
+>
+> 		flt_signal++;
+> 		siglongjmp(sigfpe_flt_env, 1);
+> 	}
+> 	int main(int argc, void *argv[])
+> 	{
+> 		struct sigaction sa;
+> 		double d;
+>
+> 		printf("Start\n");
+> 		if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+> 			sa.sa_flags = SA_SIGINFO;
+> 			sa.sa_sigaction = sigfpe_flt_action;
+> 			sigemptyset(&sa.sa_mask);
+> 			sigaction(SIGFPE, &sa, NULL);
+> 			fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+> 			d = 1.0 / strtod("0", NULL);
+> 		}
+> 		printf("FPE signal handler invoked %d times.\n");
+
+And, of course, I still missed the extra agument:
+
+                 printf("FPE signal handler invoked %d times.\n", flt_signal);
+
+
+> 	}
+>
+> Executing the program gives the following results:
+>
+> 	# cc -o test test.c
+> 	# ./test
+> 	Start
+> 	FPE signal handler invoked 0 times.
+> 	#
+>
+> On "real" hardware,
+>
+> 	{225} cc -o test test.c
+> 	{226} ./test
+> 	Start
+> 	FPE signal handler invoked 1 times.
+> 	{227}
+>
+>
+> -------------------------------------------------------------------------
+> | Paul Goyette     | PGP Key fingerprint:     | E-mail addresses:       |
+> | Customer Service | FA29 0E3B 35AF E8AE 6651 | paul at whooppee.com    |
+> | Network Engineer | 0786 F758 55DE 53BA 7731 | pgoyette at juniper.net |
+> | Kernel Developer |                          | pgoyette at netbsd.org  |
+> -------------------------------------------------------------------------
+>
+> -- 
+> You received this bug notification because you are a direct subscriber
+> of the bug.
+> https://bugs.launchpad.net/bugs/696834
+>
+> Title:
+>  FP exception reporting not working on NetBSD host
+>
+> Status in QEMU:
+>  New
+>
+> Bug description:
+>  I recognize that NetBSD is not one of the officially supported host OS.  However, qemu 0.13.0 is available in the NetBSD pkgsrc collection, and works quite well.  Well, with one exception (pun intended): It seems that Floating Point exceptions don't get reported properly.
+>
+> The following code-snippet demonstrates the problem:
+>
+>
+> volatile int flt_signal = 0;
+>
+> static sigjmp_buf sigfpe_flt_env;
+> static void
+> sigfpe_flt_action(int signo, siginfo_t *info, void *ptr)
+> {
+>        flt_signal++;
+> }
+>
+> void trigger(void)
+> {
+>        struct sigaction sa;
+>        double d = strtod("0", NULL);
+>
+>        if (sigsetjmp(sigfpe_flt_env, 0) == 0) {
+>                sa.sa_flags = SA_SIGINFO;
+>                sa.sa_sigaction = sigfpe_flt_action;
+>                sigemptyset(&sa.sa_mask);
+>                sigaction(SIGFPE, &sa, NULL);
+>                fpsetmask(FP_X_INV|FP_X_DZ|FP_X_OFL|FP_X_UFL|FP_X_IMP);
+>                printf("%g\n", 1 / d);
+>        }
+>        printf("FPE signal handler invoked %d times.\n");
+> }
+>
+> To unsubscribe from this bug, go to:
+> https://bugs.launchpad.net/qemu/+bug/696834/+subscribe
+>
+> !DSPAM:4d21f0752341470756574!
+>
+>
+>
+
+-------------------------------------------------------------------------
+| Paul Goyette     | PGP Key fingerprint:     | E-mail addresses:       |
+| Customer Service | FA29 0E3B 35AF E8AE 6651 | paul at whooppee.com    |
+| Network Engineer | 0786 F758 55DE 53BA 7731 | pgoyette at juniper.net |
+| Kernel Developer |                          | pgoyette at netbsd.org  |
+-------------------------------------------------------------------------
+
+LinkedIn
+------------
+
+   
+Bug,
+
+I'd like to add you to my professional network on LinkedIn.
+
+- Paulo
+
+Paulo Cezar
+Platform Researcher and Developer at INdT 
+São Paulo Area, Brazil
+
+Confirm that you know Paulo Cezar
+https://www.linkedin.com/e/-g11m92-go1e59vx-23/isd/2968180228/v_gmfnNW/
+
+
+ 
+-- 
+(c) 2011, LinkedIn Corporation
+
+QEMU 0.13 is completely outdated nowadays - can you still reproduce this problem with the latest version of QEMU (currently version 2.8) ?
+
+On Tue, 10 Jan 2017, Thomas Huth wrote:
+
+> QEMU 0.13 is completely outdated nowadays - can you still reproduce this
+> problem with the latest version of QEMU (currently version 2.8) ?
+
+The test program running on qemu 2.8.0 now produces the expected results 
+- 1 FP exception
+
+You can close this bug.
+
+
+
++------------------+--------------------------+------------------------+
+| Paul Goyette     | PGP Key fingerprint:     | E-mail addresses:      |
+| (Retired)        | FA29 0E3B 35AF E8AE 6651 | paul at whooppee.com   |
+| Kernel Developer | 0786 F758 55DE 53BA 7731 | pgoyette at netbsd.org |
++------------------+--------------------------+------------------------+
+
+
+Thanks for verifying!
+

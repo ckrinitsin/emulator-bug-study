@@ -1,0 +1,143 @@
+synchronous abort on accessing unused I/O ports on aarch64
+
+version: QEMU emulator version 5.2.0 (Debian 1:5.2+dfsg-6)
+command line: qemu-system-aarch64 \
+	-machine virt,virtualization=on,graphics=on,usb=on -cpu cortex-a57 -smp 2 -m 2G \
+	-device virtio-blk-device,drive=hd0 \
+	-drive if=none,format=raw,id=hd0,file=buildroot \
+	-kernel arch/arm64/boot/Image \
+	-nographic \
+	-device virtio-rng-pci \
+	-net user,host=10.0.2.10,hostfwd=tcp::10022-:22 -net nic,model=virtio-net-pci \
+	-append "root=/dev/vda earlyprintk=serial console=ttyAMA0 earlycon"
+
+I am observing "synchronous external abort" when kernel tries to access unused I/O ports (see below), while hardware/qemu should return 0xffffffff in this case.
+
+This is factored out of this LKML thread where Arnd describes it in more details:
+https://lore.kernel<email address hidden>/
+
+Internal error: synchronous external abort: 96000050 [#1] PREEMPT SMP
+Dumping ftrace buffer:
+   (ftrace buffer empty)
+Modules linked in:
+CPU: 0 PID: 11231 Comm: syz-executor.1 Not tainted 5.12.0-rc2-syzkaller-00302-g28806e4d9b97 #0
+Hardware name: linux,dummy-virt (DT)
+pstate: 80000085 (Nzcv daIf -PAN -UAO -TCO BTYPE=--)
+pc : __raw_writeb arch/arm64/include/asm/io.h:27 [inline]
+pc : _outb include/asm-generic/io.h:501 [inline]
+pc : logic_outb+0x3c/0x114 lib/logic_pio.c:302
+lr : io_serial_out+0x80/0xc0 drivers/tty/serial/8250/8250_port.c:453
+sp : ffff000015f0f980
+x29: ffff000015f0f980 x28: ffff80001de0005d 
+x27: ffff80001601df00 x26: ffff000015f0fc90 
+x25: ffff80001de00000 x24: ffff80001de00000 
+x23: ffff00000e27f600 x22: 0000000000000000 
+x21: 0000000000000002 x20: 0000000000000002 
+x19: fffffbfffe800001 x18: ffff00006a678b48 
+x17: 0000000000000000 x16: 0000000000000000 
+x15: ffff8000197be810 x14: 1fffe00002be1f0e 
+x13: 1fffe00002be1e90 x12: ffff600002be1f39 
+x11: 1fffe00002be1f38 x10: ffff600002be1f38 
+x9 : dfff800000000000 x8 : 0000000000000003 
+x7 : 0000000000000001 x6 : 0000000000000004 
+x5 : ffff000015f0f9c0 x4 : dfff800000000000 
+x3 : 0000000000000001 x2 : 1ffff00003494e6b 
+x1 : fffffbfffe800000 x0 : 0000000000ffbffe 
+Call trace:
+ _outb include/asm-generic/io.h:501 [inline]
+ logic_outb+0x3c/0x114 lib/logic_pio.c:302
+ io_serial_out+0x80/0xc0 drivers/tty/serial/8250/8250_port.c:453
+ serial_out drivers/tty/serial/8250/8250.h:118 [inline]
+ serial8250_set_THRI drivers/tty/serial/8250/8250.h:138 [inline]
+ __start_tx drivers/tty/serial/8250/8250_port.c:1566 [inline]
+ serial8250_start_tx+0x338/0x6c0 drivers/tty/serial/8250/8250_port.c:1666
+ __uart_start.isra.0+0x10c/0x154 drivers/tty/serial/serial_core.c:127
+ uart_start+0xe0/0x210 drivers/tty/serial/serial_core.c:137
+ uart_flush_chars+0x10/0x20 drivers/tty/serial/serial_core.c:573
+ __receive_buf drivers/tty/n_tty.c:1646 [inline]
+ n_tty_receive_buf_common+0x588/0x22c0 drivers/tty/n_tty.c:1739
+ n_tty_receive_buf+0x14/0x20 drivers/tty/n_tty.c:1768
+ tiocsti drivers/tty/tty_io.c:2317 [inline]
+ tty_ioctl+0xed0/0x1aec drivers/tty/tty_io.c:2718
+ vfs_ioctl fs/ioctl.c:48 [inline]
+ __do_sys_ioctl fs/ioctl.c:753 [inline]
+ __se_sys_ioctl fs/ioctl.c:739 [inline]
+ __arm64_sys_ioctl+0x120/0x18c fs/ioctl.c:739
+ __invoke_syscall arch/arm64/kernel/syscall.c:37 [inline]
+ invoke_syscall arch/arm64/kernel/syscall.c:49 [inline]
+ el0_svc_common.constprop.0+0xf0/0x2c0 arch/arm64/kernel/syscall.c:129
+ do_el0_svc+0xa4/0xd0 arch/arm64/kernel/syscall.c:168
+ el0_svc+0x24/0x34 arch/arm64/kernel/entry-common.c:416
+ el0_sync_handler+0x1a4/0x1b0 arch/arm64/kernel/entry-common.c:432
+ el0_sync+0x170/0x180 arch/arm64/kernel/entry.S:699
+Code: d2bfd001 f2df7fe1 f2ffffe1 8b010273 (39000274) 
+---[ end trace 79cb47219936c254 ]---
+
+My best guess is that the PCI I/O port handling in qemu only returns data for ports that are connected to an actual device.
+
+In this case, the kernel attempts to access a 8250 serial port at an address where none exists. While this is also a bug in the kernel, a real PCI implementation would not cause an external abort but simply return 'all-ones' (0xff, 0xffff, 0xffffffff) for a read request and ignore writes. This is something that the kernel relies on for probing unknown ISA style devices.
+
+Am I missing it, or does the kernel's logging for data aborts not print the FAR_EL1 value ?
+
+
+That seems correct, and could probably be improved. In this case, I know that _outb() only writes within the PCI PIO virtual address between fffffbfffe800000 and fffffbffff800000, which according to the boot log (https://gist.githubusercontent.com/dvyukov/084890d9b4aa7cd54f468e652a9b5881/raw/54c12248ff6a4885ba6c530d56b3adad59bc6187/gistfile1.txt) was mapped to qemu's PCI IO space, using DEVICE_nGnRnE attributes (PIO space unlike any other MMIO in the kernel uses 'nE'):
+
+[    3.973419][    T1] pci-host-generic 4010000000.pcie: host bridge /pcie@10000000 ranges:
+[    3.974309][    T1] pci-host-generic 4010000000.pcie:       IO 0x003eff0000..0x003effffff -> 0x0000000000
+[    3.975021][    T1] pci-host-generic 4010000000.pcie:      MEM 0x0010000000..0x003efeffff -> 0x0010000000
+
+So physical address 0x003eff0000 corresponds to virtual address fffffbfffe800000, which corresponds to logical PIO port number 0. The serial port in the kernel was probed at port number 0, so the driver attempts to write to the 8250 compatible UART_IER at address fffffbfffe800001, which is in register x19.
+
+Is there a test case (all necessary images/files/QEMU command line) I can repro this with ?
+
+
+The image is (gunzip it after download):
+https://storage.googleapis.com/syzkaller/images/buildroot-arm64-2020.11.gz
+
+Kernel:
+https://storage.googleapis.com/syzkaller/temp/arm64-Image
+
+qemu command line:
+
+qemu-system-aarch64 \
+	-machine virt,virtualization=on,graphics=on,usb=on -cpu cortex-a57 -smp 2 -m 2G \
+	-device virtio-blk-device,drive=hd0 \
+	-drive if=none,format=raw,id=hd0,file=buildroot-arm64-2020.11 \
+	-kernel arm64-Image \
+	-nographic \
+	-device virtio-rng-pci \
+	-net user,host=10.0.2.10,hostfwd=tcp::10022-:22 -net nic,model=virtio-net-pci \
+	-append "root=/dev/vda earlyprintk=serial console=ttyAMA0 earlycon"
+
+Reproducer:
+
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+int main(void)
+{
+  int fd = syscall(__NR_openat, 0xffffffffffffff9cul, "/dev/ttyS3", 0ul, 0ul);
+  char ch = 0;
+  syscall(__NR_ioctl, fd, 0x5412, &ch); // TIOCSTI
+  return 0;
+}
+
+Build with:
+arch64-linux-gnu-gcc prog.c -static
+
+scp to the VM and run. The image has password-less root ssh.
+
+Uploaded the binary reproducer as:
+https://storage.googleapis.com/syzkaller/temp/arm64-tty-crash
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/317
+
+

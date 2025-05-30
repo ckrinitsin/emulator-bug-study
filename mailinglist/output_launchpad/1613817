@@ -1,0 +1,117 @@
+x86: ret, lret and iret with noncanonical IP saves wrong IP on the exception stack
+
+This test program:
+
+# compile with: gcc -nostartfiles -nostdlib
+_start:         .globl  _start
+                mov     %ss,%eax
+                push    %rax
+                push    %rsp
+                pushf
+                mov     %cs,%eax
+                push    %rax
+                mov     $0x1234567812345678,%rax
+                push    %rax
+//qemu bug: ip=1234567812345678, should be ip=0000000000400abc:
+                iretq
+1:
+                jmp     1b
+
+should segfault on IRET instruction because return address on stack is invalid
+(it is not canonical). And it does, both on native CPU and in qemu.
+But there is a difference: on native CPU, it fails before instruction is executed,
+IOW: saved IP points to the failed IRET:
+
+# strace -i ./bad_ip_in_iret 
+[00007fa609805d57] execve("./bad_ip_in_iret", ["./bad_ip_in_iret"], [/* 54 vars */]) = 0
+[00000000004000e7] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+ ^^^^^^^^^^^^^^^^-NOTE THIS
+[????????????????] +++ killed by SIGSEGV (core dumped) +++
+
+
+In qemu, evidently instruction succeeds, and then emulated CPU throws an exception because fetching instructions from non-canonical addresses is not allowed:
+
+/ # strace -i ./bad_ip_in_iret
+[000000000041a790] execve("./bad_ip_in_iret", ["./bad_ip_in_iret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+ ^^^^^^^^^^^^^^^^-NOTE THIS
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault
+
+Thus, the emulation is not the same as real CPU.
+
+This is not specific to IRET, the same happens with "far return" LRET,
+and with ordinary RET instructions as well.
+In qemu:
+
+/ # strace -i ./bad_ip_in_lret
+[000000000041a790] execve("./bad_ip_in_lret", ["./bad_ip_in_lret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault
+/ # strace -i ./bad_ip_in_ret
+[000000000041a790] execve("./bad_ip_in_ret", ["./bad_ip_in_ret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault
+
+# qemu-system-x86_64 --version
+QEMU emulator version 2.6.92(qemu-2.7.0-0.1.rc2.fc26), Copyright (c) 2003-2008 Fabrice Bellard
+
+Running it like this:
+
+qemu-system-x86_64 -no-reboot -kernel "$bzImage" -initrd initramfs.cpio -append "panic=1"
+
+(i.e. no KVM, no unusual options)
+
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+
+Still happens with qemu 5.1.92
+
+I imagine the fix should be inserted here:
+
+static inline void helper_ret_protected(CPUX86State *env, int shift,
+                                        int is_iret, int addend,
+                                        uintptr_t retaddr)
+{
+    uint32_t new_cs, new_eflags, new_ss;
+    uint32_t new_es, new_ds, new_fs, new_gs;
+    uint32_t e1, e2, ss_e1, ss_e2;
+    int cpl, dpl, rpl, eflags_mask, iopl;
+    target_ulong ssp, sp, new_eip, new_esp, sp_mask;
+
+#ifdef TARGET_X86_64
+    if (shift == 2) {
+        sp_mask = -1;
+    } else
+#endif
+    {
+        sp_mask = get_sp_mask(env->segs[R_SS].flags);
+    }
+    sp = env->regs[R_ESP];
+    ssp = env->segs[R_SS].base;
+    new_eflags = 0; /* avoid warning */
+#ifdef TARGET_X86_64
+    if (shift == 2) {
+        POPQ_RA(sp, new_eip, retaddr);
+if (new_eip is not canonical) raise_exception_err_ra();  <==== HERE
+        POPQ_RA(sp, new_cs, retaddr);
+        new_cs &= 0xffff;
+        if (is_iret) {
+            POPQ_RA(sp, new_eflags, retaddr);
+        }
+    } else
+#endif
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/125
+
+

@@ -1,0 +1,210 @@
+RTL8168 NIC VFIO not working anymore since QEMU 2.1
+
+After upgrading QEMU from 2.0 to 2.1 (and libiscsi from 1.7.0 to 1.12 as a dependency) my two RTL8168 NICs stopped working.
+The NICs do not respond to any command and even the LEDs on the network connection turn off, a few seconds after the VM started.
+To get them back running I had to downgrade to 2.0 and restart the system.
+Unfortunately, I have no clue what to do or how to debug this problem since there are no specific errors logged.
+I tried two different VMs: Debian Wheezy and IPFire (see attachment for further details).
+The QEMU 2.1 changelog states "Support for RTL8168 NICs." so there were some major changes done, I guess.
+
+On the IPFire guest the kernel log shows many of these lines:
+r8169 0000:00:07.0 green1: rtl_eriar_cond == 1 (loop: 100, delay: 100)
+r8169 0000:00:07.0 green1: rtl_phy_reset_cond == 1 (loop: 100, delay: 1)
+
+On the Debian guest there is only:
+r8169 0000:00:07.0: firmware: agent loaded rtl_nic/rtl8168e-3.fw into memory
+r8169 0000:00:07.0: lan0: link down
+ADDRCONF(NETDEV_UP): lan0: link is not ready
+
+The commandline for IPFire can be seen in the attachment. It is the same for Debian.
+There are also the complete kernel logs for the working (2.0) and non-working (2.1) cases.
+
+
+
+In general, rtl is a terrible choice for a device assignment NIC in my experience.  Intel NICs are much better and worth the extra cost.  However, QEMU2.1 did attempt to add a quirk for RTL8168 that allows the Windows driver to work correctly in a guest.  In my testing, the Linux driver never made use of this quirk and should have been unaffected.  You can test disabling the quirk by editing hw/misc/vfio.c and finding the vfio_probe_rtl8168_bar2_window_quirk() function.  Before the first "if (..." add a line that is simply:
+
+return;
+
+rebuild, install, and let us know the results.
+
+I disabled vfio_probe_rtl8168_bar2_window_quirk() as you suggested and indeed, the problem is gone now using QEMU 2.1.2.
+RTL really isn't the best choice, I guess.
+Thanks for your quick reply!
+
+Does this improve anything?  Reviewing the quirk seems to show there's a bug in how we're writing to the MSI-X table.  Not sure how it worked before.  Tested this with a Win8.1 VM and assigned RTL8111/8168/8411.  Thanks.
+
+--- a/hw/misc/vfio.c
++++ b/hw/misc/vfio.c
+@@ -1834,8 +1834,8 @@ static void vfio_rtl8168_window_quirk_write(void *opaque, hwaddr addr,
+                         vdev->host.bus, vdev->host.slot, vdev->host.function);
+ 
+                 io_mem_write(&vdev->pdev.msix_table_mmio,
+-                             (hwaddr)(quirk->data.address_match & 0xfff),
+-                             data, size);
++                             (hwaddr)(data & 0xfff),
++                             (uint64_t)quirk->data.address_mask, size);
+             }
+ 
+             quirk->data.flags = 1;
+
+
+launchpad mangled that pretty good, maybe this is better - http://fpaste.org/148539/
+
+This does not improve anything.
+It results in the same "LEDs off + NIC device unresponsive" problem.
+Thanks anyway.
+
+Alex, are you sure about the constant 0x10000000U (bit 27) being used in the code below ?
+Shouldn't it rather be a 0x80000000U (bit 31 which you commented about) ?
+I added a /* NOT REACHED ? */ below, as I feel that might be the problem.
+
+Florian,
+are you willing to test the so modified source with and without Alex's patch of comment #4 ?
+Note that the constant 0x10000000U is also used for ex-or in the function vfio_rtl8168_window_quirk_read(),
+where it should (I think) also be 0x80000000U (or maybe just 0, i.e. no modification of the saved value ?)
+
+AND:
+Shouldn't variable "uint64_t val;" in function vfio_rtl8168_window_quirk_read() be initialised 0,
+as it is size 8, which is larger than "size" (which I gather is 4) ?
+
+Anyway, just to keep everybody updated about newer versions of QEMU:
+The relevant code blocks seem to have moved to hw/vfio/pci.c in QEMU 2.3.
+
+static void vfio_rtl8168_window_quirk_write(void *opaque, hwaddr addr,
+                                            uint64_t data, unsigned size)
+{
+    VFIOQuirk *quirk = opaque;
+    VFIODevice *vdev = quirk->vdev;
+
+    switch (addr) {
+    case 4: /* address */
+        if ((data & 0x7fff0000) == 0x10000) {
+            if (data & 0x10000000U &&
+                vdev->pdev.cap_present & QEMU_PCI_CAP_MSIX) {
+/* NOT REACHED ? */
+                DPRINTF("%s MSI-X table write(%04x:%02x:%02x.%d)\n",
+                        memory_region_name(&quirk->mem), vdev->host.domain,
+                        vdev->host.bus, vdev->host.slot, vdev->host.function);
+
+                io_mem_write(&vdev->pdev.msix_table_mmio,
+                             (hwaddr)(quirk->data.address_match & 0xfff),
+                             data, size);
+            }
+
+            quirk->data.flags = 1;
+            quirk->data.address_match = data;
+
+            return;
+        }
+
+
+After investigating a little more I have the impression, that
+a) Alex's patch #4 is required
+and
+b) 'val' does not need to be initialised
+
+Thus remains replacing each of the two instances of 0x10000000U with 0x80000000U,
+where it remains open whether the 'xor' operation (now on bit 31 rather than bit 27) in vfio_rtl8168_window_quirk_read() really creates the required result.
+I'd rather envision an 'or bit31' or an 'and ~bit31'.
+
+
+I had too many problems with the Chipset so I decided to sell the System.
+As a result I cannot test for this bug anymore, sorry.
+Thanks anyway for your effort on this problem!
+
+Thorsten, is this the patch you're suggesting then?
+
+http://fpaste.org/244037/43684040/
+
+Yes, thank you, that adapted patch looks good to me.
+It seems V2.4 based though, so it would need to be backported down to 2.3 through 2.1.
+Is there an established process for that kind of backporting need ?
+
+Do you confirm my 'not reached' hypothesis (which would explain why your patch #4 did not make a difference) ?
+
+Unfortunately I will not have time for testing during the next 2 weeks.
+
+Anyway, are you willing to shed some light on the reason why you stick to ex-or bit 31 in the 'fake-read' block ?
+I would appreciate some comment about that in the code.
+
+
+I made some time for limited testing.
+The released V2.1 puts the vfio-ed RTL8168 into a zombie state when running an IPFire VM, which requires a subsequent POWER cycle in order to let mii-tools show anything else than 'no link' (i.e. to get the LED back on). Pushing the reset button on the x64 metal was NOT enough.
+
+Then I binary-patched my V2.1 qemu x64 executable so it compares against a 'wrong' PCI ID inside vfio_probe_rtl8168_bar2_window_quirk() (to confirm comment #3). Yes, that made it work again.
+
+Further patch-attempts towards comment #10 all ended up in RTL zombie state (even though the IPFire VM was otherwise responsive). Each time a power cycle was required to get the RTL back alive.
+
+Could there be a general problem because the RTL must be usable in MSI-X mode for Windows and in in MSI mode for Linux ?
+Maybe a cmdline switch should be added to activate the quirk just when MSI-X is intended ?
+
+
+I just tried an ipfire 2.17 core 92 VM with assigned rtl8168 using the patches I posted last night:
+
+http://lists.nongnu.org/archive/html/qemu-devel/2015-07/msg03528.html
+
+The rtl NIC works fine in the guest and tracing shows that the guest never accesses the MSI-X table backdoor (nor should it since it's operating the device in MSI mode).  If there's an older version of ipfire that doesn't work, please specify.  Please try the above referenced patches against current qemu.git.
+
+Alex' patch has been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=69970fcef937bddd7f745
+... so I assume this ticket could be closed now?
+
+Current QEMU code is quite different now.
+When I tested last (with QEMU 2.4) the problem still existed.
+I had quite a discussion with Alex up to and around end of 2015,
+but unfortunately since then I just did not have any spare time to
+convince Alex to accept what I call 'the real fix', a series of patches.
+I also could not test QEMU2.5 yet, but it does not *look* like it 
+contains any additional fix towards the problem.
+
+Just a hint about the 'underlying' problem:
+Several subtypes of that card hang up DURING loading the assigned 
+firmware, as QEMU does not correctly map all required i/o areas
+for supporting the firmware load (unless i/o mmap is disabled).
+The cards need to be power cycled then, reset is not enough.
+The correct mapping cannot really be derived from looking at the
+Linux driver code - it is rather to be deduced from access traces.
+
+If a firmware is NOT accessible, the card doesn't hang,
+but also it is running 'unpatched' i.e. might expose bugs that the
+hardware designer/manufacturer has detected and fixed via firmware.
+
+A better workaround is disabling i/o mmap when VFIO-attaching the card.
+This is supported by newer QEMU versions.
+
+So no,
+the problem is not fixed yet,
+but yes,
+I guess you can close this bug if you feel like it.
+
+Regards
+
+Am 22.06.2016 um 13:10 schrieb T. Huth:
+> Alex' patch has been included here:
+> http://git.qemu.org/?p=qemu.git;a=commitdiff;h=69970fcef937bddd7f745
+> ... so I assume this ticket could be closed now?
+
+
+Hi *,
+
+it seems we could finally fix this bug:
+https://bugs.launchpad.net/qemu/+bug/1384892
+
+with the following patches:
+https://lists.nongnu.org/archive/html/qemu-devel/2016-10/msg07260.html
+
+Regards,
+
+Thorsten
+
+Am 22.06.2016 um 13:10 schrieb T. Huth:
+> Alex' patch has been included here:
+> http://git.qemu.org/?p=qemu.git;a=commitdiff;h=69970fcef937bddd7f745
+> ... so I assume this ticket could be closed now?
+>
+
+
+The patch that has been mentioned in the last comment has been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=31e6a7b17b35711eb44f0e
+... and has been released with QEMU v2.8 already, so marking this as "fix released" now.
+

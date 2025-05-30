@@ -1,0 +1,242 @@
+[UBUNTU 22.04] OS guest boot issues on 9p filesystem
+
+=== Reported by <email address hidden> - 2024-05-13 03:53:01 ===
+
+---Problem Description---
+OS guest boot issues on 9p filesystem due to unix domain sockets open failure
+ 
+Contact Information = <email address hidden> 
+ 
+Machine Type = 3931-7G4 
+ 
+---uname output---
+5.15.0-92-generic #102-Ubuntu SMP Wed Jan 10 09:35:24 UTC 2024 s390x s390x s390x GNU/Linux
+ 
+---Steps to Reproduce---
+ #!/bin/bash
+
+# Cleanup target dir
+[ -d ./target ] && rm -rf target
+mkdir target
+
+# Add configuration updates
+mkdir -p ./target/etc/initramfs-tools/
+echo 9p >> ./target/etc/initramfs-tools/modules
+echo 9pnet_virtio >> ./target/etc/initramfs-tools/modules
+
+# Add the test script
+cat > ./target/test_init << EOF
+#!/bin/bash
+
+echo "Test for unix domain sockets"
+
+nc -Ul /socket &
+sleep 1
+echo "Sockets work" | nc -UN /socket || echo "Sockets fail"
+
+echo o > /proc/sysrq-trigger
+sleep 999
+EOF
+chmod 700 ./target/test_init
+
+# Create an Ubuntu 23.10 around it
+echo "Creating Ubuntu target OS"
+debootstrap --variant=minbase\
+            --include=udev,kmod,initramfs-tools,systemd,netcat-openbsd,linux-image-generic \
+            --exclude=man,bash-completion \
+            mantic ./target > /dev/null || exit 1
+
+# Run the test in 9p forwarded filesystem
+echo "Running OS in qemu"
+qemu-system-s390x \
+  -m 8192 \
+  -smp 4 \
+  -nodefaults -nographic -no-reboot -no-user-config \
+  -kernel ./target/boot/vmlinuz \
+  -initrd ./target/boot/initrd.img \
+  -append 'root=fsRoot rw rootfstype=9p rootflags=trans=virtio,version=9p2000.L,msize=512000,cache=mmap,posixacl console=ttysclp0 init=/test_init quiet' \
+  -fsdev local,security_model=passthrough,multidevs=remap,id=fsdev-fsRoot,path=./target \
+  -device virtio-9p-pci,id=fsRoot,fsdev=fsdev-fsRoot,mount_tag=fsRoot \
+  -device virtio-serial-ccw -device sclpconsole,chardev=console \
+  -chardev stdio,id=console,signal=off 
+
+ 
+---Debugger---
+A debugger is not configured
+
+Userspace rpm: qemu-(current).deb 
+ 
+Userspace tool common name: qemu 
+
+Userspace tool obtained from project website:  na 
+ 
+The userspace tool has the following bit modes: both 
+ 
+*Additional Instructions for <email address hidden>:
+-Attach ltrace and strace of userspace application.
+
+------- Comment From <email address hidden> 2024-05-13 06:24 EDT-------
+This bug is also described at:
+https://gitlab.com/qemu-project/qemu/-/issues/2337
+created in the qemu project bugtracker.
+
+------- Comment From <email address hidden> 2024-05-13 06:57 EDT-------
+This Bug is the result of the fix to:
+CVE-2023-2861: Prohibit opening any special file directly on host
+
+I also opened a Bug in the qemu bugtracker
+https://gitlab.com/qemu-project/qemu/-/issues/2337
+
+The containers fail because syslog cannot open its unix domain socket on the filesystem.
+We tracked the change that provokes this error to a CVE change in qemu that forbids opening of special files to
+prevent exposing data from the host. Special files should be handled by the guest os.
+Unix domain socket files are also special files, and they are handled by the guest OS in their entirety, and the 9p server in qemu assigns them individual inodes so they are safe to open. But they must be opened so their fd can be passed to the appropriate connect() or bind() function so the OS can use them.
+Socket files don't have a traditional read or write functionality, they are mere representatives for a local address.
+There is no convention for where domain socket files should go, so there is no easy fix by just creating a tmpfs somewhere.
+We also see other workloads and services failing for not being able to open their local socket files.
+
+The analysis of CVE-2023-2861 in detail reveals
+- opening of device files through the 9p server directly grants access to read/write functions of those device files. Also device files can be created in-place anywhere.
+- opening of FIFOs is somewhat unsafe as long as there are possible collisions that could expose host data using read/write.
+- opening of sockets is safe because the 9p server protects the revealed inode and provides no way to connect the file to a socket.
+
+Thank you for the report.
+
+Given that this is an upstream regression and there is a related upstream bug about it, I believe it's best to wait for their input/feedback before moving forward.
+
+------- Comment From <email address hidden> 2024-05-24 04:00 EDT-------
+There's absolutely no movement upstream-
+
+Hi,
+
+I took some time today to take a closer look into this issue.  I wanted to determine whether this was coming from something that we did, or some upstream change.  Here are my findings:
+
+1) This is not architecture-specific.  I can reproduce the problem (thanks for the script, btw!) on s390x and amd64.  This was somewhat expected because we're talking about an issue affecting a filesystem here, but it's good to be able to confirm.
+
+2) This issue was *not* happening 6.2+dfsg-2ubuntu6.15, and started happening afterwards.  This confirms that this is indeed a regression introduced by the upload of 6.2+dfsg-2ubuntu6.16 (which was a security upload).
+
+3) Ultimately, this is a security regression and will need to be handled by our Security team.  I will get in touch with them.  Unfortunately, although this is a regression that comes from upstream, I don't see much interest from their part in fixing problems with 9pfs.  I will leave a comment in the upstream bug report to see if it generates any movement.
+
+Thanks.
+
+This is the upstream commit which introduced the change in behaviour:
+
+https://gitlab.com/qemu-project/qemu/-/commit/f6b0de53fb87ddefed348a39284c8e2f28dc4eda
+
+There is no subsequent fix to the new restrictions, and the only more recent commit is one to deprecate the whole proxy backend:
+
+https://gitlab.com/qemu-project/qemu/-/commit/71d72ececa086114df80fe4cc04d701b59002eb2
+
+I will investigate whether we can relax the restrictions to allow sockets.
+
+FWIW, I built QEMU with a proposed fix here:
+
+https://launchpad.net/~sergiodj/+archive/ubuntu/qemu-9pfs-fix
+
+It passes the testcase provided in the bug description.  I'd still like to hear Marc's opinion here as the Security team person, but at least we have a possible fix.
+
+Cheers,
+
+------- Comment From <email address hidden> 2024-06-03 04:09 EDT-------
+(In reply to comment #13)
+> FWIW, I built QEMU with a proposed fix here:
+>
+> https://launchpad.net/~sergiodj/+archive/ubuntu/qemu-9pfs-fix
+>
+> It passes the testcase provided in the bug description.  I'd still like to
+> hear Marc's opinion here as the Security team person, but at least we have a
+> possible fix.
+>
+> Cheers,
+
+@sergiodj
+
+What was the patch ?
+
+Strictly speaking, this is 9Pfs. Opening device files for read and write is expected to work for 9P - but for qemu guests running Linux this might not be obvious.
+
+Please let me jump in (for TZ reasons).
+
+The patch "debian/patches/ubuntu/lp-2065579-9pfs-allow-sockets.patch" (as always referenced in debin/changelog) that Sergio created and that is incl. in the PPA build is this:
+
+From: Sergio Durigan Junior <email address hidden>
+Date: Thu, 30 May 2024 16:45:56 -0400
+Subject: hw/9pfs/9p-util.h: Also allow sockets to be opened
+
+Forwarded: not-needed
+Bug-Ubuntu: https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/2065579
+---
+ hw/9pfs/9p-util.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/hw/9pfs/9p-util.h b/hw/9pfs/9p-util.h
+index ff32179..a3df012 100644
+--- a/hw/9pfs/9p-util.h
++++ b/hw/9pfs/9p-util.h
+@@ -47,7 +47,8 @@ static inline int close_if_special_file(int fd)
+         close_preserve_errno(fd);
+         return -1;
+     }
+-    if (!S_ISREG(stbuf.st_mode) && !S_ISDIR(stbuf.st_mode)) {
++    if (!S_ISREG(stbuf.st_mode) && !S_ISDIR(stbuf.st_mode)
++        && !S_ISSOCK(stbuf.st_mode)) {
+         error_report_once(
+             "9p: broken or compromised client detected; attempt to open "
+             "special file (i.e. neither regular file, nor directory)"
+
+In response to comment #7, I have no issue releasing a security update regression fix for focal and jammy that relaxes the CVE fix for sockets since that is a change in behaviour. Let me know once the proposed patch has been successfully tested to resolve the issue.
+
+------- Comment From <email address hidden> 2024-06-04 07:23 EDT-------
+@sergiodj
+
+My patch went further and also allowed FIFOs.
+This patch also passed all my verification with the workload that was previously failing.
+
+iff --git a/hw/9pfs/9p-util.h b/hw/9pfs/9p-util.h
+index 51c94b0116..d19bb26570 100644
+--- a/hw/9pfs/9p-util.h
++++ b/hw/9pfs/9p-util.h
+@@ -130,9 +130,9 @@ static inline int close_if_special_file(int fd)
+close_preserve_errno(fd);
+return -1;
+}
+-    if (!S_ISREG(stbuf.st_mode) && !S_ISDIR(stbuf.st_mode)) {
++    if (!S_ISREG(stbuf.st_mode) && !S_ISDIR(stbuf.st_mode) && !S_ISSOCK(stbuf.st_mode) && !S_ISFIFO(stbuf.st_mode)) {
+error_report_once(
+-            "9p: broken or compromised client detected; attempt to open "
++            "9p: broken or compromised client detected; attempt to open a device"
+"special file (i.e. neither regular file, nor directory)"
+);
+close(fd);
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu6.29
+
+---------------
+qemu (1:4.2-3ubuntu6.29) focal-security; urgency=medium
+
+  * SECURITY REGRESSION: 9pfs restrictions on sockets (LP: #2065579)
+    - debian/patches/ubuntu/lp-2065579-9pfs-allow-sockets.patch: allow
+      sockets and FIFOs to be opened in hw/9pfs/9p-util.h. The fix for
+      CVE-2023-2861 was too restrictive for some use-cases.
+
+ -- Marc Deslauriers <email address hidden>  Wed, 05 Jun 2024 12:25:53 -0400
+
+This bug was fixed in the package qemu - 1:6.2+dfsg-2ubuntu6.21
+
+---------------
+qemu (1:6.2+dfsg-2ubuntu6.21) jammy-security; urgency=medium
+
+  * SECURITY REGRESSION: 9pfs restrictions on sockets (LP: #2065579)
+    - debian/patches/ubuntu/lp-2065579-9pfs-allow-sockets.patch: allow
+      sockets and FIFOs to be opened in hw/9pfs/9p-util.h. The fix for
+      CVE-2023-2861 was too restrictive for some use-cases.
+
+ -- Marc Deslauriers <email address hidden>  Wed, 05 Jun 2024 12:25:53 -0400
+
+------- Comment From <email address hidden> 2024-06-07 06:53 EDT-------
+The fix to this bug has been released to -security.
+
+Thanks to everyone for your speedy work to get this fixed.
+
+With this, I am closing this bug: changing the status to ==> CLOSED
+

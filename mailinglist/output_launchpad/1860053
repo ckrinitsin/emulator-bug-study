@@ -1,0 +1,59 @@
+Possible lack of precision when calling clock_gettime via vDSO on user mode ppc64le
+
+Occurs on QEMU v4.2.0 run on docker (via the qemu-user-static:v4.2.0-2 image) on an AMD64 Ubuntu 18.04.3 LTS machine provided by travis-ci.org.
+
+From golang's https://github.com/golang/go/issues/36592:
+
+It was discovered that golang's time.NewTicker() and time.Sleep() malfunction when a compiled application was run via QEMU's ppc64le emulator in user mode.
+
+The methods did not malfunction on actual PowerPC hardware or when the same golang application was compiled for golang's arm, arm64 or 386 targets and was run via user mode QEMU on the same system.
+
+Curiously, the methods also worked when the program was compiled under go 1.11, but do malfunction in go 1.12 and 1.13.
+
+It was identified the change in behaviour was most likely attributable to golang switching to using vSDO for calling clock_gettime() on PowerPC 64 architectures in 1.12. I.E:
+https://github.com/golang/go/commit/dbd8af74723d2c98cbdcc70f7e2801f69b57ac5b
+
+We therefore suspect there may be a bug in QEMU's user-mode emulation of ppc64le as relates to vDSO calls to clock_gettime().
+
+The nature of the malfunction of time.NewTicker() and time.Sleep() is such that sleeps or ticks with a granularity of less than one second do not appear to be possible (they all revert to 1 second sleeps/ticks). Could it be that the nanoseconds field of clock_gettime() is getting lost in the vDSO version but not in the syscall? Or some other issue calling these methods via vDSO?
+
+Thanks in advance.
+
+QEMU does not implement any vDSO, so this cannot be the explanation.
+
+Since there is no vdso, the Go code goes into the syscall fallback:
+
+MOVD	runtime·vdsoClockgettimeSym(SB), R12	// Check for VDSO availability
+CMP	R12, R0
+BEQ	fallback
+(...)
+fallback:
+	ADD	$32, R1, R4
+	SYSCALL $SYS_clock_gettime
+	MOVD	32(R1), R3
+	MOVD	48(R1), R5
+	JMP	finish
+
+But upon inspection, it seems the offset while loading R5 is not correct:
+
+in QEMU's clock_gettime implementation:	
+(gdb) p/x *host_ts
+$8 = {tv_sec = 0x9225f, tv_nsec = 0x375f74ee}
+
+in the Go runtime:
+(gdb) p/x *($r1 + 48)
+$6 = 0x388c8
+(gdb) p/x *($r1 + 40)
+$7 = 0x375f74ee
+
+
+Thank you Fabiano for investigating. 
+
+It seems the golang side agrees with your analysis:
+https://github.com/golang/go/issues/36592
+
+I have marked this bug invalid for now. Thank you for your help.
+
+Regards,
+Patrick
+

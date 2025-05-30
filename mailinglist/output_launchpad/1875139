@@ -1,0 +1,173 @@
+Domain fails to start when 'readonly' device not writable
+
+This issue is introduced in QEMU 4.2.0 (4.1.0 is working fine)
+
+My root disk is a LVM2 volume thin snapshot that is marked as read-only
+But when I try to start the domain (using virt-manager) I get the following error:
+
+Error starting domain: internal error: process exited while connecting to monitor: 2020-04-26T06:55:06.342700Z qemu-system-x86_64: -blockdev {"driver":"host_device","filename":"/dev/vg/vmroot-20200425","aio":"native","node-name":"libvirt-3-storage","cache":{"direct":true,"no-flush":false},"auto-read-only":true,"discard":"unmap"} The device is not writable: Permission denied
+
+Changing the lvm snapshot to writeable allows me to start the domain.
+(Making it changes possible during domain is running)
+
+I don't think QEMU should fail when it can't open a (block) device when the read-only option is set.
+(why is write access needed?)
+
+Reproduce steps:
+* Create LVM read-only volume (I don't think any data is needed)
+* Create domain with read-only volume as block device
+* Try to start the domain
+
+Traceback (most recent call last):
+  File "/usr/share/virt-manager/virtManager/asyncjob.py", line 75, in cb_wrapper
+    callback(asyncjob, *args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/asyncjob.py", line 111, in tmpcb
+    callback(*args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/object/libvirtobject.py", line 66, in newfn
+    ret = fn(self, *args, **kwargs)
+  File "/usr/share/virt-manager/virtManager/object/domain.py", line 1279, in startup
+    self._backend.create()
+  File "/usr/lib/python3.7/site-packages/libvirt.py", line 1152, in create
+    if ret == -1: raise libvirtError ('virDomainCreate() failed', dom=self)
+libvirt.libvirtError: internal error: process exited while connecting to monitor: 2020-04-26T07:29:47.463835Z qemu-system-x86_64: -blockdev {"driver":"host_device","filename":"/var/lib/libvirt/vmportage/rootdisk","aio":"native","node-name":"libvirt-3-storage","cache":{"direct":true,"no-flush":false},"auto-read-only":true,"discard":"unmap"}: The device is not writable: Permission denied
+
+
+Can you provide the full guest XML for this   - "/etc/libvirt/qemu/$GUESTNAME.xml", and also the full QEMU command line - "/var/log/libvirt/qemu/$GUESTNAME.xml".  We need to see whether the disk is considered read-only from libvirt's POV.
+
+> This issue is introduced in QEMU 4.2.0 (4.1.0 is working fine)
+
+That's not neccessarily the case - with QEMU 4.2.0, libvirt switched over to using the new -blockdev command line syntax. When you were testing with 4.1.0, it would have been using the legacy -drive syntax.  So the change in behaviour is more likely related to the usage of -blockdev, than any bug introduced in QEMU.
+
+The domain.xml:
+<domain type='kvm'>
+  <name>rotest</name>
+  <uuid>b4aa0288-8886-42df-abfd-4c8f729e1330</uuid>
+  <memory unit='KiB'>2048000</memory>
+  <currentMemory unit='KiB'>2048000</currentMemory>
+  <vcpu placement='static'>2</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-2.7'>hvm</type>
+    <kernel>/var/lib/libvirt/pink/kernel</kernel>
+    <cmdline>root=/dev/sda ro panic=300 systemd.show_status=1 systemd.unit=graphical.target quiet</cmdline>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+  </features>
+  <cpu mode='custom' match='exact' check='none'>
+    <model fallback='forbid'>qemu64</model>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source dev='/dev/nvmvg/rotest'/>
+      <target dev='sda' bus='scsi'/>
+      <readonly/>
+      <shareable/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source dev='/dev/nvmvg/rotest-var'/>
+      <target dev='sdb' bus='scsi'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <controller type='pci' index='0' model='pci-root'/>
+    <controller type='scsi' index='0' model='virtio-scsi'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </controller>
+    <controller type='usb' index='0' model='piix3-uhci'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+    </controller>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='spice' autoport='yes'>
+      <listen type='address'/>
+      <gl enable='no' rendernode='/dev/dri/by-path/pci-0000:00:02.0-render'/>
+    </graphics>
+    <video>
+      <model type='virtio' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x07' function='0x0'/>
+    </memballoon>
+  </devices>
+</domain>
+
+--------------------------------------------------------------------------------
+
+The qemu command:
+2020-04-27 11:57:11.720+0000: starting up libvirt version: 6.0.0, qemu version: 4.2.0, kernel: 5.4.28-gentoo, hostname: gentoo
+LC_ALL=C \
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+HOME=/var/lib/libvirt/qemu/domain-10-rotest \
+XDG_DATA_HOME=/var/lib/libvirt/qemu/domain-10-rotest/.local/share \
+XDG_CACHE_HOME=/var/lib/libvirt/qemu/domain-10-rotest/.cache \
+XDG_CONFIG_HOME=/var/lib/libvirt/qemu/domain-10-rotest/.config \
+QEMU_AUDIO_DRV=spice \
+/usr/bin/qemu-system-x86_64 \
+-name guest=rotest,debug-threads=on \
+-S \
+-object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-10-rotest/master-key.aes \
+-machine pc-i440fx-2.7,accel=kvm,usb=off,dump-guest-core=off \
+-cpu qemu64 \
+-m 2000 \
+-overcommit mem-lock=off \
+-smp 2,sockets=2,cores=1,threads=1 \
+-uuid b4aa0288-8886-42df-abfd-4c8f729e1330 \
+-no-user-config \
+-nodefaults \
+-chardev socket,id=charmonitor,fd=32,server,nowait \
+-mon chardev=charmonitor,id=monitor,mode=control \
+-rtc base=utc,driftfix=slew \
+-global kvm-pit.lost_tick_policy=delay \
+-no-hpet \
+-no-shutdown \
+-boot strict=on \
+-kernel /var/lib/libvirt/pink/kernel \
+-append 'root=/dev/sda ro panic=300 systemd.show_status=1 systemd.unit=graphical.target quiet' \
+-device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 \
+-device virtio-scsi-pci,id=scsi0,bus=pci.0,addr=0x5 \
+-blockdev '{"driver":"host_device","filename":"/dev/nvmvg/rotest","node-name":"libvirt-2-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-2-format","read-only":true,"driver":"raw","file":"libvirt-2-storage"}' \
+-device scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=0,device_id=drive-scsi0-0-0-0,share-rw=on,drive=libvirt-2-format,id=scsi0-0-0-0,bootindex=1 \
+-blockdev '{"driver":"host_device","filename":"/dev/nvmvg/rotest-var","node-name":"libvirt-1-storage","cache":{"direct":true,"no-flush":false},"auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-1-format","read-only":false,"cache":{"direct":true,"no-flush":false},"driver":"raw","file":"libvirt-1-storage"}' \
+-device scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=1,device_id=drive-scsi0-0-0-1,drive=libvirt-1-format,id=scsi0-0-0-1,write-cache=on \
+-spice port=5900,addr=192.168.1.9,disable-ticketing,seamless-migration=on \
+-device virtio-vga,id=video0,max_outputs=1,bus=pci.0,addr=0x2 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x7 \
+-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+-msg timestamp=on
+2020-04-27T11:57:11.804028Z qemu-system-x86_64: -blockdev {"driver":"host_device","filename":"/dev/nvmvg/rotest","node-name":"libvirt-2-storage","auto-read-only":true,"discard":"unmap"}: The device is not writable: Permission denied
+2020-04-27 11:57:11.805+0000: shutting down, reason=failed
+
+This was indeed caused by libvirt starting to use -blockdev. The issue is that qemu's 'auto-read-only' property which is used by libvirt for the backing files doesn't properly work if the 'host_device' backend encounters a read-only LV.
+
+The above situation also happens if you have an read-only LV in the backing chain.
+
+In the current upstream situation of qemu's APIs there currently isn't anything that libvirt can do in this case, because any solution would either not fix the problem completely or would require sacrificing other features, the auto-read-only property needs to be fixed in qemu.
+
+I've also filed https://bugzilla.redhat.com/show_bug.cgi?id=1828252 to track this issue.
+
+I saw that that the related issue was implemented in 5.1.0.
+
+So after I updated my QEMU to version 5.1.0. My VM(s) with a LVM read-only volume started again.
+
+Thanks for getting this issue solved.
+
+
+
+
+If I've got that right, this issue got solved, so I'm closing it now. Please file a new ticket in our new tracker at gitlab.com if there is still a problem.
+

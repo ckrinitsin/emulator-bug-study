@@ -1,0 +1,115 @@
+vnc server closed socket after arrow "down" keyevent
+
+This is a rewrite for https://bugs.launchpad.net/qemu/+bug/1670377
+
+QEMU 2.6 or later
+tigervncviwer 1.6  
+
+Once get into grub boot interface(choose boot os, or recovery mode), keep pressing arrow down button for couple times, qemu will close the connection, vnc used zrle mode.
+
+Interesting place:
+1. when stopped at grub interface, only arrow up and down key could trigger it, 
+2.  only in zrle or tight mode, could work well in raw mode
+2. it only triggered by remote connection, not happen if local vncviewer and vnc server
+
+
+A trace is attached.
+
+Thanks
+
+
+
+Find the root reason: qio_channel_write is going to write 290124 data, but only wrote 238644, and for the next write 51489, it returned error, then trigger vnc_client_io_error and disconnect socket. 
+
+
+ssize_t vnc_client_write_buf(VncState *vs, const uint8_t *data, size_t datalen)
+{
+    Error *err = NULL;
+    ssize_t ret;
+    ret = qio_channel_write(
+        vs->ioc, (const char *)data, datalen, &err);
+    VNC_DEBUG("Wrote wire %p %zd -> %ld\n", data, datalen, ret);
+    return vnc_client_io_error(vs, ret, &err);
+}
+
+// log file
+
+
+Write Plain: Pending output 0x5579e6bd2c60 size 524288 offset 290124. Wait SSF 0
+32760@1493228975.268871:object_class_dynamic_cast_assert qio-channel-socket->qio-channel (io/channel.c:60:qio_channel_writev_full)
+32760@1493228975.268876:object_dynamic_cast_assert qio-channel-socket->qio-channel-socket (io/channel-socket.c:508:qio_channel_socket_writev)
+Wrote wire 0x5579e6bd2c60 290124 -> 290124
+
+
+
+Write Plain: Pending output 0x5579e6bd2c60 size 524288 offset 290124. Wait SSF 0
+32760@1493228975.731842:object_class_dynamic_cast_assert qio-channel-socket->qio-channel (io/channel.c:60:qio_channel_writev_full)
+32760@1493228975.731846:object_dynamic_cast_assert qio-channel-socket->qio-channel-socket (io/channel-socket.c:508:qio_channel_socket_writev)
+Wrote wire 0x5579e6bd2c60 290124 -> 238644
+Write Plain: Pending output 0x5579e6bd2c60 size 65536 offset 51480. Wait SSF 0
+32760@1493228975.731934:object_class_dynamic_cast_assert qio-channel-socket->qio-channel (io/channel.c:60:qio_channel_writev_full)
+32760@1493228975.731937:object_dynamic_cast_assert qio-channel-socket->qio-channel-socket (io/channel-socket.c:508:qio_channel_socket_writev)
+Wrote wire 0x5579e6bd2c60 51480 -> -2
+vnc_set_share_mode/0x5579e7b6d730: shared -> disconnected
+
+>  Wrote wire 0x5579e6bd2c60 51480 -> -2
+
+That is QIO_CHANNEL_ERR_BLOCK, aka EAGAIN.
+
+This is fixed in the 2.9.0 release with
+
+commit 537848ee62195fc06c328b1cd64f4218f404a7f1
+Author: Michael Tokarev <email address hidden>
+Date:   Fri Feb 3 12:52:29 2017 +0300
+
+    vnc: do not disconnect on EAGAIN
+    
+    When qemu vnc server is trying to send large update to clients,
+    there might be a situation when system responds with something
+    like EAGAIN, indicating that there's no system memory to send
+    that much data (depending on the network speed, client and server
+    and what is happening).  In this case, something like this happens
+    on qemu side (from strace):
+    
+    sendmsg(16, {msg_name(0)=NULL,
+            msg_iov(1)=[{"\244\"..., 729186}],
+            msg_controllen=0, msg_flags=0}, 0) = 103950
+    sendmsg(16, {msg_name(0)=NULL,
+            msg_iov(1)=[{"lz\346"..., 1559618}],
+            msg_controllen=0, msg_flags=0}, 0) = -1 EAGAIN
+    sendmsg(-1, {msg_name(0)=NULL,
+            msg_iov(1)=[{"lz\346"..., 1559618}],
+            msg_controllen=0, msg_flags=0}, 0) = -1 EBADF
+    
+    qemu closes the socket before the retry, and obviously it gets EBADF
+    when trying to send to -1.
+    
+    This is because there WAS a special handling for EAGAIN, but now it doesn't
+    work anymore, after commit 04d2529da27db512dcbd5e99d0e26d333f16efcc, because
+    now in all error-like cases we initiate vnc disconnect.
+    
+    This change were introduced in qemu 2.6, and caused numerous grief for many
+    people, resulting in their vnc clients reporting sporadic random disconnects
+    from vnc server.
+    
+    Fix that by doing the disconnect only when necessary, i.e. omitting this
+    very case of EAGAIN.
+    
+    Hopefully the existing condition (comparing with QIO_CHANNEL_ERR_BLOCK)
+    is sufficient, as the original code (before the above commit) were
+    checking for other errno values too.
+    
+    Apparently there's another (semi?)bug exist somewhere here, since the
+    code tries to write to fd# -1, it probably should check if the connection
+    is open before. But this isn't important.
+    
+    Signed-off-by: Michael Tokarev <email address hidden>
+    Reviewed-by: Daniel P. Berrange <email address hidden>
+    Message-id: <email address hidden>
+    Fixes: 04d2529da27db512dcbd5e99d0e26d333f16efcc
+    Cc: Daniel P. Berrange <email address hidden>
+    Cc: Gerd Hoffmann <email address hidden>
+    Cc: <email address hidden>
+    Signed-off-by: Gerd Hoffmann <email address hidden>
+
+

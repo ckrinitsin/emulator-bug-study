@@ -1,0 +1,1323 @@
+gcc 8.2 reports stringop-truncation when building qemu
+
+QEMU 3.0
+
+block/sheepdog.c: In function 'find_vdi_name':
+block/sheepdog.c:1239:5: error: 'strncpy' specified bound 256 equals destination size [-Werror=stringop-truncation]
+     strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+If this is the intended behavior, please suppress the warning. For example:
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+    strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+#pragma GCC diagnostic pop
+
+On Tue, Dec 18, 2018 at 3:09 PM Philippe Mathieu-Daudé
+<email address hidden> wrote:
+>
+> GCC 8 added a -Wstringop-truncation warning:
+>
+>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>   bug 81117 is specifically intended to highlight likely unintended
+>   uses of the strncpy function that truncate the terminating NUL
+>   character from the source string.
+>
+> This new warning leads to compilation failures:
+>
+>     CC      migration/global_state.o
+>   qemu/migration/global_state.c: In function 'global_state_store_running':
+>   qemu/migration/global_state.c:45:5: error: 'strncpy' specified bound 100 equals destination size [-Werror=stringop-truncation]
+>        strncpy((char *)global_state.runstate, state, sizeof(global_state.runstate));
+>        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+>
+> The runstate name doesn't require the strings to be NUL-terminated,
+> therefore strncpy is the right function to use here.
+>
+> We could add a #pragma GCC diagnostic ignored "-Wstringop-truncation"
+> around, disable the warning globally using -Wno-stringop-truncation,
+> but since QEMU provides the strpadcpy() which does the same purpose,
+> simply use it to avoid the annoying warning.
+>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+
+Reviewed-by: Marc-André Lureau <email address hidden>
+
+> ---
+>  migration/global_state.c | 4 ++--
+>  1 file changed, 2 insertions(+), 2 deletions(-)
+>
+> diff --git a/migration/global_state.c b/migration/global_state.c
+> index 8e8ab5c51e..c7e7618118 100644
+> --- a/migration/global_state.c
+> +++ b/migration/global_state.c
+> @@ -42,8 +42,8 @@ int global_state_store(void)
+>  void global_state_store_running(void)
+>  {
+>      const char *state = RunState_str(RUN_STATE_RUNNING);
+> -    strncpy((char *)global_state.runstate,
+> -           state, sizeof(global_state.runstate));
+> +    strpadcpy((char *)global_state.runstate,
+> +              sizeof(global_state.runstate), state, '\0');
+>  }
+>
+>  bool global_state_received(void)
+> --
+> 2.17.2
+>
+>
+
+
+-- 
+Marc-André Lureau
+
+
+On Tue, 18 Dec 2018 12:03:31 +0100
+Philippe Mathieu-Daudé <email address hidden> wrote:
+
+> From: Marc-André Lureau <email address hidden>
+> 
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>   bug 81117 is specifically intended to highlight likely unintended
+>   uses of the strncpy function that truncate the terminating NUL
+>   character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>     CC      hw/acpi/core.o
+>   In function 'acpi_table_install', inlined from 'acpi_table_add' at qemu/hw/acpi/core.c:296:5:
+>   qemu/hw/acpi/core.c:184:9: error: 'strncpy' specified bound 4 equals destination size [-Werror=stringop-truncation]
+>            strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+>            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   make: *** [qemu/rules.mak:69: hw/acpi/core.o] Error 1
+> 
+> The ACPI tables don't require the strings to be NUL-terminated,
+> therefore strncpy is the right function to use here.
+> 
+> We could add a #pragma GCC diagnostic ignored "-Wstringop-truncation"
+> around, disable the warning globally using -Wno-stringop-truncation,
+> but since QEMU provides the strpadcpy() which does the same purpose,
+> simply use it to avoid the annoying warning.
+> 
+> Signed-off-by: Marc-André Lureau <email address hidden>
+> Reviewed-by: Eric Blake <email address hidden>
+> Reviewed-by: Philippe Mathieu-Daudé <email address hidden>
+> [PMD: reword commit subject and description]
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+
+Reviewed-by: Igor Mammedov <email address hidden>
+
+> ---
+>  hw/acpi/aml-build.c |  6 ++++--
+>  hw/acpi/core.c      | 13 +++++++------
+>  2 files changed, 11 insertions(+), 8 deletions(-)
+> 
+> diff --git a/hw/acpi/aml-build.c b/hw/acpi/aml-build.c
+> index 1e43cd736d..397833462a 100644
+> --- a/hw/acpi/aml-build.c
+> +++ b/hw/acpi/aml-build.c
+> @@ -24,6 +24,7 @@
+>  #include "hw/acpi/aml-build.h"
+>  #include "qemu/bswap.h"
+>  #include "qemu/bitops.h"
+> +#include "qemu/cutils.h"
+>  #include "sysemu/numa.h"
+>  
+>  static GArray *build_alloc_array(void)
+> @@ -1532,13 +1533,14 @@ build_header(BIOSLinker *linker, GArray *table_data,
+>      h->revision = rev;
+>  
+>      if (oem_id) {
+> -        strncpy((char *)h->oem_id, oem_id, sizeof h->oem_id);
+> +        strpadcpy((char *)h->oem_id, sizeof h->oem_id, oem_id, '\0');
+>      } else {
+>          memcpy(h->oem_id, ACPI_BUILD_APPNAME6, 6);
+>      }
+>  
+>      if (oem_table_id) {
+> -        strncpy((char *)h->oem_table_id, oem_table_id, sizeof(h->oem_table_id));
+> +        strpadcpy((char *)h->oem_table_id, sizeof(h->oem_table_id),
+> +                  oem_table_id, '\0');
+>      } else {
+>          memcpy(h->oem_table_id, ACPI_BUILD_APPNAME4, 4);
+>          memcpy(h->oem_table_id + 4, sig, 4);
+> diff --git a/hw/acpi/core.c b/hw/acpi/core.c
+> index aafdc61648..6e8f4e5713 100644
+> --- a/hw/acpi/core.c
+> +++ b/hw/acpi/core.c
+> @@ -31,6 +31,7 @@
+>  #include "qapi/qapi-visit-misc.h"
+>  #include "qemu/error-report.h"
+>  #include "qemu/option.h"
+> +#include "qemu/cutils.h"
+>  
+>  struct acpi_table_header {
+>      uint16_t _length;         /* our length, not actual part of the hdr */
+> @@ -181,7 +182,7 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
+>      ext_hdr->_length = cpu_to_le16(acpi_payload_size);
+>  
+>      if (hdrs->has_sig) {
+> -        strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+> +        strpadcpy(ext_hdr->sig, sizeof ext_hdr->sig, hdrs->sig, '\0');
+>          ++changed_fields;
+>      }
+>  
+> @@ -200,12 +201,12 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
+>      ext_hdr->checksum = 0;
+>  
+>      if (hdrs->has_oem_id) {
+> -        strncpy(ext_hdr->oem_id, hdrs->oem_id, sizeof ext_hdr->oem_id);
+> +        strpadcpy(ext_hdr->oem_id, sizeof ext_hdr->oem_id, hdrs->oem_id, '\0');
+>          ++changed_fields;
+>      }
+>      if (hdrs->has_oem_table_id) {
+> -        strncpy(ext_hdr->oem_table_id, hdrs->oem_table_id,
+> -                sizeof ext_hdr->oem_table_id);
+> +        strpadcpy(ext_hdr->oem_table_id, sizeof ext_hdr->oem_table_id,
+> +                  hdrs->oem_table_id, '\0');
+>          ++changed_fields;
+>      }
+>      if (hdrs->has_oem_rev) {
+> @@ -213,8 +214,8 @@ static void acpi_table_install(const char unsigned *blob, size_t bloblen,
+>          ++changed_fields;
+>      }
+>      if (hdrs->has_asl_compiler_id) {
+> -        strncpy(ext_hdr->asl_compiler_id, hdrs->asl_compiler_id,
+> -                sizeof ext_hdr->asl_compiler_id);
+> +        strpadcpy(ext_hdr->asl_compiler_id, sizeof ext_hdr->asl_compiler_id,
+> +                  hdrs->asl_compiler_id, '\0');
+>          ++changed_fields;
+>      }
+>      if (hdrs->has_asl_compiler_rev) {
+
+
+
+On Tue, Dec 18, 2018 at 12:03:30PM +0100, Philippe Mathieu-Daudé wrote:
+> GCC 8 new warning prevents builds to success since quite some time.
+> First report on the mailing list is in July 2018:
+> https://lists.gnu.org/archive/html/qemu-devel/2018-07/msg03723.html
+> 
+> Various intents has been sent to fix this:
+> - Incorrectly using g_strlcpy()
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03705.html
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03706.html
+> - Using assert() and strpadcpy()
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-11/msg03938.html
+> - Use #pragma GCC diagnostic ignored "-Wstringop-truncation"
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> - adding an inline wrapper with said pragma in there
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> - -Wno-stringop-truncation is the makefile
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> 
+> This series replace the strncpy() calls by strpadcpy() which seemed
+> to me the saniest option.
+> 
+> Regards,
+> 
+> Phil.
+
+Do you happen to know why does it build fine with
+Gcc 8.2.1?
+
+Reading the GCC manual it seems that
+there is a "nostring" attribute that means
+"might not be 0 terminated".
+I think we should switch to that which fixes the warning
+but also warns if someone tries to misuse these
+as C-strings.
+
+Seems to be a better option, does it not?
+
+
+> Marc-André Lureau (1):
+>   hw/acpi: Replace strncpy() by strpadcpy(pad='\0')
+> 
+> Philippe Mathieu-Daudé (2):
+>   block/sheepdog: Replace strncpy() by strpadcpy(pad='\0')
+>   migration: Replace strncpy() by strpadcpy(pad='\0')
+> 
+>  block/sheepdog.c         |  6 +++---
+>  hw/acpi/aml-build.c      |  6 ++++--
+>  hw/acpi/core.c           | 13 +++++++------
+>  migration/global_state.c |  4 ++--
+>  4 files changed, 16 insertions(+), 13 deletions(-)
+> 
+> -- 
+> 2.17.2
+
+
+On Tue, Dec 18, 2018 at 09:31:00AM -0500, Michael S. Tsirkin wrote:
+> On Tue, Dec 18, 2018 at 12:03:30PM +0100, Philippe Mathieu-Daudé wrote:
+> > GCC 8 new warning prevents builds to success since quite some time.
+> > First report on the mailing list is in July 2018:
+> > https://lists.gnu.org/archive/html/qemu-devel/2018-07/msg03723.html
+> > 
+> > Various intents has been sent to fix this:
+> > - Incorrectly using g_strlcpy()
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03705.html
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03706.html
+> > - Using assert() and strpadcpy()
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-11/msg03938.html
+> > - Use #pragma GCC diagnostic ignored "-Wstringop-truncation"
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > - adding an inline wrapper with said pragma in there
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > - -Wno-stringop-truncation is the makefile
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > 
+> > This series replace the strncpy() calls by strpadcpy() which seemed
+> > to me the saniest option.
+> > 
+> > Regards,
+> > 
+> > Phil.
+> 
+> Do you happen to know why does it build fine with
+> Gcc 8.2.1?
+> 
+> Reading the GCC manual it seems that
+> there is a "nostring" attribute that means
+
+typo - its "nonstring"
+
+> "might not be 0 terminated".
+> I think we should switch to that which fixes the warning
+> but also warns if someone tries to misuse these
+> as C-strings.
+> 
+> Seems to be a better option, does it not?
+
+Yes, it does look best as gcc manual explicitly suggests "nonstring"
+as the way to stop this strncpy warning.
+
+
+Regards,
+Daniel
+-- 
+|: https://berrange.com      -o-    https://www.flickr.com/photos/dberrange :|
+|: https://libvirt.org         -o-            https://fstop138.berrange.com :|
+|: https://entangle-photo.org    -o-    https://www.instagram.com/dberrange :|
+
+
+On Tue, Dec 18, 2018 at 09:31:00AM -0500, Michael S. Tsirkin wrote:
+> On Tue, Dec 18, 2018 at 12:03:30PM +0100, Philippe Mathieu-Daudé wrote:
+> > GCC 8 new warning prevents builds to success since quite some time.
+> > First report on the mailing list is in July 2018:
+> > https://lists.gnu.org/archive/html/qemu-devel/2018-07/msg03723.html
+> > 
+> > Various intents has been sent to fix this:
+> > - Incorrectly using g_strlcpy()
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03705.html
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03706.html
+> > - Using assert() and strpadcpy()
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-11/msg03938.html
+> > - Use #pragma GCC diagnostic ignored "-Wstringop-truncation"
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > - adding an inline wrapper with said pragma in there
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > - -Wno-stringop-truncation is the makefile
+> >   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> > 
+> > This series replace the strncpy() calls by strpadcpy() which seemed
+> > to me the saniest option.
+> > 
+> > Regards,
+> > 
+> > Phil.
+> 
+> Do you happen to know why does it build fine with
+> Gcc 8.2.1?
+> 
+> Reading the GCC manual it seems that
+> there is a "nostring" attribute
+
+Sorry that should be "nonstring".
+
+
+> that means
+> "might not be 0 terminated".
+> I think we should switch to that which fixes the warning
+> but also warns if someone tries to misuse these
+> as C-strings.
+> 
+> Seems to be a better option, does it not?
+> 
+
+Also maybe we can make strpadcpy check for the nonstring
+attribute too somehow?
+Or did gcc just hardcode the strncpy name?
+
+> > Marc-André Lureau (1):
+> >   hw/acpi: Replace strncpy() by strpadcpy(pad='\0')
+> > 
+> > Philippe Mathieu-Daudé (2):
+> >   block/sheepdog: Replace strncpy() by strpadcpy(pad='\0')
+> >   migration: Replace strncpy() by strpadcpy(pad='\0')
+> > 
+> >  block/sheepdog.c         |  6 +++---
+> >  hw/acpi/aml-build.c      |  6 ++++--
+> >  hw/acpi/core.c           | 13 +++++++------
+> >  migration/global_state.c |  4 ++--
+> >  4 files changed, 16 insertions(+), 13 deletions(-)
+> > 
+> > -- 
+> > 2.17.2
+
+
+On Tue, Dec 18, 2018 at 03:45:08PM +0100, Paolo Bonzini wrote:
+> On 18/12/18 15:31, Michael S. Tsirkin wrote:
+> > Do you happen to know why does it build fine with
+> > Gcc 8.2.1?
+> > 
+> > Reading the GCC manual it seems that
+> > there is a "nostring" attribute that means
+> > "might not be 0 terminated".
+> > I think we should switch to that which fixes the warning
+> > but also warns if someone tries to misuse these
+> > as C-strings.
+> > 
+> > Seems to be a better option, does it not?
+> > 
+> > 
+> 
+> Using strpadcpy is clever and self-documenting, though.  We have it
+> already, so why not use it.
+> 
+> Paolo
+
+The advantage of nonstring is that it will catch attempts to
+use these fields with functions that expect a 0 terminated string.
+
+strpadcpy will instead just silence the warning.
+
+
+-- 
+MST
+
+
+On Tue, Dec 18, 2018 at 05:38:17PM +0100, Paolo Bonzini wrote:
+> On 18/12/18 15:54, Michael S. Tsirkin wrote:
+> > On Tue, Dec 18, 2018 at 03:45:08PM +0100, Paolo Bonzini wrote:
+> >> On 18/12/18 15:31, Michael S. Tsirkin wrote:
+> >>> Do you happen to know why does it build fine with
+> >>> Gcc 8.2.1?
+> >>>
+> >>> Reading the GCC manual it seems that
+> >>> there is a "nostring" attribute that means
+> >>> "might not be 0 terminated".
+> >>> I think we should switch to that which fixes the warning
+> >>> but also warns if someone tries to misuse these
+> >>> as C-strings.
+> >>>
+> >>> Seems to be a better option, does it not?
+> >>>
+> >>>
+> >>
+> >> Using strpadcpy is clever and self-documenting, though.  We have it
+> >> already, so why not use it.
+> >>
+> >> Paolo
+> > 
+> > The advantage of nonstring is that it will catch attempts to
+> > use these fields with functions that expect a 0 terminated string.
+> > 
+> > strpadcpy will instead just silence the warning.
+> 
+> Ah, I see.  We could also do both, that's a matter of taste.
+> 
+> Paolo
+
+Do you happen to know how to make gcc check the buffer size
+for strpadcpy? Is the name strncpy just hard-coded?
+
+-- 
+MST
+
+
+On Tue, Dec 18, 2018 at 05:55:27PM +0100, Philippe Mathieu-Daudé wrote:
+> On 12/18/18 3:54 PM, Michael S. Tsirkin wrote:
+> > On Tue, Dec 18, 2018 at 03:45:08PM +0100, Paolo Bonzini wrote:
+> >> On 18/12/18 15:31, Michael S. Tsirkin wrote:
+> >>> Do you happen to know why does it build fine with
+> >>> Gcc 8.2.1?
+> >>>
+> >>> Reading the GCC manual it seems that
+> >>> there is a "nostring" attribute that means
+> >>> "might not be 0 terminated".
+> >>> I think we should switch to that which fixes the warning
+> >>> but also warns if someone tries to misuse these
+> >>> as C-strings.
+> >>>
+> >>> Seems to be a better option, does it not?
+> >>>
+> >>>
+> >>
+> >> Using strpadcpy is clever and self-documenting, though.  We have it
+> >> already, so why not use it.
+> >>
+> >> Paolo
+> > 
+> > The advantage of nonstring is that it will catch attempts to
+> > use these fields with functions that expect a 0 terminated string.
+> > 
+> > strpadcpy will instead just silence the warning.
+> 
+> migration/global_state.c:109:15: error: 'strlen' argument 1 declared
+> attribute 'nonstring' [-Werror=stringop-overflow=]
+>      s->size = strlen((char *)s->runstate) + 1;
+>                ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+> 
+> GCC won... It is true this strlen() is buggy, indeed s->runstate might
+> be not NUL-terminated.
+
+
+Ooh nice. I smell some CVE fixes coming from this effort.
+
+
+-- 
+MST
+
+
+On Tue, Dec 18, 2018 at 06:12:05PM +0100, Paolo Bonzini wrote:
+> On 18/12/18 17:55, Philippe Mathieu-Daudé wrote:
+> >> strpadcpy will instead just silence the warning.
+> > migration/global_state.c:109:15: error: 'strlen' argument 1 declared
+> > attribute 'nonstring' [-Werror=stringop-overflow=]
+> >      s->size = strlen((char *)s->runstate) + 1;
+> >                ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+> > 
+> > GCC won... It is true this strlen() is buggy, indeed s->runstate might
+> > be not NUL-terminated.
+> 
+> No, runstate is declared as an array of 100 bytes, which are more than
+> enough.  It's ugly code but not buggy.
+> 
+> Paolo
+
+Yes ... but it is loaded using
+        VMSTATE_BUFFER(runstate, GlobalState),
+and parsed using qapi_enum_parse which does not get
+the buffer length.
+
+So unless we are lucky there's a buffer overrun
+on a remote/file input here.
+
+Seems buggy to me - what am I missing?
+
+-- 
+MST
+
+
+On Tue, Dec 18, 2018 at 12:03:34PM -0500, Michael S. Tsirkin wrote:
+> On Tue, Dec 18, 2018 at 05:38:17PM +0100, Paolo Bonzini wrote:
+> > On 18/12/18 15:54, Michael S. Tsirkin wrote:
+> > > On Tue, Dec 18, 2018 at 03:45:08PM +0100, Paolo Bonzini wrote:
+> > >> On 18/12/18 15:31, Michael S. Tsirkin wrote:
+> > >>> Do you happen to know why does it build fine with
+> > >>> Gcc 8.2.1?
+> > >>>
+> > >>> Reading the GCC manual it seems that
+> > >>> there is a "nostring" attribute that means
+> > >>> "might not be 0 terminated".
+> > >>> I think we should switch to that which fixes the warning
+> > >>> but also warns if someone tries to misuse these
+> > >>> as C-strings.
+> > >>>
+> > >>> Seems to be a better option, does it not?
+> > >>>
+> > >>>
+> > >>
+> > >> Using strpadcpy is clever and self-documenting, though.  We have it
+> > >> already, so why not use it.
+> > >>
+> > >> Paolo
+> > > 
+> > > The advantage of nonstring is that it will catch attempts to
+> > > use these fields with functions that expect a 0 terminated string.
+> > > 
+> > > strpadcpy will instead just silence the warning.
+> > 
+> > Ah, I see.  We could also do both, that's a matter of taste.
+> > 
+> > Paolo
+> 
+> Do you happen to know how to make gcc check the buffer size
+> for strpadcpy? Is the name strncpy just hard-coded?
+
+GCC provides  strncpy as a builtin function and its warning only
+checks its builtin.
+
+Regards,
+Daniel
+-- 
+|: https://berrange.com      -o-    https://www.flickr.com/photos/dberrange :|
+|: https://libvirt.org         -o-            https://fstop138.berrange.com :|
+|: https://entangle-photo.org    -o-    https://www.instagram.com/dberrange :|
+
+
+On 12/18/18 11:51 AM, Philippe Mathieu-Daudé wrote:
+> GCC 8 introduced the -Wstringop-truncation checker to detect truncation by
+> the strncat and strncpy functions (closely related to -Wstringop-overflow,
+> which detect buffer overflow by string-modifying functions declared in
+> <string.h>).
+
+This paragraph talks about a new warning checker, but makes no mention 
+of an attribute.
+
+> 
+> Add the QEMU_NONSTRING macro which checks if the compiler supports this
+> attribute.
+
+Thus, "this attribute" has no antecedent; did you forget to add a 
+sentence to the previous paragraph, or maybe put the mention of adding 
+QEMU_NONSTRING after...
+
+> 
+>>From the GCC manual [*]:
+> 
+>    The nonstring variable attribute specifies that an object or member
+>    declaration with type array of char, signed char, or unsigned char,
+>    or pointer to such a type is intended to store character arrays that
+>    do not necessarily contain a terminating NUL. This is useful in detecting
+>    uses of such arrays or pointers with functions that expect NUL-terminated
+>    strings, and to avoid warnings when such an array or pointer is used as
+>    an argument to a bounded string manipulation function such as strncpy.
+
+...the explanation of how the attribute was added in tandem with the new 
+warning checker for silencing specific instances of the warning?
+
+> 
+> [*] https://gcc.gnu.org/onlinedocs/gcc/Common-Variable-Attributes.html#index-nonstring-variable-attribute
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   include/qemu/compiler.h | 15 +++++++++++++++
+>   1 file changed, 15 insertions(+)
+> 
+
+Reviewed-by: Eric Blake <email address hidden>
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+On 12/18/18 11:51 AM, Philippe Mathieu-Daudé wrote:
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>    The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>    bug 81117 is specifically intended to highlight likely unintended
+>    uses of the strncpy function that truncate the terminating NUL
+>    character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>      CC      block/sheepdog.o
+>    qemu/block/sheepdog.c: In function 'find_vdi_name':
+>    qemu/block/sheepdog.c:1239:5: error: 'strncpy' specified bound 256 equals destination size [-Werror=stringop-truncation]
+>         strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+>         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>    make: *** [qemu/rules.mak:69: block/sheepdog.o] Error 1
+> 
+> As described previous to the strncpy() calls, the use of strncpy() is
+> correct here:
+> 
+>      /* This pair of strncpy calls ensures that the buffer is zero-filled,
+>       * which is desirable since we'll soon be sending those bytes, and
+>       * don't want the send_req to read uninitialized data.
+>       */
+>      strncpy(buf, filename, SD_MAX_VDI_LEN);
+>      strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+> 
+> Use the QEMU_NONSTRING attribute, since this array is intended to store
+> character arrays that do not necessarily contain a terminating NUL.
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   block/sheepdog.c | 2 +-
+>   1 file changed, 1 insertion(+), 1 deletion(-)
+
+Reviewed-by: Eric Blake <email address hidden>
+
+> 
+> diff --git a/block/sheepdog.c b/block/sheepdog.c
+> index 0125df9d49..d4ad6b119d 100644
+> --- a/block/sheepdog.c
+> +++ b/block/sheepdog.c
+> @@ -1224,7 +1224,7 @@ static int find_vdi_name(BDRVSheepdogState *s, const char *filename,
+>       SheepdogVdiReq hdr;
+>       SheepdogVdiRsp *rsp = (SheepdogVdiRsp *)&hdr;
+>       unsigned int wlen, rlen = 0;
+> -    char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
+> +    QEMU_NONSTRING char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
+>   
+>       fd = connect_to_sdog(s, errp);
+>       if (fd < 0) {
+> 
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+On 12/18/18 11:51 AM, Philippe Mathieu-Daudé wrote:
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>    The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>    bug 81117 is specifically intended to highlight likely unintended
+>    uses of the strncpy function that truncate the terminating NUL
+>    character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>      CC      migration/global_state.o
+>    qemu/migration/global_state.c: In function 'global_state_store_running':
+>    qemu/migration/global_state.c:45:5: error: 'strncpy' specified bound 100 equals destination size [-Werror=stringop-truncation]
+>         strncpy((char *)global_state.runstate, state, sizeof(global_state.runstate));
+>         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>    make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+> 
+> Use the QEMU_NONSTRING attribute, since this array is intended to store
+> character arrays that do not necessarily contain a terminating NUL.
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   migration/global_state.c | 2 +-
+>   1 file changed, 1 insertion(+), 1 deletion(-)
+
+Should this be squashed with 5/5?
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+On 12/18/18 11:51 AM, Philippe Mathieu-Daudé wrote:
+> GCC 8 introduced the -Wstringop-overflow, which detect buffer overflow
+> by string-modifying functions declared in <string.h>, such strncpy(),
+> used in global_state_store_running().
+> 
+> Since the global_state.runstate does not necessarily contains a
+> terminating NUL character, We had to use the QEMU_NONSTRING attribute.
+
+s/We/we/
+
+> 
+> The GCC manual says about the nonstring attribute:
+> 
+>    However, when the array is declared with the attribute the call to
+>    strlen is diagnosed because when the array doesn’t contain a
+>    NUL-terminated string the call is undefined. [...]
+>    In addition, calling strnlen and strndup with such arrays is safe
+>    provided a suitable bound is specified, and not diagnosed.
+> 
+> GCC indeed found an incorrect use of strlen(), because this array
+> is loaded by VMSTATE_BUFFER(runstate, GlobalState) then parsed
+> using qapi_enum_parse which does not get the buffer length.
+> 
+> Use strnlen() which returns sizeof(s->runstate) if the array is not
+> NUL-terminated.
+> 
+> This fixes:
+> 
+>      CC      migration/global_state.o
+>    qemu/migration/global_state.c: In function 'global_state_pre_save':
+>    qemu/migration/global_state.c:109:15: error: 'strlen' argument 1 declared attribute 'nonstring' [-Werror=stringop-overflow=]
+>         s->size = strlen((char *)s->runstate) + 1;
+>                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+>    qemu/migration/global_state.c:24:13: note: argument 'runstate' declared here
+>         uint8_t runstate[100] QEMU_NONSTRING;
+>                 ^~~~~~~~
+>    cc1: all warnings being treated as errors
+>    make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+> 
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   migration/global_state.c | 2 +-
+>   1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/migration/global_state.c b/migration/global_state.c
+> index 6e19333422..c19030ef62 100644
+> --- a/migration/global_state.c
+> +++ b/migration/global_state.c
+> @@ -106,7 +106,7 @@ static int global_state_pre_save(void *opaque)
+>       GlobalState *s = opaque;
+>   
+>       trace_migrate_global_state_pre_save((char *)s->runstate);
+> -    s->size = strlen((char *)s->runstate) + 1;
+
+The old code sets s->size to the string length + space for the NUL byte 
+(by assuming that a NUL byte was present), and accidentally sets it 
+beyond the s->runstate array if there was no NUL byte (our existing 
+runstate names are shorter than 100 bytes, so this could only happen on 
+a malicious stream).
+
+> +    s->size = strnlen((char *)s->runstate, sizeof(s->runstate)) + 1;
+
+The new code can still end up setting s->size beyond the array.  Is that 
+intended, or would it be better to use strnlen(s->runstate, 
+sizeof(s->runstate) - 1) + 1?
+
+Also, as I argued on 4/5, why isn't this squashed in with the patch that 
+marks the field NONSTRING?
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+On 12/18/18 11:51 AM, Philippe Mathieu-Daudé wrote:
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>    The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>    bug 81117 is specifically intended to highlight likely unintended
+>    uses of the strncpy function that truncate the terminating NUL
+>    character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>      CC      migration/global_state.o
+>    qemu/migration/global_state.c: In function 'global_state_store_running':
+>    qemu/migration/global_state.c:45:5: error: 'strncpy' specified bound 100 equals destination size [-Werror=stringop-truncation]
+>         strncpy((char *)global_state.runstate, state, sizeof(global_state.runstate));
+>         ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>    make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+> 
+> Use the QEMU_NONSTRING attribute, since this array is intended to store
+> character arrays that do not necessarily contain a terminating NUL.
+
+>   typedef struct {
+>       uint32_t size;
+> -    uint8_t runstate[100];
+> +    uint8_t runstate[100] QEMU_NONSTRING;
+
+Since 100 bytes for runstate[] is larger than any string possible in our 
+current enum string values, could we instead add an assert that 
+strlen(state) < sizeof(global_state.runstate), and then use strpadcpy() 
+to make our intent obvious while still shutting up the compiler warning, 
+but without having to deal with the fallout of marking runstate as a 
+non-string?
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+On Tue, Dec 18, 2018 at 06:51:17PM +0100, Philippe Mathieu-Daudé wrote:
+> GCC 8 new warning prevents builds to success since quite some time.
+> First report on the mailing list is in July 2018:
+> https://lists.gnu.org/archive/html/qemu-devel/2018-07/msg03723.html
+> 
+> Various intents has been sent to fix this:
+> - Incorrectly using g_strlcpy()
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03705.html
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-08/msg03706.html
+> - Using assert() and strpadcpy()
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-11/msg03938.html
+> - Use #pragma GCC diagnostic ignored "-Wstringop-truncation"
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> - adding an inline wrapper with said pragma in there
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> - -Wno-stringop-truncation is the makefile
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04261.html
+> - Use the 'nonstring' attribute
+>   https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04493.html
+> 
+> This series add the QEMU_NONSTRING definition and use it.
+> 
+> Regards,
+> 
+> Phil.
+
+
+Reviewed-by: Michael S. Tsirkin <email address hidden>
+
+> Philippe Mathieu-Daudé (5):
+>   qemu/compiler: Define QEMU_NONSTRING
+>   block/sheepdog: Use QEMU_NONSTRING for non NUL-terminated arrays
+>   hw/acpi: Use QEMU_NONSTRING for non NUL-terminated arrays
+>   migration: Use QEMU_NONSTRING for non NUL-terminated arrays
+>   migration: Use strnlen() for fixed-size string
+> 
+>  block/sheepdog.c            |  2 +-
+>  hw/acpi/core.c              |  8 ++++----
+>  include/hw/acpi/acpi-defs.h |  8 ++++----
+>  include/qemu/compiler.h     | 15 +++++++++++++++
+>  migration/global_state.c    |  4 ++--
+>  5 files changed, 26 insertions(+), 11 deletions(-)
+> 
+> -- 
+> 2.17.2
+
+
+On Tue, Dec 18, 2018 at 06:51:19PM +0100, Philippe Mathieu-Daudé wrote:
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>   bug 81117 is specifically intended to highlight likely unintended
+>   uses of the strncpy function that truncate the terminating NUL
+>   character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>     CC      block/sheepdog.o
+>   qemu/block/sheepdog.c: In function 'find_vdi_name':
+>   qemu/block/sheepdog.c:1239:5: error: 'strncpy' specified bound 256 equals destination size [-Werror=stringop-truncation]
+>        strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+>        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   make: *** [qemu/rules.mak:69: block/sheepdog.o] Error 1
+> 
+> As described previous to the strncpy() calls, the use of strncpy() is
+> correct here:
+> 
+>     /* This pair of strncpy calls ensures that the buffer is zero-filled,
+>      * which is desirable since we'll soon be sending those bytes, and
+>      * don't want the send_req to read uninitialized data.
+>      */
+>     strncpy(buf, filename, SD_MAX_VDI_LEN);
+>     strncpy(buf + SD_MAX_VDI_LEN, tag, SD_MAX_VDI_TAG_LEN);
+> 
+> Use the QEMU_NONSTRING attribute, since this array is intended to store
+> character arrays that do not necessarily contain a terminating NUL.
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>  block/sheepdog.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/block/sheepdog.c b/block/sheepdog.c
+> index 0125df9d49..d4ad6b119d 100644
+> --- a/block/sheepdog.c
+> +++ b/block/sheepdog.c
+> @@ -1224,7 +1224,7 @@ static int find_vdi_name(BDRVSheepdogState *s, const char *filename,
+>      SheepdogVdiReq hdr;
+>      SheepdogVdiRsp *rsp = (SheepdogVdiRsp *)&hdr;
+>      unsigned int wlen, rlen = 0;
+> -    char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
+> +    QEMU_NONSTRING char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN];
+
+In case you decide to respin anyway - this would be
+a bit nicer as:
+	char buf[SD_MAX_VDI_LEN + SD_MAX_VDI_TAG_LEN] QEMU_NONSTRING
+
+
+
+
+>      fd = connect_to_sdog(s, errp);
+>      if (fd < 0) {
+> -- 
+> 2.17.2
+
+
+On Tue, Dec 18, 2018 at 06:51:22PM +0100, Philippe Mathieu-Daudé wrote:
+> GCC 8 introduced the -Wstringop-overflow, which detect buffer overflow
+> by string-modifying functions declared in <string.h>, such strncpy(),
+> used in global_state_store_running().
+> 
+> Since the global_state.runstate does not necessarily contains a
+> terminating NUL character, We had to use the QEMU_NONSTRING attribute.
+> 
+> The GCC manual says about the nonstring attribute:
+> 
+>   However, when the array is declared with the attribute the call to
+>   strlen is diagnosed because when the array doesn’t contain a
+>   NUL-terminated string the call is undefined. [...]
+>   In addition, calling strnlen and strndup with such arrays is safe
+>   provided a suitable bound is specified, and not diagnosed.
+> 
+> GCC indeed found an incorrect use of strlen(), because this array
+> is loaded by VMSTATE_BUFFER(runstate, GlobalState) then parsed
+> using qapi_enum_parse which does not get the buffer length.
+> 
+> Use strnlen() which returns sizeof(s->runstate) if the array is not
+> NUL-terminated.
+> 
+> This fixes:
+> 
+>     CC      migration/global_state.o
+>   qemu/migration/global_state.c: In function 'global_state_pre_save':
+>   qemu/migration/global_state.c:109:15: error: 'strlen' argument 1 declared attribute 'nonstring' [-Werror=stringop-overflow=]
+>        s->size = strlen((char *)s->runstate) + 1;
+>                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   qemu/migration/global_state.c:24:13: note: argument 'runstate' declared here
+>        uint8_t runstate[100] QEMU_NONSTRING;
+>                ^~~~~~~~
+>   cc1: all warnings being treated as errors
+>   make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+> 
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>  migration/global_state.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/migration/global_state.c b/migration/global_state.c
+> index 6e19333422..c19030ef62 100644
+> --- a/migration/global_state.c
+> +++ b/migration/global_state.c
+> @@ -106,7 +106,7 @@ static int global_state_pre_save(void *opaque)
+>      GlobalState *s = opaque;
+>  
+>      trace_migrate_global_state_pre_save((char *)s->runstate);
+> -    s->size = strlen((char *)s->runstate) + 1;
+> +    s->size = strnlen((char *)s->runstate, sizeof(s->runstate)) + 1;
+>  
+>      return 0;
+
+I don't think this works correctly if strnlen returns
+sizeof(s->runstate). Which never happens so we probably should
+jus add
+
+	assert(e->size is <= sizeof(s->runstate));
+
+But also I think this is not enough, there's a problem in post-load
+in the call to qapi_enum_parse. You probably want to force
+the last character to 0 there.
+
+
+>  }
+> -- 
+> 2.17.2
+
+
+On Tue, 18 Dec 2018 18:51:20 +0100
+Philippe Mathieu-Daudé <email address hidden> wrote:
+
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>   bug 81117 is specifically intended to highlight likely unintended
+>   uses of the strncpy function that truncate the terminating NUL
+>   character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>     CC      hw/acpi/core.o
+>   In function 'acpi_table_install', inlined from 'acpi_table_add' at qemu/hw/acpi/core.c:296:5:
+>   qemu/hw/acpi/core.c:184:9: error: 'strncpy' specified bound 4 equals destination size [-Werror=stringop-truncation]
+>            strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+>            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   make: *** [qemu/rules.mak:69: hw/acpi/core.o] Error 1
+> 
+> Use the QEMU_NONSTRING attribute, since ACPI tables don't require the
+> strings to be NUL-terminated.
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>  hw/acpi/core.c              | 8 ++++----
+>  include/hw/acpi/acpi-defs.h | 8 ++++----
+>  2 files changed, 8 insertions(+), 8 deletions(-)
+> 
+> diff --git a/hw/acpi/core.c b/hw/acpi/core.c
+> index aafdc61648..f60f750c3d 100644
+> --- a/hw/acpi/core.c
+> +++ b/hw/acpi/core.c
+> @@ -35,14 +35,14 @@
+>  struct acpi_table_header {
+>      uint16_t _length;         /* our length, not actual part of the hdr */
+>                                /* allows easier parsing for fw_cfg clients */
+> -    char sig[4];              /* ACPI signature (4 ASCII characters) */
+> +    char sig[4] QEMU_NONSTRING; /* ACPI signature (4 ASCII characters) */
+>      uint32_t length;          /* Length of table, in bytes, including header */
+>      uint8_t revision;         /* ACPI Specification minor version # */
+>      uint8_t checksum;         /* To make sum of entire table == 0 */
+> -    char oem_id[6];           /* OEM identification */
+> -    char oem_table_id[8];     /* OEM table identification */
+> +    char oem_id[6] QEMU_NONSTRING; /* OEM identification */
+> +    char oem_table_id[8] QEMU_NONSTRING; /* OEM table identification */
+>      uint32_t oem_revision;    /* OEM revision number */
+> -    char asl_compiler_id[4];  /* ASL compiler vendor ID */
+> +    char asl_compiler_id[4] QEMU_NONSTRING; /* ASL compiler vendor ID */
+>      uint32_t asl_compiler_revision; /* ASL compiler revision number */
+>  } QEMU_PACKED;
+>  
+> diff --git a/include/hw/acpi/acpi-defs.h b/include/hw/acpi/acpi-defs.h
+> index af8e023968..3bf0bec8ba 100644
+> --- a/include/hw/acpi/acpi-defs.h
+> +++ b/include/hw/acpi/acpi-defs.h
+> @@ -43,7 +43,7 @@ enum {
+>  struct AcpiRsdpDescriptor {        /* Root System Descriptor Pointer */
+>      uint64_t signature;              /* ACPI signature, contains "RSD PTR " */
+>      uint8_t  checksum;               /* To make sum of struct == 0 */
+> -    uint8_t  oem_id [6];             /* OEM identification */
+> +    uint8_t  oem_id [6] QEMU_NONSTRING; /* OEM identification */
+>      uint8_t  revision;               /* Must be 0 for 1.0, 2 for 2.0 */
+>      uint32_t rsdt_physical_address;  /* 32-bit physical address of RSDT */
+>      uint32_t length;                 /* XSDT Length in bytes including hdr */
+
+you'll need to rebase this on top the latest Michael's pull request.
+[PULL v2 25/30] hw: arm: Carry RSDP specific data through  AcpiRsdpData
+[PULL v2 29/30] hw: acpi: Remove AcpiRsdpDescriptor and fix tests
+
+> @@ -62,10 +62,10 @@ typedef struct AcpiRsdpDescriptor AcpiRsdpDescriptor;
+>      uint32_t length;                 /* Length of table, in bytes, including header */ \
+>      uint8_t  revision;               /* ACPI Specification minor version # */ \
+>      uint8_t  checksum;               /* To make sum of entire table == 0 */ \
+> -    uint8_t  oem_id [6];             /* OEM identification */ \
+> -    uint8_t  oem_table_id [8];       /* OEM table identification */ \
+> +    uint8_t  oem_id [6] QEMU_NONSTRING; /* OEM identification */ \
+> +    uint8_t  oem_table_id [8] QEMU_NONSTRING; /* OEM table identification */ \
+>      uint32_t oem_revision;           /* OEM revision number */ \
+> -    uint8_t  asl_compiler_id [4];    /* ASL compiler vendor ID */ \
+> +    uint8_t  asl_compiler_id [4] QEMU_NONSTRING; /* ASL compiler vendor ID */ \
+>      uint32_t asl_compiler_revision;  /* ASL compiler revision number */
+>  
+>  
+
+
+
+On Wed, 19 Dec 2018 10:20:36 +0100
+Philippe Mathieu-Daudé <email address hidden> wrote:
+
+> Le mer. 19 déc. 2018 10:16, Igor Mammedov <email address hidden> a écrit :
+> 
+> > On Tue, 18 Dec 2018 18:51:20 +0100
+> > Philippe Mathieu-Daudé <email address hidden> wrote:
+> >  
+> > > GCC 8 added a -Wstringop-truncation warning:
+> > >
+> > >   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+> > >   bug 81117 is specifically intended to highlight likely unintended
+> > >   uses of the strncpy function that truncate the terminating NUL
+> > >   character from the source string.
+> > >
+> > > This new warning leads to compilation failures:
+> > >
+> > >     CC      hw/acpi/core.o
+> > >   In function 'acpi_table_install', inlined from 'acpi_table_add' at  
+> > qemu/hw/acpi/core.c:296:5:  
+> > >   qemu/hw/acpi/core.c:184:9: error: 'strncpy' specified bound 4 equals  
+> > destination size [-Werror=stringop-truncation]  
+> > >            strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+> > >            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> > >   make: *** [qemu/rules.mak:69: hw/acpi/core.o] Error 1
+> > >
+> > > Use the QEMU_NONSTRING attribute, since ACPI tables don't require the
+> > > strings to be NUL-terminated.
+> > >
+> > > Suggested-by: Michael S. Tsirkin <email address hidden>
+> > > Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> > > ---
+> > >  hw/acpi/core.c              | 8 ++++----
+> > >  include/hw/acpi/acpi-defs.h | 8 ++++----
+> > >  2 files changed, 8 insertions(+), 8 deletions(-)
+> > >
+> > > diff --git a/hw/acpi/core.c b/hw/acpi/core.c
+> > > index aafdc61648..f60f750c3d 100644
+> > > --- a/hw/acpi/core.c
+> > > +++ b/hw/acpi/core.c
+> > > @@ -35,14 +35,14 @@
+> > >  struct acpi_table_header {
+> > >      uint16_t _length;         /* our length, not actual part of the hdr  
+> > */  
+> > >                                /* allows easier parsing for fw_cfg  
+> > clients */  
+> > > -    char sig[4];              /* ACPI signature (4 ASCII characters) */
+> > > +    char sig[4] QEMU_NONSTRING; /* ACPI signature (4 ASCII characters)  
+> > */  
+> > >      uint32_t length;          /* Length of table, in bytes, including  
+> > header */  
+> > >      uint8_t revision;         /* ACPI Specification minor version # */
+> > >      uint8_t checksum;         /* To make sum of entire table == 0 */
+> > > -    char oem_id[6];           /* OEM identification */
+> > > -    char oem_table_id[8];     /* OEM table identification */
+> > > +    char oem_id[6] QEMU_NONSTRING; /* OEM identification */
+> > > +    char oem_table_id[8] QEMU_NONSTRING; /* OEM table identification */
+> > >      uint32_t oem_revision;    /* OEM revision number */
+> > > -    char asl_compiler_id[4];  /* ASL compiler vendor ID */
+> > > +    char asl_compiler_id[4] QEMU_NONSTRING; /* ASL compiler vendor ID */
+> > >      uint32_t asl_compiler_revision; /* ASL compiler revision number */
+> > >  } QEMU_PACKED;
+> > >
+> > > diff --git a/include/hw/acpi/acpi-defs.h b/include/hw/acpi/acpi-defs.h
+> > > index af8e023968..3bf0bec8ba 100644
+> > > --- a/include/hw/acpi/acpi-defs.h
+> > > +++ b/include/hw/acpi/acpi-defs.h
+> > > @@ -43,7 +43,7 @@ enum {
+> > >  struct AcpiRsdpDescriptor {        /* Root System Descriptor Pointer */
+> > >      uint64_t signature;              /* ACPI signature, contains "RSD  
+> > PTR " */  
+> > >      uint8_t  checksum;               /* To make sum of struct == 0 */
+> > > -    uint8_t  oem_id [6];             /* OEM identification */
+> > > +    uint8_t  oem_id [6] QEMU_NONSTRING; /* OEM identification */
+> > >      uint8_t  revision;               /* Must be 0 for 1.0, 2 for 2.0 */
+> > >      uint32_t rsdt_physical_address;  /* 32-bit physical address of RSDT  
+> > */  
+> > >      uint32_t length;                 /* XSDT Length in bytes including  
+> > hdr */
+> >
+> > you'll need to rebase this on top the latest Michael's pull request.
+> > [PULL v2 25/30] hw: arm: Carry RSDP specific data through  AcpiRsdpData
+> > [PULL v2 29/30] hw: acpi: Remove AcpiRsdpDescriptor and fix tests
+> >  
+> 
+> OK. Can I add your Ack-by then?
+pls note that new AcpiRsdpData has oem_id field that needs the same treatment
+
+with rebase
+Reviewed-by: Igor Mammedov <email address hidden>
+
+> 
+> > @@ -62,10 +62,10 @@ typedef struct AcpiRsdpDescriptor AcpiRsdpDescriptor;  
+> > >      uint32_t length;                 /* Length of table, in bytes,  
+> > including header */ \  
+> > >      uint8_t  revision;               /* ACPI Specification minor  
+> > version # */ \  
+> > >      uint8_t  checksum;               /* To make sum of entire table ==  
+> > 0 */ \  
+> > > -    uint8_t  oem_id [6];             /* OEM identification */ \
+> > > -    uint8_t  oem_table_id [8];       /* OEM table identification */ \
+> > > +    uint8_t  oem_id [6] QEMU_NONSTRING; /* OEM identification */ \
+> > > +    uint8_t  oem_table_id [8] QEMU_NONSTRING; /* OEM table  
+> > identification */ \  
+> > >      uint32_t oem_revision;           /* OEM revision number */ \
+> > > -    uint8_t  asl_compiler_id [4];    /* ASL compiler vendor ID */ \
+> > > +    uint8_t  asl_compiler_id [4] QEMU_NONSTRING; /* ASL compiler vendor  
+> > ID */ \  
+> > >      uint32_t asl_compiler_revision;  /* ASL compiler revision number */
+> > >
+> > >  
+> >
+> >  
+
+
+
+On Wed, 19 Dec 2018 14:00:37 +0100
+Andrew Jones <email address hidden> wrote:
+
+> On Wed, Dec 19, 2018 at 01:43:40PM +0100, Philippe Mathieu-Daudé wrote:
+> > Hi Drew,
+> > 
+> > On 12/19/18 11:10 AM, Andrew Jones wrote:
+> > > On Tue, Dec 18, 2018 at 06:51:20PM +0100, Philippe Mathieu-Daudé wrote:
+> > >> GCC 8 added a -Wstringop-truncation warning:
+> > >>
+> > >>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+> > >>   bug 81117 is specifically intended to highlight likely unintended
+> > >>   uses of the strncpy function that truncate the terminating NUL
+> > >>   character from the source string.
+> > >>
+> > >> This new warning leads to compilation failures:
+> > >>
+> > >>     CC      hw/acpi/core.o
+> > >>   In function 'acpi_table_install', inlined from 'acpi_table_add' at qemu/hw/acpi/core.c:296:5:
+> > >>   qemu/hw/acpi/core.c:184:9: error: 'strncpy' specified bound 4 equals destination size [-Werror=stringop-truncation]
+> > >>            strncpy(ext_hdr->sig, hdrs->sig, sizeof ext_hdr->sig);
+> > >>            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+> > >>   make: *** [qemu/rules.mak:69: hw/acpi/core.o] Error 1
+> > >>
+> > >> Use the QEMU_NONSTRING attribute, since ACPI tables don't require the
+> > >> strings to be NUL-terminated.
+> > > 
+> > > Aren't we always starting with zero-initialized structures in ACPI code?
+> > > If so, then we should be able to change the strncpy's to memcpy's.
+> > 
+> > The first call zero-initializes, but then we call realloc():
+> > 
+> >     /* We won't fail from here on. Initialize / extend the globals. */
+> >     if (acpi_tables == NULL) {
+> >         acpi_tables_len = sizeof(uint16_t);
+> >         acpi_tables = g_malloc0(acpi_tables_len);
+> >     }
+> > 
+> >     acpi_tables = g_realloc(acpi_tables, acpi_tables_len +
+> >                                          ACPI_TABLE_PFX_SIZE +
+> >                                          sizeof dfl_hdr + body_size);
+> > 
+> >     ext_hdr = (struct acpi_table_header *)(acpi_tables +
+> >                                            acpi_tables_len);
+> > 
+> > So memcpy() isn't enough.
+> 
+> Ah, thanks.
+> 
+> > 
+> > I can resend the previous patch which uses strpadcpy() if you prefer,
+> > Igor already reviewed it:
+> > 
+> > https://lists.gnu.org/archive/html/qemu-devel/2018-12/msg04406.html
+> >
+> 
+> I do like strpadcpy() better, but I'm not going to lose sleep about
+> this either way it goes.
+I'm ok with both ways, but v2 consensus was to use QEMU_NONSTRING if I got it right
+
+> 
+> Thanks,
+> drew 
+
+
+
+* Philippe Mathieu-Daudé (<email address hidden>) wrote:
+> GCC 8 added a -Wstringop-truncation warning:
+> 
+>   The -Wstringop-truncation warning added in GCC 8.0 via r254630 for
+>   bug 81117 is specifically intended to highlight likely unintended
+>   uses of the strncpy function that truncate the terminating NUL
+>   character from the source string.
+> 
+> This new warning leads to compilation failures:
+> 
+>     CC      migration/global_state.o
+>   qemu/migration/global_state.c: In function 'global_state_store_running':
+>   qemu/migration/global_state.c:45:5: error: 'strncpy' specified bound 100 equals destination size [-Werror=stringop-truncation]
+>        strncpy((char *)global_state.runstate, state, sizeof(global_state.runstate));
+>        ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+>   make: *** [qemu/rules.mak:69: migration/global_state.o] Error 1
+> 
+> Use the QEMU_NONSTRING attribute, since this array is intended to store
+> character arrays that do not necessarily contain a terminating NUL.
+> 
+> Suggested-by: Michael S. Tsirkin <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>  migration/global_state.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/migration/global_state.c b/migration/global_state.c
+> index 8e8ab5c51e..6e19333422 100644
+> --- a/migration/global_state.c
+> +++ b/migration/global_state.c
+> @@ -21,7 +21,7 @@
+>  
+>  typedef struct {
+>      uint32_t size;
+> -    uint8_t runstate[100];
+> +    uint8_t runstate[100] QEMU_NONSTRING;
+
+Hmm; global_state_post_load needs to be fixed for this;  it
+uses s->runsate and ends up passing it to both a trace
+and a qapi_enum_parse - so it's really treating it as a string.
+That code is unsafe anyway since it's assuming the received
+runstate would be terminated.
+
+Dave
+
+>      RunState state;
+>      bool received;
+>  } GlobalState;
+> -- 
+> 2.17.2
+> 
+--
+Dr. David Alan Gilbert / <email address hidden> / Manchester, UK
+
+
+We think we've fixed all the GCC 8.2 stringop-truncation warnings now, so current QEMU git master and the 4.0 rc1 we've just tagged should both build cleanly. Please reopen the bug if we missed one somehow.
+
+

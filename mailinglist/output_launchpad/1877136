@@ -1,0 +1,64 @@
+Qemu GDB Arm core registers XML description not valid for M-profile
+
+When trying to debug an armv7-m binary running on Qemu, GDB makes some mistakes due to mistakenly believing the target is not M-profile.
+
+One observable is that backtraces over signal handlers are not handled correctly -- since the special M-profile EXC_RETURN value is not recognised.  That happens because GDB doesn't think the target is M-profile.
+
+This happens because GDB sees a reported feature set from the Qemu remote connection that includes the feature `org.gnu.gdb.arm.core`.
+
+As described in the GDB online docs, for "M-profile targets (e.g. Cortex-M3), the ‘org.gnu.gdb.arm.core’ feature is replaced by ‘org.gnu.gdb.arm.m-profile’"
+https://sourceware.org/gdb/current/onlinedocs/gdb/ARM-Features.html
+
+From a scan of the Qemu source code on commit ea1329bb3a8d5cd25b70e3dbf73e7ded4d5ad756 it seems that when emulating an arm core it uses `arm-core.xml` unconditionally for `CPUClass->gdb_core_xml_file`, and that means the only feature provided is `org.gnu.gdb.arm.core`.
+
+Note that even though there is a command to set the architecture in GDB, setting the target architecture to an M-profile core is still not a valid workaround.
+This is because the target description overrides everything in setting the `is_m` attribute within GDB.
+
+Reproduction of the observable:
+Using the examples here https://git.linaro.org/people/peter.maydell/m-profile-tests.git/tree/ .
+Build the examples, and run 
+```
+qemu-system-arm -s -S -no-reboot -M lm3s6965evb -m 16 -serial stdio -display none -net nic -net user,restrict=on -d guest_errors,unimp -kernel test3-kern.bin
+```
+
+Then in a GDB session
+```
+vshcmd: > arm-none-eabi-gdb -q                                                                                                                                                                    
+(gdb)
+vshcmd: > file test3-kern.elf
+Reading symbols from test3-kern.elf...
+(gdb)
+vshcmd: > target remote localhost:1234
+Remote debugging using localhost:1234
+_start () at init-m.S:53
+53        mov r0, #0
+(gdb)
+vshcmd: > show architecture
+The target architecture is set automatically (currently armv7)
+(gdb)
+vshcmd: > break svc
+Breakpoint 1 at 0x6fc: svc. (2 locations)
+(gdb)
+vshcmd: > cont
+Continuing.
+
+Breakpoint 1, svc () at test3.c:16
+16          int test = SEQ();
+(gdb)
+vshcmd: > bt
+#0  svc () at test3.c:16
+#1  0xfffffff8 in ?? ()
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+(gdb)
+vshcmd: > print/x $lr
+$1 = 0xfffffff9
+(gdb)
+```
+
+Patch submitted: https://<email address hidden>/
+
+
+Fix now in master, will be in QEMU 5.1.
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=c888f7e0fdcc09c8600
+

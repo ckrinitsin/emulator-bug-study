@@ -1,0 +1,309 @@
+[UBUNTU 20.04] KVM guest fails to find zipl boot menu index
+
+---Problem Description---
+A KVM guest fails to find the zipl boot menu index if the "zIPL" magic value is listed at the end of a disk block. 
+ 
+---System Hang---
+System sits in disabled wait, last console display
+LOADPARM=[        ]
+Using virtio-blk.
+Using ECKD scheme (block size  4096), CDL
+VOLSER=[0X0067]
+ 
+ 
+---Steps to Reproduce---
+1. Install Distro KVM guest from ISO on a DASD, e.g. using virt-install, my invocation was 
+$ virt-install --name secguest2 --memory 2048 --disk path=/dev/disk/by-path/ccw-0.0.af6a --cdrom /var/lib/libvirt/images/xxxxxx.iso
+
+2. Select DHCP networking and ASCII console, and accept all defaults of the installer
+
+3. Let the installer reboot after the installation completes
+
+It is possible to recover by editing the domain XML with an explicit loadparm to select a boot menu entry. E.g. I changed the disk definition to
+   <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native'/>
+      <source dev='/dev/disk/by-path/ccw-0.0.af6a'/>
+      <target dev='vda' bus='virtio'/>
+      <boot order='1' loadparm='1'/>
+      <address type='ccw' cssid='0xfe' ssid='0x0' devno='0xaf6a'/>
+    </disk>
+
+The patches are now upstream:
+5f97ba0c74cc ("pc-bios/s390-ccw: fix off-by-one error")
+468184ec9024 ("pc-bios/s390-ccw: break loop if a null block number is reached")
+
+Current versions of qemu within Ubuntu
+
+focal (20.04LTS) 1:4.2-3ubuntu6 [ports]: arm64 armhf ppc64el s390x
+focal-updates (metapackages): 1:4.2-3ubuntu6.14: amd64 arm64 armhf ppc64el s390x
+
+groovy (20.10) (metapackages): 1:5.0-5ubuntu9 [ports]: arm64 armhf ppc64el s390x
+groovy-updates (metapackages): 1:5.0-5ubuntu9.6: amd64 arm64 armhf ppc64el s390x
+
+hirsute (metapackages): 1:5.2+dfsg-9ubuntu1: amd64 arm64 armhf ppc64el s390x 
+
+
+git-commits will apply seamlessley for the requested levels if not already integrated
+
+------- Comment From <email address hidden> 2021-03-26 04:38 EDT-------
+Just to avoid any bad surprise, these patches require a rebuild of the bios image so the binary must also be updated.
+
+This already is in upstream qemu 5.2, thereby Hirsute is fixed already.
+I'll prep PPAs for a try for Focal/Groovy in a bit
+
+PPA is here: https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/4504
+
+Would you mind to check if this really is enough and all that you'd need?
+Once that is confirmed I can prep this for the SRU process.
+
+Hi @Christan B. :-)
+With "rebuild of the bios image" I guess you meant:
+  /usr/share/qemu/s390-ccw.img
+  /usr/share/qemu/s390-netboot.img
+Those are built from the same source, so fixing and building src:qemu fixes this in one go.
+
+If you had other binaries in mind let me know.
+
+------- Comment From <email address hidden> 2021-03-29 07:42 EDT-------
+(In reply to comment #12)
+> Hi @Christan B. :-)
+> With "rebuild of the bios image" I guess you meant:
+> /usr/share/qemu/s390-ccw.img
+> /usr/share/qemu/s390-netboot.img
+> Those are built from the same source, so fixing and building src:qemu fixes
+> this in one go.
+>
+> If you had other binaries in mind let me know.
+
+Yes I had these 2 in mind.
+I was not sure if Ubuntu always builds these files or if you use the pre-build ones.
+
+Hi,
+I have tested this with:
+$ virt-install --name testinst1 --memory 2048 --disk path=/dev/disk/by-path/ccw-0.0.151e --cdrom /var/lib/libvirt/images/ubuntu-18.04.5-server-s390x.iso
+
+But while the issue itself and the fix is clear, this did not trigger the issue.
+In my case the reboot after install worked just fine even without the fix.
+Might I ask:
+- which "xxxxxx.iso" it is in your example that has issues with this?
+- which disk setup did you select on install (that is then put onto the dasd by the installer)
+- what should I expect in the error case, I expected a fail or hang on reboot but got:
+
+```
+The system is going down NOW!
+Sent SIGTERM to all processes
+Sent SIGKILL to all processes
+Requesting system reboot
+
+Domain creation completed.ts; <Enter> activates buttons
+Restarting guest.
+Connected to domain testinst1
+Escape character is ^]
+
+Booting entry #0
+[    0.450525] Linux version 4.15.0-140-generic (buildd@bos02-s390x-010) (gcc version 7.5.0 (Ubuntu 7.5.0-3ubuntu1~18.04)) #144-Ubuntu SMP Fri Mar 19 14:11:29 UTC 2021 (Ubuntu 4.15.0-140.144-
+generic 4.15.18)
+```
+
+```
+The config (in regard to boot) that virtinst left (and that worked) was:
+  <os>
+    <type arch='s390x' machine='s390-ccw-virtio-focal'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+...
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='native'/>
+      <source dev='/dev/disk/by-path/ccw-0.0.151e' index='2'/>
+      <backingStore/>
+      <target dev='vda' bus='virtio'/>
+      <alias name='virtio-disk0'/>
+      <address type='ccw' cssid='0xfe' ssid='0x0' devno='0x0000'/>
+    </disk>
+```
+
+I agree to the fix, but need a reasonable testcase that works (also to explain to the SRU team why this is a realistic issue someone would hit).
+
+Could I skip all the install description and just take a existing guest running on a dasd and then use a custom zipl.conf to trigger this? If so which zipl.conf would you recommend?
+
+------- Comment From <email address hidden> 2021-03-29 08:47 EDT-------
+(In reply to comment #14)
+> Hi,
+> I have tested this with:
+> $ virt-install --name testinst1 --memory 2048 --disk
+> path=/dev/disk/by-path/ccw-0.0.151e --cdrom
+> /var/lib/libvirt/images/ubuntu-18.04.5-server-s390x.iso
+>
+> But while the issue itself and the fix is clear, this did not trigger the
+> issue.
+> In my case the reboot after install worked just fine even without the fix.
+> Might I ask:
+> - which "xxxxxx.iso" it is in your example that has issues with this?
+
+This was a non Ubuntu distribution. It can happen on any distro that has the s390-tools commit/patch "zipl: Make use of __noreturn macro" and not the fix  "zipl/libc: libc_stop move 'noreturn' to declaration"
+
+I spoke to cborntra, and it turned out that this affects only guests with zipl
+with:        86856f98 "zipl: Make use of __noreturn macro"
+but not yet: c367a6bb "zipl/libc: libc_stop move 'noreturn' to declaration"
+
+That means 2.12/2.13 and that translates to Focal.
+Therefore retry this as:
+
+ubuntu@s1lp5:~$ virt-install --name testinst2 --memory 2048 --disk path=/dev/disk/by-path/ccw-0.0.151e --cdrom /var/lib/libvirt/images/ubuntu-20.04-legacy-server-s390x.iso
+- all defaults -
+- install as "entire disk -
+
+Then on reboot I get still what seems working:
+
+```
+The system is going down NOW!
+Sent SIGTERM to all processes
+Sent SIGKILL to all processes
+Requesting system reboot
+
+Domain creation completed.ts; <Enter> activates buttons
+Restarting guest.
+Connected to domain testinst2
+Escape character is ^]
+
+Booting entry #0
+```
+
+We talked further and it is also compiler specific.
+Eventually any guest "could" fail and it definitely is wise to fix this.
+Just verification gets harder.
+
+I'll try some other ISOs as instructed by Christian to see if one can be used as repro case.
+
+
+This iso should do the trick "SLE-15-SP2-Full-s390x-GM-Media1.iso" to reproduce.
+
+------- Comment From <email address hidden> 2021-03-29 13:09 EDT-------
+(In reply to comment #22)
+> This iso should do the trick "SLE-15-SP2-Full-s390x-GM-Media1.iso" to
+> reproduce.
+
+Yep exactly. Without the ISO it's harder to reproduce... Because then you have to (AFAICR):
+1. patch your zipl code so the stage loader (I think it was stage2) has the right size
+2. use this patched zipl for zipl'ing the DASD
+3. use qemu to boot from this DASD
+
+FYI - uploaded to the -unapproved queue yesterday. Now on the SRU team to evaluate.
+
+Hello bugproxy, or anyone else affected,
+
+Accepted qemu into groovy-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:5.0-5ubuntu9.7 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-groovy to verification-done-groovy. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-groovy. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+Hello bugproxy, or anyone else affected,
+
+Accepted qemu into focal-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:4.2-3ubuntu6.15 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-focal to verification-done-focal. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-focal. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+I happen to know that Marc is verifying this - thanks in advance!
+
+All autopkgtests for the newly accepted qemu (1:4.2-3ubuntu6.15) for focal have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+casper/1.445.1 (amd64, ppc64el)
+systemd/245.4-4ubuntu3.6 (amd64)
+ubuntu-image/1.11+20.04ubuntu1 (armhf, amd64, s390x)
+livecd-rootfs/2.664.19 (ppc64el)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/focal/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+All autopkgtests for the newly accepted qemu (1:5.0-5ubuntu9.7) for groovy have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+systemd/246.6-1ubuntu1.3 (ppc64el)
+cloud-utils/0.31-29-ge0792e3d-0ubuntu1 (s390x)
+open-iscsi/2.1.1-1ubuntu2 (amd64)
+ubuntu-image/1.11+20.10ubuntu1 (armhf)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/groovy/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+FYI I'm working on the autopkgtest issues - but all of those are known flaky cases, so I expect no long term blocker.
+
+The other two bugs that are part of this SRU are verified by now, so it needs just this one to complete - which we know can be hard to re-create without special unlucky bootloader record sizes.
+
+On the good side, I've not seen regressions to the non-affected-boots
+
+@Marc - let us know once you've completed the testing
+
+FYI - autopkgtest issues resolved as well now (as assumed it was due to flaky tests)
+
+------- Comment From <email address hidden> 2021-04-08 08:37 EDT-------
+@Christian: I've verified the fix works.
+
+Thanks (we have had way too much non-fun with no debug symbols on the roms, bootloader record sizes and so on).
+I really appreciate that you went so deep on this Marc!
+
+The verification of the Stable Release Update for qemu has completed successfully and the package is now being released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 1:5.0-5ubuntu9.7
+
+---------------
+qemu (1:5.0-5ubuntu9.7) groovy; urgency=medium
+
+  * d/p/u/lp-1921468-*: fix issues handling boot menu index on s390x
+    (LP: #1921468)
+  * d/p/u/lp-1887535-configure-replace-enable-disable-git-update-with-wit.patch,
+    d/rules: Backport --with-git-submodules param so building from git repo
+    doesn't fail (LP: #1887535)
+  * Fix byte aligned writes when writing to image stored on NFS
+    server, as they aren't required to be 4kib aligned. (LP: #1921665)
+    - d/p/u/lp-1921665-1-block-Require-aligned-image-size-to-avoid-assert.patch
+    - d/p/u/lp-1921665-2-file-posix-Allow-byte-aligned-O_DIRECT-with-NFS.patch
+
+ -- Christian Ehrhardt <email address hidden>  Fri, 26 Mar 2021 10:36:31 +0100
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu6.15
+
+---------------
+qemu (1:4.2-3ubuntu6.15) focal; urgency=medium
+
+  * d/p/u/lp-1921468-*: fix issues handling boot menu index on s390x
+    (LP: #1921468)
+  * d/p/u/lp-1887535-configure-replace-enable-disable-git-update-with-wit.patch,
+    d/rules: Backport --with-git-submodules param so building from git repo
+    doesn't fail (LP: #1887535)
+  * Fix byte aligned writes when writing to image stored on NFS
+    server, as they aren't required to be 4kib aligned. (LP: #1921665)
+    - d/p/u/lp-1921665-1-block-Require-aligned-image-size-to-avoid-assert.patch
+    - d/p/u/lp-1921665-2-file-posix-Allow-byte-aligned-O_DIRECT-with-NFS.patch
+
+ -- Christian Ehrhardt <email address hidden>  Fri, 26 Mar 2021 10:38:47 +0100
+
+------- Comment From <email address hidden> 2021-04-15 07:09 EDT-------
+IBM bugzilla status-> closed, Fix Released with all requested distros
+

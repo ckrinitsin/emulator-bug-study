@@ -1,0 +1,143 @@
+virsh snapshot-create too slow (kvm, qcow2, savevm)
+
+Action
+======
+# time virsh snapshot-create 1
+
+* Taking snapshot of a running KVM virtual machine
+
+Result
+======
+Domain snapshot 1300983161 created
+real    4m46.994s
+user    0m0.000s
+sys     0m0.010s
+
+Expected result
+===============
+* Snapshot taken after few seconds instead of minutes.
+
+Environment
+===========
+* Ubuntu Natty Narwhal upgraded from Lucid and Meerkat, fully updated.
+
+* Stock natty packages of libvirt and qemu installed (libvirt-bin 0.8.8-1ubuntu5; libvirt0 0.8.8-1ubuntu5; qemu-common 0.14.0+noroms-0ubuntu3; qemu-kvm 0.14.0+noroms-0ubuntu3).
+
+* Virtual machine disk format is qcow2 (debian 5 installed)
+image: /storage/debian.qcow2
+file format: qcow2
+virtual size: 10G (10737418240 bytes)
+disk size: 1.2G
+cluster_size: 65536
+Snapshot list:
+ID        TAG                 VM SIZE                DATE       VM CLOCK
+1         snap01                  48M 2011-03-24 09:46:33   00:00:58.899
+2         1300979368              58M 2011-03-24 11:09:28   00:01:03.589
+3         1300983161              57M 2011-03-24 12:12:41   00:00:51.905
+
+* qcow2 disk is stored on ext4 filesystem, without RAID or LVM or any special setup.
+
+* running guest VM takes about 40M RAM from inside, from outside 576M are given to that machine
+
+* host has fast dual-core pentium cpu with virtualization support, around 8G of RAM and 7200rpm harddrive (dd from urandom to file gives about 20M/s)
+
+* running processes: sshd, atd (empty), crond (empty), libvirtd, tmux, bash, rsyslogd, upstart-socket-bridge, udevd, dnsmasq, iotop (python)
+
+* networking is done by bridging and bonding
+
+
+Detail description
+==================
+
+* Under root, command 'virsh create-snapshot 1' is issued on booted and running KVM machine with debian inside.
+
+* After about four minutes, the process is done.
+
+* 'iotop' shows two 'kvm' processes reading/writing to disk. First one has IO around 1500 K/s, second one has around 400 K/s. That takes about three minutes. Then first process grabs about 3 M/s of IO and suddenly dissapears (1-2 sec). Then second process does about 7.5 M/s of IO for around a 1-2 minutes.
+
+* Snapshot is successfuly created and is usable for reverting or extracting.
+
+* Pretty much the same behaviour occurs when command 'savevm' is issued directly from qemu monitor, without using libvirf44bfb7fb978c9313ce050a1c4149bf04aa0a670t at all (actually, virsh snapshot-create just calls 'savevm' to the monitor socket).
+
+* This behaviour was observed on lucid, meerkat, natty and even with git version of libvirt (f44bfb7fb978c9313ce050a1c4149bf04aa0a670). Also slowsave packages from  https://bugs.launchpad.net/ubuntu/+source/libvirt/+bug/524447 gave this issue.
+
+
+Thank you for helping to solve this issue!
+
+ProblemType: Bug
+DistroRelease: Ubuntu 11.04
+Package: libvirt-bin 0.8.8-1ubuntu5
+ProcVersionSignature: Ubuntu 2.6.38-7.38-server 2.6.38
+Uname: Linux 2.6.38-7-server x86_64
+Architecture: amd64
+Date: Thu Mar 24 12:19:41 2011
+InstallationMedia: Ubuntu-Server 10.04.2 LTS "Lucid Lynx" - Release amd64 (20110211.1)
+ProcEnviron:
+ LANG=en_US.UTF-8
+ SHELL=/bin/bash
+SourcePackage: libvirt
+UpgradeStatus: No upgrade log present (probably fresh install)
+
+
+
+Yup, I can definately reproduce this.
+
+The current upstream qemu.git from git://git.savannah.nongnu.org/qemu.git
+also has the slow savevm.  However, it's loadvm takes only a few seconds.
+
+
+savevm _is_ slow, because it's writing to a qcow2 file with full (meta)data allocation which is terrible slow since 0.13 (and 0.12.5) unless you use cache=unsafe.  It's the same slowdown as observed with default cache mode when performing an operating system install into a freshly created qcow2 - it may take several hours.  To verify, run `iostat -dkx 5' and see how busy (the last column) your disk is during the save - I suspect it'll be about 100%.
+
+Confirmed that doing
+
+
+  kvm -drive file=lucid.img,cache=unsafe,index=0,boot=on -m 512M -smp 2 -vnc :1 -monitor stdio
+
+and doing 'savevm savevm5'
+
+takes about 2 seconds.
+
+So, for fast savevm, 'cache=unsafe' is the workaround.  Shoudl this bug then be marked invalid, or 'wontfix'?
+
+I confirm that without 'cache' option, I have got from iostat those result while doing 'savevm'
+
+Device: sda
+rrqm/s: 0.00
+wrqm/s: 316.00
+r/s: 0.00
+w/s: 94.80
+rkB/s: 0.00
+wkB/s: 1541.60
+avgrq-sz: 32.52
+avgqu-sz: 0.98
+await: 10.32
+svctm: 10.10
+%util: 95.76
+
+I also confirm, that when option 'cache=unsafe' is used, snapshot (from qemu monitor) is done as quickly as it should (few seconds). 
+
+I am not sure if this is a solution or workaround or just a closer description of a bug.
+
+http://libvirt.org/formatdomain.html#elementsDisks describes option 'cache'. When I use that (cache="none") it spits out:
+
+error: Failed to create domain from vm.xml
+error: internal error process exited while connecting to monitor: kvm: -drive file=/home/dum8d0g/vms/deb.qcow2,if=none,id=drive-ide0-0-0,boot=on,format=qcow2,cache=none: could not open disk image /home/dum8d0g/vms/deb.qcow2: Invalid argument
+
+When that option is removed, domain is created successfuly. I guess I have another bugreport to fill.
+
+So, for me, the issue is somehow solved from the qemu side. I think, this could be marked as wontfix.
+
+In qemu 0.14 cache=writeback and cache=none are expected to perform well. The default cache=writethrough is a very conservative setting which is slow by design. I'm pretty sure that it has always been slow, even before 0.12.5.
+
+I think that the specific problem with savevm may be related to the VM state being saved in too small chunks. With cache=writethrough this will hurt most.
+
+I had posted a patch to fix the issue before:(http://patchwork.ozlabs.org/patch/64346/), saving memory state is time consuming, which may takes several minutes.
+
+@edison,
+
+if you want to push such a patch, please do it through upstream, since it is actually a new feature.
+
+I'm going to mark this 'wontfix' (as I thought I had done before), rather than invalid, though the latter still sounds accurate as well.
+
+Cool. Writes about 9 times the data of the actual snapshot size.
+

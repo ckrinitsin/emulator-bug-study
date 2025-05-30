@@ -1,0 +1,130 @@
+using x-vga=on with vfio-pci leads to segfault
+
+bug occures at least with qemu 2.8.0 and 2.8.1 in 64bit-system
+
+stripped cmd for minimal config:
+qemu-system-i386 -m 2048 -M q35  -enable-kvm -nodefaults -nodefconfig -device ioh3420,bus=pcie.0,addr=0x9,multifunction=on,port=1,chassis=1,id=root.1 -device vfio-pci,host=01:00.0,bus=root.1,addr=01.0,x-vga=on
+
+Backtrace is:
+#0  0x00005555557ca836 in memory_region_update_container_subregions (subregion=0x55555828f2f0) at qemu-2.8.1/memory.c:2030
+#1  0x00005555557ca9dc in memory_region_add_subregion_common (mr=0x0, offset=8, subregion=0x55555828f2f0) at qemu-2.8.1/memory.c:2049
+#2  0x00005555557caa9a in memory_region_add_subregion_overlap (mr=0x0, offset=8, subregion=0x55555828f2f0, priority=1) at qemu-2.8.1/memory.c:2066
+#3  0x0000555555832e48 in vfio_probe_nvidia_bar5_quirk (vdev=0x55555805aef0, nr=5) at qemu-2.8.1/hw/vfio/pci-quirks.c:689
+#4  0x0000555555835433 in vfio_bar_quirk_setup (vdev=0x55555805aef0, nr=5) at qemu-2.8.1/hw/vfio/pci-quirks.c:1652
+#5  0x000055555582f122 in vfio_realize (pdev=0x55555805aef0, errp=0x7fffffffdc78) at qemu-2.8.1/hw/vfio/pci.c:2777
+#6  0x0000555555a86195 in pci_qdev_realize (qdev=0x55555805aef0, errp=0x7fffffffdcf0) at hw/pci/pci.c:1966
+#7  0x00005555559be7b7 in device_set_realized (obj=0x55555805aef0, value=true, errp=0x7fffffffdeb0) at hw/core/qdev.c:918
+#8  0x0000555555bb017f in property_set_bool (obj=0x55555805aef0, v=0x55555805ced0, name=0x555556071b56 "realized", opaque=0x555557f15860, errp=0x7fffffffdeb0) at qom/object.c:1854
+#9  0x0000555555bae2e6 in object_property_set (obj=0x55555805aef0, v=0x55555805ced0, name=0x555556071b56 "realized", errp=0x7fffffffdeb0) at qom/object.c:1088
+#10 0x0000555555bb184f in object_property_set_qobject (obj=0x55555805aef0, value=0x55555805cd70, name=0x555556071b56 "realized", errp=0x7fffffffdeb0) at qom/qom-qobject.c:27
+#11 0x0000555555bae637 in object_property_set_bool (obj=0x55555805aef0, value=true, name=0x555556071b56 "realized", errp=0x7fffffffdeb0) at qom/object.c:1157
+#12 0x00005555558fee4b in qdev_device_add (opts=0x555556b15160, errp=0x7fffffffdf28) at qdev-monitor.c:623
+#13 0x00005555559142c1 in device_init_func (opaque=0x0, opts=0x555556b15160, errp=0x0) at vl.c:2373
+#14 0x0000555555cc3bb7 in qemu_opts_foreach (list=0x555556548b80 <qemu_device_opts>, func=0x555555914283 <device_init_func>, opaque=0x0, errp=0x0) at util/qemu-option.c:1116
+#15 0x00005555559198aa in main (argc=12, argv=0x7fffffffe388, envp=0x7fffffffe3f0) at vl.c:4574
+
+as I can see, it happens during initialization of the device-option.
+
+seems that the code tries to loop over a memory-region mr, which is null from at least three calls before it crashes.
+
+because there seems to be special handling for nvidia-cards, here're the pci-infos of the card:
+01:00.0 VGA compatible controller [0300]: NVIDIA Corporation G72 [GeForce 7300 GS] [10de:01df] (rev a1) (prog-if 00 [VGA controller])
+	Subsystem: Gigabyte Technology Co., Ltd Device [1458:342a]
+	Flags: fast devsel, IRQ 16
+	Memory at de000000 (32-bit, non-prefetchable) [disabled] [size=16M]
+	Memory at c0000000 (64-bit, prefetchable) [disabled] [size=256M]
+	Memory at dd000000 (64-bit, non-prefetchable) [disabled] [size=16M]
+	Expansion ROM at df000000 [disabled] [size=128K]
+	Capabilities: [60] Power Management version 2
+	Capabilities: [68] MSI: Enable- Count=1/1 Maskable- 64bit+
+	Capabilities: [78] Express Endpoint, MSI 00
+	Capabilities: [100] Virtual Channel
+	Capabilities: [128] Power Budgeting <?>
+	Kernel driver in use: vfio-pci
+
+at least with a similar card in another slot the crash does not occure.
+(sorry, can't change the slots at the moment)
+
+It's highly likely that a 7-series GeForce has a different BAR layout than a modern card and should be considered unsupported.  Is the "similar card in another slot" also a 7-series or older card?  Out of curiosity, add another -v to the lspci output (lspci -vv) so that it identifies which BARs are which.  A more modern card looks like this:
+
+	Region 0: Memory at f6000000 (32-bit, non-prefetchable) [size=16M]
+	Region 1: Memory at e0000000 (64-bit, prefetchable) [size=256M]
+	Region 3: Memory at f0000000 (64-bit, prefetchable) [size=32M]
+	Region 5: I/O ports at e000 [size=128]
+	Expansion ROM at f7000000 [disabled] [size=512K]
+
+Thus the quirk should be triggered on the I/O port BAR, which your card doesn't seem to have.
+
+well but even if it's unsupported it shouldn't segfault...
+
+the other card is nearly the same
+this one is a GeForce 7300 GS, the other a GeForce 7300 GT
+
+I think, the above output was done with "lspci -vv", but I've do it again:
+lspci -vv for the "bad card" is:
+
+01:00.0 VGA compatible controller: NVIDIA Corporation G72 [GeForce 7300 GS] (rev a1) (prog-if 00 [VGA controller])
+	Subsystem: Gigabyte Technology Co., Ltd Device 342a
+	Flags: fast devsel, IRQ 16
+	Memory at de000000 (32-bit, non-prefetchable) [disabled] [size=16M]
+	Memory at c0000000 (64-bit, prefetchable) [disabled] [size=256M]
+	Memory at dd000000 (64-bit, non-prefetchable) [disabled] [size=16M]
+	Expansion ROM at df000000 [disabled] [size=128K]
+	Capabilities: [60] Power Management version 2
+	Capabilities: [68] MSI: Enable- Count=1/1 Maskable- 64bit+
+	Capabilities: [78] Express Endpoint, MSI 00
+	Capabilities: [100] Virtual Channel
+	Capabilities: [128] Power Budgeting <?>
+	Kernel driver in use: vfio-pci
+
+
+and for the "good" card:
+07:00.0 VGA compatible controller: NVIDIA Corporation G73 [GeForce 7300 GT] (rev a1) (prog-if 00 [VGA controller])
+	Subsystem: CardExpert Technology Device 1401
+	Flags: fast devsel, IRQ 16
+	Memory at db000000 (32-bit, non-prefetchable) [disabled] [size=16M]
+	Memory at b0000000 (64-bit, prefetchable) [disabled] [size=256M]
+	Memory at da000000 (64-bit, non-prefetchable) [disabled] [size=16M]
+	I/O ports at e000 [disabled] [size=128]
+	Expansion ROM at dc000000 [disabled] [size=128K]
+	Capabilities: [60] Power Management version 2
+	Capabilities: [68] MSI: Enable- Count=1/1 Maskable- 64bit+
+	Capabilities: [78] Express Endpoint, MSI 00
+	Capabilities: [100] Virtual Channel
+	Capabilities: [128] Power Budgeting <?>
+	Kernel driver in use: vfio-pci
+
+your're right that the I/O-Port is not shown for the "bad" card, even I don't know why. Maybe because the card's bios-routine saw the other or vice versa.
+
+nevertheless, segfaults are not nice...
+
+
+
+Does this resolve the segfault?
+
+diff --git a/hw/vfio/pci-quirks.c b/hw/vfio/pci-quirks.c
+index e9b493b939db..349085ea12bc 100644
+--- a/hw/vfio/pci-quirks.c
++++ b/hw/vfio/pci-quirks.c
+@@ -660,7 +660,7 @@ static void vfio_probe_nvidia_bar5_quirk(VFIOPCIDevice *vdev
+     VFIOConfigWindowQuirk *window;
+ 
+     if (!vfio_pci_is(vdev, PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID) ||
+-        !vdev->vga || nr != 5) {
++        !vdev->vga || nr != 5 || !vdev->bars[5].ioport) {
+         return;
+     }
+ 
+
+
+after applying the patch no segfault occures any more.
+
+thanks for quick fix.
+
+
+regarding my assumption the missing I/O may depend on bios/slot or similar: it doesn't. the card does not show the entry in either slot or even as only extra-card.
+
+
+
+This is now fixed in QEMU 2.9-rc
+

@@ -1,0 +1,156 @@
+qemu: fatal: Trying to execute code outside RAM or ROM; worked in 1.4.0, fails in 1.4.92
+
+I'm using qemu to run and debug the EDK2 uEFI environment. OVMF is being built out of the EDK2 tree I've checked out (r14367).  (Reproducing all this could be tedious so I am available for debugging/testing.)
+
+qemu 1.4.0 was able to execute this guest environment with no trouble, qemu 1.4.92 however issues an error message and aborts.  The command line I use to start qemu is:
+
+$ /usr/local/bin/qemu-system-x86_64 -m 1024 -bios OVMF.fd -monitor stdio
+
+1.4.92 gives the following register dump:
+
+QEMU 1.4.92 monitor - type 'help' for more information
+(qemu) qemu: fatal: Trying to execute code outside RAM or ROM at 0x0000000100000000
+
+RAX=000000003e084da8 RBX=000000003e084868 RCX=0000000000000000 RDX=000000003e084f00
+RSI=0000000000000001 RDI=000000003e085000 RBP=000000003e084708 RSP=000000003fac8510
+R8 =0000000000000000 R9 =000000003e14c3e3 R10=0000000000000033 R11=00000000000000d3
+R12=000000003e0848a0 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=00000000ffffffe4 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0008 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+CS =0028 0000000000000000 ffffffff 00af9b00 DPL=0 CS64 [-RA]
+SS =0008 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+DS =0008 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+FS =0008 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+GS =0008 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+LDT=0000 0000000000000000 0000ffff 00008200 DPL=0 LDT
+TR =0000 0000000000000000 0000ffff 00008b00 DPL=0 TSS64-busy
+GDT=     000000003fa50e98 0000003f
+IDT=     000000003f9d6e20 00000fff
+CR0=80000033 CR2=0000000000000000 CR3=000000003fa67000 CR4=00000668
+...
+
+
+Questions:
+1) Is this problem relevant?  (is full backward compatability to be supported?)
+2) Are there new guest execution controls in 1.4.9x that might cause this?
+3) If #2, can they be disabled by a qemu command line switch?
+4) If not #2, in what qemu source file specifically can I find the logic causing the abort? (help me help you :)
+5) If guest memory is corrupted or improperly mapped, how can I keep qemu alive to examime/dump guest memory?
+
+Attching the bios I'm using (you may be able to reproduce the problem with this file alone).
+
+Ha, I thought kvm was on by default.  Apparently not, qemu -enable-kvm
+avoids this issue.
+
+Yes, 0x0000000100000000 with RIP=00000000ffffffe4 is quite suspicious,
+especially after the splash screen has been displayed.  Off in the weeds
+comes to mind - so I'm guessing corrupted or incorrectly mapped guest
+memory?
+
+The git tree is where?  (I just grabbed the tarball)
+
+
+Is there something special about this git repo?  I can pull other git repos
+through my firewall with no problems, but this one fails (always at the
+same place) with:
+
+$ git clone http://git.qemu.org/git/qemu.git
+Cloning into 'qemu'...
+### takes 1 or 2 mins - can see a lot of git objects succeed, then:
+error: The requested URL returned error: 407 authenticationrequired
+(curl_result = 22, http_code = 407, sha1 =
+cad2b59c198340a636c5e015fb90e0326a1d3dd7)
+error: Unable to find cad2b59c198340a636c5e015fb90e0326a1d3dd7 under
+http://git.qemu.org/git/qemu.git
+Cannot obtain needed commit cad2b59c198340a636c5e015fb90e0326a1d3dd7
+while processing commit b174de51ae397549f58b1b76efa9026b213a1efd.
+error: Fetch failed.
+
+
+Ok, somehow the firewall was messed up - it works now.   :/
+
+
+4a6fd938f5457ee161d2acbd9364608a2a68b7a1 is the first bad commit
+commit 4a6fd938f5457ee161d2acbd9364608a2a68b7a1
+Author: Richard Henderson <email address hidden>
+Date:   Thu Jan 10 13:29:23 2013 -0800
+
+    target-i386: Tidy prefix parsing
+
+    Avoid duplicating switch statement between 32 and 64-bit modes.
+
+    Signed-off-by: Richard Henderson <email address hidden>
+
+:040000 040000 19911356bcd4fe71bfc36485c066368a439edd2d
+ca7c74f1404cb025f3dbb7a77966a790ae7e890f M      target-i386
+
+
+The previous commit (988c3eb0d) works fine.
+
+
+
+
+Proposed patch: http://thread.gmane.org/gmane.comp.emulators.qemu/213023
+
+On Fri, 24 May 2013 23:23:02 +0200
+Laszlo Ersek <email address hidden> wrote:
+
+> ------------------------------[ proposed fix ]--------------------------
+> diff --git a/target-i386/translate.c b/target-i386/translate.c
+> index 0e0356f..4fbd6c0 100644
+> --- a/target-i386/translate.c
+> +++ b/target-i386/translate.c
+> @@ -4813,7 +4813,11 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
+>              /* 0x66 is ignored if rex.w is set */
+>              dflag = 2;
+>          }
+> -        if (!(prefixes & PREFIX_ADR)) {
+> +        if (prefixes & PREFIX_ADR) {
+> +            /* flip it back, 0x67 should have no effect */
+> +            aflag ^= 1;
+> +        }
+> +        else {
+>              aflag = 2;
+>          }
+>      }
+> ------------------------------[ proposed fix ]--------------------------
+> 
+> I'll post it separately to the list for review.
+> 
+> Luiz, can you please test it with Windows guests?
+
+On Windows 8 I can get past the boot loop point and even see Windows' boot
+logo, but then I get a black screen (which I guess is the evolution of the
+blue screen) asking me to reboot the PC saying "Error Code: 0x0000005D".
+
+That error code is what I get with Windows 2008, with or without or patch.
+I googled a bit about it, and it seems to be related to some CPU
+incompatibility, which makes me think that this is a difference issue
+(meaning that your patch does fix the boot loop bug).
+
+
+I just tried Richard's fix against HEAD (6a4e17711) and it works for me.  I also like that his fix clearly constrains aflag to the values 1 and 2 for 64bit mode - a concept which matches the intent of the 0x67 prefix.
+
+$ git diff target-i386/translate.c 
+diff --git a/target-i386/translate.c b/target-i386/translate.c
+index 0aeccdb..cb7fe0b 100644
+--- a/target-i386/translate.c
++++ b/target-i386/translate.c
+@@ -4816,6 +4816,8 @@ static target_ulong disas_insn(CPUX86State *env, DisasCont
+         if (!(prefixes & PREFIX_ADR)) {
+             aflag = 2;
+         }
++        /* 0x67 toggles between 64-bit and 32-bit addressing */
++        aflag = (prefixes & PREFIX_ADR ? 1 : 2);
+     }
+ #endif
+
+
+I think this has likely been fixed by this commit here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=dec3fc9657e0682637de4d
+... so setting the status to "Fix Released" now. If the problem still persists, please feel free to open this ticket again.
+
+Sigh.  3 years ago I could test this - today?  Not possible.  I'm sorry I
+can't confirm.  :/
+
+

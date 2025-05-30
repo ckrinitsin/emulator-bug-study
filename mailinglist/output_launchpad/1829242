@@ -1,0 +1,60 @@
+qemu on windows host exits after savevm command
+
+I'm running qemu-system-i386.exe 3.1.0 with this command line:
+"C:\Program Files\qemu\qemu-system-i386.exe"  -L C:\user\qemu\pc-bios\ -name win7 -m 4G -uuid 564db62e-e031-b5cf-5f34-a75f8cefa98e -rtc base=localtime -accel hax -hdd C:\VirtualMachines\Dev\Win10x64_VS17\swap.qcow "C:\VirtualMachines\qemu\qemu_win7.qcow"
+Host OS Windows 10 x64, guest OS Wondows 7 x86.
+
+Wait till the OS loads, go to compat_monitor0 tab and enter command:
+savevm loaded_win
+After a few seconds qemu exits, running it another time and entering command:
+info snapshots
+says "There is no snapshot available". I've tried rinning it with -accel tcg, with same results. I've tried less memory (1G), same results.
+
+Hi Alex,
+   I'm not sure we've tried a savevm on a windows host; I don't have one easily available.
+When you say 'after a few seconds qemu exits' - does it give any errors or crash or anything?
+
+Hi Alex,
+   I'm not sure we've tried a savevm on a windows host; I don't have one easily available.
+When you say 'after a few seconds qemu exits' - does it give any errors or crash or anything?
+
+Hi,
+No, no messages, no crash window which appears when windows catches unhandled exceptions in software. Looks as if there was an asynchronous command to exit during savevm which executed in parallel to the command.
+
+I think you'll have to break out a debugger on it to see why it's exiting; if you can break on any exit paths and get a backtrace we can have some more guesswork.
+
+To do this I must crosscompile qemu on a linux host and debug on a windows host. Is there a gdb for 64-bit windows, since windows debuggers don't understand DWARF debugging info, and is it possible to give him paths to source files, since paths on the build machine and the debugging machine will be different?
+
+Sorry, no idea - I don't know windows build/debug.
+(I know the migration code that savevm uses, which is why I looked at this bug)
+
+Running the operation under debugger catches this error:
+Critical error detected c0000374
+(2314.a54): Break instruction exception - code 80000003 (first chance)
+ntdll!RtlIsNonEmptyDirectoryReparsePointAllowed+0x72:
+00007ffe`0780b2d2 cc              int     3
+
+This error means that a heap corruption was detected. To find the place where the corruption occured, I've ran qemu under appverifier, which is some kind of ASAN\MSAN for windows.
+The tool caught an access violation, the callstack seems to be not full, save_snapshot calls qemu_savevm_state_iterate, then a call to ram_save_iterate, then ram_find_and_save_block. But the address of the exception does not correspond to this function.
+Disassembling qemu and searching for this address, I've found that it probably corresponds to this snippet in ram_save_host_page:
+    do {
+        /* Check the pages is dirty and if it is send it */
+        if (!migration_bitmap_clear_dirty(rs, pss->block, pss->page)) {
+            pss->page++;
+            continue;
+        }
+
+The missing callstack part is probably ram_find_and_save_block calling ram_save_host_page at this place:
+        if (found) {
+            pages = ram_save_host_page(rs, &pss, last_stage);
+        }
+
+It seems that the compiler inlined several functions to ram_find_and_save_block and that is the reason for the partial stack.
+Since I am still unable to see local variable values during debugging, I can't give more info now. 
+I think the bug can be found when running qemu on linux with ASAN\MSAN. When this does not find the bug, I do more debugging.
+I want mention that the caught access violation is due to reading an invalid address. The bug found without appverifier is due to writing to an invalid address, so there may be several bugs.
+
+that code should be ok; if you can find it with a debug I'd try and figure out what block and page pss is currently pointing to.  Is it normal RAM or something special?
+
+I'm still unable to see all locals, but can output some of them with printf. qemu_savevm_state_iterate is called 35 times, iterates over timer, COLOState, slirp, block and ram entrys, and the error is on handling ram entry.
+

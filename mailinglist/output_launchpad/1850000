@@ -1,0 +1,143 @@
+4.1.0 bogus QCOW2 corruption reported after compress
+
+Creating a compressed image then running `qemu-img check <..>.qcow2' on said image seems to report bogus corruption in some (but not all) cases:
+
+Step 1.
+
+# qemu-img info win7-base.qcow2
+image: win7-base.qcow2
+file format: qcow2
+virtual size: 20 GiB (21474836480 bytes)
+disk size: 12.2 GiB
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: true
+    refcount bits: 16
+    corrupt: false
+
+# qemu-img check win7-base.qcow2
+No errors were found on the image.
+327680/327680 = 100.00% allocated, 0.00% fragmented, 0.00% compressed clusters
+Image end offset: 21478375424
+
+Step 2.
+
+# qemu-img convert -f qcow2 -O qcow2 -c win7-base.qcow2 test1-z.qcow2
+
+Step 3.
+
+# qemu-img info test1-z.qcow2
+image: test1-z.qcow2
+file format: qcow2
+virtual size: 20 GiB (21474836480 bytes)
+disk size: 5.78 GiB
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+
+# qemu-img check test1-z.qcow2
+ERROR cluster 1191 refcount=1 reference=2
+ERROR cluster 1194 refcount=1 reference=4
+ERROR cluster 1195 refcount=1 reference=7
+ERROR cluster 1196 refcount=1 reference=7
+ERROR cluster 1197 refcount=1 reference=6
+ERROR cluster 1198 refcount=1 reference=4
+ERROR cluster 1199 refcount=1 reference=4
+ERROR cluster 1200 refcount=1 reference=5
+ERROR cluster 1201 refcount=1 reference=3
+<...> snip many errors
+Leaked cluster 94847 refcount=3 reference=0
+Leaked cluster 94848 refcount=3 reference=0
+Leaked cluster 94849 refcount=11 reference=0
+Leaked cluster 94850 refcount=14 reference=0
+
+20503 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+20503 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+197000/327680 = 60.12% allocated, 89.32% fragmented, 88.50% compressed clusters
+Image end offset: 6216220672
+
+
+The resultant image seems to work fine in a VM when used as a backing file.
+
+Interestingly, if I substitute a qemu-img binary from qemu-4.0 then no errors are reported.
+
+# /tmp/qemu-img check test1-z.qcow2
+No errors were found on the image.
+197000/327680 = 60.12% allocated, 89.32% fragmented, 88.50% compressed clusters
+Image end offset: 6216220672
+
+Is the image corrupted or not? I'm guessing not.
+
+Just in case it matters, this is ext4 fs on rotational disk. Latest Arch Linux but self compiled 4.1.0 with recent QCOW2 corruption fixes added.
+
+I haven't tried latest trunk but might do so if time permits.
+
+Current trunk still displays the problem.
+
+A git bisection between 4.0.0 and 4.1.0 revealed:
+
+b6c246942b14d3e0dec46a6c5868ed84e7dbea19 is the first bad commit
+commit b6c246942b14d3e0dec46a6c5868ed84e7dbea19
+Author: Alberto Garcia <email address hidden>
+Date:   Fri May 10 19:22:54 2019 +0300
+
+    qcow2: Define and use QCOW2_COMPRESSED_SECTOR_SIZE
+    
+    When an L2 table entry points to a compressed cluster the space used
+    by the data is specified in 512-byte sectors. This size is independent
+    from BDRV_SECTOR_SIZE and is specific to the qcow2 file format.
+    
+    The QCOW2_COMPRESSED_SECTOR_SIZE constant defined in this patch makes
+    this explicit.
+    
+    Signed-off-by: Alberto Garcia <email address hidden>
+    Signed-off-by: Kevin Wolf <email address hidden>
+
+ block/qcow2-cluster.c  |  5 +++--
+ block/qcow2-refcount.c | 25 ++++++++++++++-----------
+ block/qcow2.c          |  3 ++-
+ block/qcow2.h          |  4 ++++
+ 4 files changed, 23 insertions(+), 14 deletions(-)
+
+
+
+
+
+There is definitely a bug in that patch, and that is that QCOW2_COMPRESSED_SECTOR_MASK is an unsigned int instead of a uint64_t (so the mask is too small).
+
+It looks like the bug has existed in some places before that patch (because they use ~511 as a mask), but not in others.
+
+This would explain why the bug is visible only for some images, namely for those with a compressed size of more than 4 GB, I presume.
+
+
+And indeed, fixing QCOW2_COMPRESSED_SECTOR_MASK to be an unsigned long long fixes the bug.  I’ll send a patch (but I’ll have to write a more simple and quicker test case first).
+
+Max
+
+Forgot to say that I sent a patch:
+
+https://lists.nongnu.org/archive/html/qemu-block/2019-10/msg01764.html
+
+
+Thanks for reporting!
+
+Max
+
+Thank you Max.
+
+Can confirm your patch fixes my issue (qemu-img check ...)
+
+Not sure about those other code paths. I don't use internal snapshots and I'm not sure under which circumstances qcow2_free_any_clusters() gets exercised.
+
+Just for good measure, with patch applied I created another >4GB compressed image then booted it a few times and all seems fine.
+
+Fix has been included in QEMU v4.2:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=24552feb6ae2f615b76c2
+

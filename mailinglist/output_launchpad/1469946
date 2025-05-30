@@ -1,0 +1,252 @@
+guest can't get IP when create guest with bridge.
+
+Environment:
+------------
+Host OS (ia32/ia32e/IA64):ia32e
+Guest OS (ia32/ia32e/IA64):ia32e
+Guest OS Type (Linux/Windows):linux
+kvm.git Commit:aefbef10e3ae6e2c6e3c54f906f10b34c73a2c66
+qemu.git Commit:dc1e1350f8061021df765b396295329797d66933
+Host Kernel Version:4.1.0
+Hardware:Ivytown_EP, Haswell_EP
+
+
+Bug detailed description:
+--------------------------
+when create guest with bridge, the guest can not get ip.
+
+note:
+1. fail rate: 3/5
+2. this is a qemu bug:
+kvm      + qemu   =  result
+aefbef10 + dc1e1350    =  bad 
+aefbef10 + a4ef02fd   =  good
+
+Reproduce steps:
+----------------
+1. create guest:
+qemu-system-x86_64 -enable-kvm -m 2G -smp 4 -device virtio-net-pci,netdev=net0,mac=$random_mac -netdev tap,id=net0,script=/etc/kvm/qemu-ifup rhel6u5.qcow
+
+Current result:
+----------------
+guest can't get IP
+
+Expected result:
+----------------
+guest can get ip
+
+Basic root-causing log:
+----------------------
+
+the first bad commit is
+commit a90a7425cf592a3afeff3eaf32f543b83050ee5c
+Author: Fam Zheng <email address hidden>
+Date:   Thu Jun 4 14:45:17 2015 +0800
+
+    tap: Drop tap_can_send
+    
+    This callback is called by main loop before polling s->fd, if it returns
+    false, the fd will not be polled in this iteration.
+    
+    This is redundant with checks inside read callback. After this patch,
+    the data will be sent to peer when it arrives. If the device can't
+    receive, it will be queued to incoming_queue, and when the device status
+    changes, this queue will be flushed.
+    
+    Signed-off-by: Fam Zheng <email address hidden>
+    Message-id: <email address hidden>
+    Signed-off-by: Stefan Hajnoczi <email address hidden>
+
+On Tue, 06/30 03:41, chao zhou wrote:
+> the first bad commit is
+> commit a90a7425cf592a3afeff3eaf32f543b83050ee5c
+> Author: Fam Zheng <email address hidden>
+> Date:   Thu Jun 4 14:45:17 2015 +0800
+> 
+>     tap: Drop tap_can_send
+>     
+>     This callback is called by main loop before polling s->fd, if it returns
+>     false, the fd will not be polled in this iteration.
+>     
+>     This is redundant with checks inside read callback. After this patch,
+>     the data will be sent to peer when it arrives. If the device can't
+>     receive, it will be queued to incoming_queue, and when the device status
+>     changes, this queue will be flushed.
+>     
+>     Signed-off-by: Fam Zheng <email address hidden>
+>     Message-id: <email address hidden>
+>     Signed-off-by: Stefan Hajnoczi <email address hidden>
+
+Could you try this patch?
+
+http://lists.nongnu.org/archive/html/qemu-devel/2015-06/msg07377.html
+
+Fam
+
+
+after try the patch http://lists.nongnu.org/archive/html/qemu-devel/2015-06/msg07377.html with qemu.git commit(d2966f804d70a244f5dde395fc5d22a50ed3e74e)
+the guest can get IP, but after save/retore or live migration, the guest is alive, but ping or ssh  guest's IP fail .
+
+On Wed, 07/01 06:36, chao zhou wrote:
+> after try the patch
+> http://lists.nongnu.org/archive/html/qemu-devel/2015-06/msg07377.html with
+> qemu.git commit(d2966f804d70a244f5dde395fc5d22a50ed3e74e) the guest can get
+> IP, but after save/retore or live migration, the guest is alive, but ping or
+> ssh  guest's IP fail .
+
+Another fix is needed to handle stop/resume. I'm sending it now with you in the
+Cc list. Please test!
+
+Thanks,
+Fam
+
+> 
+> -- 
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1469946
+> 
+> Title:
+>   guest can't get IP when create guest with bridge.
+> 
+> Status in QEMU:
+>   New
+> 
+> Bug description:
+>   Environment:
+>   ------------
+>   Host OS (ia32/ia32e/IA64):ia32e
+>   Guest OS (ia32/ia32e/IA64):ia32e
+>   Guest OS Type (Linux/Windows):linux
+>   kvm.git Commit:aefbef10e3ae6e2c6e3c54f906f10b34c73a2c66
+>   qemu.git Commit:dc1e1350f8061021df765b396295329797d66933
+>   Host Kernel Version:4.1.0
+>   Hardware:Ivytown_EP, Haswell_EP
+> 
+>   
+>   Bug detailed description:
+>   --------------------------
+>   when create guest with bridge, the guest can not get ip.
+> 
+>   note:
+>   1. fail rate: 3/5
+>   2. this is a qemu bug:
+>   kvm      + qemu   =  result
+>   aefbef10 + dc1e1350    =  bad 
+>   aefbef10 + a4ef02fd   =  good
+> 
+>   Reproduce steps:
+>   ----------------
+>   1. create guest:
+>   qemu-system-x86_64 -enable-kvm -m 2G -smp 4 -device virtio-net-pci,netdev=net0,mac=$random_mac -netdev tap,id=net0,script=/etc/kvm/qemu-ifup rhel6u5.qcow
+> 
+>   Current result:
+>   ----------------
+>   guest can't get IP
+> 
+>   Expected result:
+>   ----------------
+>   guest can get ip
+> 
+>   Basic root-causing log:
+>   ----------------------
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1469946/+subscriptions
+> 
+
+
+Since commit 6e99c63 "net/socket: Drop net_socket_can_send" and friends, net queues need to be explicitly flushed after qemu_can_send_packet() returns false, because the netdev side will disable the polling of fd.
+
+This fixes the case of "cont" after "stop" (or migration), i.e.
+vm_running changes to true, by listening to vm state changes.
+
+Signed-off-by: Fam Zheng <email address hidden>
+---
+ include/net/net.h |  2 ++
+ net/net.c         | 14 +++++++++++++-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/net.h b/include/net/net.h index 6a6cbef..619a6e1 100644
+--- a/include/net/net.h
++++ b/include/net/net.h
+@@ -8,6 +8,7 @@
+ #include "net/queue.h"
+ #include "migration/vmstate.h"
+ #include "qapi-types.h"
++#include "sysemu/sysemu.h"
+ 
+ #define MAX_QUEUE_NUM 1024
+ 
+@@ -92,6 +93,7 @@ struct NetClientState {
+     NetClientDestructor *destructor;
+     unsigned int queue_index;
+     unsigned rxfilter_notify_enabled:1;
++    VMChangeStateEntry *vmcse;
+ };
+ 
+ typedef struct NICState {
+diff --git a/net/net.c b/net/net.c
+index 6ff7fec..edfa6a0 100644
+--- a/net/net.c
++++ b/net/net.c
+@@ -43,7 +43,6 @@
+ #include "qapi-visit.h"
+ #include "qapi/opts-visitor.h"
+ #include "qapi/dealloc-visitor.h"
+-#include "sysemu/sysemu.h"
+ 
+ /* Net bridge is currently not supported for W32. */  #if !defined(_WIN32) @@ -263,6 +262,16 @@ static void qemu_net_client_destructor(NetClientState *nc)
+     g_free(nc);
+ }
+ 
++static void qemu_net_client_handle_vmstate(void *opaque,
++                                           int running,
++                                           RunState state) {
++    NetClientState *nc = opaque;
++    if (running && qemu_can_send_packet(nc) && nc->peer) {
++        qemu_flush_queued_packets(nc->peer);
++    }
++}
++
+ static void qemu_net_client_setup(NetClientState *nc,
+                                   NetClientInfo *info,
+                                   NetClientState *peer, @@ -287,6 +296,8 @@ static void qemu_net_client_setup(NetClientState *nc,
+ 
+     nc->incoming_queue = qemu_new_net_queue(nc);
+     nc->destructor = destructor;
++    nc->vmcse = qemu_add_vm_change_state_handler(qemu_net_client_handle_vmstate,
++                                                 nc);
+ }
+ 
+ NetClientState *qemu_new_net_client(NetClientInfo *info, @@ -395,6 +406,7 @@ void qemu_del_net_client(NetClientState *nc)
+                                           MAX_QUEUE_NUM);
+     assert(queues != 0);
+ 
++    qemu_del_vm_change_state_handler(nc->vmcse);
+     /* If there is a peer NIC, delete and cleanup client, but do not free. */
+     if (nc->peer && nc->peer->info->type == NET_CLIENT_OPTIONS_KIND_NIC) {
+         NICState *nic = qemu_get_nic(nc->peer);
+--
+2.4.3
+
+
+
+after try this patch and http://lists.nongnu.org/archive/html/qemu-devel/2015-06/msg07377.html  with qemu.git d2966f804d70a244f5dde395fc5d22a50ed3e74e
+ after save/retore or live migration, the guest is alive,  ping or ssh guest's IP , it is fine
+
+
+Does the bug's patch has merged in qemu.git?
+I test the latest qemu.git(commit:5b5e8cdd7da7a2214dd062afff5b866234aab228), the bug still can reproduce.
+
+On Mon, Jul 20, 2015 at 07:46:55AM -0000, chao zhou wrote:
+> Does the bug's patch has merged in qemu.git?
+> I test the latest qemu.git(commit:5b5e8cdd7da7a2214dd062afff5b866234aab228), the bug still can reproduce.
+
+Please git fetch origin and try again.
+
+
+The patch mentioned earlier has been committed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=625de449fc5597f2e1aff
+... so I think we can mark this as fixed now.
+

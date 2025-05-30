@@ -1,0 +1,285 @@
+9pfs file create with mapped-xattr can fail on overlayfs
+
+QEMU Version: 3.1.0 as packaged in debian buster, but the code appears to do the same in master.
+qemu command-line: qemu-system-x86_64 -m 1G -nographic -nic "user,model=virtio-net-pci,tftp=$(pwd),net=10.0.2.0/24,host=10.0.2.2" -fsdev local,id=fs,path=$thisdir/..,security_model=mapped-xattr -device virtio-9p-pci,fsdev=fs,mount_tag=fs -drive "file=$rootdisk,if=virtio,format=raw" -kernel "$kernel" -initrd "$initrd" -append "$append"
+
+
+I'm using CI that runs in a Docker container and runs a qemu VM with code and results shared via virtio 9p.
+The 9p fsdev is configured with security_model=mapped-xattr
+When the test code attempts to create a log file in an existing directory, open with O_CREAT fails with -ENOENT.
+
+The relevant strace excerpt is:
+
+28791 openat(11, ".", O_RDONLY|O_NOFOLLOW|O_PATH|O_DIRECTORY) = 20
+28791 openat(20, "src", O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY) = 21
+28791 fcntl(21, F_SETFL, O_RDONLY|O_DIRECTORY) = 0
+28791 close(20)                         = 0
+28791 openat(21, "client.log", O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW, 0600) = 20
+28791 fcntl(20, F_SETFL, O_WRONLY|O_CREAT|O_NONBLOCK|O_NOFOLLOW) = 0
+28791 lsetxattr("/proc/self/fd/21/client.log", "user.virtfs.uid", "\0\0\0", 4, 0) = -1 ENOENT (No such file or directory)
+
+My hypothesis for what's going wrong is since the Docker container's overlayfs copies-up on writes, when it opens the file it's created a new version of the `src` directory containing a `client.log`, but this new src directory isn't accessible by file descriptor 20 and the lsetxattr call is instead attempting to set attributes on the path in the old `src` directory.
+
+Looking at the code, a fix would be to change `hw/9pfs/9p-local.c` and change `local_open2` to instead of calling `local_set_xattrat` to set the xattrs by directory file descriptor and file name, to have a version of local_set_xattrat` which uses `fsetxattr` to set the virtfs attributes instead of the `fsetxattrat_nofollow` helper.
+
+This reliably happened for me in CI, but I don't have access to the CI host or the time to strip the test down to make a minimal test case, and had difficulty reproducing the error on other machines.
+
+Since the report is about overlayfs being involved, could you please try if 
+the following patch makes a difference?
+
+https://github.com/gkurz/qemu/commit/f7f5a1b01307af1c7b6c94672f2ce75c36f10565
+
+It's not yet on master, but will be soon.
+
+I've tested it (eventually, hit
+https://github.com/torvalds/linux/commit/467d12f5c7842896d2de3ced74e4147ee29e97c8
+while trying to build it),
+it doesn't help, since my program wasn't failing from attempting to
+use O_NOATIME.
+
+The following patch fixed the -ENOENT on file create for me. I also
+applied the fix to symlink. Potentially it could happen to mknod and
+other calls that create a new directory entry, which couldn't be
+simply fixed by altering the open file, but I've not encountered
+issues there.
+
+On Sat, 9 May 2020 at 15:05, Christian Schoenebeck
+<email address hidden> wrote:
+>
+> Since the report is about overlayfs being involved, could you please try if
+> the following patch makes a difference?
+>
+> https://github.com/gkurz/qemu/commit/f7f5a1b01307af1c7b6c94672f2ce75c36f10565
+>
+> It's not yet on master, but will be soon.
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1877384
+>
+> Title:
+>   9pfs file create with mapped-xattr can fail on overlayfs
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   QEMU Version: 3.1.0 as packaged in debian buster, but the code appears to do the same in master.
+>   qemu command-line: qemu-system-x86_64 -m 1G -nographic -nic "user,model=virtio-net-pci,tftp=$(pwd),net=10.0.2.0/24,host=10.0.2.2" -fsdev local,id=fs,path=$thisdir/..,security_model=mapped-xattr -device virtio-9p-pci,fsdev=fs,mount_tag=fs -drive "file=$rootdisk,if=virtio,format=raw" -kernel "$kernel" -initrd "$initrd" -append "$append"
+>
+>
+>   I'm using CI that runs in a Docker container and runs a qemu VM with code and results shared via virtio 9p.
+>   The 9p fsdev is configured with security_model=mapped-xattr
+>   When the test code attempts to create a log file in an existing directory, open with O_CREAT fails with -ENOENT.
+>
+>   The relevant strace excerpt is:
+>
+>   28791 openat(11, ".", O_RDONLY|O_NOFOLLOW|O_PATH|O_DIRECTORY) = 20
+>   28791 openat(20, "src", O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY) = 21
+>   28791 fcntl(21, F_SETFL, O_RDONLY|O_DIRECTORY) = 0
+>   28791 close(20)                         = 0
+>   28791 openat(21, "client.log", O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW, 0600) = 20
+>   28791 fcntl(20, F_SETFL, O_WRONLY|O_CREAT|O_NONBLOCK|O_NOFOLLOW) = 0
+>   28791 lsetxattr("/proc/self/fd/21/client.log", "user.virtfs.uid", "\0\0\0", 4, 0) = -1 ENOENT (No such file or directory)
+>
+>   My hypothesis for what's going wrong is since the Docker container's
+>   overlayfs copies-up on writes, when it opens the file it's created a
+>   new version of the `src` directory containing a `client.log`, but this
+>   new src directory isn't accessible by file descriptor 20 and the
+>   lsetxattr call is instead attempting to set attributes on the path in
+>   the old `src` directory.
+>
+>   Looking at the code, a fix would be to change `hw/9pfs/9p-local.c` and
+>   change `local_open2` to instead of calling `local_set_xattrat` to set
+>   the xattrs by directory file descriptor and file name, to have a
+>   version of local_set_xattrat` which uses `fsetxattr` to set the virtfs
+>   attributes instead of the `fsetxattrat_nofollow` helper.
+>
+>   This reliably happened for me in CI, but I don't have access to the CI
+>   host or the time to strip the test down to make a minimal test case,
+>   and had difficulty reproducing the error on other machines.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1877384/+subscriptions
+
+
+Yes, that compile error with QEMU + recent kernel headers is a bit annoying, and AFAICS it is not fixed in Debian yet.
+
+Would you mind writing a test case for this bug that you fixed, to prevent this accidentally being broken in future again?
+
+Please note that 9pfs is currently only been taken care of by 2 people, and both only on a side channel. The 9pfs code base is complex and error prone to edge cases like this one, so active assistance would be very much appreciated!
+
+If you might consider writing a test case, I would give you quick, easy and short instructions how to compile the 9pfs test cases, and which source files to touch. There is no guest OS installation required for the test cases.
+
+Thanks!
+
+Swamped with other work at the moment, but this hasn't been forgotten.
+I might be able to take a look at it next week.
+
+On Sat, 16 May 2020 at 12:55, Christian Schoenebeck
+<email address hidden> wrote:
+>
+> Yes, that compile error with QEMU + recent kernel headers is a bit
+> annoying, and AFAICS it is not fixed in Debian yet.
+>
+> Would you mind writing a test case for this bug that you fixed, to
+> prevent this accidentally being broken in future again?
+>
+> Please note that 9pfs is currently only been taken care of by 2 people,
+> and both only on a side channel. The 9pfs code base is complex and error
+> prone to edge cases like this one, so active assistance would be very
+> much appreciated!
+>
+> If you might consider writing a test case, I would give you quick, easy
+> and short instructions how to compile the 9pfs test cases, and which
+> source files to touch. There is no guest OS installation required for
+> the test cases.
+>
+> Thanks!
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1877384
+>
+> Title:
+>   9pfs file create with mapped-xattr can fail on overlayfs
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   QEMU Version: 3.1.0 as packaged in debian buster, but the code appears to do the same in master.
+>   qemu command-line: qemu-system-x86_64 -m 1G -nographic -nic "user,model=virtio-net-pci,tftp=$(pwd),net=10.0.2.0/24,host=10.0.2.2" -fsdev local,id=fs,path=$thisdir/..,security_model=mapped-xattr -device virtio-9p-pci,fsdev=fs,mount_tag=fs -drive "file=$rootdisk,if=virtio,format=raw" -kernel "$kernel" -initrd "$initrd" -append "$append"
+>
+>
+>   I'm using CI that runs in a Docker container and runs a qemu VM with code and results shared via virtio 9p.
+>   The 9p fsdev is configured with security_model=mapped-xattr
+>   When the test code attempts to create a log file in an existing directory, open with O_CREAT fails with -ENOENT.
+>
+>   The relevant strace excerpt is:
+>
+>   28791 openat(11, ".", O_RDONLY|O_NOFOLLOW|O_PATH|O_DIRECTORY) = 20
+>   28791 openat(20, "src", O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY) = 21
+>   28791 fcntl(21, F_SETFL, O_RDONLY|O_DIRECTORY) = 0
+>   28791 close(20)                         = 0
+>   28791 openat(21, "client.log", O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW, 0600) = 20
+>   28791 fcntl(20, F_SETFL, O_WRONLY|O_CREAT|O_NONBLOCK|O_NOFOLLOW) = 0
+>   28791 lsetxattr("/proc/self/fd/21/client.log", "user.virtfs.uid", "\0\0\0", 4, 0) = -1 ENOENT (No such file or directory)
+>
+>   My hypothesis for what's going wrong is since the Docker container's
+>   overlayfs copies-up on writes, when it opens the file it's created a
+>   new version of the `src` directory containing a `client.log`, but this
+>   new src directory isn't accessible by file descriptor 20 and the
+>   lsetxattr call is instead attempting to set attributes on the path in
+>   the old `src` directory.
+>
+>   Looking at the code, a fix would be to change `hw/9pfs/9p-local.c` and
+>   change `local_open2` to instead of calling `local_set_xattrat` to set
+>   the xattrs by directory file descriptor and file name, to have a
+>   version of local_set_xattrat` which uses `fsetxattr` to set the virtfs
+>   attributes instead of the `fsetxattrat_nofollow` helper.
+>
+>   This reliably happened for me in CI, but I don't have access to the CI
+>   host or the time to strip the test down to make a minimal test case,
+>   and had difficulty reproducing the error on other machines.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1877384/+subscriptions
+
+
+Good! Then just for the case ...
+
+Compiling the 9pfs test cases:
+
+cd build
+make tests/qtest/qos-test
+
+Running the test cases:
+
+export QTEST_QEMU_BINARY=x86_64-softmmu/qemu-system-x86_64
+tests/qtest/qos-test
+
+All 9pfs test cases are in:
+tests/qtest/virtio-9p-test.c
+
+The 9pfs test cases are using a simulated filesystem driver called 'synth' driver:
+hw/9pfs/9p-synth.c
+That 'synth' driver is exclusively used for the 9pfs test cases, it is not used for anything else, so you can add there whatever you need to simulate any file system behaviour required for your test case.
+
+Fixed in commit d76f4f97eb2772bf85fe286097183d0c7db19ae8
+
+Closed by accident, Christian just told me that this is not fixed yet. Sorry for the inconvenience.
+
+It might be, I revisited a month back and could no longer trigger the
+bug, so it's possible unrelated changes or kernel changes have fixed
+the overlayfs copy-up semantics in cases where it would cause issues
+with QEMU. If I ever see it again I can resubmit evidence, so it may
+be better off closed.
+
+On Thu, 10 Dec 2020 at 12:01, Thomas Huth <email address hidden> wrote:
+>
+> Closed by accident, Christian just told me that this is not fixed yet.
+> Sorry for the inconvenience.
+>
+> ** Changed in: qemu
+>        Status: Fix Released => Confirmed
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1877384
+>
+> Title:
+>   9pfs file create with mapped-xattr can fail on overlayfs
+>
+> Status in QEMU:
+>   Confirmed
+>
+> Bug description:
+>   QEMU Version: 3.1.0 as packaged in debian buster, but the code appears to do the same in master.
+>   qemu command-line: qemu-system-x86_64 -m 1G -nographic -nic "user,model=virtio-net-pci,tftp=$(pwd),net=10.0.2.0/24,host=10.0.2.2" -fsdev local,id=fs,path=$thisdir/..,security_model=mapped-xattr -device virtio-9p-pci,fsdev=fs,mount_tag=fs -drive "file=$rootdisk,if=virtio,format=raw" -kernel "$kernel" -initrd "$initrd" -append "$append"
+>
+>
+>   I'm using CI that runs in a Docker container and runs a qemu VM with code and results shared via virtio 9p.
+>   The 9p fsdev is configured with security_model=mapped-xattr
+>   When the test code attempts to create a log file in an existing directory, open with O_CREAT fails with -ENOENT.
+>
+>   The relevant strace excerpt is:
+>
+>   28791 openat(11, ".", O_RDONLY|O_NOFOLLOW|O_PATH|O_DIRECTORY) = 20
+>   28791 openat(20, "src", O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY) = 21
+>   28791 fcntl(21, F_SETFL, O_RDONLY|O_DIRECTORY) = 0
+>   28791 close(20)                         = 0
+>   28791 openat(21, "client.log", O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW, 0600) = 20
+>   28791 fcntl(20, F_SETFL, O_WRONLY|O_CREAT|O_NONBLOCK|O_NOFOLLOW) = 0
+>   28791 lsetxattr("/proc/self/fd/21/client.log", "user.virtfs.uid", "\0\0\0", 4, 0) = -1 ENOENT (No such file or directory)
+>
+>   My hypothesis for what's going wrong is since the Docker container's
+>   overlayfs copies-up on writes, when it opens the file it's created a
+>   new version of the `src` directory containing a `client.log`, but this
+>   new src directory isn't accessible by file descriptor 20 and the
+>   lsetxattr call is instead attempting to set attributes on the path in
+>   the old `src` directory.
+>
+>   Looking at the code, a fix would be to change `hw/9pfs/9p-local.c` and
+>   change `local_open2` to instead of calling `local_set_xattrat` to set
+>   the xattrs by directory file descriptor and file name, to have a
+>   version of local_set_xattrat` which uses `fsetxattr` to set the virtfs
+>   attributes instead of the `fsetxattrat_nofollow` helper.
+>
+>   This reliably happened for me in CI, but I don't have access to the CI
+>   host or the time to strip the test down to make a minimal test case,
+>   and had difficulty reproducing the error on other machines.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1877384/+subscriptions
+
+
+Good to know. Then it makes sense to close this report for now. Feel free to reopen it if necessary.
+
+Thanks!
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,247 @@
+race condition between vhost_net_stop and CHR_EVENT_CLOSED on shutdown crashes qemu
+
+[impact]
+
+on shutdown of a guest, there is a race condition that results in qemu crashing instead of normally shutting down.  The bt looks similar to this (depending on the specific version of qemu, of course; this is taken from 2.5 version of qemu):
+
+(gdb) bt
+#0  __GI___pthread_mutex_lock (mutex=0x0) at ../nptl/pthread_mutex_lock.c:66
+#1  0x00005636c0bc4389 in qemu_mutex_lock (mutex=mutex@entry=0x0) at /build/qemu-7I4i1R/qemu-2.5+dfsg/util/qemu-thread-posix.c:73
+#2  0x00005636c0988130 in qemu_chr_fe_write_all (s=s@entry=0x0, buf=buf@entry=0x7ffe65c086a0 "\v", len=len@entry=20) at /build/qemu-7I4i1R/qemu-2.5+dfsg/qemu-char.c:205
+#3  0x00005636c08f3483 in vhost_user_write (msg=msg@entry=0x7ffe65c086a0, fds=fds@entry=0x0, fd_num=fd_num@entry=0, dev=0x5636c1bf6b70, dev=0x5636c1bf6b70)
+    at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost-user.c:195
+#4  0x00005636c08f411c in vhost_user_get_vring_base (dev=0x5636c1bf6b70, ring=0x7ffe65c087e0) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost-user.c:364
+#5  0x00005636c08efff0 in vhost_virtqueue_stop (dev=dev@entry=0x5636c1bf6b70, vdev=vdev@entry=0x5636c2853338, vq=0x5636c1bf6d00, idx=1) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost.c:895
+#6  0x00005636c08f2944 in vhost_dev_stop (hdev=hdev@entry=0x5636c1bf6b70, vdev=vdev@entry=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost.c:1262
+#7  0x00005636c08db2a8 in vhost_net_stop_one (net=0x5636c1bf6b70, dev=dev@entry=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/vhost_net.c:293
+#8  0x00005636c08dbe5b in vhost_net_stop (dev=dev@entry=0x5636c2853338, ncs=0x5636c209d110, total_queues=total_queues@entry=1) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/vhost_net.c:371
+#9  0x00005636c08d7745 in virtio_net_vhost_status (status=7 '\a', n=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/virtio-net.c:150
+#10 virtio_net_set_status (vdev=<optimized out>, status=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/virtio-net.c:162
+#11 0x00005636c08ec42c in virtio_set_status (vdev=0x5636c2853338, val=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/virtio.c:624
+#12 0x00005636c098fed2 in vm_state_notify (running=running@entry=0, state=state@entry=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1605
+#13 0x00005636c089172a in do_vm_stop (state=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/cpus.c:724
+#14 vm_stop (state=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/cpus.c:1407
+#15 0x00005636c085d240 in main_loop_should_exit () at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1883
+#16 main_loop () at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1931
+#17 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:4683
+
+
+[test case]
+
+unfortunately since this is a race condition, it's very hard to arbitrarily reproduce; it depends very much on the overall configuration of the guest as well as how exactly it's shut down - specifically, its vhost user net must be closed from the host side at a specific time during qemu shutdown.
+
+I have someone with such a setup who has reported to me their setup is able to reproduce this reliably, but the config is too complex for me to reproduce so I have relied on their reproduction and testing to debug and craft the patch for this.
+
+[regression potential]
+
+the change adds flags to prevent repeated calls to both vhost_net_stop() and vhost_net_cleanup() (really, prevents repeated calls to vhost_dev_cleanup()).  Any regression would be seen when stopping and/or cleaning up a vhost net.  Regressions might include failure to hot-remove a vhost net from a guest, or failure to cleanup (i.e. mem leak), or crashes during cleanup or stopping a vhost net.
+
+[other info]
+
+this was originally seen in the 2.5 version of qemu - specifically, the UCA version in trusty-mitaka (which uses the xenial qemu codebase).  However, this appears to still apply upstream, and I am sending a patch to the qemu list to patch upstream as well.
+
+test builds in https://launchpad.net/~ddstreet/+archive/ubuntu/lp1823458
+
+Note as mentioned in the description, it appears this was fixed upstream by commit e7c83a885f8, which is included starting in version 2.9. However, this commit depends on at least commit 5345fdb4467, and likely more other previous commits, which make widespread code changes and are unsuitable to backport. Therefore this seems like it should be specifically worked around in the Xenial qemu codebase.
+
+
+
+SRU note: please see Christian's MP review (linked from this bug) for some advice on additional care during SRU verification.
+
+Hello Dan, or anyone else affected,
+
+Accepted qemu into xenial-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.5+dfsg-5ubuntu10.37 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested and change the tag from verification-needed-xenial to verification-done-xenial. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-xenial. In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+
+
+uca: workaround patches are needed in mitaka and ocata.  Mitaka can pull from Xenial build as usual, and debdiff for Ocata attached.  Other UCA releases are later than 2.9 and so are fixed with the upstream fix mentioned in the description.
+
+Hello Dan, or anyone else affected,
+
+Accepted qemu into mitaka-proposed. The package will build now and be available in the Ubuntu Cloud Archive in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package. To enable the -proposed repository:
+
+  sudo add-apt-repository cloud-archive:mitaka-proposed
+  sudo apt-get update
+
+Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-mitaka-needed to verification-mitaka-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-mitaka-failed. In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification . Thank you in advance!
+
+Hello Dan, or anyone else affected,
+
+Accepted qemu into ocata-proposed. The package will build now and be available in the Ubuntu Cloud Archive in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package. To enable the -proposed repository:
+
+  sudo add-apt-repository cloud-archive:ocata-proposed
+  sudo apt-get update
+
+Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-ocata-needed to verification-ocata-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-ocata-failed. In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification . Thank you in advance!
+
+This has been verified by the original reporter to fix the problem of qemu crashing.
+
+clarification: by "original reporter" I mean the customer of Canonical, reporting the problem to us.
+
+Since this SRU is rather hard to verify + Christian's suggestion to let the SRU age a bit longer, I would still wait a few days before releasing.
+
+Dan (or anyone else involved) - could you maybe perform some safety checks using this package against the use-cases mentioned in the regression potential? I guess that would make me feel much safer releasing this when knowing it was tested more than by just one person too.
+
+I'm setting this to Incomplete per sil2100's last comment.
+
+@sil2100 yes I agree, let's wait longer before releasing.  We have the Canonical customer performing testing with the package, and we can run some additional sanity checks as well.  The config coming from the customer is an openstack setup using OVS, so that's what we will setup and perform sanity testing on.
+
+@cpaelzer, if you have any suggestions for specific tests/configurations that might be good to test the specific code changed here, please let me know.  
+
+@bdmurray, sure, let's leave it set to incomplete while we're regression testing ;-)
+
+
+> @cpaelzer, if you have any suggestions for specific tests/configurations
+> that might be good to test the specific code changed here, please let me
+> know.
+
+I have ran the few test that would cover that area in the past on PPAs already.
+Unfortunately this is a very specific path and I don't have much more
+tests for it.
+
+If anything comes to my mind it would be loops of attaching/detaching
+extra interfaces to guests and try some traffic on them.
+And every now and then in between supend/resume the or shutdown/start
+the guest again.
+Like:
+repeat forever
+   start or resume
+        repeat ~20 times
+          add network device
+          check network device to work
+   shutdown or suspend
+This should cover a lot of paths that your change might have affected.
+/me hopes that indents will be retained by LP
+
+
+On a Xenial DPDK setup with the proposed qemu version (1:2.5+dfsg-5ubuntu10.37), I created a VM and attached a vhost-user interface to it using this xml:
+
+$ cat vm3-iface2.xml 
+  <interface type='vhostuser'>
+    <mac address='52:54:00:c3:37:7e'/>
+    <source type='unix' path='/run/openvswitch/vhu2' mode='client'/>
+    <model type='virtio'/>
+    <driver name='vhost'/>
+    <address type='pci' domain='0x0000' bus='0x00' slot='0x08' function='0x0'/>
+  </interface>
+
+the OVS interface was created with:
+# ovs-vsctl add-port br1 vhu2 -- set Interface vhu2 type=dpdkvhostuser
+
+The interface was added to the vm with:
+$ virsh attach-device vm3 vm3-iface2.xml --live
+
+and detached with:
+$ virsh detach-device vm3 vm3-iface2.xml --live
+
+Inside the guest, the vhost-user interface was configured with DHCP, and a ping started to the DHCP server, 10.0.2.2:
+
+ubuntu@vm3:~$ ping 10.0.2.2
+PING 10.0.2.2 (10.0.2.2) 56(84) bytes of data.
+64 bytes from 10.0.2.2: icmp_seq=1 ttl=255 time=0.122 ms
+64 bytes from 10.0.2.2: icmp_seq=2 ttl=255 time=0.107 ms
+64 bytes from 10.0.2.2: icmp_seq=3 ttl=255 time=0.112 ms
+64 bytes from 10.0.2.2: icmp_seq=4 ttl=255 time=0.110 ms
+From 10.198.200.1 icmp_seq=5 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=6 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=7 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=8 Destination Port Unreachable
+64 bytes from 10.0.2.2: icmp_seq=9 ttl=255 time=0.255 ms
+From 10.198.200.1 icmp_seq=10 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=11 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=12 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=13 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=14 Destination Port Unreachable
+From 10.198.200.1 icmp_seq=15 Destination Port Unreachable
+64 bytes from 10.0.2.2: icmp_seq=16 ttl=255 time=0.277 ms
+64 bytes from 10.0.2.2: icmp_seq=17 ttl=255 time=0.127 ms
+64 bytes from 10.0.2.2: icmp_seq=18 ttl=255 time=0.104 ms
+
+
+each change in ping (working, not working) corresponded to attaching or detaching the vhost-user interface; repeated attaches/detaches were made with no problems, and ping correctly working or not working based on if the interface was attached or not.
+
+The guest was suspended, I waited for 5 seconds, and then resumed the guest, with no problems.
+
+The guest was shutdown with the interface attached with no problem or crash; the guest was also shutdown with the interface detached (after attaching and detaching several times) with no problem.
+
+All this was repeated several times with no problems seen.
+
+I believe this covers regression testing for the area of code the patch touches, so marking this as fix committed again; this should be ready for release.
+
+This is even more than what I wanted, thanks!
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 1:2.5+dfsg-5ubuntu10.37
+
+---------------
+qemu (1:2.5+dfsg-5ubuntu10.37) xenial; urgency=medium
+
+  * d/p/lp1823458/add-VirtIONet-vhost_stopped-flag-to-prevent-multiple.patch,
+    d/p/lp1823458/do-not-call-vhost_net_cleanup-on-running-net-from-ch.patch:
+    - Prevent crash due to race condition on shutdown;
+      this is fixed differently upstream (starting in Bionic), but
+      the change is too large to backport into Xenial.  These two very
+      small patches work around the problem in an unintrusive way.
+      (LP: #1823458)
+
+ -- Dan Streetman <email address hidden>  Tue, 23 Apr 2019 05:19:55 -0400
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates. In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+
+This bug was fixed in the package qemu - 1:2.8+dfsg-3ubuntu2.9~cloud5.1
+---------------
+
+ qemu (1:2.8+dfsg-3ubuntu2.9~cloud5.1) xenial-ocata; urgency=medium
+ .
+   * d/p/lp1823458/add-VirtIONet-vhost_stopped-flag-to-prevent-multiple.patch,
+     d/p/lp1823458/do-not-call-vhost_net_cleanup-on-running-net-from-ch.patch:
+     - Prevent crash due to race condition on shutdown;
+       this is fixed differently upstream (starting in Bionic), but
+       the change is too large to backport into Xenial.  These two very
+       small patches work around the problem in an unintrusive way.
+       (LP: #1823458)
+
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates. In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+
+This bug was fixed in the package qemu - 1:2.5+dfsg-5ubuntu10.37~cloud0
+---------------
+
+ qemu (1:2.5+dfsg-5ubuntu10.37~cloud0) trusty-mitaka; urgency=medium
+ .
+   * New update for the Ubuntu Cloud Archive.
+ .
+ qemu (1:2.5+dfsg-5ubuntu10.37) xenial; urgency=medium
+ .
+   * d/p/lp1823458/add-VirtIONet-vhost_stopped-flag-to-prevent-multiple.patch,
+     d/p/lp1823458/do-not-call-vhost_net_cleanup-on-running-net-from-ch.patch:
+     - Prevent crash due to race condition on shutdown;
+       this is fixed differently upstream (starting in Bionic), but
+       the change is too large to backport into Xenial.  These two very
+       small patches work around the problem in an unintrusive way.
+       (LP: #1823458)
+
+
+see bug 1829245 for regression introduced by this patch; these patches will be reverted from xenial, and then re-uploaded along with a patch for the regression in bug 1829380
+

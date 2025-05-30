@@ -1,0 +1,135 @@
+chrome based apps can not be run under qemu user mode
+
+chrome uses /proc/self/exe to fork render process.
+Here a simple code to reproduce the issue. It's output parent then child but failed with qemu: unknown option 'type=renderer'.
+
+Maybe we can modify exec syscall to replace /proc/self/exe to the real path.
+
+//gcc -o self self.c 
+#include <stdio.h>
+#include <sys/types.h>
+#include <unistd.h>
+int main(int argc, char** argv) {
+  if(argc==1){
+    printf ("parent\n");
+	if ( fork() == 0 )
+    {
+        return execl("/proc/self/exe","/proc/self/exe", "--type=renderer",NULL);
+    }
+  } else {
+    printf ("child\n");
+  }
+  return 0;
+}
+
+similar reports:
+https://github.com/AppImage/AppImageKit/issues/965  
+https://github.com/golang/go/issues/42080  
+
+Workardound:
+compile chrome or your chrome based app with a patch to content/common/child_process_host_impl.cc:GetChildPath, get the realpath of /proc/self/exe:  
+
+diff --git a/content/common/child_process_host_impl.cc b/content/common/child_process_host_impl.cc
+index bc78aba80ac8..9fab74d3bae8 100644
+--- a/content/common/child_process_host_impl.cc
++++ b/content/common/child_process_host_impl.cc
+@@ -60,8 +60,12 @@ base::FilePath ChildProcessHost::GetChildPath(int flags) {
+ #if defined(OS_LINUX)
+   // Use /proc/self/exe rather than our known binary path so updates
+   // can't swap out the binary from underneath us.
+-  if (child_path.empty() && flags & CHILD_ALLOW_SELF)
+-    child_path = base::FilePath(base::kProcSelfExe);
++  if (child_path.empty() && flags & CHILD_ALLOW_SELF) {
++    if (!ReadSymbolicLink(base::FilePath(base::kProcSelfExe), &child_path)) {
++      NOTREACHED() << "Unable to resolve " << base::kProcSelfExe << ".";
++      child_path = base::FilePath(base::kProcSelfExe);
++    }
++  }
+ #endif
+
+   // On most platforms, the child executable is the same as the current
+
+qemu patch:  
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 95d79ddc43..227d9b1b0e 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -8537,7 +8537,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+              * before the execve completes and makes it the other
+              * program's problem.
+              */
+-            ret = get_errno(safe_execve(p, argp, envp));
++            ret = get_errno(safe_execve(is_proc_myself(p, "exe") ? exec_path : p, argp, envp));
+             unlock_user(p, arg1, 0);
+ 
+             goto execve_end;
+
+
+I think this is the good approach to fix the problem, but exec_path can be not set in the case of
+AT_EXECFD (binfmt_misc with credential flag) because we use execfd instead. You should use
+do_openat() to get the file descriptor and execveat() to start the process.
+
+Thanks,
+Laurent
+
+Just found there's already a patch for this:
+https://lists.sr.ht/~philmd/qemu/patches/8196
+
+Le 27/04/2021 à 12:58, Wind Li a écrit :
+> Just found there's already a patch for this:
+> https://lists.sr.ht/~philmd/qemu/patches/8196
+> 
+
+Yes, you are right.
+
+I didn't see this patch because he didn't cc: me and he removed the "linux-user" tag from the subject...
+
+Could you verify it actually fixes the problem?
+
+
+Yes. It fixes the execve issue.
+
+
+Here is the command line to start chromium, --no-zygote is needed to avoid the gpu releated crash: 
+
+qemu-aarch64 /usr/lib/chromium/chrome --no-sandbox --no-zygote
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/324
+
+

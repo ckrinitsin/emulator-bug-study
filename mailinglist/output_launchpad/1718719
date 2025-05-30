@@ -1,0 +1,134 @@
+qemu can't capture keys properly under wayland
+
+This appears to be different than the previous similar bugs; patches do look to be applied to use libinput in the wayland case. Still:
+
+unknown keycodes `(unnamed)', please report to <email address hidden>
+
+I am using qemu-system-x86                       1:2.10+dfsg-0ubuntu1
+
+Many key inputs work correctly, but at boot the system will not properly catch the arrow keys, the above error shows up immediately after hitting Esc (for instance) to get to the boot menu. Booting from CD onto a daily Ubuntu desktop image, I can't navigate the splash menu.
+
+The same works correctly through virt-manager (which uses spice AFAICT, but wayland tends to crash when running virt-manager), and things work if I switch my session to Xorg rather than wayland.
+
+Hi Mathieu,
+thanks for the report but since we are up-to-date with qemu and I can't find an obvious breakage we might have introduced for this, this should go to qmeu-upstream in this case.
+
+Furthermore are these actually two issues?:
+#1 - wayland crashes under spice
+     more of a wayland bug then I'd expect, but upstream qemu
+     might have heard of it and have good pointers
+#2 - new qemu does not recognize keys correctly with the default (SDL I'd think) frontend?
+     That is worth to report upstream qemu for sure.
+
+I added an upstream qemu (and a wayland) task and you can help them to recreate in case they have questions on how exactly to do so.
+
+I wanted to write steps to reproduce, which should be as simple as:
+$ wget http://cdimage.ubuntu.com/daily-live/current/artful-desktop-amd64.iso
+$ qemu-system-x86_64 -m 512 -boot d -cdrom artful-desktop-amd64.iso
+
+But that works for me as seen in the attached video.
+@Mathieu - can you elaborate how to trigger the missing key issue?
+
+Hi! I am running Artful on my X1 Carbon Gen3.
+
+I downloaded the Ubuntu Server Artful final beta and attempt to do an install with the following qemu cli:
+
+$ qemu-system-x86_64 -enable-kvm -cpu host -m 1024 -boot d -hda vdisk.img -cdrom artful-server-amd64.iso -monitor stdio
+
+Trying to use the arrow key at the first menu does not work and errors with the unknown keycodes error. However, if I issue the `sendkey down` command from the qemu CLI it works as expected.
+
+
+So it is likely a wayland <-> SDL thing.
+@Desktop Team could you take alook into this - the repro steps in c#2 are pretty easy I'd think but none of us would know where in the UI stack to look for.
+
+Upstream bug is probably https://bugs.freedesktop.org/show_bug.cgi?id=102475 ?
+
+Now the question is should the patch be dropped or wait for a fix from upstream. I'm leaning towards the first option, since artful is about to be released.
+
+is the patch providing any user visible improvement? if not it would probably make sense to delay including it to next cycle
+
+Actually, this bug would affect current 1.19-branch too since the patches are backported there as well. You can test ppa:canonical-x/x-staging to verify, which has xorg-server from current stable branch.
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+The Ubuntu maintainer backported the recent change to add keyboard grabbing to xwayland, with that change the keyboard arrow keys stop working in kvm
+
+Can you please elaborate of what exactly has been backported and the resulting patches?
+
+Which Wayland compositor do you use?
+
+It's worth noting that the xwayland patches in themselves won't make a difference *unless* the Wayland compositor implements the corresponding protocol, and I am aware of none for now (the patch for mutter is still pending).
+
+The Ubuntu diff is
+http://launchpadlibrarian.net/334552966/xorg-server_2%3A1.19.3-1ubuntu3_2%3A1.19.3-1ubuntu4.diff.gz
+
+it looks like the backported commits are 
+
+xwayland-pointer-confine.diff
++d5e2f271ad93e50 xwayland: Remove two unused proc pointers.
++ca17f3e9fd3b59f xwayland: Lock the pointer if it is confined and has no cursor
++513e3bd3870fdb8 xwayland: Update root window size when desktop size changes
++fafdb0cc9697eb5 xwayland: "Accept" confineTo on InputOnly windows
++c217fcb4c4640ff xwayland: Allow pointer warp on root/None window
+
+xwayland-add-grab-protocol-support.diff
+https://cgit.freedesktop.org/xorg/xserver/commit/?id=0a448d133
+
+Ubuntu doesn't have any compositor change, it's standard GNOME 3.24 so there is must be something wrong and it does make a difference without implementing the protocole.
+
+Note that reverting 0a448d133 does fix the issue
+
+Tried reproducing the issue with the arrow keys using the current Xwayland from master with mutter/gnome-shell from master, using qemu-kvm with SDL backend (-display sdl) but failedto reproduce, all keys (including the arrow keys) work fine in the guest.
+
+Created attachment 133910
+Test patch
+
+Can you try the attached patch (this is for testing purpose *only*) and report back if that makes any difference?
+
+With this patch, if the compositor has no support for Xwayland keyboard grab protocol as you said you haven't in Ubuntu, Xwayland won't set up its grab handler at all.
+
+the patch doesn't seem to make a difference
+
+Well, what this patch does is disabling any specific grab handler if the Xwayland grab protocol is not available, by postponing the setup of those handler until Xwayland can bind to the relevant interface as advertised by the compositor.
+
+If the compositor doesn't support the Xwayland grab protocol, then all those routines are not "enabled" in Xwayland, I don't see how they could break anything if not used...
+
+Unfortunately, we cannot tell whether or not the compositor supports the Xwayland grab protocol using something like weston-info because, for security reasons, the compositor will (should) only advertiset he given protocl to Xwayland alone and hide it to any other client.
+
+So, if that patch makes no difference, it means that:
+
+ - The Wayland compositor claim to support Xwayland grab protocol but is buggy and doesn't send all key events as expected
+
+ - Or the problem is completely unrelated to this patch.
+
+So next step for you is to:
+
+ - Check the actual patches applied to mutter in Ubuntu
+ - Check what happens at the protocol level
+
+To do so, yo can use the envvar WAYLAND_DEBUG prior to start gnome-shell (which will spawn Xwayland) so that we can tell what globals are listed in the wl_registry and see if "zwp_xwayland_keyboard_grab_manager_v1" is one of them.
+
+e.g., from a console:
+
+  $ WAYLAND_DEBUG=1 dbus-run-session -- gnome-shell --display-server --wayland |& tee ~/wayland-debug.log
+
+The wl_registry globals will be listed at the beginning of the log so that should be enough to tell if the compositor claims to be supporting "zwp_xwayland_keyboard_grab_manager_v1".
+
+Then, you can start qemu-kvm as usual and try to press the keys that do not work, those will be captured in the log as well, so we can tell if the compositor sends those key events to the client (Xwayland, in which case the problem lies in Xwayland) or not (in which case the problem lies in the compositor).
+
+Please attach the "wayland-debug.log" to this bugzilla once you've performed those tests (but make sure you don't type any sensitive data in any application while the log is being captured as any key event will be logged).
+
+the issue isn't there when using your debug command but it begins in that session if gsd-media-keys is started... I'm calling it a week now but I'm going to poke to it a bit more on monday
+
+-- GitLab Migration Automatic Message --
+
+This bug has been migrated to freedesktop.org's GitLab instance and has been closed from further activity.
+
+You can subscribe and participate further through the new bug through this link to our GitLab instance: https://gitlab.freedesktop.org/xorg/xserver/issues/706.
+
+upstream can't reproduce this bug, so I wonder if the backport was incomplete and it's fixed in the current release (1.20.8), could you test again?
+
+Is there still an issue left here for upstream QEMU?
+
+Since there wasn't a reply to my question since more than half a year, I'm assuming that this does not affect upstream QEMU anymore. Thus I'm removing upstream QEMU from this ticket now.
+

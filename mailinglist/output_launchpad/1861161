@@ -1,0 +1,146 @@
+qemu-arm-static stuck with 100% CPU when cross-compiling emacs
+
+Hello,
+
+I'm trying to build multi-arch docker images for https://hub.docker.com/r/silex/emacs.
+
+Here is the machine I'm building on:
+
+root@ubuntu-4gb-fsn1-1:~# lsb_release -a
+No LSB modules are available.
+Distributor ID: Ubuntu
+Description:    Ubuntu 18.04.3 LTS
+Release:        18.04
+Codename:       bionic
+root@ubuntu-4gb-fsn1-1:~# uname -a
+Linux ubuntu-4gb-fsn1-1 4.15.0-74-generic #84-Ubuntu SMP Thu Dec 19 08:06:28 UTC 2019 x86_64 x86_64 x86_64 GNU/Linux
+
+Whenever I try to build the following alpine Dockerfile https://gitlab.com/Silex777/docker-emacs/blob/master/26.3/alpine/3.9/dev/Dockerfile with this command:
+
+$ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+$ docker build --pull -t test --platform arm .
+
+It builds fine until this:
+
+root@ubuntu-4gb-fsn1-1:~# ps -ef | grep qemu
+root     26473 26465 99 14:26 pts/0    01:59:58 /usr/bin/qemu-arm-static ../src/bootstrap-emacs -batch --no-site-file --no-site-lisp --eval (setq load-prefer-newer t) -f batch-byte-compile emacs-lisp/macroexp.el
+
+This is supposed to take a few seconds, but in practice it takes 100% CPU and never ends. When I strace the process I see this:
+
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 120
+tgkill(5875, 5878, SIGRT_2)             = -1 EAGAIN (Resource temporarily unavailable)
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 120
+tgkill(5875, 5878, SIGRT_2)             = -1 EAGAIN (Resource temporarily unavailable)
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 120
+tgkill(5875, 5878, SIGRT_2)             = -1 EAGAIN (Resource temporarily unavailable)
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 120
+tgkill(5875, 5878, SIGRT_2)             = -1 EAGAIN (Resource temporarily unavailable)
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 120
+tgkill(5875, 5878, SIGRT_2)             = -1 EAGAIN (Resource temporarily unavailable)
+
+It happens with all the QEMU versions I tested: 
+- 2.11.1 (OS version)
+- 4.1.1-1 (from multiarch/qemu-user-static:4.1.1-1)
+- 4.2.0-2 (from multiarch/qemu-user-static)
+
+Any ideas of what I could do to debug it further?
+
+Kind regards,
+Philippe
+
+Given the presence of getdents64 in the strace, I wonder if you are running into LP:1805913. You could test this theory by running the test with a host filesystem that is not ext4.
+
+
+Thanks. It matches my bug because ubuntu:18.04 has a glibc 2.27 while alpine 3.9 has glib 2.58, and your bug report mentions that 2.27 has not the bug, so it makes sense.
+
+However I don't see how not having the host filesystem as ext4 would change anything, can you elaborate? Also, what filesystem do you recommand?
+
+Okay, currently testing XFS. Using newer version of glibc on alpine triggered other problems, like 0% CPU processes stuck on FUTEX_WAIT.
+
+Building on XFS does the same thing :-( To test I bind mounted my XFS partition on `/var/lib/docker` so everything docker was stored on XFS. Not sure if this is what you meant. 
+
+I tried several workarounds including removing `dir_index` from ext4 partitions and using a 32 bit qemu-user-static version, but it does not work:
+
+The process still gets stuck in a loop involving `getdents64`:
+
+
+```
+root@earth:~# file /usr/bin/qemu-arm-static
+/usr/bin/qemu-arm-static: ELF 32-bit LSB executable, Intel 80386, version 1 (GNU/Linux), statically linked, for GNU/Linux 3.2.0, BuildID[sha1]=ff1224d87ca5dece8d0b0f5735cfee7fae97ee58, stripped
+
+root@earth:~# ps afx | grep qemu
+21031 pts/0    S+     0:00          \_ grep --color=auto qemu
+ 1036 ?        Ss     0:00 /usr/sbin/qemu-ga --daemonize -m virtio-serial -p /dev/virtio-ports/org.qemu.guest_agent.0
+10584 ?        Ssl    0:00      |   |   \_ /usr/bin/qemu-arm-static /usr/bin/make install
+28768 ?        Sl     0:01      |   |       \_ /usr/bin/qemu-arm-static /usr/bin/make -C src VCSWITNESS=$(srcdir)/../.git/logs/HEAD all
+16718 ?        Sl     0:00      |   |           \_ /usr/bin/qemu-arm-static /usr/bin/make -C ../lisp compile-first EMACS=../src/bootstrap-emacs
+16726 ?        Rl    48:24      |   |               \_ /usr/bin/qemu-arm-static ../src/bootstrap-emacs -batch --no-site-file --no-site-lisp --eval (setq load-prefer-newer t) -f batch-byte-compile emacs-lisp/macroexp.el
+10696 ?        Ssl    0:00      |       \_ /usr/bin/qemu-aarch64-static /usr/bin/make install
+10972 ?        Sl     0:02      |           \_ /usr/bin/qemu-aarch64-static /usr/bin/make -C src VCSWITNESS=$(srcdir)/../.git/logs/HEAD all
+20397 ?        Sl     0:00      |               \_ /usr/bin/qemu-aarch64-static /usr/bin/make -C ../lisp compile-first EMACS=../src/bootstrap-emacs
+20405 ?        Rl    24:09      |                   \_ /usr/bin/qemu-aarch64-static ../src/bootstrap-emacs -batch --no-site-file --no-site-lisp --eval (setq load-prefer-newer t) -f batch-byte-compile emacs-lisp/macroexp.el
+
+root@earth:~# strace -p 16726
+clock_gettime(CLOCK_REALTIME, {tv_sec=1584794027, tv_nsec=921230669}) = 0
+getdents64(5, /* 0 entries */, 2048)    = 0
+_llseek(5, 0, [0], SEEK_SET)            = 0
+getdents64(5, /* 5 entries */, 2048)    = 144
+tgkill(29984, 29987, SIGRT_2)           = -1 EAGAIN (Resource temporarily unavailable)
+clock_gettime(CLOCK_REALTIME, {tv_sec=1584794027, tv_nsec=921642405}) = 0
+getdents64(5, /* 0 entries */, 2048)    = 0
+_llseek(5, 0, [0], SEEK_SET)            = 0
+getdents64(5, /* 5 entries */, 2048)    = 144
+tgkill(29984, 29987, SIGRT_2)           = -1 EAGAIN (Resource temporarily unavailable)
+clock_gettime(CLOCK_REALTIME, {tv_sec=1584794027, tv_nsec=922333065}) = 0
+getdents64(5, /* 0 entries */, 2048)    = 0
+_llseek(5, 0, [0], SEEK_SET)            = 0
+getdents64(5, /* 5 entries */, 2048)    = 144
+tgkill(29984, 29987, SIGRT_2)           = -1 EAGAIN (Resource temporarily unavailable)
+clock_gettime(CLOCK_REALTIME, ^C{tv_sec=1584794027, tv_nsec=923201432}) = 0
+strace: Process 16726 detached
+```
+
+What is interesting is that the qemu-aarch64-static process also get stuck, which if I understand the bug correctly should not happen. I'll try stracing the process to figure out what happens.
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

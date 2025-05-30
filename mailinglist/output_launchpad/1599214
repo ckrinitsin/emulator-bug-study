@@ -1,0 +1,140 @@
+virtlogd: qemu 2.6.0 doesn't log boot message
+
+This report is related to the OpenStack Nova bug [1].
+
+OpenStack tries to utilize the "virtlogd" feature of qemu [2].
+
+steps to reproduce:
+1) launch a quest with qemu 2.6.0 which uses virtlogd for the stdout/stderr of its char device
+2) check the contents of the backing file of that char device
+
+expected result:
+The boot messages of the guest are logged in this file
+
+actual result:
+The file is empty
+
+notes:
+When I'm connected to that char device and reboot the guest, I see the boot messages in the terminal and also in the backing log file.
+
+References:
+[1] https://bugs.launchpad.net/nova/+bug/1597789
+[2] http://git.qemu.org/?p=qemu.git;a=blobdiff;f=qemu-char.c;h=11caa5648de99c9e0ee158f280fbc02ab05915d3;hp=d7be1851e5e9d268aa924a05958da292b048839c;hb=d0d7708ba29cbcc343364a46bff981e0ff88366f;hpb=f1c17521e79df863a5771d96974fab0d07f02be0
+
+Can you provide the full QEMU command line arguments you're using to reproduce this problem. I tested a guest with the following console config:
+
+    <serial type='unix'>
+      <source mode='bind' path='/var/lib/libvirt/qemu/f25-console.sock'/>
+      <log file='/var/lib/libvirt/qemu/f25-console.log'/>
+      <target port='1'/>
+      <alias name='serial1'/>
+    </serial>
+
+and confirmed that the log file gets written, even when no client is connected to the UNIX domain socket.
+
+qemu log: 
+http://paste.openstack.org/show/542559/
+
+Ok, relevant part of command line is
+
+-add-fd set=2,fd=33
+-chardev socket,id=charconsole0,host=9.152.151.129,port=10000,server,nowait,logfile=/dev/fdset/2,logappend=on
+-device virtconsole,chardev=charconsole0,id=console0
+-chardev pty,id=charconsole1
+-device sclpconsole,chardev=charconsole1,id=console1
+
+
+Which shows a TCP based serial console with log file
+
+> Which shows a TCP based serial console with log file
+
+Yes, that's true. It's also on the s390x architecture.
+
+The char device in the libvirt domain XML is this:
+
+    <console type="tcp">
+      <source host="9.152.151.133" mode="bind" service="10000"/>
+      <log file="/opt/stack/data/nova/instances/40fd2986-69f3-4db5-a17f-fd9ef1c69350/console.log" append="off"/>
+    </console>
+
+Full domain XML: http://paste.openstack.org/show/542597/
+
+Ok, so the problem is a difference in behaviour for virtio-console vs serial ports.
+
+For plain x86 serial ports, if there's no client connected to the backend, any data is just discarded.
+
+For virtio-console, if there's no client connected to the backend, it'll refuse to send data, hence we never get to log it either.
+
+What i'm not sure on is whether this is supposed to work this way. The virtio-console device actually provides two separate services - a paravirt serial port and a paravirt interactive console. The paravirt serial port mode, certainly requires this behaviour, but I'm not convinced the console mode should do this. 
+
+Patch at https://lists.gnu.org/archive/html/qemu-devel/2016-07/msg06708.html
+
+Fix in 2.7.0 release thanks to
+
+commit bce6261eb2d879625126485d4ddd28cacb93152e
+Author: Daniel P. Berrange <email address hidden>
+Date:   Wed Aug 3 17:22:36 2016 +0100
+
+    virtio-console: set frontend open permanently for console devs
+    
+    The virtio-console.c file handles both serial consoles
+    and interactive consoles, since they're backed by the
+    same device model.
+    
+    Since serial devices are expected to be reliable and
+    need to notify the guest when the backend is opened
+    or closed, the virtio-console.c file wires up support
+    for chardev events. This affects both serial consoles
+    and interactive consoles, using a network connection
+    based chardev backend such as 'socket', but not when
+    using a PTY based backend or plain 'file' backends.
+    
+    When the host side is not connected the handle_output()
+    method in virtio-serial-bus.c will drop any data sent
+    by the guest, before it even reaches the virtio-console.c
+    code. This means that if the chardev has a logfile
+    configured, the data will never get logged.
+    
+    Consider for example, configuring a x86_64 guest with a
+    plain UART serial port
+    
+      -chardev socket,id=charserial1,host=127.0.0.1,port=9001,server,nowait,logfile=console1.log,logappend=on
+      -device isa-serial,chardev=charserial1,id=serial1
+    
+    vs a s390 guest which has to use the virtio-console port
+    
+      -chardev socket,id=charconsole1,host=127.0.0.1,port=9000,server,nowait,logfile=console2.log,logappend=on
+      -device virtconsole,chardev=charconsole1,id=console1
+    
+    The isa-serial one gets data written to the log regardless
+    of whether a client is connected, while the virtioconsole
+    one only gets data written to the log when a client is
+    connected.
+    
+    There is no need for virtio-serial-bus.c to aggressively
+    drop the data for console devices, as the chardev code is
+    prefectly capable of discarding the data itself.
+    
+    So this patch changes virtconsole devices so that they
+    are always marked as having the host side open. This
+    ensures that the guest OS will always send any data it
+    has (Linux virtio-console hvc driver actually ignores
+    the host open state and sends data regardless, but we
+    should not rely on that), and also prevents the
+    virtio-serial-bus code prematurely discarding data.
+    
+    The behaviour of virtserialport devices is *not* changed,
+    only virtconsole, because for the former, it is important
+    that the guest OSknow exactly when the host side is opened
+    / closed so it can do any protocol re-negotiation that may
+    be required.
+    
+    Fixes bug: https://bugs.launchpad.net/qemu/+bug/1599214
+    
+    Acked-by: Cornelia Huck <email address hidden>
+    Signed-off-by: Daniel P. Berrange <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Amit Shah <email address hidden>
+
+
+

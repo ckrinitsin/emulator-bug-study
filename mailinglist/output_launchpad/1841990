@@ -1,0 +1,386 @@
+instruction 'denbcdq' misbehaving
+
+Instruction 'denbcdq' appears to have no effect.  Test case attached.
+
+On ppc64le native:
+--
+gcc -g -O -mcpu=power9 bcdcfsq.c test-denbcdq.c -o test-denbcdq
+$ ./test-denbcdq
+0x00000000000000000000000000000000
+0x0000000000000000000000000000000c
+0x22080000000000000000000000000000
+$ ./test-denbcdq 1
+0x00000000000000000000000000000001
+0x0000000000000000000000000000001c
+0x22080000000000000000000000000001
+$ ./test-denbcdq $(seq 0 99)
+0x00000000000000000000000000000064
+0x0000000000000000000000000000100c
+0x22080000000000000000000000000080
+--
+
+With "qemu-ppc64le -cpu power9"
+--
+$ qemu-ppc64le -cpu power9 -L [...] ./test-denbcdq
+0x00000000000000000000000000000000
+0x0000000000000000000000000000000c
+0x0000000000000000000000000000000c
+$ qemu-ppc64le -cpu power9 -L [...] ./test-denbcdq 1
+0x00000000000000000000000000000001
+0x0000000000000000000000000000001c
+0x0000000000000000000000000000001c
+$ qemu-ppc64le -cpu power9 -L [...] ./test-denbcdq $(seq 100)
+0x00000000000000000000000000000064
+0x0000000000000000000000000000100c
+0x0000000000000000000000000000100c
+--
+
+I started looking at the code, but I got confused rather quickly.  Could be related to endianness? I think denbcdq arrived on the scene before little-endian was a big deal.  Maybe something to do with utilizing implicit floating-point register pairs...  I don't think the right data is getting to helper_denbcdq, which would point back to the gen_fprp_ptr uses in dfp-impl.inc.c (GEN_DFP_T_FPR_I32_Rc).  (Maybe?)
+
+
+
+I tried to compile your test program with 2 different GCC versions but it keeps failing, do you need a special/recent version? Meanwhile can you attach a statically linked binary?
+
+$ gcc -v
+gcc version 6.3.0 20170516 (Debian 6.3.0-18) 
+
+$ gcc -g -O -mcpu=power9 test-denbcdq.c -o test-denbcdq
+test-denbcdq.c: In function 'bcdcfsq':
+test-denbcdq.c:7:2: error: impossible register constraint in 'asm'
+  asm volatile ( "bcdcfsq. %0,%1,0" : "=v" (r) : "v" (i128) );
+  ^~~
+
+--
+
+$ gcc version 8.1.1 20180626 (Red Hat Cross 8.1.1-3) (GCC)
+
+$ gcc -g -O -mcpu=power9 test-denbcdq.c -o test-denbcdq
+test-denbcdq.c: In function ‘main’:
+test-denbcdq.c:15:3: error: decimal floating point not supported for this target
+   _Decimal128 d128;
+   ^~~~~~~~~~~
+
+FWIW I could compile the attached test with:
+
+$ gcc -v
+gcc version 8.3.1 20190507 (Red Hat 8.3.1-4) (GCC)
+
+@Philippe, thank you for spending the time to find a compiler that works with the testcase. I've been operating on RHEL 8 primarily:
+gcc version 8.2.1 20180905 (Red Hat 8.2.1-3) (GCC)
+
+This seems related to this change:
+
+commit ef96e3ae9698d6726a8113f448c82985a9f31ff5
+Author: Mark Cave-Ayland <email address hidden>
+Date:   Wed Jan 2 09:14:22 2019 +0000
+
+    target/ppc: move FP and VMX registers into aligned vsr register array
+    
+    The VSX register array is a block of 64 128-bit registers where the first 32
+    registers consist of the existing 64-bit FP registers extended to 128-bit
+    using new VSR registers, and the last 32 registers are the VMX 128-bit
+    registers as show below:
+    
+                64-bit               64-bit
+        +--------------------+--------------------+
+        |        FP0         |                    |  VSR0
+        +--------------------+--------------------+
+        |        FP1         |                    |  VSR1
+        +--------------------+--------------------+
+        |        ...         |        ...         |  ...
+        +--------------------+--------------------+
+        |        FP30        |                    |  VSR30
+        +--------------------+--------------------+
+        |        FP31        |                    |  VSR31
+        +--------------------+--------------------+
+        |                  VMX0                   |  VSR32
+        +-----------------------------------------+
+        |                  VMX1                   |  VSR33
+        +-----------------------------------------+
+        |                  ...                    |  ...
+        +-----------------------------------------+
+        |                  VMX30                  |  VSR62
+        +-----------------------------------------+
+        |                  VMX31                  |  VSR63
+        +-----------------------------------------+
+    
+    In order to allow for future conversion of VSX instructions to use TCG vector
+    operations, recreate the same layout using an aligned version of the existing
+    vsr register array.
+    
+    Since the old fpr and avr register arrays are removed, the existing callers
+    must also be updated to use the correct offset in the vsr register array. This
+    also includes switching the relevant VMState fields over to using subarrays
+    to make sure that migration is preserved.
+
+@@ -1055,11 +1053,10 @@ struct CPUPPCState {
+-    /* VSX registers */
+-    uint64_t vsr[32];
++    /* VSX registers (including FP and AVR) */
++    ppc_vsr_t vsr[64] QEMU_ALIGNED(16);
+
+The denbcdq helper is:
+
+#define DFP_HELPER_ENBCD(op, size)                                           \
+void helper_##op(CPUPPCState *env, uint64_t *t, uint64_t *b, uint32_t s)     \
+{                                                                            \
+[...]
+    if ((size) == 64) {                                                      \
+        t[0] = dfp.t64[0];                                                   \
+    } else if ((size) == 128) {                                              \
+        t[0] = dfp.t64[HI_IDX];                                              \
+        t[1] = dfp.t64[LO_IDX];                                              \
+    }                                                                        \
+}
+
+t[1] doesn't point to the proper vsr register anymore.
+
+Thanks for the report Paul (and also the investigation work Philippe).
+
+So yes it seems the DFP code is another fallout from the conversion of the floating point registers over to host-endian/VSR format. I've had a quick look at this and it seems that the simple fix to compensate for the FP registers not being contiguous anymore still won't work on ppc64le.
+
+In order to fix this properly I think the best solution is to use an approach similar to that used in my last set of VSX patches, i.e. using macros to avoid having separate code paths for big and little endian hosts.
+
+I can certainly come up with some patches for this, however I don't have any ppc64le hardware to test it myself. If I were to do a trial conversion of denbcdq would you be able to test it for me?
+
+
+I have access to lots of Power hardware, and happy to test and help however I can!  Thanks, Mark!
+
+Sorry I didn't get a chance to look at this before I went away on holiday, however I've just posted a patchset at https://lists.gnu.org/archive/html/qemu-devel/2019-09/msg05577.html which should resolve the issue for you.
+
+With the above patchset applied I now see the following results with your test program:
+
+LE host:
+$ ../qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power9 test-denbcdqle
+0x00000000000000000000000000000000
+0x0000000000000000000000000000000c
+0x22080000000000000000000000000000
+$ ../qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power9 test-denbcdqle 1
+0x00000000000000000000000000000001
+0x0000000000000000000000000000001c
+0x22080000000000000000000000000001
+$ ../qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power9 test-denbcdqle $(seq 0 99)
+0x00000000000000000000000000000064
+0x0000000000000000000000000000100c
+0x22080000000000000000000000000080
+
+BE host:
+$ ../qemu-ppc64 -L /usr/powerpc64-linux-gnu -cpu power9 test-denbcdq
+0x00000000000000000000000000000000
+0x000000000000000c0000000000000000
+0x00000000000000002208000000000000
+$ ../qemu-ppc64 -L /usr/powerpc64-linux-gnu -cpu power9 test-denbcdq 1
+0x00000000000000010000000000000000
+0x000000000000001c0000000000000000
+0x00000000000000012208000000000000
+$ ../qemu-ppc64 -L /usr/powerpc64-linux-gnu -cpu power9 test-denbcdq $(seq 0 99)
+0x00000000000000640000000000000000
+0x000000000000100c0000000000000000
+0x00000000000000802208000000000000
+
+If you could confirm that the BE host results above match those on real hardware then that would be great as I've switched over to use macros that should do the right thing regardless of host endian.
+
+Finally if you have access to a more comprehensive test suite then that would be helpful to test more of the 64-bit DFP number paths and some of more esoteric DFP instructions.
+
+I'm still trying to track down a BE system.  Everything I have which is newer than POWER7 is LE, and POWER7 is not sufficient to run the test.
+
+The test suite that produced the problem is from https://github.com/open-power-sdk/pveclib.  The good news is that with your (v1) changes, 275 tests no longer fail.  22 tests still fail, but I bet it is different issue(s).
+
+That certainly sounds like progress. Did you see the follow up email indicating the typo that I found in patch 6? It can be fixed by applying the following diff on top:
+
+diff --git a/target/ppc/dfp_helper.c b/target/ppc/dfp_helper.c
+index c2d335e928..b801acbedc 100644
+--- a/target/ppc/dfp_helper.c
++++ b/target/ppc/dfp_helper.c
+@@ -1054,7 +1054,7 @@ static inline void dfp_set_sign_64(ppc_vsr_t *t, uint8_t sgn)
+ static inline void dfp_set_sign_128(ppc_vsr_t *t, uint8_t sgn)
+ {
+     t->VsrD(0) <<= 4;
+-    t->VsrD(0) |= (t->VsrD(0) >> 60);
++    t->VsrD(0) |= (t->VsrD(1) >> 60);
+     t->VsrD(1) <<= 4;
+     t->VsrD(1) |= (sgn & 0xF);
+ }
+
+Does that help any more tests to pass? Also the changes to the FP register layout were made in QEMU 4.0 and so it seems to me that even if some tests fail, if the results between QEMU 3.1 and QEMU git master with the patchset applied are equivalent then we can assume that the patchset functionality is correct.
+
+
+> Did you see the follow up email indicating the typo that I found in patch 6?
+
+I did, then forgot to include it in my build.  I've included that change now...
+
+> Does that help any more tests to pass?
+
+I'm down from 22 failures to 8.
+
+That's looking much better :)  And finally, how many failures do you get running the same test under QEMU 3.1? If that gives you zero failures then I'll need to look a lot closer at the changes to try and figure out what is going on.
+
+As a matter of interest, which tests are the ones that are failing?
+
+I haven't tried QEMU 3.1 yet.  Adding to to-do list.
+
+I am narrowing down the remaining failures.  Within the pveclib test suite, there are two tests, one is failing, "pveclib_test".  It contains numerous subtests.  The failing subtests are:
+- test_setb_bcdsq
+- test_setb_bcdinv
+- test_bcdsr
+- test_bcdsrrqi
+
+Investigating the first two so far, it looks like "bcdadd." and "bcdsub." are not operating correctly.  gdb sessions showing the difference in behavior between QEMU 4.2+patches and hardware (in that order):
+
+QEMU 4.2+patches:
+
+(gdb) x/i $pc                                                                                                       
+=> 0x10000698 <vec_setbool_bcdsq+60>:   bcdsub. v0,v0,v1,0                                                          
+(gdb) p $vr0.uint128                                                                                                
+$3 = 0x9999999999999999999999999999999d                                                                             
+(gdb) p $vr1.uint128                                                                                                
+$4 = 0x1d                                                                                                           
+(gdb) stepi                                                                                                         
+(gdb) p $vr1.uint128                                                                                                
+$5 = 0x1d
+
+hardware:
+
+1: x/i $pc
+=> 0x10000698 <vec_setbool_bcdsq+60>:	bcdsub. v0,v0,v1,0
+(gdb) p $vr0.uint128
+$2 = 0x9999999999999999999999999999999d
+(gdb) p $vr1.uint128
+$3 = 0x1d
+(gdb) nexti
+(gdb) p $vr0.uint128
+$4 = 0x9999999999999999999999999999998d
+
+--
+
+QEMU 4.2+patches:
+
+=> 0x10000740 <vec_setbool_bcdinv+60>:  bcdadd. v0,v0,v1,0
+(gdb) p $vr0.uint128                                      
+$1 = 0xa999999999999999000000000000000c                   
+(gdb) p $vr1.uint128                                      
+$2 = 0xc                                                  
+(gdb) p $cr                                               
+$4 = 0x24000242                                           
+(gdb) nexti                                               
+(gdb) p $vr0.uint128                                      
+$5 = 0xffffffffffffffffffffffffffffffff                   
+(gdb) p $cr                             
+$6 = 0x24000212                         
+
+hardware:
+
+=> 0x10000740 <vec_setbool_bcdinv+60>:  bcdadd. v0,v0,v1,0
+(gdb) p $vr0.uint128
+$2 = 0xa999999999999999000000000000000c
+(gdb) p $vr1.uint128
+$3 = 0xc
+(gdb) p $cr
+$4 = 0x24000442
+(gdb) nexti
+(gdb) p $vr0.uint128
+$5 = 0x999999999999999000000000000000c
+(gdb) p $cr
+$6 = 0x24000412
+
+Right so this looks like a different bug: if you look at helper_bcdadd() and helper_bcdsub() in target/ppc/int_helper.c then you can see the problem straight away: the code is accessing the elements of ppc_avr_t without directly without using the VsrX() macros which correct for host endian.
+
+Fortunately the fix is really easy - replace the direct access with the relevant VsrX() macro from target/ppc/cpu.h instead. It does look as if there are several places in the BCD code that need fixing up though.
+
+The first thing to fix is the #define BCD_DIG_BYTE around line 2055: the VsrX() macro offsets are in "big-endian" format to match the ISA specification so VsrD(0) is the MSB and VsrD(1) is the LSB, which means that during the conversion you generally want the index from within the #if defined(HOST_WORDS_BIGENDIAN) ... #endif section.
+
+Given that the VsrX() macros invert the array index according to host endian then you can completely remove everything between #if defined(HOST_WORDS_BIGENDIAN) ... #endif and replace it with simply:
+
+    #define BCD_DIG_BYTE(n) (15 - ((n) / 2))
+
+Then as an example in the bcd_get_sgn() function below you can change the switch from:
+
+    switch (bcd->u8[BCD_DIG_BYTE(0)] & 0xF)
+
+to:
+
+    switch (bcd->VsrB(BCD_DIG_BYTE(0)) & 0xF)
+
+etc. and repeat for the remaining bcd helpers down to helper_vsbox() around line 2766. Note it seems the last few bcd helpers have a #if defined(HOST_WORDS_BIGENDIAN) ... #endif section towards the start that might a bit of thought, however once they are written in terms of the VsrX() macros then everything will "just work" regardless of host endian.
+
+
+`vsl` appears to be acting incorrectly as well, per the test 'vec_bcdsr':
+
+=> 0x100006e0 <vec_slq+132>:    vsl     v0,v0,v1      
+(gdb) p $vr0.uint128                                  
+$21 = 0x10111213141516172021222324252650              
+(gdb) p $vr1.uint128                                  
+$22 = 0x0                                             
+(gdb) stepi                                           
+0x00000000100006e4 in vec_slq ()                      
+1: x/i $pc                                             each byte                                                       
+=> 0x100006e4 <vec_slq+136>:    xxlor   vs0,vs32,vs32 
+(gdb) p $vr0.uint128                                  
+$23 = 0x10111213141516572021222324252650
+
+=> 0x100006e0 <vec_slq+132>:    vsl     v0,v0,v1
+(gdb) p $vr0.uint128
+$21 = 0x10111213141516172021222324252650
+(gdb) p $vr1.uint128
+$22 = 0x0
+(gdb) stepi
+0x00000000100006e4 in vec_slq ()
+1: x/i $pc
+=> 0x100006e4 <vec_slq+136>:    xxlor   vs0,vs32,vs32
+(gdb) p $vr0.uint128
+$23 = 0x10111213141516172021222324252650
+
+Note in the final result differs in the first nybble of the 8th MSB ('57' vs '17').
+
+The final failure is 'vsr' acting incorrectly, with basically the same issue as 'vsl'.
+
+Ahhh in that case I suspect that you may be seeing a bug in this commit:
+
+commit 4e6d0920e7547e6af4bbac5ffe9adfe6ea621822
+Author: Stefan Brankovic <email address hidden>
+Date:   Mon Jul 15 16:22:48 2019 +0200
+
+    target/ppc: Optimize emulation of vsl and vsr instructions
+    
+    Optimization of altivec instructions vsl and vsr(Vector Shift Left/Rigt).
+    Perform shift operation (left and right respectively) on 128 bit value of
+    register vA by value specified in bits 125-127 of register vB. Lowest 3
+    bits in each byte element of register vB must be identical or result is
+    undefined.
+    
+    For vsl instruction, the first step is bits 125-127 of register vB have
+    to be saved in variable sh. Then, the highest sh bits of the lower
+    doubleword element of register vA are saved in variable shifted,
+    in order not to lose those bits when shift operation is performed on
+    the lower doubleword element of register vA, which is the next
+    step. After shifting the lower doubleword element shift operation
+    is performed on higher doubleword element of vA, with replacement of
+    the lowest sh bits(that are now 0) with bits saved in shifted.
+    
+    For vsr instruction, firstly, the bits 125-127 of register vB have
+    to be saved in variable sh. Then, the lowest sh bits of the higher
+    doubleword element of register vA are saved in variable shifted,
+    in odred not to lose those bits when the shift operation is
+    performed on the higher doubleword element of register vA, which is
+    the next step. After shifting higher doubleword element, shift operation
+    is performed on lower doubleword element of vA, with replacement of
+    highest sh bits(that are now 0) with bits saved in shifted.
+    
+    Signed-off-by: Stefan Brankovic <email address hidden>
+    Reviewed-by: Richard Henderson <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: David Gibson <email address hidden>
+
+In fact, looking at that commit I think you should just be able to revert it for a quick test - does that enable your regression tests to pass?
+
+
+Reverted 4e6d0920e7547e6af4bbac5ffe9adfe6ea621822, and those 'vsl/vsr' tests now succeed.
+
+Great! It looks as if I can't add Stefan to the bug report in launchpad since he isn't registered there, so I'll send a quick email to qemu-devel and add him as CC.
+
+In the meantime whilst your test setup is working and everything is fresh, I'll have a quick go at switching the BCD_DIG_BYTE bits over to use the VsrX() macros to abstract out more host endian behaviour...
+
+If I got that right, this has been fixed by this commit here:
+https://gitlab.com/qemu-project/qemu/-/commit/8d745875c28528a3015
+... so I'm closing this now. If you disagree, feel free to open it again.
+

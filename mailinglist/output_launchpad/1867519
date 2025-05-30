@@ -1,0 +1,250 @@
+qemu 4.2 segfaults on VF detach
+
+After updating Ubuntu 20.04 to the Beta version, we get the following error and the virtual machines stucks when detaching PCI devices using virsh command: 
+
+Error:
+error: Failed to detach device from /tmp/vf_interface_attached.xml
+error: internal error: End of file from qemu monitor
+
+steps to reproduce:
+ 1. create a VM over Ubuntu 20.04 (5.4.0-14-generic)
+ 2. attach PCI device to this VM (Mellanox VF for example)
+ 3. try to detaching  the PCI device using virsh command:
+   a. create a pci interface xml file:
+        
+      <hostdev mode='subsystem' type='pci' managed='yes'>
+      <driver name='vfio'/>
+      <source>
+      <address type='pci' domain='0x0000' bus='0x11' slot='0x00' function='0x2' />
+      </source>
+      </hostdev>
+    
+   b.  #virsh detach-device <VM-Doman-name> <pci interface xml file>
+
+
+
+- Ubuntu release:
+  Description:    Ubuntu Focal Fossa (development branch)
+  Release:        20.04
+
+- Package ver:
+  libvirt0:
+  Installed: 6.0.0-0ubuntu3
+  Candidate: 6.0.0-0ubuntu5
+  Version table:
+     6.0.0-0ubuntu5 500
+        500 http://il.archive.ubuntu.com/ubuntu focal/main amd64 Packages
+ *** 6.0.0-0ubuntu3 100
+        100 /var/lib/dpkg/status
+
+- What you expected to happen: 
+  PCI device detached without any errors.
+
+- What happened instead:
+  getting the errors above and he VM stuck
+
+additional info:
+after downgrading the libvirt0 package and all the dependent packages to 5.4 the previous, version, seems that the issue disappeared
+
+Hi Mohammad,
+I'll to recreate your issue, but while that goes on I already would want to ask if you could report the following tracked while you try to detach the device:
+
+1. host dmesg -w
+2. journalctl -f
+3. /var/log/libvirt/qemu/<questname>.log
+
+Please report all these in case there is something that helps to pinpoint the root cause.
+
+Could you also please try more devices to know which kind this issue it restricted to?
+1. try other VFs on the same device
+2. try VFs on a different device (if you have any)
+3. try non-VF but full PCI passthrough
+
+Does the issue occor on your system for all of these ?
+
+For the time being I only found a system with a full device to passthrough not a VF.
+That worked fine for me, the guest gets the dev and can load its drivers.
+[  297.340525] mlx5_core 0000:00:08.0: Port module event: module 0, Cable unplugged
+[  297.361111] mlx5_core 0000:00:08.0: MLX5E: StrdRq(0) RqSz(1024) StrdSz(256) RxCqeCmprss(0)
+[  297.572313] mlx5_core 0000:00:08.0 ens8: renamed from eth0
+
+But since that was "only" PCI-passthrough and not yet VFs I'm looking forward to your answers on your case.
+
+Once more thing you could track and report is the guests "dmesg -w" while trying to attach to see if there is anything appearing there or aborting much earlier.
+
+I got VFs enabled now, attach works fine as well.
+
+But I can confirm that detach breaks it.
+
+XML used for the device:
+  <interface type='hostdev' managed='yes'>
+    <driver name='vfio'/>
+      <mac address='52:54:00:c3:0e:32'/>
+    <source>
+      <address type='pci' domain='0x0000' bus='0x08' slot='0x00' function='0x2'/>
+    </source>
+  </interface>
+
+$ virsh detach-device focal-pttest VF-pass-through.xml
+error: Failed to detach device from VF-pass-through.xml
+error: internal error: End of file from qemu monitor
+
+Logs:
+1. Guest dmesg (doesn't exist as it dies immediately).
+
+2. qemu log:
+2020-03-18 11:02:18.221+0000: shutting down, reason=crashed
+
+This one is interesting, Host dmesg:
+[ 5819.223023] CPU 0/KVM[2763]: segfault at 0 ip 000055d37b4b245d sp 00007f2f5fffe188 error 6 in qemu-system-x86_64[55d37b008000+529000]
+[ 5819.223030] Code: 08 48 89 50 10 48 89 37 48 89 7e 10 c3 f3 0f 1e fa 48 8b 47 08 48 8b 57 10 48 85 c0 74 0c 48 89 50 10 48 8b 57 10 48 8b 47 08 <48> 89 02 c3 66 66 2e 0f 1f 84 00 00 00 00 00 0f 1f 40 00 f3 0f 1e
+
+Afterwards I see the device come back to the host, but the segfault is the reason it died.
+
+I re-run the above, full PCI passthrough still attaches/detaches fine.
+
+VFs attach fine
+VFs break on detach
+
+I've thrown qemu into GDB and this is the backtrace
+Thread 4 "CPU 0/KVM" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7f82f0e31700 (LWP 3998)]
+0x000055d2f322d45d in notifier_remove (notifier=notifier@entry=0x55d2f40c5078) at ./util/notify.c:31
+31          QLIST_REMOVE(notifier, node);
+(gdb) bt
+#0  0x000055d2f322d45d in notifier_remove (notifier=notifier@entry=0x55d2f40c5078) at ./util/notify.c:31
+#1  0x000055d2f2df8df9 in kvm_irqchip_remove_change_notifier (n=n@entry=0x55d2f40c5078) at ./accel/kvm/kvm-all.c:1409
+#2  0x000055d2f2e56989 in vfio_exitfn (pdev=<optimized out>) at ./hw/vfio/pci.c:3079
+#3  0x000055d2f3025c1b in pci_qdev_unrealize (dev=<optimized out>, errp=<optimized out>) at ./hw/pci/pci.c:1131
+#4  0x000055d2f2f8c6e2 in device_set_realized (obj=<optimized out>, value=<optimized out>, errp=0x0) at ./hw/core/qdev.c:932
+#5  0x000055d2f312449b in property_set_bool (obj=0x55d2f40c4430, v=<optimized out>, name=<optimized out>, opaque=0x55d2f4083ee0, errp=0x0) at ./qom/object.c:2078
+#6  0x000055d2f3128c84 in object_property_set_qobject (obj=obj@entry=0x55d2f40c4430, value=value@entry=0x7f82dc2f7130, name=name@entry=0x55d2f330d85d "realized", errp=errp@entry=0x0)
+    at ./qom/qom-qobject.c:26
+#7  0x000055d2f31264ba in object_property_set_bool (obj=0x55d2f40c4430, value=<optimized out>, name=0x55d2f330d85d "realized", errp=0x0) at ./qom/object.c:1336
+#8  0x000055d2f2f56bca in acpi_pcihp_device_unplug_cb (hotplug_dev=<optimized out>, s=<optimized out>, dev=0x55d2f40c4430, errp=<optimized out>) at ./hw/acpi/pcihp.c:269
+#9  0x000055d2f2f56253 in acpi_pcihp_eject_slot (s=<optimized out>, bsel=<optimized out>, slots=slots@entry=256) at ./hw/acpi/pcihp.c:170
+#10 0x000055d2f2f56383 in pci_write (size=<optimized out>, data=256, addr=8, opaque=<optimized out>) at ./hw/acpi/pcihp.c:341
+#11 pci_write (opaque=<optimized out>, addr=<optimized out>, data=256, size=<optimized out>) at ./hw/acpi/pcihp.c:332
+#12 0x000055d2f2de9cfb in memory_region_write_accessor (mr=mr@entry=0x55d2f4780970, addr=8, value=value@entry=0x7f82f0e304f8, size=size@entry=4, shift=<optimized out>, 
+    mask=mask@entry=4294967295, attrs=...) at ./memory.c:483
+#13 0x000055d2f2de79ee in access_with_adjusted_size (addr=addr@entry=8, value=value@entry=0x7f82f0e304f8, size=size@entry=4, access_size_min=<optimized out>, 
+    access_size_max=<optimized out>, access_fn=access_fn@entry=0x55d2f2de9bd0 <memory_region_write_accessor>, mr=0x55d2f4780970, attrs=...) at ./memory.c:544
+#14 0x000055d2f2debfc3 in memory_region_dispatch_write (mr=mr@entry=0x55d2f4780970, addr=8, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ./memory.c:1475
+#15 0x000055d2f2d96a30 in flatview_write_continue (fv=fv@entry=0x7f82dc14bbc0, addr=addr@entry=44552, attrs=..., buf=buf@entry=0x7f82f17e9000 "", len=len@entry=4, addr1=<optimized out>, 
+    l=<optimized out>, mr=0x55d2f4780970) at ./include/qemu/host-utils.h:164
+#16 0x000055d2f2d96c46 in flatview_write (fv=0x7f82dc14bbc0, addr=44552, attrs=..., buf=0x7f82f17e9000 "", len=4) at ./exec.c:3169
+#17 0x000055d2f2d9b01f in address_space_write (as=as@entry=0x55d2f3956960 <address_space_io>, addr=addr@entry=44552, attrs=..., buf=<optimized out>, len=len@entry=4) at ./exec.c:3259
+#18 0x000055d2f2d9b09e in address_space_rw (as=as@entry=0x55d2f3956960 <address_space_io>, addr=addr@entry=44552, attrs=..., attrs@entry=..., buf=<optimized out>, len=len@entry=4, 
+    is_write=is_write@entry=true) at ./exec.c:3269
+#19 0x000055d2f2dfc94f in kvm_handle_io (count=1, size=4, direction=<optimized out>, data=<optimized out>, attrs=..., port=44552) at ./accel/kvm/kvm-all.c:2104
+#20 kvm_cpu_exec (cpu=cpu@entry=0x55d2f3dc9090) at ./accel/kvm/kvm-all.c:2350
+#21 0x000055d2f2dde53e in qemu_kvm_cpu_thread_fn (arg=0x55d2f3dc9090) at ./cpus.c:1318
+#22 qemu_kvm_cpu_thread_fn (arg=arg@entry=0x55d2f3dc9090) at ./cpus.c:1290
+#23 0x000055d2f321fe13 in qemu_thread_start (args=<optimized out>) at ./util/qemu-thread-posix.c:519
+#24 0x00007f82f4290609 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#25 0x00007f82f41b7153 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+
+I changed the bug task to Qemu (Ubuntu) as this isn't a libvirt error.
+
+I also added an upstream qemu task in case this is a known issue for the developers there. Someone might be able to point us at a known discussion/fix.
+
+The Backtrace I added in the last comment should help to identify known cases.
+
+Hi Christian,
+
+yes that exactly what we see in our tests,
+so are the logs that you asked for in comment#1 still needed?
+also if you fix it can you please provide us a link for a package or even a workaround until the issue resolved, since this issue stuck our QA from testing ASAP over Focal. 
+
+At the breaking function we have:
+
+29      void notifier_remove(Notifier *notifier)
+30      {
+31          QLIST_REMOVE(notifier, node);
+32      }
+
+
+
+(gdb) p notifier
+$1 = (Notifier *) 0x55d2f40c5078
+(gdb) p *notifier
+$2 = {notify = 0x0, node = {le_next = 0x0, le_prev = 0x0}}
+
+And since QLIST_REMOVE is defined as:
+140 #define QLIST_REMOVE(elm, field) do {                                   \        
+141         if ((elm)->field.le_next != NULL)                               \        
+142                 (elm)->field.le_next->field.le_prev =                   \        
+143                     (elm)->field.le_prev;                               \        
+144         *(elm)->field.le_prev = (elm)->field.le_next;                   \        
+145 } while (/*CONSTCOND*/0)
+
+(gdb) p (notifier)->node.le_next
+$5 = (struct Notifier *) 0x0
+(gdb) p &(notifier->node)
+$11 = (struct {...} *) 0x55d2f40c5080
+
+There actually is a != NULL check, might it have changed on the fly.
+I need to look at it more thoroughly, but it should be enough to recognize a known issue.
+
+Might be https://git.qemu.org/?p=qemu.git;a=commit;h=0446f8121723b134ca1d1ed0b73e96d4a0a8689d
+
+This would also match the backtrace path.
+
+That commit you mention is confirmed to solve a bug reported against Fedora with almost the same stack trace you see here.
+
+Hi Christian,
+
+Yes,
+seems that the patch you mentioned fixing the issue i rebuilt the qemu with the patch and it's work fine now. 
+Thank you guys.
+
+
+I regularly before a release pull in fixes that were posted for qemu-stable.
+This is one of them, I'll again do such a build and retest this issue with it.
+
+I identified and backported (only one needed modification) 33 patches.
+But as usual there might be some context needed on top - I have build that over night in [1]
+
+Testing that on my reproducer 
+
+Attach-host:
+[84652.671123] vfio-pci 0000:08:00.2: enabling device (0000 -> 0002)
+
+Attach-guest:
+[   45.199920] pci 0000:00:08.0: [15b3:1016] type 00 class 0x020000
+[   45.200374] pci 0000:00:08.0: reg 0x10: [mem 0x00000000-0x000fffff 64bit pref]
+[   45.201358] pci 0000:00:08.0: enabling Extended Tags
+[   45.202726] pci 0000:00:08.0: 0.000 Gb/s available PCIe bandwidth, limited by Unknown speed x0 link at 0000:00:08.0 (capable of 63.008 Gb/s with 8 GT/s x8 link)
+[   45.208316] pci 0000:00:08.0: BAR 0: assigned [mem 0x100000000-0x1000fffff 64bit pref]
+[   45.256566] mlx5_core 0000:00:08.0: enabling device (0000 -> 0002)
+[   45.262103] mlx5_core 0000:00:08.0: firmware version: 14.27.1016
+[   45.544010] mlx5_core 0000:00:08.0: MLX5E: StrdRq(0) RqSz(1024) StrdSz(256) RxCqeCmprss(0)
+[   45.710123] mlx5_core 0000:00:08.0 ens8: renamed from eth0
+[   60.992547] random: crng init done
+[   60.992552] random: 3 urandom warning(s) missed due to ratelimiting
+
+Detach-host:
+[84926.767411] mlx5_core 0000:08:00.2: enabling device (0000 -> 0002)
+[84926.767514] mlx5_core 0000:08:00.2: firmware version: 14.27.1016
+[84927.036146] mlx5_core 0000:08:00.2: MLX5E: StrdRq(0) RqSz(1024) StrdSz(256) RxCqeCmprss(0)
+[84927.208523] mlx5_core 0000:08:00.2 ens1v1: renamed from eth0
+
+Detach-guest:
+<nothing>
+
+
+So yes, these changes fix the issue here (and a bunch of others).
+I'll open up an MP to get these changes into Ubuntu 20.04.
+
+[1]: https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/3981
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu3
+
+---------------
+qemu (1:4.2-3ubuntu3) focal; urgency=medium
+
+  * d/p/stable/lp-1867519-*: Stabilize qemu 4.2 with upstream
+    patches @qemu-stable (LP: #1867519)
+
+ -- Christian Ehrhardt <email address hidden>  Wed, 18 Mar 2020 13:57:57 +0100
+

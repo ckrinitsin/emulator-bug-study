@@ -1,0 +1,385 @@
+qemu-system-sparc stucked while booting using ss20_v2.25_rom 
+
+I cannot boot up OBP using the current (5.1) version of qemu with ss20_v2.25_rom. It just stuck at "Power-ON reset" and hanged.  However using the previous version from 2015 I can successfully both up the OBP. 
+
+qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25.rom -nographic
+
+Power-ON Reset
+
+(*hang) 
+
+regards
+Yap KV
+
+I have just compiled a few version from source code:
+
+4.1.1  worked: able to boot up with -bios ss20_v2.25.rom 
+5.0.0  worked: able to boot up with -bios ss20_v2.25.rom 
+5.1.0  not working. Stuck after "Power-On Reset"
+
+SS5.bin worked for 5.1.0
+
+
+Per the "NCR89C105 Chip Specification" referenced in the header:
+
+                  Chip-level Address Map
+
+  ------------------------------------------------------------------
+  | 1D0 0000 ->   | Counter/Timers                        | W,D    |
+  |   1DF FFFF    |                                       |        |
+  ...
+
+  The address map indicated the allowed accesses at each address.
+  [...] W indicates a word access, and D indicates a double-word
+  access.
+
+The SLAVIO timer controller is implemented expecting 32-bit accesses.
+Commit a3d12d073e1 restricted the memory accesses to 32-bit, while
+the device allows 64-bit accesses.
+
+This was not an issue until commit 5d971f9e67 which reverted
+("memory: accept mismatching sizes in memory_region_access_valid").
+
+Fix by renaming .valid MemoryRegionOps as .impl, and add the valid
+access range (W -> 4, D -> 8).
+
+Since commit 21786c7e598 ("memory: Log invalid memory accesses")
+this class of bug can be quickly debugged displaying 'guest_errors'
+accesses, as:
+
+  $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -serial stdio -d guest_errors
+
+  Power-ON Reset
+  Invalid access at addr 0x0, size 8, region 'timer-1', reason: invalid size (min:4 max:4)
+
+  $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -monitor stdio -S
+  (qemu) info mtree
+  address-space: memory
+    0000000000000000-ffffffffffffffff (prio 0, i/o): system
+      ...
+      0000000ff1300000-0000000ff130000f (prio 0, i/o): timer-1
+             ^^^^^^^^^                                 ^^^^^^^
+                   \ memory region base address and name /
+
+  (qemu) info qtree
+  bus: main-system-bus
+    dev: slavio_timer, id ""              <-- device type name
+      gpio-out "sysbus-irq" 17
+      num_cpus = 1 (0x1)
+      mmio 0000000ff1310000/0000000000000014
+      mmio 0000000ff1300000/0000000000000010 <--- base address
+      mmio 0000000ff1301000/0000000000000010
+      mmio 0000000ff1302000/0000000000000010
+      ...
+
+Reported-by: Yap KV <email address hidden>
+Buglink: https://bugs.launchpad.net/bugs/1906905
+Fixes: a3d12d073e1 ("slavio_timer: convert to memory API")
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Cc: Benoit Canet <email address hidden>
+Cc: <email address hidden>
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+ hw/timer/slavio_timer.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/hw/timer/slavio_timer.c b/hw/timer/slavio_timer.c
+index 5b2d20cb6a5..03e33fc5926 100644
+--- a/hw/timer/slavio_timer.c
++++ b/hw/timer/slavio_timer.c
+@@ -331,6 +331,10 @@ static const MemoryRegionOps slavio_timer_mem_ops = {
+     .write = slavio_timer_mem_writel,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+     .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
++    .impl = {
+         .min_access_size = 4,
+         .max_access_size = 4,
+     },
+-- 
+2.26.2
+
+
+
+On 05/12/2020 15:09, Philippe Mathieu-Daudé wrote:
+
+> Per the "NCR89C105 Chip Specification" referenced in the header:
+> 
+>                    Chip-level Address Map
+> 
+>    ------------------------------------------------------------------
+>    | 1D0 0000 ->   | Counter/Timers                        | W,D    |
+>    |   1DF FFFF    |                                       |        |
+>    ...
+> 
+>    The address map indicated the allowed accesses at each address.
+>    [...] W indicates a word access, and D indicates a double-word
+>    access.
+> 
+> The SLAVIO timer controller is implemented expecting 32-bit accesses.
+> Commit a3d12d073e1 restricted the memory accesses to 32-bit, while
+> the device allows 64-bit accesses.
+> 
+> This was not an issue until commit 5d971f9e67 which reverted
+> ("memory: accept mismatching sizes in memory_region_access_valid").
+> 
+> Fix by renaming .valid MemoryRegionOps as .impl, and add the valid
+> access range (W -> 4, D -> 8).
+> 
+> Since commit 21786c7e598 ("memory: Log invalid memory accesses")
+> this class of bug can be quickly debugged displaying 'guest_errors'
+> accesses, as:
+> 
+>    $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -serial stdio -d guest_errors
+> 
+>    Power-ON Reset
+>    Invalid access at addr 0x0, size 8, region 'timer-1', reason: invalid size (min:4 max:4)
+> 
+>    $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -monitor stdio -S
+>    (qemu) info mtree
+>    address-space: memory
+>      0000000000000000-ffffffffffffffff (prio 0, i/o): system
+>        ...
+>        0000000ff1300000-0000000ff130000f (prio 0, i/o): timer-1
+>               ^^^^^^^^^                                 ^^^^^^^
+>                     \ memory region base address and name /
+> 
+>    (qemu) info qtree
+>    bus: main-system-bus
+>      dev: slavio_timer, id ""              <-- device type name
+>        gpio-out "sysbus-irq" 17
+>        num_cpus = 1 (0x1)
+>        mmio 0000000ff1310000/0000000000000014
+>        mmio 0000000ff1300000/0000000000000010 <--- base address
+>        mmio 0000000ff1301000/0000000000000010
+>        mmio 0000000ff1302000/0000000000000010
+>        ...
+> 
+> Reported-by: Yap KV <email address hidden>
+> Buglink: https://bugs.launchpad.net/bugs/1906905
+> Fixes: a3d12d073e1 ("slavio_timer: convert to memory API")
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+> Cc: Benoit Canet <email address hidden>
+> Cc: <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   hw/timer/slavio_timer.c | 4 ++++
+>   1 file changed, 4 insertions(+)
+> 
+> diff --git a/hw/timer/slavio_timer.c b/hw/timer/slavio_timer.c
+> index 5b2d20cb6a5..03e33fc5926 100644
+> --- a/hw/timer/slavio_timer.c
+> +++ b/hw/timer/slavio_timer.c
+> @@ -331,6 +331,10 @@ static const MemoryRegionOps slavio_timer_mem_ops = {
+>       .write = slavio_timer_mem_writel,
+>       .endianness = DEVICE_NATIVE_ENDIAN,
+>       .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+> +    .impl = {
+>           .min_access_size = 4,
+>           .max_access_size = 4,
+>       },
+
+I don't really use the proprietary Sun ROMs here, but the fix looks good to me:
+
+Reviewed-by: Mark Cave-Ayland <email address hidden>
+
+It's probably also worth a CC to qemu-stable to try and also get this into 5.1.1 to 
+accompany the related TCX issues.
+
+
+ATB,
+
+Mark.
+
+
+ping?
+
+On 12/5/20 4:09 PM, Philippe Mathieu-Daudé wrote:
+> Per the "NCR89C105 Chip Specification" referenced in the header:
+> 
+>                   Chip-level Address Map
+> 
+>   ------------------------------------------------------------------
+>   | 1D0 0000 ->   | Counter/Timers                        | W,D    |
+>   |   1DF FFFF    |                                       |        |
+>   ...
+> 
+>   The address map indicated the allowed accesses at each address.
+>   [...] W indicates a word access, and D indicates a double-word
+>   access.
+> 
+> The SLAVIO timer controller is implemented expecting 32-bit accesses.
+> Commit a3d12d073e1 restricted the memory accesses to 32-bit, while
+> the device allows 64-bit accesses.
+> 
+> This was not an issue until commit 5d971f9e67 which reverted
+> ("memory: accept mismatching sizes in memory_region_access_valid").
+> 
+> Fix by renaming .valid MemoryRegionOps as .impl, and add the valid
+> access range (W -> 4, D -> 8).
+> 
+> Since commit 21786c7e598 ("memory: Log invalid memory accesses")
+> this class of bug can be quickly debugged displaying 'guest_errors'
+> accesses, as:
+> 
+>   $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -serial stdio -d guest_errors
+> 
+>   Power-ON Reset
+>   Invalid access at addr 0x0, size 8, region 'timer-1', reason: invalid size (min:4 max:4)
+> 
+>   $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -monitor stdio -S
+>   (qemu) info mtree
+>   address-space: memory
+>     0000000000000000-ffffffffffffffff (prio 0, i/o): system
+>       ...
+>       0000000ff1300000-0000000ff130000f (prio 0, i/o): timer-1
+>              ^^^^^^^^^                                 ^^^^^^^
+>                    \ memory region base address and name /
+> 
+>   (qemu) info qtree
+>   bus: main-system-bus
+>     dev: slavio_timer, id ""              <-- device type name
+>       gpio-out "sysbus-irq" 17
+>       num_cpus = 1 (0x1)
+>       mmio 0000000ff1310000/0000000000000014
+>       mmio 0000000ff1300000/0000000000000010 <--- base address
+>       mmio 0000000ff1301000/0000000000000010
+>       mmio 0000000ff1302000/0000000000000010
+>       ...
+> 
+> Reported-by: Yap KV <email address hidden>
+> Buglink: https://bugs.launchpad.net/bugs/1906905
+> Fixes: a3d12d073e1 ("slavio_timer: convert to memory API")
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+> Cc: Benoit Canet <email address hidden>
+> Cc: <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>  hw/timer/slavio_timer.c | 4 ++++
+>  1 file changed, 4 insertions(+)
+> 
+> diff --git a/hw/timer/slavio_timer.c b/hw/timer/slavio_timer.c
+> index 5b2d20cb6a5..03e33fc5926 100644
+> --- a/hw/timer/slavio_timer.c
+> +++ b/hw/timer/slavio_timer.c
+> @@ -331,6 +331,10 @@ static const MemoryRegionOps slavio_timer_mem_ops = {
+>      .write = slavio_timer_mem_writel,
+>      .endianness = DEVICE_NATIVE_ENDIAN,
+>      .valid = {
+> +        .min_access_size = 4,
+> +        .max_access_size = 8,
+> +    },
+> +    .impl = {
+>          .min_access_size = 4,
+>          .max_access_size = 4,
+>      },
+> 
+
+
+On 05/01/2021 11:06, Philippe Mathieu-Daudé wrote:
+
+> ping?
+> 
+> On 12/5/20 4:09 PM, Philippe Mathieu-Daudé wrote:
+>> Per the "NCR89C105 Chip Specification" referenced in the header:
+>>
+>>                    Chip-level Address Map
+>>
+>>    ------------------------------------------------------------------
+>>    | 1D0 0000 ->   | Counter/Timers                        | W,D    |
+>>    |   1DF FFFF    |                                       |        |
+>>    ...
+>>
+>>    The address map indicated the allowed accesses at each address.
+>>    [...] W indicates a word access, and D indicates a double-word
+>>    access.
+>>
+>> The SLAVIO timer controller is implemented expecting 32-bit accesses.
+>> Commit a3d12d073e1 restricted the memory accesses to 32-bit, while
+>> the device allows 64-bit accesses.
+>>
+>> This was not an issue until commit 5d971f9e67 which reverted
+>> ("memory: accept mismatching sizes in memory_region_access_valid").
+>>
+>> Fix by renaming .valid MemoryRegionOps as .impl, and add the valid
+>> access range (W -> 4, D -> 8).
+>>
+>> Since commit 21786c7e598 ("memory: Log invalid memory accesses")
+>> this class of bug can be quickly debugged displaying 'guest_errors'
+>> accesses, as:
+>>
+>>    $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -serial stdio -d guest_errors
+>>
+>>    Power-ON Reset
+>>    Invalid access at addr 0x0, size 8, region 'timer-1', reason: invalid size (min:4 max:4)
+>>
+>>    $ qemu-system-sparc -M SS-20 -m 256 -bios ss20_v2.25_rom -monitor stdio -S
+>>    (qemu) info mtree
+>>    address-space: memory
+>>      0000000000000000-ffffffffffffffff (prio 0, i/o): system
+>>        ...
+>>        0000000ff1300000-0000000ff130000f (prio 0, i/o): timer-1
+>>               ^^^^^^^^^                                 ^^^^^^^
+>>                     \ memory region base address and name /
+>>
+>>    (qemu) info qtree
+>>    bus: main-system-bus
+>>      dev: slavio_timer, id ""              <-- device type name
+>>        gpio-out "sysbus-irq" 17
+>>        num_cpus = 1 (0x1)
+>>        mmio 0000000ff1310000/0000000000000014
+>>        mmio 0000000ff1300000/0000000000000010 <--- base address
+>>        mmio 0000000ff1301000/0000000000000010
+>>        mmio 0000000ff1302000/0000000000000010
+>>        ...
+>>
+>> Reported-by: Yap KV <email address hidden>
+>> Buglink: https://bugs.launchpad.net/bugs/1906905
+>> Fixes: a3d12d073e1 ("slavio_timer: convert to memory API")
+>> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+>> ---
+>> Cc: Benoit Canet <email address hidden>
+>> Cc: <email address hidden>
+>> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+>> ---
+>>   hw/timer/slavio_timer.c | 4 ++++
+>>   1 file changed, 4 insertions(+)
+>>
+>> diff --git a/hw/timer/slavio_timer.c b/hw/timer/slavio_timer.c
+>> index 5b2d20cb6a5..03e33fc5926 100644
+>> --- a/hw/timer/slavio_timer.c
+>> +++ b/hw/timer/slavio_timer.c
+>> @@ -331,6 +331,10 @@ static const MemoryRegionOps slavio_timer_mem_ops = {
+>>       .write = slavio_timer_mem_writel,
+>>       .endianness = DEVICE_NATIVE_ENDIAN,
+>>       .valid = {
+>> +        .min_access_size = 4,
+>> +        .max_access_size = 8,
+>> +    },
+>> +    .impl = {
+>>           .min_access_size = 4,
+>>           .max_access_size = 4,
+>>       },
+
+Looks like I did queue this to my local qemu-sparc branch, but was waiting to see if 
+there was feedback on the other outstanding SPARC patches before sending a PR. The 
+patches are all fairly minor, however I would prefer an Ack for the outstanding LEON 
+patchset first. I'll go chase that one up now.
+
+
+ATB,
+
+Mark.
+
+
+Fix has been included here:
+https://gitlab.com/qemu-project/qemu/-/commit/62a9b228b5fefe0f9e364d
+

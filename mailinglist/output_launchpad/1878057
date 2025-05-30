@@ -1,0 +1,523 @@
+null-ptr dereference in megasas_command_complete
+
+Hello,
+While fuzzing, I found an input that triggers a null-pointer dereference in
+megasas_command_complete:
+
+==14959==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000003 (pc 0x55b1d11b4df1 bp 0x7ffeb55ca450 sp 0x7ffeb55ca1e0 T0)
+==14959==The signal is caused by a WRITE memory access.
+==14959==Hint: address points to the zero page.
+    #0 0x55b1d11b4df1 in megasas_command_complete /home/alxndr/Development/qemu/hw/scsi/megasas.c:1877:40
+    #1 0x55b1d11759ec in scsi_req_complete /home/alxndr/Development/qemu/hw/scsi/scsi-bus.c:1430:5
+    #2 0x55b1d115c98f in scsi_aio_complete /home/alxndr/Development/qemu/hw/scsi/scsi-disk.c:216:5
+    #3 0x55b1d151c638 in blk_aio_complete /home/alxndr/Development/qemu/block/block-backend.c:1375:9
+    #4 0x55b1d151c638 in blk_aio_complete_bh /home/alxndr/Development/qemu/block/block-backend.c:1385:5
+    #5 0x55b1d16f3a5b in aio_bh_call /home/alxndr/Development/qemu/util/async.c:136:5
+    #6 0x55b1d16f3a5b in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+    #7 0x55b1d16fe43e in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+    #8 0x55b1d16f54fa in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+    #9 0x7f47937c89ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+    #10 0x55b1d16fbef4 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:219:9
+    #11 0x55b1d16fbef4 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:242:5
+    #12 0x55b1d16fbef4 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:518:11
+    #13 0x55b1d0cd16a6 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1664:9
+    #14 0x55b1d1608dca in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+    #15 0x7f4792378e0a in __libc_start_main /build/glibc-GwnBeO/glibc-2.30/csu/../csu/libc-start.c:308:16
+    #16 0x55b1d091d7b9 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x8f47b9)
+
+I can reproduce it in qemu 5.0 built with using:
+cat << EOF | ~/Development/qemu/build/i386-softmmu/qemu-system-i386 -M pc-q35-5.0 -no-shutdown -M q35 -device megasas -device scsi-cd,drive=null0 -blockdev driver=null-co,read-zeroes=on,node-name=null0 -nographic -qtest stdio -monitor none -serial none
+outl 0xcf8 0x80001814
+outl 0xcfc 0xc021
+outl 0xcf8 0x80001818
+outl 0xcf8 0x80001804
+outw 0xcfc 0x7
+outl 0xcf8 0x80001810
+outl 0xcfc 0xe10c0000
+outl 0xcf8 0x8000f810
+write 0x44b20 0x1 0x35
+write 0x44b00 0x1 0x03
+write 0xc021e10c0040 0x81 0x014b04000131000000014b04000138000000014b0400013f000000014b04000146000000014b0400014d000000014b04000154000000014b0400015b000000014b04000162000000014b04000169000000014b04000170000000014b04000177000000014b0400017e000000014b04000185000000014b0400018c000000014b04
+EOF
+
+I also attached the trace to this launchpad report, in case the formatting is broken:
+
+qemu-system-i386 -qtest stdio -monitor none -serial none -M pc-q35-5.0 -no-shutdown -M q35 -device megasas -device scsi-cd,drive=null0 -blockdev driver=null-co,read-zeroes=on,node-name=null0 -nographic < attachment
+
+Please let me know if I can provide any further info.
+-Alex
+
+
+
+Might be relevant:
+
+commit 6df5718bd3ec56225c44cf96440c723c1b611b87
+Author: Hannes Reinecke <email address hidden>
+Date:   Wed Oct 29 13:00:15 2014 +0100
+
+    megasas: Rework frame queueing algorithm
+    
+    Windows requires the frames to be unmapped, otherwise we run
+    into a race condition where the updated frame data is not
+    visible to the guest.
+    With that we can simplify the queue algorithm and use a bitmap
+    for tracking free frames.
+
+ /*
+  * This absolutely needs to be locked if
+  * qemu ever goes multithreaded.
+  */
+ static MegasasCmd *megasas_enqueue_frame(MegasasState *s,
+     hwaddr frame, uint64_t context, int count)
+
+Using -trace scsi\* -trace megasas\*:
+
+megasas_qf_enqueue frame 0x0 count 0 context 0x0 head 0x0 tail 0x0 busy 1
+megasas_handle_scsi LD SCSI dev 1/0/0 sdev 0x5555573f5560 xfer 0
+scsi_req_parsed target 0 lun 0 tag 0 command 53 dir 0 length 0
+scsi_req_parsed_lba target 0 lun 0 tag 0 command 53 lba 0
+scsi_req_alloc target 0 lun 0 tag 0
+scsi_disk_new_request Command: lun=0 tag=0x0 data= 0x35 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+megasas_scsi_nodata scmd 0: no data to be transferred
+megasas_mmio_invalid_writel addr 0x44: 0x3101
+megasas_mmio_invalid_writel addr 0x48: 0x44b0100
+megasas_mmio_invalid_writel addr 0x4c: 0x380100
+megasas_mmio_invalid_writel addr 0x50: 0x4b010000
+megasas_mmio_invalid_writel addr 0x54: 0x3f010004
+megasas_mmio_invalid_writel addr 0x58: 0x1000000
+megasas_mmio_invalid_writel addr 0x5c: 0x100044b
+megasas_mmio_invalid_writel addr 0x60: 0x46
+megasas_mmio_invalid_writel addr 0x64: 0x44b01
+megasas_mmio_invalid_writel addr 0x68: 0x4d01
+megasas_mmio_invalid_writel addr 0x6c: 0x44b0100
+megasas_mmio_invalid_writel addr 0x70: 0x540100
+megasas_mmio_invalid_writel addr 0x74: 0x4b010000
+megasas_mmio_invalid_writel addr 0x78: 0x5b010004
+megasas_mmio_invalid_writel addr 0x7c: 0x1000000
+megasas_mmio_invalid_writel addr 0x80: 0x100044b
+megasas_mmio_invalid_writel addr 0x84: 0x62
+megasas_mmio_invalid_writel addr 0x88: 0x44b01
+megasas_mmio_invalid_writel addr 0x8c: 0x6901
+megasas_mmio_invalid_writel addr 0x90: 0x44b0100
+megasas_mmio_invalid_writel addr 0x94: 0x700100
+megasas_mmio_invalid_writel addr 0x98: 0x4b010000
+megasas_mmio_invalid_writel addr 0x9c: 0x77010004
+megasas_mmio_writel reg MFI_ODCR0: 0x1000000
+megasas_mmio_invalid_writel addr 0xa4: 0x100044b
+megasas_mmio_invalid_writel addr 0xa8: 0x7e
+megasas_mmio_invalid_writel addr 0xac: 0x44b01
+megasas_mmio_invalid_writel addr 0xb0: 0x8501
+megasas_mmio_invalid_writel addr 0xb4: 0x44b0100
+megasas_mmio_invalid_writel addr 0xb8: 0x8c0100
+megasas_mmio_invalid_writel addr 0xbc: 0x4b010000
+megasas_mmio_writel reg MFI_IQPL: 0x4
+megasas_qf_new frame 0x1 addr 0x0
+megasas_enqueue_frame fr: 0x7fffa1e00000
+megasas_qf_enqueue frame 0x1 count 2 context 0x0 head 0x0 tail 0x0 busy 2
+megasas_init_firmware pa 0x0 
+megasas_init_queue queue at 0x0 len 0 head 0x0 tail 0x0 flags 0x0
+megasas_unmap_frame fr: 0x7fffa1e44b00
+megasas_unmap_frame fr: 0x7fffa1e00000
+megasas_qf_complete_noirq context 0x0 
+scsi_req_dequeue target 0 lun 0 tag 0
+scsi_aio_complete
+megasas_command_complete scmd 0: status 0x0, residual 0
+megasas_scsi_complete scmd 0: status 0x0, len 0/0
+
+The frame is unmapped when the complete callback occurs.
+Then SIGSEGV in megasas_command_complete():
+
+1856 static void megasas_command_complete(SCSIRequest *req, uint32_t status,
+1857                                      size_t resid)
+1858 {
+1859     MegasasCmd *cmd = req->hba_private;
+1860     uint8_t cmd_status = MFI_STAT_OK;
+1861 
+1862     trace_megasas_command_complete(cmd->index, status, resid);
+1863 
+1864     if (req->io_canceled) {
+1865         return;
+1866     }
+1867 
+1868     if (cmd->dcmd_opcode != -1) {
+1869         /*
+1870          * Internal command complete
+1871          */
+1872         cmd_status = megasas_finish_internal_dcmd(cmd, req, resid);
+1873         if (cmd_status == MFI_STAT_INVALID_STATUS) {
+1874             return;
+1875         }
+1876     } else {
+1877         req->status = status;
+1878         trace_megasas_scsi_complete(cmd->index, req->status,
+1879                                     cmd->iov_size, req->cmd.xfer);
+1880         if (req->status != GOOD) {
+1881             cmd_status = MFI_STAT_SCSI_DONE_WITH_ERROR;
+1882         }
+1883         if (req->status == CHECK_CONDITION) {
+1884             megasas_copy_sense(cmd);
+1885         }
+1886 
+1887         cmd->frame->header.scsi_status = req->status;
+
+             ^^^^^^^^^^ This is NULL.
+
+1888     }
+1889     cmd->frame->header.cmd_status = cmd_status;
+1890     megasas_complete_command(cmd);
+1891 }
+
+Cc'ing Hannes who doesn't have a Launchpad account.
+
+On 7/18/20 12:24 PM, Philippe Mathieu-Daudé wrote:
+> Might be relevant:
+> 
+> commit 6df5718bd3ec56225c44cf96440c723c1b611b87
+> Author: Hannes Reinecke <email address hidden>
+> Date:   Wed Oct 29 13:00:15 2014 +0100
+> 
+>     megasas: Rework frame queueing algorithm
+>     
+>     Windows requires the frames to be unmapped, otherwise we run
+>     into a race condition where the updated frame data is not
+>     visible to the guest.
+>     With that we can simplify the queue algorithm and use a bitmap
+>     for tracking free frames.
+> 
+>  /*
+>   * This absolutely needs to be locked if
+>   * qemu ever goes multithreaded.
+>   */
+>  static MegasasCmd *megasas_enqueue_frame(MegasasState *s,
+>      hwaddr frame, uint64_t context, int count)
+> 
+> Using -trace scsi\* -trace megasas\*:
+> 
+> megasas_qf_enqueue frame 0x0 count 0 context 0x0 head 0x0 tail 0x0 busy 1
+> megasas_handle_scsi LD SCSI dev 1/0/0 sdev 0x5555573f5560 xfer 0
+> scsi_req_parsed target 0 lun 0 tag 0 command 53 dir 0 length 0
+> scsi_req_parsed_lba target 0 lun 0 tag 0 command 53 lba 0
+> scsi_req_alloc target 0 lun 0 tag 0
+> scsi_disk_new_request Command: lun=0 tag=0x0 data= 0x35 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+> megasas_scsi_nodata scmd 0: no data to be transferred
+> megasas_mmio_invalid_writel addr 0x44: 0x3101
+> megasas_mmio_invalid_writel addr 0x48: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x4c: 0x380100
+> megasas_mmio_invalid_writel addr 0x50: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x54: 0x3f010004
+> megasas_mmio_invalid_writel addr 0x58: 0x1000000
+> megasas_mmio_invalid_writel addr 0x5c: 0x100044b
+> megasas_mmio_invalid_writel addr 0x60: 0x46
+> megasas_mmio_invalid_writel addr 0x64: 0x44b01
+> megasas_mmio_invalid_writel addr 0x68: 0x4d01
+> megasas_mmio_invalid_writel addr 0x6c: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x70: 0x540100
+> megasas_mmio_invalid_writel addr 0x74: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x78: 0x5b010004
+> megasas_mmio_invalid_writel addr 0x7c: 0x1000000
+> megasas_mmio_invalid_writel addr 0x80: 0x100044b
+> megasas_mmio_invalid_writel addr 0x84: 0x62
+> megasas_mmio_invalid_writel addr 0x88: 0x44b01
+> megasas_mmio_invalid_writel addr 0x8c: 0x6901
+> megasas_mmio_invalid_writel addr 0x90: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x94: 0x700100
+> megasas_mmio_invalid_writel addr 0x98: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x9c: 0x77010004
+> megasas_mmio_writel reg MFI_ODCR0: 0x1000000
+> megasas_mmio_invalid_writel addr 0xa4: 0x100044b
+> megasas_mmio_invalid_writel addr 0xa8: 0x7e
+> megasas_mmio_invalid_writel addr 0xac: 0x44b01
+> megasas_mmio_invalid_writel addr 0xb0: 0x8501
+> megasas_mmio_invalid_writel addr 0xb4: 0x44b0100
+> megasas_mmio_invalid_writel addr 0xb8: 0x8c0100
+> megasas_mmio_invalid_writel addr 0xbc: 0x4b010000
+> megasas_mmio_writel reg MFI_IQPL: 0x4
+> megasas_qf_new frame 0x1 addr 0x0
+> megasas_enqueue_frame fr: 0x7fffa1e00000
+> megasas_qf_enqueue frame 0x1 count 2 context 0x0 head 0x0 tail 0x0 busy 2
+> megasas_init_firmware pa 0x0 
+> megasas_init_queue queue at 0x0 len 0 head 0x0 tail 0x0 flags 0x0
+> megasas_unmap_frame fr: 0x7fffa1e44b00
+> megasas_unmap_frame fr: 0x7fffa1e00000
+> megasas_qf_complete_noirq context 0x0 
+> scsi_req_dequeue target 0 lun 0 tag 0
+> scsi_aio_complete
+> megasas_command_complete scmd 0: status 0x0, residual 0
+> megasas_scsi_complete scmd 0: status 0x0, len 0/0
+> 
+> The frame is unmapped when the complete callback occurs.
+> Then SIGSEGV in megasas_command_complete():
+> 
+> 1856 static void megasas_command_complete(SCSIRequest *req, uint32_t status,
+> 1857                                      size_t resid)
+> 1858 {
+> 1859     MegasasCmd *cmd = req->hba_private;
+> 1860     uint8_t cmd_status = MFI_STAT_OK;
+> 1861 
+> 1862     trace_megasas_command_complete(cmd->index, status, resid);
+> 1863 
+> 1864     if (req->io_canceled) {
+> 1865         return;
+> 1866     }
+> 1867 
+> 1868     if (cmd->dcmd_opcode != -1) {
+> 1869         /*
+> 1870          * Internal command complete
+> 1871          */
+> 1872         cmd_status = megasas_finish_internal_dcmd(cmd, req, resid);
+> 1873         if (cmd_status == MFI_STAT_INVALID_STATUS) {
+> 1874             return;
+> 1875         }
+> 1876     } else {
+> 1877         req->status = status;
+> 1878         trace_megasas_scsi_complete(cmd->index, req->status,
+> 1879                                     cmd->iov_size, req->cmd.xfer);
+> 1880         if (req->status != GOOD) {
+> 1881             cmd_status = MFI_STAT_SCSI_DONE_WITH_ERROR;
+> 1882         }
+> 1883         if (req->status == CHECK_CONDITION) {
+> 1884             megasas_copy_sense(cmd);
+> 1885         }
+> 1886 
+> 1887         cmd->frame->header.scsi_status = req->status;
+> 
+>              ^^^^^^^^^^ This is NULL.
+> 
+> 1888     }
+> 1889     cmd->frame->header.cmd_status = cmd_status;
+> 1890     megasas_complete_command(cmd);
+> 1891 }
+> 
+> ** Changed in: qemu
+>        Status: New => Confirmed
+> 
+
+
+
+I ran this through my minimization script to remove the extraneous qtest
+commands:
+
+cat << EOF | ./i386-softmmu/qemu-system-i386 \
+-M pc-q35-5.0 -no-shutdown -M q35 -device megasas \
+-device scsi-cd,drive=null0 \
+-blockdev driver=null-co,read-zeroes=on,node-name=null0 \
+-nographic -qtest stdio -monitor none -serial none
+outl 0xcf8 0x80001814
+outl 0xcfc 0xc021
+outl 0xcf8 0x80001804
+outw 0xcfc 0x7
+outl 0xcf8 0x80001810
+outl 0xcfc 0xe10c0000
+write 0x44b20 0x1 0x35
+write 0x44b00 0x1 0x03
+write 0xc021e10c0040 0x4 0x014b0400
+write 0xc021e10c00c0 0x1 0x04
+EOF
+
+
+On 200718 1024, Philippe Mathieu-Daudé wrote:
+> Might be relevant:
+> 
+> commit 6df5718bd3ec56225c44cf96440c723c1b611b87
+> Author: Hannes Reinecke <email address hidden>
+> Date:   Wed Oct 29 13:00:15 2014 +0100
+> 
+>     megasas: Rework frame queueing algorithm
+>     
+>     Windows requires the frames to be unmapped, otherwise we run
+>     into a race condition where the updated frame data is not
+>     visible to the guest.
+>     With that we can simplify the queue algorithm and use a bitmap
+>     for tracking free frames.
+> 
+>  /*
+>   * This absolutely needs to be locked if
+>   * qemu ever goes multithreaded.
+>   */
+>  static MegasasCmd *megasas_enqueue_frame(MegasasState *s,
+>      hwaddr frame, uint64_t context, int count)
+> 
+> Using -trace scsi\* -trace megasas\*:
+> 
+> megasas_qf_enqueue frame 0x0 count 0 context 0x0 head 0x0 tail 0x0 busy 1
+> megasas_handle_scsi LD SCSI dev 1/0/0 sdev 0x5555573f5560 xfer 0
+> scsi_req_parsed target 0 lun 0 tag 0 command 53 dir 0 length 0
+> scsi_req_parsed_lba target 0 lun 0 tag 0 command 53 lba 0
+> scsi_req_alloc target 0 lun 0 tag 0
+> scsi_disk_new_request Command: lun=0 tag=0x0 data= 0x35 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+> megasas_scsi_nodata scmd 0: no data to be transferred
+> megasas_mmio_invalid_writel addr 0x44: 0x3101
+> megasas_mmio_invalid_writel addr 0x48: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x4c: 0x380100
+> megasas_mmio_invalid_writel addr 0x50: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x54: 0x3f010004
+> megasas_mmio_invalid_writel addr 0x58: 0x1000000
+> megasas_mmio_invalid_writel addr 0x5c: 0x100044b
+> megasas_mmio_invalid_writel addr 0x60: 0x46
+> megasas_mmio_invalid_writel addr 0x64: 0x44b01
+> megasas_mmio_invalid_writel addr 0x68: 0x4d01
+> megasas_mmio_invalid_writel addr 0x6c: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x70: 0x540100
+> megasas_mmio_invalid_writel addr 0x74: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x78: 0x5b010004
+> megasas_mmio_invalid_writel addr 0x7c: 0x1000000
+> megasas_mmio_invalid_writel addr 0x80: 0x100044b
+> megasas_mmio_invalid_writel addr 0x84: 0x62
+> megasas_mmio_invalid_writel addr 0x88: 0x44b01
+> megasas_mmio_invalid_writel addr 0x8c: 0x6901
+> megasas_mmio_invalid_writel addr 0x90: 0x44b0100
+> megasas_mmio_invalid_writel addr 0x94: 0x700100
+> megasas_mmio_invalid_writel addr 0x98: 0x4b010000
+> megasas_mmio_invalid_writel addr 0x9c: 0x77010004
+> megasas_mmio_writel reg MFI_ODCR0: 0x1000000
+> megasas_mmio_invalid_writel addr 0xa4: 0x100044b
+> megasas_mmio_invalid_writel addr 0xa8: 0x7e
+> megasas_mmio_invalid_writel addr 0xac: 0x44b01
+> megasas_mmio_invalid_writel addr 0xb0: 0x8501
+> megasas_mmio_invalid_writel addr 0xb4: 0x44b0100
+> megasas_mmio_invalid_writel addr 0xb8: 0x8c0100
+> megasas_mmio_invalid_writel addr 0xbc: 0x4b010000
+> megasas_mmio_writel reg MFI_IQPL: 0x4
+> megasas_qf_new frame 0x1 addr 0x0
+> megasas_enqueue_frame fr: 0x7fffa1e00000
+> megasas_qf_enqueue frame 0x1 count 2 context 0x0 head 0x0 tail 0x0 busy 2
+> megasas_init_firmware pa 0x0 
+> megasas_init_queue queue at 0x0 len 0 head 0x0 tail 0x0 flags 0x0
+> megasas_unmap_frame fr: 0x7fffa1e44b00
+> megasas_unmap_frame fr: 0x7fffa1e00000
+> megasas_qf_complete_noirq context 0x0 
+> scsi_req_dequeue target 0 lun 0 tag 0
+> scsi_aio_complete
+> megasas_command_complete scmd 0: status 0x0, residual 0
+> megasas_scsi_complete scmd 0: status 0x0, len 0/0
+> 
+> The frame is unmapped when the complete callback occurs.
+> Then SIGSEGV in megasas_command_complete():
+> 
+> 1856 static void megasas_command_complete(SCSIRequest *req, uint32_t status,
+> 1857                                      size_t resid)
+> 1858 {
+> 1859     MegasasCmd *cmd = req->hba_private;
+> 1860     uint8_t cmd_status = MFI_STAT_OK;
+> 1861 
+> 1862     trace_megasas_command_complete(cmd->index, status, resid);
+> 1863 
+> 1864     if (req->io_canceled) {
+> 1865         return;
+> 1866     }
+> 1867 
+> 1868     if (cmd->dcmd_opcode != -1) {
+> 1869         /*
+> 1870          * Internal command complete
+> 1871          */
+> 1872         cmd_status = megasas_finish_internal_dcmd(cmd, req, resid);
+> 1873         if (cmd_status == MFI_STAT_INVALID_STATUS) {
+> 1874             return;
+> 1875         }
+> 1876     } else {
+> 1877         req->status = status;
+> 1878         trace_megasas_scsi_complete(cmd->index, req->status,
+> 1879                                     cmd->iov_size, req->cmd.xfer);
+> 1880         if (req->status != GOOD) {
+> 1881             cmd_status = MFI_STAT_SCSI_DONE_WITH_ERROR;
+> 1882         }
+> 1883         if (req->status == CHECK_CONDITION) {
+> 1884             megasas_copy_sense(cmd);
+> 1885         }
+> 1886 
+> 1887         cmd->frame->header.scsi_status = req->status;
+> 
+>              ^^^^^^^^^^ This is NULL.
+> 
+> 1888     }
+> 1889     cmd->frame->header.cmd_status = cmd_status;
+> 1890     megasas_complete_command(cmd);
+> 1891 }
+> 
+> ** Changed in: qemu
+>        Status: New => Confirmed
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1878057
+> 
+> Title:
+>   null-ptr dereference in megasas_command_complete
+> 
+> Status in QEMU:
+>   Confirmed
+> 
+> Bug description:
+>   Hello,
+>   While fuzzing, I found an input that triggers a null-pointer dereference in
+>   megasas_command_complete:
+> 
+>   ==14959==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000003 (pc 0x55b1d11b4df1 bp 0x7ffeb55ca450 sp 0x7ffeb55ca1e0 T0)
+>   ==14959==The signal is caused by a WRITE memory access.
+>   ==14959==Hint: address points to the zero page.
+>       #0 0x55b1d11b4df1 in megasas_command_complete /home/alxndr/Development/qemu/hw/scsi/megasas.c:1877:40
+>       #1 0x55b1d11759ec in scsi_req_complete /home/alxndr/Development/qemu/hw/scsi/scsi-bus.c:1430:5
+>       #2 0x55b1d115c98f in scsi_aio_complete /home/alxndr/Development/qemu/hw/scsi/scsi-disk.c:216:5
+>       #3 0x55b1d151c638 in blk_aio_complete /home/alxndr/Development/qemu/block/block-backend.c:1375:9
+>       #4 0x55b1d151c638 in blk_aio_complete_bh /home/alxndr/Development/qemu/block/block-backend.c:1385:5
+>       #5 0x55b1d16f3a5b in aio_bh_call /home/alxndr/Development/qemu/util/async.c:136:5
+>       #6 0x55b1d16f3a5b in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>       #7 0x55b1d16fe43e in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>       #8 0x55b1d16f54fa in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>       #9 0x7f47937c89ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+>       #10 0x55b1d16fbef4 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:219:9
+>       #11 0x55b1d16fbef4 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:242:5
+>       #12 0x55b1d16fbef4 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:518:11
+>       #13 0x55b1d0cd16a6 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1664:9
+>       #14 0x55b1d1608dca in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+>       #15 0x7f4792378e0a in __libc_start_main /build/glibc-GwnBeO/glibc-2.30/csu/../csu/libc-start.c:308:16
+>       #16 0x55b1d091d7b9 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x8f47b9)
+> 
+>   I can reproduce it in qemu 5.0 built with using:
+>   cat << EOF | ~/Development/qemu/build/i386-softmmu/qemu-system-i386 -M pc-q35-5.0 -no-shutdown -M q35 -device megasas -device scsi-cd,drive=null0 -blockdev driver=null-co,read-zeroes=on,node-name=null0 -nographic -qtest stdio -monitor none -serial none
+>   outl 0xcf8 0x80001814
+>   outl 0xcfc 0xc021
+>   outl 0xcf8 0x80001818
+>   outl 0xcf8 0x80001804
+>   outw 0xcfc 0x7
+>   outl 0xcf8 0x80001810
+>   outl 0xcfc 0xe10c0000
+>   outl 0xcf8 0x8000f810
+>   write 0x44b20 0x1 0x35
+>   write 0x44b00 0x1 0x03
+>   write 0xc021e10c0040 0x81 0x014b04000131000000014b04000138000000014b0400013f000000014b04000146000000014b0400014d000000014b04000154000000014b0400015b000000014b04000162000000014b04000169000000014b04000170000000014b04000177000000014b0400017e000000014b04000185000000014b0400018c000000014b04
+>   EOF
+> 
+>   I also attached the trace to this launchpad report, in case the
+>   formatting is broken:
+> 
+>   qemu-system-i386 -qtest stdio -monitor none -serial none -M pc-q35-5.0
+>   -no-shutdown -M q35 -device megasas -device scsi-cd,drive=null0
+>   -blockdev driver=null-co,read-zeroes=on,node-name=null0 -nographic <
+>   attachment
+> 
+>   Please let me know if I can provide any further info.
+>   -Alex
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1878057/+subscriptions
+
+
+Can you still reproduce this issue with the current version of QEMU? For me, it does not crash anymore, so I assume this has been fixed already?
+
+Looks like OSS-Fuzz has a reproducer that still works:
+https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=29192#c3
+
+I'll move this one over to gitlab
+
+If I get https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=29192#c4 right, this has been fixed some days later in June? Or is it still reproducible?
+
+I moved this report over to QEMU's new bug tracker on gitlab.com.
+Please continue with the discussion here:
+
+https://gitlab.com/qemu-project/qemu/-/issues/551
+
+Thanks for moving it over! ... let's close this one here on Launchpad now.
+
+

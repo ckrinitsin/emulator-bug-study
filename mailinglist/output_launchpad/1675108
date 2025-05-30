@@ -1,0 +1,355 @@
+Cocoa UI always crashes on startup
+
+Commit 8bb93c6f99a42c2e0943bc904b283cd622d302c5 ("ui/console: ensure graphic updates don't race with TCG vCPUs") causes the graphic update to run on a non-main thread, which Cocoa is not happy with. It crashes immediately after startup.
+
+$ i386-softmmu/qemu-system-i386 
+2017-03-22 10:09:25.113 qemu-system-i386[15968:9538245] *** Terminating app due to uncaught exception 'NSInternalInconsistencyException', reason: 'nextEventMatchingMask should only be called from the Main Thread!'
+*** First throw call stack:
+(
+	0   CoreFoundation                      0x00007fff91e72e7b __exceptionPreprocess + 171
+	1   libobjc.A.dylib                     0x00007fffa6a5ccad objc_exception_throw + 48
+	2   AppKit                              0x00007fff900953fd -[NSApplication(NSEvent) _nextEventMatchingEventMask:untilDate:inMode:dequeue:] + 4471
+	3   qemu-system-i386                    0x0000000104f75a49 cocoa_refresh + 233
+	4   qemu-system-i386                    0x0000000104e0312c process_queued_cpu_work + 140
+	5   qemu-system-i386                    0x0000000104d1a73c qemu_tcg_rr_cpu_thread_fn + 284
+	6   libsystem_pthread.dylib             0x00007fffa7557aab _pthread_body + 180
+	7   libsystem_pthread.dylib             0x00007fffa75579f7 _pthread_body + 0
+	8   libsystem_pthread.dylib             0x00007fffa75571fd thread_start + 13
+)
+libc++abi.dylib: terminating with uncaught exception of type NSException
+Abort trap: 6
+
+System: macOS 10.12.3, Xcode 8.2.1
+
+On 22 March 2017 at 17:26, Brendan Shanks <email address hidden> wrote:
+> Public bug reported:
+>
+> Commit 8bb93c6f99a42c2e0943bc904b283cd622d302c5 ("ui/console: ensure
+> graphic updates don't race with TCG vCPUs") causes the graphic update to
+> run on a non-main thread, which Cocoa is not happy with. It crashes
+> immediately after startup.
+
+Oops. Alex, we can't just run UI code on random threads like this.
+Any ideas?
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On 22 March 2017 at 17:26, Brendan Shanks <email address hidden> wrote:
+>> Public bug reported:
+>>
+>> Commit 8bb93c6f99a42c2e0943bc904b283cd622d302c5 ("ui/console: ensure
+>> graphic updates don't race with TCG vCPUs") causes the graphic update to
+>> run on a non-main thread, which Cocoa is not happy with. It crashes
+>> immediately after startup.
+>
+> Oops. Alex, we can't just run UI code on random threads like this.
+
+Technically its not a random thread its the vCPU context (which ensures
+the vCPU isn't updating while the display is being updated). But I guess
+the Cocoa is limited to not being able to update from an arbitrary
+thread?
+
+There was a patch posted yesterday to ensure the BQL is held during the
+deferred work but this doesn't look like that.
+
+> Any ideas?
+
+Hmm a quick Google seems to imply Cocoa is inflexible in its
+requirements. You can try this ugly but untested patch (I don't have any
+Macs handy):
+
+modified   ui/console.c
+@@ -1598,8 +1598,16 @@ static void dpy_refresh(DisplayState *s)
+     QLIST_FOREACH(dcl, &s->listeners, next) {
+         if (dcl->ops->dpy_refresh) {
+             if (tcg_enabled()) {
++#ifdef CONFIG_COCOA
++                qemu_mutex_unlock_iothread();
++                start_exclusive();
++                do_safe_dpy_refresh(first_cpu, RUN_ON_CPU_HOST_PTR(dcl));
++                end_exclusive();
++                qemu_mutex_lock_iothread();
++#else
+                 async_safe_run_on_cpu(first_cpu, do_safe_dpy_refresh,
+                                       RUN_ON_CPU_HOST_PTR(dcl));
++#endif
+             } else {
+                 dcl->ops->dpy_refresh(dcl);
+             }
+
+
+Other than that I guess we need to bring forward the plans to "fixed the dirty tracking
+races in display adapters"
+
+>
+> thanks
+> -- PMM
+
+
+--
+Alex Bennée
+
+
+On 23 March 2017 at 11:13, Alex Bennée <email address hidden> wrote:
+> Technically its not a random thread its the vCPU context (which ensures
+> the vCPU isn't updating while the display is being updated). But I guess
+> the Cocoa is limited to not being able to update from an arbitrary
+> thread?
+
+Yes. It's very common for windowing libraries to mandate that you
+do all windowing operations from one specific thread.
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On 23 March 2017 at 11:13, Alex Bennée <email address hidden> wrote:
+>> Technically its not a random thread its the vCPU context (which ensures
+>> the vCPU isn't updating while the display is being updated). But I guess
+>> the Cocoa is limited to not being able to update from an arbitrary
+>> thread?
+>
+> Yes. It's very common for windowing libraries to mandate that you
+> do all windowing operations from one specific thread.
+
+Fair enough. Well let me know if that works OK on MacOS and I'll fold it
+in to the other console patches. In fact I might as well do the
+start/end_exclusive dance for all OSes and it will achieve the same thing.
+
+--
+Alex Bennée
+
+
+
+On Mar 23, 2017, at 7:35 AM, <email address hidden> wrote:
+
+> Message: 15
+> Date: Thu, 23 Mar 2017 11:13:02 +0000
+> From: Alex Benn?e <email address hidden>
+> To: Peter Maydell <email address hidden>
+> Cc: Bug 1675108 <email address hidden>,	QEMU Developers
+> 	<email address hidden>, Gerd Hoffmann <email address hidden>
+> Subject: Re: [Qemu-devel] [Bug 1675108] [NEW] Cocoa UI always crashes
+> 	on startup
+> Message-ID: <email address hidden>
+> Content-Type: text/plain; charset=utf-8
+> 
+> 
+> Peter Maydell <email address hidden> writes:
+> 
+>> On 22 March 2017 at 17:26, Brendan Shanks <email address hidden> wrote:
+>>> Public bug reported:
+>>> 
+>>> Commit 8bb93c6f99a42c2e0943bc904b283cd622d302c5 ("ui/console: ensure
+>>> graphic updates don't race with TCG vCPUs") causes the graphic update to
+>>> run on a non-main thread, which Cocoa is not happy with. It crashes
+>>> immediately after startup.
+>> 
+>> Oops. Alex, we can't just run UI code on random threads like this.
+> 
+> Technically its not a random thread its the vCPU context (which ensures
+> the vCPU isn't updating while the display is being updated). But I guess
+> the Cocoa is limited to not being able to update from an arbitrary
+> thread?
+> 
+> There was a patch posted yesterday to ensure the BQL is held during the
+> deferred work but this doesn't look like that.
+> 
+>> Any ideas?
+> 
+> Hmm a quick Google seems to imply Cocoa is inflexible in its
+> requirements. You can try this ugly but untested patch (I don't have any
+> Macs handy):
+> 
+> modified   ui/console.c
+> @@ -1598,8 +1598,16 @@ static void dpy_refresh(DisplayState *s)
+>     QLIST_FOREACH(dcl, &s->listeners, next) {
+>         if (dcl->ops->dpy_refresh) {
+>             if (tcg_enabled()) {
+> +#ifdef CONFIG_COCOA
+> +                qemu_mutex_unlock_iothread();
+> +                start_exclusive();
+> +                do_safe_dpy_refresh(first_cpu, RUN_ON_CPU_HOST_PTR(dcl));
+> +                end_exclusive();
+> +                qemu_mutex_lock_iothread();
+> +#else
+>                 async_safe_run_on_cpu(first_cpu, do_safe_dpy_refresh,
+>                                       RUN_ON_CPU_HOST_PTR(dcl));
+> +#endif
+>             } else {
+>                 dcl->ops->dpy_refresh(dcl);
+>             }
+> 
+> 
+> Other than that I guess we need to bring forward the plans to "fixed the dirty tracking
+> races in display adapters"
+> 
+>> 
+>> thanks
+>> -- PMM
+> 
+> 
+> --
+> Alex Benn?e
+
+Your patch does work. I tested it on Mac OS 10.6.8 using qemu-sytem-ppc. 
+
+Has anyone checked on the GTK front-end yet to see if it is having similar problems?
+
+Tested on 10.12.3, it doesn't crash immediately (like before) but crashes reliably once I send some keyboard input to qemu:
+
+$ i386-softmmu/qemu-system-i386 
+**
+ERROR:/Users/pip/no_backup/qemu/translate-common.c:34:tcg_handle_interrupt: assertion failed: (qemu_mutex_iothread_locked())
+Abort trap: 6
+
+
+
+Thread 0 Crashed:: Dispatch queue: com.apple.main-thread
+0   libsystem_kernel.dylib        	0x00007fffa746edd6 __pthread_kill + 10
+1   libsystem_pthread.dylib       	0x00007fffa755a787 pthread_kill + 90
+2   libsystem_c.dylib             	0x00007fffa73d4420 abort + 129
+3   libglib-2.0.0.dylib           	0x00000001076aec86 g_assertion_message + 388
+4   libglib-2.0.0.dylib           	0x00000001076aece4 g_assertion_message_expr + 94
+5   qemu-system-i386              	0x00000001066bb1ec tcg_handle_interrupt + 156 (translate-common.c:50)
+6   qemu-system-i386              	0x0000000106740dfc pic_irq_request + 156 (pc.c:187)
+7   qemu-system-i386              	0x000000010673e5e4 gsi_handler + 36 (pc.c:115)
+8   qemu-system-i386              	0x000000010685e97a kbd_update_kbd_irq + 138 (pckbd.c:180)
+9   qemu-system-i386              	0x000000010694164a qemu_input_event_send_impl + 938 (input.c:328)
+10  qemu-system-i386              	0x000000010694188f qemu_input_event_send_key + 239 (input.c:359)
+11  qemu-system-i386              	0x0000000106946a00 cocoa_refresh + 272 (cocoa.m:1402)
+12  qemu-system-i386              	0x000000010693f6a8 gui_update + 104 (console.c:1603)
+
+
+The keyboard input issue looks the same as #1675549, and that's on Linux/SDL. So not specific to this fix or Cocoa.
+
+
+Brendan Shanks <email address hidden> writes:
+
+> Tested on 10.12.3, it doesn't crash immediately (like before) but
+> crashes reliably once I send some keyboard input to qemu:
+>
+> $ i386-softmmu/qemu-system-i386
+> **
+> ERROR:/Users/pip/no_backup/qemu/translate-common.c:34:tcg_handle_interrupt: assertion failed: (qemu_mutex_iothread_locked())
+> Abort trap: 6
+
+Can you test with the suggested patch I posted yesterday? If we keep the
+update under BQL this shouldn't fail.
+
+>
+>
+> Thread 0 Crashed:: Dispatch queue: com.apple.main-thread
+> 0   libsystem_kernel.dylib        	0x00007fffa746edd6 __pthread_kill + 10
+> 1   libsystem_pthread.dylib       	0x00007fffa755a787 pthread_kill + 90
+> 2   libsystem_c.dylib             	0x00007fffa73d4420 abort + 129
+> 3   libglib-2.0.0.dylib           	0x00000001076aec86 g_assertion_message + 388
+> 4   libglib-2.0.0.dylib           	0x00000001076aece4 g_assertion_message_expr + 94
+> 5   qemu-system-i386              	0x00000001066bb1ec tcg_handle_interrupt + 156 (translate-common.c:50)
+> 6   qemu-system-i386              	0x0000000106740dfc pic_irq_request + 156 (pc.c:187)
+> 7   qemu-system-i386              	0x000000010673e5e4 gsi_handler + 36 (pc.c:115)
+> 8   qemu-system-i386              	0x000000010685e97a kbd_update_kbd_irq + 138 (pckbd.c:180)
+> 9   qemu-system-i386              	0x000000010694164a qemu_input_event_send_impl + 938 (input.c:328)
+> 10  qemu-system-i386              	0x000000010694188f qemu_input_event_send_key + 239 (input.c:359)
+> 11  qemu-system-i386              	0x0000000106946a00 cocoa_refresh + 272 (cocoa.m:1402)
+> 12  qemu-system-i386              	0x000000010693f6a8 gui_update + 104 (console.c:1603)
+
+
+--
+Alex Bennée
+
+
+On Do, 2017-03-23 at 11:31 +0000, Alex Bennée wrote:
+> Peter Maydell <email address hidden> writes:
+> 
+> > On 23 March 2017 at 11:13, Alex Bennée <email address hidden> wrote:
+> >> Technically its not a random thread its the vCPU context (which ensures
+> >> the vCPU isn't updating while the display is being updated). But I guess
+> >> the Cocoa is limited to not being able to update from an arbitrary
+> >> thread?
+> >
+> > Yes. It's very common for windowing libraries to mandate that you
+> > do all windowing operations from one specific thread.
+> 
+> Fair enough. Well let me know if that works OK on MacOS and I'll fold it
+> in to the other console patches. In fact I might as well do the
+> start/end_exclusive dance for all OSes and it will achieve the same thing.
+
+Where do we stand with this one?
+
+cheers,
+  Gerd
+
+
+
+
+Gerd Hoffmann <email address hidden> writes:
+
+> On Do, 2017-03-23 at 11:31 +0000, Alex Bennée wrote:
+>> Peter Maydell <email address hidden> writes:
+>>
+>> > On 23 March 2017 at 11:13, Alex Bennée <email address hidden> wrote:
+>> >> Technically its not a random thread its the vCPU context (which ensures
+>> >> the vCPU isn't updating while the display is being updated). But I guess
+>> >> the Cocoa is limited to not being able to update from an arbitrary
+>> >> thread?
+>> >
+>> > Yes. It's very common for windowing libraries to mandate that you
+>> > do all windowing operations from one specific thread.
+>>
+>> Fair enough. Well let me know if that works OK on MacOS and I'll fold it
+>> in to the other console patches. In fact I might as well do the
+>> start/end_exclusive dance for all OSes and it will achieve the same thing.
+>
+> Where do we stand with this one?
+
+I've got two patches in my tree at the moment. I was holding off posting
+the series to see if I could make more progress with the record/replay
+bug. I'll post the series tomorrow morning but if you want to grab them
+ahead of that see:
+
+  https://github.com/stsquad/qemu/commit/6c0ddfc5752f311b4c5a2956de25821cc2cd3fd6
+  https://github.com/stsquad/qemu/commit/15d2b05a20879017f20370b71d5d144947b693fe
+
+--
+Alex Bennée
+
+
+On 27 March 2017 at 16:18, Alex Bennée <email address hidden> wrote:
+> I've got two patches in my tree at the moment. I was holding off posting
+> the series to see if I could make more progress with the record/replay
+> bug.
+
+rc candidates are cut on Tuesdays, so it's better in general not
+to sit on a fix for rc bugs if it causes them to miss going into
+the next rc tag.
+
+thanks
+-- PMM
+
+
+I just did a quick test on 10.12.3 with those two patches and didn't get any crashes
+
+
+Brendan Shanks <email address hidden> writes:
+
+> I just did a quick test on 10.12.3 with those two patches and didn't get
+> any crashes
+
+Awesome. I'm rolling the series now. I assume will pickup the patches in
+due course.
+
+--
+Alex Bennée
+
+
+Fixed in -rc2, closing.
+

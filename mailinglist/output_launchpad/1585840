@@ -1,0 +1,100 @@
+multiprocess program gets incorrect results with qemu arm-linux-user
+
+The attached program can run either in a threaded mode or a multiprocess mode.  It defaults to threaded mode, and switches to multiprocess mode if the first positional argument is "process".  "success" of the test is defined as the final count being seen as 2000000 by both tasks.
+
+In standard linux x86_64 userspace (i7, 4 cores) and in standard armhf userspace (4 cores), the test program consistently completes successfully in both modes.  But with qemu arm-linux-user, the test consistently succeeds in threaded mode and generally fails in multiprocess mode.
+
+The test reflects an essential aspect of how the Free and Open Source project linuxcnc's IPC system works: shared memory regions (created by shmat, but mmap would probably behave the same) contain data and mutexes.  I observed that our testsuite encounters numerous deadlocks and failures when running in an schroot with qemu-user (x86_64 host), and I believe the underlying cause is improper support for atomic operations in a multiprocess model. (the testsuite consistently passes on real hardware)
+
+I observed the same failure at v1.6.0 and master (v2.6.0-424-g287db79), as well as in the outdated Debian version 1:2.1+dfsg-12+deb8u5a.
+
+
+
+Hi. Your test program doesn't work for me running natively (x86-64):
+$ gcc -O -pthread -o /tmp/shmipc-native -static /tmp/shmipc.c
+$ time /tmp/shmipc-native 
+threaded test
+^C
+
+real    929m16.382s
+user    1858m14.140s
+sys     0m2.924s
+
+...I left it running overnight and it still hadn't finished when I got in in the morning, so I killed it.
+
+Do you have a repro case that completes in a more reasonable timescale?
+
+
+I agree.  The test program I originally attached works (completes in way under 1 second) on
+ debian wheezy
+ x86_64
+ i7-4930K
+
+and doesn't work on
+ debian stretch
+ x86_64
+ i7-4790K
+
+The test program should run in well under 1s, even under qemu-user-arm.
+
+The problem with my test program seems to be in the initial synchronization, which is janky because my standalone test program isn't using a proper synchronization primitive to make sure the two threads start incrementing the shared counter at around the same time.  I've attached an updated version which works for me on wheezy x86_64, stretch x86_64, trusty armhf, but not on stretch x86-64 + qemu-user.
+
+
+Typical output:
+ $ ./a.out process
+ multiprocess test
+ starting is_primary=0
+ starting is_primary=1
+ at end, *mem = 2000000
+ at end, *mem = 2000000
+ should be 2000000
+ should be 2000000
+
+Typical failing output under qemu-arm-static:
+
+ $ qemu-arm-static ./a.arm process
+ multiprocess test
+ starting is_primary=0
+ starting is_primary=1
+ at end, *mem = 1010975
+ at end, *mem = 1010975
+ should be 2000000
+ should be 2000000
+
+Note that when qemu-arm-static is restricted to 1 CPU via `tasket`, the frequency of the failure changes from "almost every time" to "one in ten".
+
+Thank you for taking the time to look at my test program.  I apologize that I caused you to waste a day of (CPU) time waiting for the test program to complete.
+
+Latest tests of qemu-arm-static performed with
+$ apt policy qemu-user-static
+qemu-user-static:
+  Installed: 1:2.8+dfsg-6+deb9u3
+  Candidate: 1:2.8+dfsg-6+deb9u3
+  Version table:
+ *** 1:2.8+dfsg-6+deb9u3 500
+        500 http://security.debian.org stretch/updates/main amd64 Packages
+        100 /var/lib/dpkg/status
+     1:2.8+dfsg-6+deb9u2 500
+        500 http://ftp.us.debian.org/debian stretch/main amd64 Packages
+
+
+Thanks for the updated test program. I've now run it and can confirm it still fails in 'process' mode with current head of git:
+
+$ ~/linaro/qemu-from-laptop/qemu/build/all-linux-static/arm-linux-user/qemu-arm /tmp/shmipc-armhf process
+multiprocess test
+starting is_primary=0
+starting is_primary=1
+at end, *mem = 1013192
+at end, *mem = 1013192
+should be 2000000
+should be 2000000
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/121
+
+

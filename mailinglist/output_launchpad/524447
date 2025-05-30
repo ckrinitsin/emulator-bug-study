@@ -1,0 +1,323 @@
+virsh save is very slow
+
+As reported here: http://www.redhat.com/archives/libvir-list/2009-December/msg00203.html
+
+"virsh save" is very slow - it writes the image at around 1MB/sec on my test system.
+
+(I think I saw a bug report for this issue on Fedora's bugzilla, but I can't find it now...)
+
+Confirmed under Karmic.
+
+Anthony-
+
+Any upstream update here?  Looks like this issue has been reported on the qemu-devel@mailing list.  Curious if or when we might expect a fix for this?
+
+Thanks!
+
+I'm marking confirmed, since there's external references to this situation happening.
+
+This stops me migrating away from VMware Server to KVM/libvirt. I use suspend (to disk) for backup an when shutting down the host. It would need nearly an hour to save all domains on our server. Why are there so few responses here an in the qemu-Mailinglist? Does nobody care?
+
+I can reproduce with:
+
+x86_64-softmmu/qemu-system-x86_64 -hda ~/images/linux.img -snapshot -m 4G -monitor stdio -enable-kvm
+QEMU 0.12.50 monitor - type 'help' for more information
+(qemu) migrate_set_speed 1G
+(qemu) migrate -d "exec:dd of=foo.img"
+
+On:
+
+commit d9b73e47a3d596c5b33802597ec5bd91ef3348e2
+Author: Corentin Chary <email address hidden>
+Date:   Tue Jun 1 23:05:44 2010 +0200
+
+    vnc: add missing target for vnc-encodings-*.o
+
+
+Even though the rate limit is set at 1G, we're not getting more than 1-2MB/s of migration traffic.
+
+This actually turns out to be related to dd's default block size.  By default, dd uses a block size of 512.  The effect of this is that qemu fills the pipe buffer very quickly because dd just is submitting very small requests (that will require a RMW).
+
+If you set an explict block size with dd (via bs=1M), you'll notice a significant improvement in throughput.
+
+So I think this turns out to be a libvirt issue, not a qemu issue.
+
+I filed an upstream libvirt bug for the dd block size issue:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=599091
+
+Changing to libvirt as commentary here, and on the upstream bug report by Cole indicate a fix has been commit that improves this performance.  
+
+Re-introducing qemu-kvm, as commentary on qemu-devel mailing list suggest there could be a timing concern meaning poor performance.  Leaving Libvirt on this report, as upstream libvirt have quoted improved performance adjusting the block size for dd.  However, Qemu feel that the real issue is in the qemu/kvm code.
+
+Thanks.
+
+Do you have a link for the qemu-devel thread? I had a look at http://lists.gnu.org/archive/html/qemu-devel/ but couldn't see anything.
+
+Just a note that the 0.8.1 release available in maverick gives me about
+a 50-second save for a 512M memory image (producing 100M outfile).  The
+patch listed above and suspected of speeding the saves is not in 0.8.1.
+When I hand-apply just that patch, saves take about 8 seconds, but
+restore fails.  Presumably taking the whole of latest git (or 0.8.2
+whenever it is released) will result in both working and fast
+save/restore.
+
+
+You may want to try the patch to qemu that avi just posted to the qemu-devel mailing list. I think this would probably fix your issue.
+
+Iggy, which patch exactly? I don't seem to be able to find it.
+
+Frederic, this patch:
+http://<email address hidden>/msg37743.html
+
+Frederick,
+
+please let me know if you can confirm that this patch fixes it for you.  If you need
+me to set up a ppa with that patch, please let me know.
+
+@earl,
+
+thanks for finding the specific patch!
+
+Will a fix for this go into maverick?
+
+This is quite critical for using kvm/libvirt for virtual server hosting on maverick.
+
+The patch is in 0.13.0, so changing the status.
+
+How should I interpret "Fix Released"?
+
+qemu in maverick is still 0.12.5 and 0.12.3 in lucid.
+
+Will this not be fixed in current stable LTS and non-LTS releases?
+
+Michael Tokarev <email address hidden> writes:
+
+> 03.01.2011 16:23, EsbenHaabendal wrote:
+>> How should I interpret "Fix Released"?
+>> 
+>> qemu in maverick is still 0.12.5 and 0.12.3 in lucid.
+>
+> Not all the world is ubuntu.  In qemu (and qemu-kvm) the
+> issue is fixed in 0.13, which were released quite some
+> time ago.
+>
+>> Will this not be fixed in current stable LTS and non-LTS releases?
+>
+> There's no "stable LTS" and "non-LTS" releases in qemu,
+> there are plain releases.
+
+Ok.  I see.
+
+And the current importance for libvirt (Ubuntu) and qemu-kvm (Ubuntu) is
+marked as "Wishlist".
+
+So my question goes to these two components.  When can we expect to see
+this fixed in current Ubuntu releases, of which I currently count at
+least maverick and lucid.
+
+Hi,
+
+please test the qemu-kvm packages in ppa:serge-hallyn/virt for lucid (0.12.3+noroms-0ubuntu10slowsave2) and maverick (0.12.5+noroms-0ubuntu7slowsave2), which have the proposed patch from upstream.  If they succeed, then I will proceed with the SRU.
+
+
+
+
+
+
+In order to proceed with SRU, we need someone to confirm that the debs in comment #21 or #22 work for them.
+
+Using ubuntu natty narwhal installed today (2011-03-24) I tried to do a snapshot with the help of libvirt. Here are the results using natty version of qemu-kvm and libvirt and using presented slowdown packages.
+
+root@koberec:~# time virsh snapshot-create 1
+Domain snapshot 1300968929 created
+
+real    4m39.594s
+user    0m0.000s
+sys     0m0.020s
+root@koberec:~# cd /storage/slowsave/
+root@koberec:/storage/slowsave# dpkg -l | grep -E 'libvirt|qemu'                                                                                                                                                 
+ii  libvirt-bin                     0.8.8-1ubuntu5                           the programs for the libvirt library
+ii  libvirt0                        0.8.8-1ubuntu5                           library for interfacing with different virtualization systems
+ii  qemu-common                     0.14.0+noroms-0ubuntu3                   qemu common functionality (bios, documentation, etc)
+ii  qemu-kvm                        0.14.0+noroms-0ubuntu3                   Full virtualization on i386 and amd64 hardware
+root@koberec:/storage/slowsave# dpkg -r qemu-common qemu-kvm                                                                                                                                                     
+root@koberec:/storage/slowsave# dpkg -i qemu-common_0.12.5+noroms-0ubuntu7.2_all.deb qemu-kvm_0.12.5+noroms-0ubuntu7.2_amd64.deb 
+root@koberec:/storage/slowsave# pkill kvm; sleep 5; service libvirt-bin restart
+root@koberec:/storage/slowsave# time virsh snapshot-create 1
+Domain snapshot 1300969754 created
+
+real    2m22.055s
+user    0m0.000s
+sys     0m0.010s
+root@koberec:/storage/slowsave# qemu-img snapshot -l /storage/debian.qcow2 | tail -n 1
+8         1300969754              57M 2011-03-24 08:29:14   00:03:37.652
+root@koberec:/storage/slowsave# virsh console 1
+Connected to domain vm
+Escape character is ^]
+
+Debian GNU/Linux 5.0 debian ttyS0
+
+debian login: root
+Password: 
+Last login: Thu Mar 24 08:15:18 EDT 2011 on ttyS0
+Linux debian 2.6.26-2-amd64 #1 SMP Thu Sep 16 15:56:38 UTC 2010 x86_64
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+debian:~# free -m
+             total       used       free     shared    buffers     cached
+Mem:           561         39        521          0          4         16
+-/+ buffers/cache:         19        542
+Swap:          478          0        478
+debian:~# 
+root@koberec:/storage/slowsave# dd if=/dev/urandom of=/storage/emptyfile bs=1M count=40
+40+0 records in
+40+0 records out
+41943040 bytes (42 MB) copied, 5.4184 s, 7.7 MB/s
+
+
+I am not sure if my measurements are relevant to anything in here, but I hope so.
+
+Thanks for that info.  That is unexpected.  Could you send the xml description of the domain you were snapshotting, as well as the format of the backing file (i.e. qemu-img info filename.img) and what filesystem it is stored on (or whether it is LVM)?  I'd like to try to reproduce it.
+
+Since you are seeing this in natty, it seems certain that while your symptom is the same as that in the original bug report, the cause is different.  So it may be best to open a new bug report to track down the new issue in natty.
+
+
+To be clear, please re-install the stock natty packages, do a virsh snapshot-create, and then do 'ubuntu-bug libvirt-bin' to file a new bug.  Then please give the info I asked for in comment 25 in that bug.
+
+Thanks!
+
+In reply to question #26 https://bugs.launchpad.net/ubuntu/+source/libvirt/+bug/741887
+
+In reply to question #25: everything is included in #27. Is it enough?
+
+Yes, thanks.
+
+I'd like to help get this fixed, particularly in Lucid.  What can I do?  Does #21 and #22 still need testing?
+
+@Jeff,
+
+they do still need testing.  However at this point new ones need to be generated.  There is a bit of a backlog on libvirt updates  to push.  Depending on how those go, I could get packages into -proposed either next week or in 2-3 weeks.
+
+I'll make a note to queue this, and ping here when I've pushed a fix to -proposed, asking you to test.
+
+Thanks!
+
+Oops, this is for qemu-kvm, not libvirt.  That can go immediately.
+
+(setting importance to medium because it has a moderate impact on a core application, and especially because it has no workaround)
+
+Ok, great!  Thanks for the quick response.  I did just now get finished testing the packages you attached in #21 using my lucid box.  Saves of a 256Mb guest went from ~50 seconds to ~3.  So it does seem to fix the issue.  I can set up a Maverick box if you need it tested there as well.
+
+I checked for basic functionality with the packages you provided and the basics seem to work, (virsh start, stop, restore, save. Guest disk, net, vnc) but I didn't do much more.  How deep should I go testing for regressions?
+
+Actually maverick is waiting for a fix for bug 790145 to be verified, but lucid is free.  I've uploaded the proposed fix to lucid-proposed, it's waiting for an SRU admin to approve it.  I will also post the amd64 lucid .debs at http://people.canonical.com/~serge/qemu-slow-save/.
+
+Hello Chris, or anyone else affected,
+
+Accepted qemu-kvm into lucid-proposed, the package will build now and be available in a few hours. Please test and give feedback here. See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed. Thank you in advance!
+
+Tested 0.12.3+noroms-0ubuntu9.14 on Lucid amd64 with all available updates.  Save speed is now approx 3 seconds for a 256Mb guest.  Tested virsh with start, stop, save, restore, suspend, resume, shutdown, destroy.  Tested guest with smp, virtio disk, virtio net, vnc display.  Everything worked as expected.
+
+If there's more I can do, let me know.  Thanks!
+
+Jeff thanks for the testing!
+
+I'll take that as verification.. marking verification-done. It just needs to wait 7 days to clear -proposed in case it causes any unintended regressions.
+
+I'm sorry, the lucid qemu-kvm update has been superseded by a security update in 0.12.3+noroms-0ubuntu9.15.
+
+I'm sorry - per the rules listed in https://wiki.ubuntu.com/StableReleaseUpdates, only bugs which are >= high priority are eligible for SRU. If you feel this bug should be high priority, please say so (with rationale) here.
+
+An updated package for lucid through natty will be placed in the ubuntu-virt ppa (https://launchpad.net/~ubuntu-virt/+archive/ppa) as an alternative way to get this fix.
+
+
+The page you referenced doesn't include anything that I can find about the ticket priority level.  It states that "Stable release updates will, in general, only be issued in order to fix high-impact bugs" and provides several examples.  Among them is "Bugs which do not fit under above categories, [security vulnerabilities, severe regressions, or loss of user data] but (1) have an obviously safe patch and (2) affect an application rather than critical infrastructure packages (like X.org or the kernel)."
+
+I submit that this is an "obviously safe patch."  The change is small, simple, isolated, has been tested to work, and doesn't change any interfaces.  Is qemu-kvm considered a "critical infrastructure package" or not?  I don't know the answer to that, but I can see valid arguments both for and against.
+
+I also have an example of a potential data loss situation, though it is admittedly somewhat weak.  I'll spare everyone the narrative but I'll share it if it would be helpful.
+
+Serge - why do you think this can't be SRU'd?  It's already been accepted into lucid-proposed once, then verified, and the only reason it's not in lucid-updates is that it got superseded by a security upload before the 7-day testing period had elapsed.
+
+If you made a new upload to lucid-proposed based on the new security upload I see no reason why it couldn't be accepted and then copied to -updates after it's been verified and the 7-day testing period has ended.
+
+I see activity around this bug is going on and on, but I don't understand -- is the talk about this patch --
+http://anonscm.debian.org/gitweb/?p=collab-maint/qemu-kvm.git;a=commit;h=7e32b4ca0ea280a2e8f4d9ace1a15d5e633d9a95
+
+?
+
+Michael: Yes, that is the correct patch. 
+
+I just wanted to point out that we've this patch in Debian since ages, and it's been included in upstream for a long time too.  Added a debbug reference for this as well.
+
+@Serge @Chris - So it sounds like this _could_ make it into Lucid? Anyone I can bribe to make that happen?
+
+As an aside, I have been running LTS versions for 8 years and I must say it seems we need a different priority scale for LTS. This bug renders the use of kvm in 10.04 very painful and the plan would be to let that exist for 5 years? Feels like a lot of key improvements are overlooked because they don't make your machine explode, but from a sys admins perspective, it feels like the risks of running the latest versions so bug fixes trickle in outweighs the missing bits in an unmaintained LTS :/
+
+This issue + this one (https://bugs.launchpad.net/ubuntu/+source/libvirt/+bug/555981) makes for a sad day.
+
+Hello Chris, or anyone else affected,
+
+Accepted qemu-kvm into lucid-proposed. The package will build now and be available in a few hours. Please test and give feedback here. See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed. Thank you in advance!
+
+Lucid 10.04.4 amd64 host.  2.6.32-38-server.  All packages up to date. 
+
+Guest:
+	Win 7 64bit
+	1Gb RAM (all in use in guest)
+	2 vproc
+	VirtIO disk (virtio-win-0.1-22)
+	VirtIO network
+	2 IDE cdroms
+	VNC display
+
+virsh save:
+	0.12.3+noroms-0ubuntu9.17		503.8 seconds
+	0.12.3+noroms-0ubuntu9.18		26.4 seconds
+
+Tested virsh start, stop, save, restore, suspend, resume, shutdown, destroy.  All works as expected.  Guest functionality unchanged.
+
+Thanks Jeff! Barring any regressions being reported, this should arrive in lucid-updates around the 24th.
+
+Is something holding up the release to lucid-updates?
+
+Ben, yes, sorry I missed the fact that there was already another bug that needs verification in lucid-proposed. Bug #592010 needs to be verified, or reverted, before this one can proceed to lucid-updates. Verification is tricky, since one needs to do a hardy -> lucid upgrade to verify it.
+
+I'll go stand up some vms to test that one out.
+
+I tested that other bug.  As far as I can tell it is not fixed.  I haven't gotten any sort of response on it for a week.  So... now what?
+
+This bug was fixed in the package qemu-kvm - 0.12.3+noroms-0ubuntu9.18
+
+---------------
+qemu-kvm (0.12.3+noroms-0ubuntu9.18) lucid-proposed; urgency=low
+
+  [ Michael Tokarev ]
+  * QEMUFileBuffered:-indicate-that-were-ready-when-the-underlying-file-is-ready.diff
+   (patch from upstream to speed up migration dramatically)
+   (closes: #597517) (LP: #524447)
+
+  [ Serge Hallyn ]
+  * debian/control: make qemu-common replace qemu (<< 0.12.3+noroms-0ubuntu9.17)
+    (LP: #592010)
+ -- Serge Hallyn <email address hidden>   Mon, 13 Feb 2012 11:24:18 -0600
+
+Just wanted to say thanks to everyone who got this fix out. Works great!
+
+See https://bugs.launchpad.net/ubuntu/+source/qemu-kvm/+bug/524447/comments/5
+
+Apparently increasing the dd block size greatly increases the speed of the domain save operation.
+
+commit 20206a4bc9f1293c69eca79290a55a5fa19976d5 in libvirt git changes the dd blocksize to 1M. This decreased the time required for a save of a suspended 512MB guest from 3min47sec to 56sec.
+
+An additional patch avoids the overhead of seeking to a 1M alignment:
+https://www.redhat.com/archives/libvir-list/2010-June/msg00239.html
+
+This is included in 0.8.2. In addition upstream QEMU has identified & fixed a flaw that had significant speed impact
+

@@ -1,0 +1,144 @@
+TI Stellaris lm3s811evb (ARM Cortex-M3) : Systick interrupt not working
+
+I've tried to create a small project that uses the CMSIS as base library.
+The problem is that the SysTick_interrupt_handler() doesn't get executed when the systick event is detected in QEMU. Furthermore, it seems asif QEMU gets stuck in an endless loop. QEMU doesn't respond to Ctrl-C on the command line and the GDB session also stalls. 'kill -9' is the only way to stop QEMU.
+
+It seems asif the initialisation of the NVIC works fine. I've traced the function calls in QEMU as follows:
+stellaris.c: stellaris_init() - Perform generic armv7 init: armv7m_init()
+   armv7m.c: armv7m_init() - Create and init the nvic:
+                               nvic = qdev_create(NULL, "armv7m_nvic");
+                               env->nvic = nvic;
+                               qdev_init_nofail(nvic);
+                           - Configure the programmable interrupt controller:
+                               Call: arm_pic_init_cpu() 
+                                        qemu_allocate_irqs(arm_pic_cpu_handler)
+                           - Initialise 64 interrupt structures.
+
+The following call sequence is observed when the systick event occur:
+armv7m_nvic.c: systick_timer_tick(): set pending interrupt
+armv7m_nvic.c: armv7m_nvic_set_pending() for irq:15
+  arm_gic.c: gic_set_pending_private(): GIC_SET_PENDING(15,)
+    arm_gic.c: gic_update() - Raise IRQ with qemu_set_irq()
+       irq.c: eqmu_set_irq() - Call the irq->handler 
+                               -- I assume the irq handler is 'arm_pic_cpu_handler()',
+                                  since that was passed as the parameter when
+                                  qemu_allocate_irqs() was called in ...
+          arm_pic.c: arm_pic_cpu_handler() - After evaluation, call cpu_interrupt()
+             exec.c: cpu_interrupt() is called.     
+
+The tools that were used during the testing of this project:
+  GCC: Codesourcery ARM eabi 2010q3
+  QEMU: Checked out on 31/12/2010 - Last commit: 0fcec41eec0432c77645b4a407d3a3e030c4abc4
+The project files are attached, for reproducing of the errors.
+   Note: The CMSIS wants to perform byte accesses to the NVIC. For the Cortex-M3, unaligned 8 bit and 16 bit accesses are allowed. The current QEMU implementation doesn't yet cater for it. As a work around, updated versions of
+arm_gic.c armv7m_nvic.h armv7m_nvic.c is also included.
+
+Launch project with: go_gdb.sh
+Attach debugger with: arm-none-eabi-gdbtui --command=gdbCommands_tui
+(s = step, n = next, c = continue, Ctrl-C = stop, print <variable> to look at variable contents)
+
+
+
+I also faced the same problem. I emulated cortex m3 in qemu ( $qemu-system-arm -M lm3s811evb  -monitor stdio -kernel out.elf -s -S -gdb tcp::53333 ) and arm-none-linux-gnueabi-gdb --command=./gdbinit
+
+and my gdbinit is below
+set verbose on
+set solib-absolute-prefix nonexistantpath
+set solib-search-path /root/CodeSourcery/Sourcery_G++_Lite/arm-none-linux-gnueabi/libc/lib
+file out.elf
+target remote localhost:53333
+set remote exec-file out.elf
+
+I didn't use any standard library. Instead I wrote a simple code referring the cortex-m3 manual. The bug section is given below. 
+
+/**** code part *****/
+#define         SysTick         ( (SysTickTemplate*) 0xE000E010 )  // as in the datasheet
+
+
+typedef struct {
+
+  volatile unsigned int CTRL;
+
+  volatile unsigned int LOAD;
+
+  volatile unsigned int VAL;
+
+  volatile unsigned int CALIB;
+
+} SysTickTemplate;
+
+
+init() 
+{
+  SysTick->CTRL = 0x4;
+
+  SysTick->LOAD = 8000000;  /* Frequency of 1 Hz */
+
+  SysTick->CTRL |= 1; /* Enable counter */
+
+  SysTick->CTRL |= 2; /* Enable interrupts */
+
+  /* here it hangs, even ctrl+C wont work here */
+
+   int c = 0;
+
+   /* codes....*/
+}
+
+The same program I used to port into LPC1343 with a SysTickHandler() to toggle an LED and there it worked.
+
+Any help is appreciated,
+
+Arun 
+
+I think the problem is line 53 in qemu-linaro/hw/armv7m_nvic.c:
+int system_clock_scale;
+
+This variable is initialized under some conditions from the Stellaris peripheral emulation code, but apparently your code does not trigger this initialization. It then uses the default value of 0, and gets into an infinite loop.
+
+I suggest that the line be changed to:
+int system_clock_scale = 1;
+
+This not only prevents the crash, but has a side benefit of being able to use the SysTick timer even without other peripherals, like this:
+qemu-system-arm -cpu cortex-m3 -nographic -monitor null -serial null -semihosting -kernel test.elf
+-device armv7m_nvic -icount 1
+
+I still get hangs by messing around with the -icount parameter, but it is a different bug - ctrl-C gets you out of those hangs.
+
+ssys_reset() should be calling  ssys_calculate_system_clock(). (We should probably use a saner default value, though. Or treat system_clock_scale == 0 as "this board doesn't provide an external clock reference". And do we really have the sense right on the SYSTICKX_CLKSOURCE flag?)
+
+> qemu-system-arm -cpu cortex-m3 -nographic -monitor null -serial null -semihosting -kernel test.elf -device armv7m_nvic -icount 1
+
+This is a nonsensical command line since it will try to instantiate an Integrator board model with a Cortex-M3 CPU.  It's not possible to correctly wire up the armv7m_nvic device from the command line, in fact, so any qemu command line that tries to do so is inherently broken; to the extent that it works this will be purely by fluke.
+
+
+NB: the attached project fails for me like this:
+qemu: hardware error: gic_dist_writeb: Bad offset d23
+
+CPU #0:
+R00=ffffffff R01=e000ed00 R02=000000e0 R03=e000ed0b
+R04=00000000 R05=00000000 R06=00000000 R07=200004bb
+R08=00000000 R09=00000000 R10=00000000 R11=00000000
+R12=00000000 R13=200004bb R14=000003bd R15=00000338
+PSR=80000173 N--- T svc32
+
+This is because we don't support byte wide accesses to the SHPR* registers. (The error message refers to the GIC because we currently map the whole of that area of address space as part of the GIC and then have it redirect some areas to code in arm7m_nvic.c. That should probably be cleaned up.)
+
+
+http://<email address hidden>/msg90256.html has some patches from Sebastian Huber which let him run the RTEMS real time system on the TI Stellaris LM3S6965 with a working system tick. As he notes, some of them are hacks and not suitable for applying to qemu, but they give a reasonable list of problems needing fixing:
+
+(1) SHPR* (and some other) system registers need to be byte and halfword accessible
+(2) GIC priority mask feature not correct for v7M? [actually this looks to be wrong for A profile too, at least as far as the reset value goes: 11MPCore had a reset value of 0xf0 but A9 has reset value of 0.]
+(3) BASEPRI and BASEPRI_MAX are totally ignored at the moment
+(4) not very much RAM and it's not configurable from command line
+
+(2) and (3) add up to "we don't implement the M profile execution priority and exception model properly"; I strongly suspect there are further bugs in this area. (I'm not convinced that sharing code between the A profile GIC and the M profile NVIC is worthwhile, incidentally.)
+
+
+I've just retested with the project attached to the bug (had to hack it a little bit to build with a recent gcc, but nothing affecting the timer code), and with current head-of-git QEMU we execute it OK and putting a breakpoint on the SysTick_Handler function shows that it is being invoked once a second, as expected.
+
+From my comment #6, we've fixed SHPR byte/halfword accessibility, and rewritten the NVIC handling so it gets priority masking, BASEPRI, etc right. The stellaris boards having not much RAM is unavoidable, but we do now have the mps2 boards if you need a basic M profile system with more memory.
+
+So I'm going to close this bug as fix-committed, as it should be fixed in 2.11. (It might have been fixed already in 2.10, but 2.11 will definitely be OK.)
+
+

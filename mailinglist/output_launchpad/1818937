@@ -1,0 +1,246 @@
+Crash with HV_ERROR on macOS host
+
+On macOS host running Windows 10 guest, qemu crashed with error message: Error: HV_ERROR.
+
+Host: macOS Mojave 10.14.3 (18D109) Late 2014 Mac mini presumably Core i5 4278U.
+QEMU: git commit a3e3b0a7bd5de211a62cdf2d6c12b96d3c403560
+QEMU parameter: qemu-system-x86_64 -m 3000 -drive file=disk.img,if=virtio,discard=unmap -accel hvf -soundhw hda -smp 3
+
+thread list
+Process 56054 stopped
+  thread #1: tid = 0x2ffec8, 0x00007fff48d0805a vImage`vLookupTable_Planar16 + 970, queue = 'com.apple.main-thread'
+  thread #2: tid = 0x2ffecc, 0x00007fff79d6d7de libsystem_kernel.dylib`__psynch_cvwait + 10
+  thread #3: tid = 0x2ffecd, 0x00007fff79d715aa libsystem_kernel.dylib`__select + 10
+  thread #4: tid = 0x2ffece, 0x00007fff79d71d9a libsystem_kernel.dylib`__sigwait + 10
+* thread #6: tid = 0x2ffed0, 0x00007fff79d7023e libsystem_kernel.dylib`__pthread_kill + 10, stop reason = signal SIGABRT
+  thread #7: tid = 0x2ffed1, 0x00007fff79d6d7de libsystem_kernel.dylib`__psynch_cvwait + 10
+  thread #8: tid = 0x2ffed2, 0x00007fff79d6d7de libsystem_kernel.dylib`__psynch_cvwait + 10
+  thread #11: tid = 0x2fff34, 0x00007fff79d6a17a libsystem_kernel.dylib`mach_msg_trap + 10, name = 'com.apple.NSEventThread'
+  thread #30: tid = 0x300c04, 0x00007fff79e233f8 libsystem_pthread.dylib`start_wqthread
+  thread #31: tid = 0x300c16, 0x00007fff79e233f8 libsystem_pthread.dylib`start_wqthread
+  thread #32: tid = 0x300c17, 0x0000000000000000
+  thread #33: tid = 0x300c93, 0x00007fff79d6d7de libsystem_kernel.dylib`__psynch_cvwait + 10
+
+
+Crashed thread:
+
+* thread #6, stop reason = signal SIGABRT
+  * frame #0: 0x00007fff79d7023e libsystem_kernel.dylib`__pthread_kill + 10
+    frame #1: 0x00007fff79e26c1c libsystem_pthread.dylib`pthread_kill + 285
+    frame #2: 0x00007fff79cd91c9 libsystem_c.dylib`abort + 127
+    frame #3: 0x000000010baa476d qemu-system-x86_64`assert_hvf_ok(ret=<unavailable>) at hvf.c:106 [opt]
+    frame #4: 0x000000010baa4c8f qemu-system-x86_64`hvf_vcpu_exec(cpu=0x00007f8e5283de00) at hvf.c:681 [opt]
+    frame #5: 0x000000010b988423 qemu-system-x86_64`qemu_hvf_cpu_thread_fn(arg=0x00007f8e5283de00) at cpus.c:1636 [opt]
+    frame #6: 0x000000010bd9dfce qemu-system-x86_64`qemu_thread_start(args=<unavailable>) at qemu-thread-posix.c:502 [opt]
+    frame #7: 0x00007fff79e24305 libsystem_pthread.dylib`_pthread_body + 126
+    frame #8: 0x00007fff79e2726f libsystem_pthread.dylib`_pthread_start + 70
+    frame #9: 0x00007fff79e23415 libsystem_pthread.dylib`thread_start + 13
+
+I can reproduce this by booting the Windows 10 x64 install ISO with the command line:
+
++ WINIMG=Win10.iso
++ VIRTIMG=virtio-win-0.1.164.iso
++ qemu-system-x86_64 -accel hvf -drive driver=raw,file=Win10.img,if=virtio -m 1536 -net nic,model=virtio -net user -cdrom Win10.iso -drive file=virtio-win-0.1.164.iso,index=3,media=cdrom -rtc base=localtime,clock=host -smp cores=2 -usb -device usb-tablet -net user
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]
+Unimplemented handler (fffff80641601c38) for 0 (f 11) 
+Unimplemented handler (fffff8064160192f) for 0 (f 7f) 
+qemu-system-x86_64: Error: HV_ERROR
+./qemu-boot.sh: line 20: 32294 Abort trap: 6           qemu-system-x86_64 -accel hvf -drive driver=raw,file=Win10.img,if=virtio -m 1536 -net nic,model=virtio -net user -cdrom ${WINIMG} -drive file=${VIRTIMG},index=3,media=cdrom -rtc base=localtime,clock=host -smp cores=2 -usb -device usb-tablet -net user
+
+^This is on version:
+
+% qemu-system-x86_64 --version
+QEMU emulator version 4.0.50 (v4.0.0-rc4-52-g3284aa1281-dirty)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+I'm looking into the issue... HV_ERROR is a high-level return value and doesn't give enough details about the nature of the error. The error is returned from vmexit handler in AppleHV.kext (which implements kernel part of Hypervisor.framework). Perhaps we should extract more data from the VMCS and print it before aborting the execution.
+
+We can reproduce this problem with Linux guests as well (running 4.15 Ubuntu Xenial and 4.14 Android kernels). Mac models with integrated GPU seem to be more affected according to our testing, and the crash does not always occur, needs multiple tries to be triggered. We would be happy to assist in debugging, once you have a patch that can generate more detailed logs.
+
+For the triage of the issue we need the following VMCS fields:
+* instruction error
+* exit reason
+* exit qualification
+
+On my machine (with macOS 10.14.5) each time QEMU exits with HV_ERROR, AppleHV spills the following error into system log:
+2019-07-06 10:38:56.148547+0300 0x1e3ee4   Default     0x0                  0      0    kernel: (AppleHV) AppleHV: /BuildRoot/Library/Caches/com.apple.xbs/Sources/Hypervisor/Hypervisor-31.230.1/kext/x86/vmx/hv_vmx_vcpu.cpp : hv_return_t hv_vmx_vcpu_t::hv_vmx_vcpu_run()
+: 997
+
+Such log lines can be read with the command:
+$ log show -predicate 'senderImagePath CONTAINS "AppleHV"'
+
+The error above can only happen if vmlaunch or vmresume has failed and RFLAGS has either CF or ZF (or both) set to 1, according to Intel SDM. Unfortunately the exact RFLAGS value is not logged by Hypervisor.framework. I have submitted a feedback report (FB6787376) to log RFLAGS if it's not zero  immediately after vmlaunch/vmresume.
+
+If you wish to assist in debugging of the issue, please build and use QEMU from the branch:
+https://github.com/roolebo/qemu/tree/debug-hv-error
+
+Or apply the patch to your tree:
+https://github.com/roolebo/qemu/commit/f8098782573a89fc323d8dcae2d5445335e626f0.diff
+
+The log line I've got is the following:
+➜  vms ~/dev/qemu/x86_64-softmmu/qemu-system-x86_64 -accel hvf -m 2G -cdrom ~/Downloads/ubuntu-18.04.2-desktop-amd64.iso -hda ubuntu.qc
+ow2
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]
+qemu-system-x86_64: hv_vcpu_run failed
+qemu-system-x86_64: instruction error:      0x0000000000000007
+qemu-system-x86_64: exit reason:            0x0000000000000030
+qemu-system-x86_64: exit qualification:     0x0000000000000083
+qemu-system-x86_64: pri proc based ctls:    0x0000000095206dfa
+qemu-system-x86_64: sec proc based ctls:    0x00000000000000a3
+qemu-system-x86_64: eptp:                   0x000000000000003f
+qemu-system-x86_64: gpa:                    0x000000007d9ef000
+qemu-system-x86_64: gla:                    0xfffffe0000000ec0
+qemu-system-x86_64: Error: HV_ERROR
+
+
+Instruction error is 0x7 and Intel SDM 31-4 Vol. 3C states that:
+The processor checks on the VMX controls and host-state area. If any of these checks fail, the VM-entry instruction fails. RFLAGS.ZF is set to 1 and either 7 (VM entry with invalid control field(s)) or 8 (VM entry with invalid host-state field(s)) is saved in the VM-instruction error field.
+
+Hi Roman, 
+
+thanks for the patch, we were able to reproduce this issue with our custom Android Cuttlefish based d VM (running 4.14 kernel):
+
+2019-07-23T11:36:37.180753Z qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]
+2019-07-23T11:36:37.182517Z qemu-system-x86_64: warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]
+2019-07-23T11:37:54.647855Z qemu-system-x86_64: hv_vcpu_run failed
+2019-07-23T11:37:54.650737Z qemu-system-x86_64: exit reason:            0x0000000000000030
+2019-07-23T11:37:54.661753Z qemu-system-x86_64: exit qualification:     0x0000000000000981
+2019-07-23T11:37:54.661769Z qemu-system-x86_64: instruction error:      0x0000000000000007
+2019-07-23T11:37:54.661780Z qemu-system-x86_64: pri proc based ctls:    0x0000000095206dfa
+2019-07-23T11:37:54.661790Z qemu-system-x86_64: sec proc based ctls:    0x00000000000000a3
+2019-07-23T11:37:54.661799Z qemu-system-x86_64: eptp:                   0x000000000000003f
+2019-07-23T11:37:54.661810Z qemu-system-x86_64: gpa:                    0x000000007fd05004
+2019-07-23T11:37:54.661820Z qemu-system-x86_64: gla:                    0xfffffe000002f004
+2019-07-23T11:37:54.661828Z qemu-system-x86_64: Error: HV_ERROR
+
+The error happened right at startup, after multiple tries.
+
+Thank you,
+Gergely
+
+My guess is that RFLAGS.ZF == 1 and one or a few of the checks on VMX controls have failed. So far I have verified the following checks (26-2 and 26-3 in Intel SDM Vol. 3C):
+* Reserved bits in Pin-based VM execution controls are set according to associated capabilities MSR 
+* Reserved bits in Primary Proc-based VM execution controls are set according to associated capabilities MSR 
+* Reserved bits in Secondary Proc-based VM execution controls are set according to associated capabilities MSR 
+* CR-3 target count is not greater than 4. (the count is 0)
+* Use I/O bitmaps check is not applicable because "use I/O bitmaps" VM-execution control is 0.
+* Reserved bits in VM-exit controls are set according to associated capabilities MSR 
+* Reserved bits in VM-entry controls are set according to associated capabilities MSR 
+
+However, the MSR-bitmap Address check might fail:
+"If the “use MSR bitmaps” VM-execution control is 1, bits 11:0 of the MSR-bitmap address must be 0. The address should not set any bits beyond the processor’s physical-address width."
+
+Bit 28 in Pin-based VM execution controls is set to 1 while the MSR address has bits 5:1 set to 1 (0x3f). There's no way to disable the "use MSR bitmaps" execution control so I'll try to make a patch that sets 4k-page aligned MSR bitmap address.
+
+Updated log lines show the VMX capabilities for the control fields and VMCS fields related to the failure:
+qemu-system-x86_64: hv_vcpu_run failed
+qemu-system-x86_64: exit reason:            0x0000000000000030
+qemu-system-x86_64: exit qualification:     0x0000000000000083
+qemu-system-x86_64: instruction error:      0x0000000000000007
+qemu-system-x86_64: VM-EXECUTION CONTROL FIELDS
+qemu-system-x86_64: Pin-Based VM-Execution Controls
+qemu-system-x86_64: pin based ctls:         0x000000000000003f
+qemu-system-x86_64: pin based caps:         0x0000007f0000003f
+qemu-system-x86_64: Processor-Based VM-Execution Controls
+qemu-system-x86_64: pri proc based ctls:    0x0000000095206dfa
+qemu-system-x86_64: pri proc based caps:    0xfdf9fffe9500697a
+qemu-system-x86_64: sec proc based ctls:    0x00000000000000a3
+qemu-system-x86_64: sec proc based caps:    0x00011cef000000a2
+qemu-system-x86_64: CR3-Target Controls
+qemu-system-x86_64: cr3 target count:       0x0000000000000000
+qemu-system-x86_64: MSR-Bitmap Address:     0x000000000000003f
+qemu-system-x86_64: VM-EXIT CONTROL FIELDS
+qemu-system-x86_64: VM-Exit Controls
+qemu-system-x86_64: vm exit ctls:           0x0000000000236fff
+qemu-system-x86_64: vm exit caps:           0x00636fff00236fff
+qemu-system-x86_64: VM-ENTRY CONTROL FIELDS
+qemu-system-x86_64: VM-Entry Controls
+qemu-system-x86_64: vm entry ctls:          0x00000000000093ff
+qemu-system-x86_64: vm entry caps:          0x000093ff000091ff
+qemu-system-x86_64: Error: HV_ERROR
+
+It's not possible to allocate MSR bitmap in userspace because it requires a physical address to be stored in the VMCS field. However, the bitmap page is already allocated inside kernel part of Hypervisor.framework. The 4k bitmap region is aligned to page boundary. It's worth to continue inspection of the checks (26.2 CHECKS ON VMX CONTROLS AND HOST-STATE AREA).
+
+The reason why MSR Bitmap Address has weird value is because it's not necessarily the value of the VMCS field (albeit VMCS_CTRL_MSR_BITMAPS is defined in hv_arch_vmx.h). HVF uses an internal lookup table that has a limited set of VMCS fields exposed by Apple. The list is documented at the reference page: https://developer.apple.com/documentation/hypervisor/1469436-virtual_machine_control_structur
+
+It's likely that 0x3f is a field from the VMCS lookup table. Given the signature of hv_vmx_vcpu_read_vmcs, I would expect an error (e.g. HV_BAD_ARGUMENT) to be returned instead of the silent failure. I have submitted FB6858948 to Apple to correct the behaviour.
+
+So, Apple doesn't provide an explicit access to MSR Bitmap Address field but allows to control the bitmap via hv_vcpu_enable_native_msr.
+
+During the inspection of Apple reference, I have noticed that Guest CR0 and CR0 Guest/Host Mask has incorrect value. Apple defines that Guest CR0 is writable only if:
+CR0.CD and CR0.NW are unset
+
+But hvf accel code follows Intel SDM "Table 9-1. IA-32 and Intel 64 Processor States Following Power-up, Reset, or INIT" and sets CR0 value to: 0x60000010
+
+Likewise, CR0 Guest/Host Mask is conditionally writable if:
+CR0.CD and CR0.NW are set
+
+I doubt if it's related to the HV_ERROR issue but I'll prepare a patch to fix both fields (and likely set CR0 Read Shadow).
+
+Are there any updates? Trying to run the IE11 image from Microsoft (based on Windows 8.1) and it is crashing with this error sporadically :-\
+
+I'm not exactly sure what commit improved the situation (either https://git.qemu.org/?p=qemu.git;a=commit;h=e37aa8b0e410 or https://git.qemu.org/?p=qemu.git;a=commit;h=fbafbb6db7742)  but I have noticed that sporadic failures are gone after the series was applied: https://lists.gnu.org/archive/html/qemu-devel/2019-11/msg03977.html
+
+The issue should be fixed in QEMU v5.0+
+
+I'm getting this error immediately and consistently when trying to boot the Win10 ISO with the following command:
+
+$ qemu-system-x86_64 -M accel=hvf -cpu host -smp 2 -hda windows-image.img -cdrom Win10_20H2_English_x64.iso -m 8G -vga virtio -usb -device usb-tablet -display default -boot d 
+qemu-system-x86_64: Error: HV_ERROR
+[1]    3921 abort      qemu-system-x86_64 -M accel=hvf -cpu host -smp 2 -hda windows-image.img -cdro
+
+$ qemu-system-x86_64 --version
+QEMU emulator version 5.1.0
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+
+Running on MacOS 11.0.1
+
+Same here. Also on macOS host:
+
+$ qemu-system-x86_64 -machine type=q35,accel=hvf \
+-cpu max \     
+-smp 2 \
+-hda ubuntu.qcow2 \
+-cdrom ./ubuntu-20.04.1-desktop-amd64.iso \
+-m 2G \
+-vga virtio \
+-usb \
+-device usb-tablet \
+-display default,show-cursor=on
+qemu-system-x86_64: Error: HV_ERROR
+[1]    77901 abort      qemu-system-x86_64 -machine type=q35,accel=hvf -cpu max -smp 2 -hda  -cdrom  
+
+$ qemu-system-x86_64 --version
+QEMU emulator version 5.1.0
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+
+$ sysctl -a | grep machdep.cpu.brand_string
+machdep.cpu.brand_string: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz
+
+
+Same here on macOS 11.0.1 when specifying accel=hvf. Crash report is attached.
+
+$ qemu-system-x86_64 -machine accel=hvf -smp 2 -m 2G -hda current.qcow -boot d -cdrom ubuntu-18.04.5-desktop-amd64.iso  
+qemu-system-x86_64: Error: HV_ERROR
+[1]    2912 abort      qemu-system-x86_64 -machine accel=hvf -smp 2 -m 2G -hda  -boot d -cdrom
+
+$ qemu-system-x86_64 --version
+QEMU emulator version 5.1.0
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+
+$ sysctl -a | grep machdep.cpu.brand_string
+machdep.cpu.brand_string: Intel(R) Core(TM) i7-1068NG7 CPU @ 2.30GH
+
+For the Mac Big sur 11.0.1 or 11.1, the HV_ERROR issue was caused by code signing issue.
+the com.apple.vm.hypervisor is deprecated and now is com.apple.security.hypervisor
+
+Following pages worth of checking:
+https://stackoverflow.com/questions/64642062/apple-hypervisor-is-completely-broken-on-macos-big-sur-beta-11-0-1
+https://superuser.com/questions/1436370/how-to-codesign-gdb-on-os-x-mojave
+
+so, basically, just need to codesign entitlement of qemu-system-x86_64 binary file and it will.
+
+I am now able to boot the linux iso without problem, but Windows 10 iso still hang at boot.....unfortnately.
+
+

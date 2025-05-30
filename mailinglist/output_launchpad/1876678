@@ -1,0 +1,583 @@
+Ubuntu 20.04 KVM / QEMU Failure with nested FreeBSD bhyve
+
+BUG:
+
+Starting FreeBSD Layer 2 bhyve Guest within Layer 1 FreeBSD VM Host on Layer 0 Ubuntu 20.04 KVM / QEMU Host result in Layer 1 Guest / Host Pausing with "Emulation Failure"
+
+TESTING:
+
+My test scenario is nested virtualisation:
+Layer 0 - Ubuntu 20.04 Host
+Layer 1 - FreeBSD 12.1 with OVMF + bhyve hypervisor Guest/Host
+Layer 2 - FreeBSD 12.1 guest
+
+Layer 0 Host is: Ubuntu 20.04 LTS KVM / QEMU / libvirt
+
+<<START QEMU VERSION>>
+$ virsh -c qemu:///system version --daemon
+Compiled against library: libvirt 6.0.0
+Using library: libvirt 6.0.0
+Using API: QEMU 6.0.0
+Running hypervisor: QEMU 4.2.0
+Running against daemon: 6.0.0
+<<END QEMU VERSION>
+
+<<START Intel VMX Support & Nesting Enabled>>
+$ cat /proc/cpuinfo | grep -c vmx
+64
+$ cat /sys/module/kvm_intel/parameters/nested
+Y
+<<END Intel VMS>>
+
+
+
+Layer 1 Guest / Host is: FreeBSD Q35 v4.2 with OVMF:
+
+Pass Host VMX support to Layer 1 Guest via <cpu mode='host-model>
+
+<<LIBVIRT CONFIG SNIPPET>>
+...
+...
+  <os>
+    <type arch='x86_64' machine='pc-q35-4.2'>hvm</type>
+    <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>
+    <nvram>/home/USER/swarm.bhyve.freebsd/OVMF_VARS.fd</nvram>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <vmport state='off'/>
+  </features>
+  <cpu mode='host-model' check='partial'/>
+...
+...
+<END LIBVIRT CONFIG SNIPPET>>
+
+Checked that Layer 1 - FreeBSD Quest / Host has VMX feature available:
+
+<<LAYER 1 - FreeBSD CPU Features>>
+# uname -a
+FreeBSD swarm.DOMAIN.HERE 12.1-RELEASE FreeBSD 12.1-RELEASE GENERIC  amd64
+
+# grep Features /var/run/dmesg.boot 
+  Features=0xf83fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,MMX,FXSR,SSE,SSE2,SS>
+  Features2=0xfffa3223<SSE3,PCLMULQDQ,VMX,SSSE3,FMA,CX16,PCID,SSE4.1,SSE4.2,x2APIC,MOVBE,POPCNT,TSCDLT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+  AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+  AMD Features2=0x121<LAHF,ABM,Prefetch>
+  Structured Extended Features=0x1c0fbb<FSGSBASE,TSCADJ,BMI1,HLE,AVX2,SMEP,BMI2,ERMS,INVPCID,RTM,RDSEED,ADX,SMAP>
+  Structured Extended Features2=0x4<UMIP>
+  Structured Extended Features3=0xac000400<MD_CLEAR,IBPB,STIBP,ARCH_CAP,SSBD>
+  XSAVE Features=0x1<XSAVEOPT>
+<<END LAYER 1 - FreeBSD CPU Features>
+
+On Layer 1 FreeBSD Guest / Host start up the Layer 2 guest..
+
+<<START LAYER 2 GUEST START>>
+# ls
+FreeBSD-11.2-RELEASE-amd64-bootonly.iso	FreeBSD-12.1-RELEASE-amd64-dvd1.iso	bee-hd1-01.img
+# /usr/sbin/bhyve -c 2 -m 2048 -H -A -s 0:0,hostbridge -s 1:0,lpc -s 2:0,e1000,tap0 -s 3:0,ahci-hd,bee-hd1-01.img -l com1,stdio -s 5:0,ahci-cd,./FreeBSD-12.1-RELEASE-amd64-dvd1.iso bee
+<<END LAYER 2 GUEST START>>
+
+Result is that Layer 1 - FreeBSD Host guest "paused".
+
+To Layer 1 machines freezes I cannot get any further diagnostics from this machine, so I run tail on libvirt log from Layer 0 - Ubuntu Host
+
+<<LAYER 0 LOG TAIL>>
+char device redirected to /dev/pts/29 (label charserial0)
+2020-05-04T06:09:15.310474Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(48FH).vmx-exit-load-perf-global-ctrl [bit 12]
+2020-05-04T06:09:15.310531Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(490H).vmx-entry-load-perf-global-ctrl [bit 13]
+2020-05-04T06:09:15.312533Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(48FH).vmx-exit-load-perf-global-ctrl [bit 12]
+2020-05-04T06:09:15.312548Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(490H).vmx-entry-load-perf-global-ctrl [bit 13]
+2020-05-04T06:09:15.313828Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(48FH).vmx-exit-load-perf-global-ctrl [bit 12]
+2020-05-04T06:09:15.313841Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(490H).vmx-entry-load-perf-global-ctrl [bit 13]
+2020-05-04T06:09:15.315185Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(48FH).vmx-exit-load-perf-global-ctrl [bit 12]
+2020-05-04T06:09:15.315201Z qemu-system-x86_64: warning: host doesn't support requested feature: MSR(490H).vmx-entry-load-perf-global-ctrl [bit 13]
+KVM internal error. Suberror: 1
+emulation failure
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00000000
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=00000000 EFL=00000000 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 00000000 00000000 00008000 DPL=0 <hiword>
+CS =0000 00000000 00000000 00008000 DPL=0 <hiword>
+SS =0000 00000000 00000000 00008000 DPL=0 <hiword>
+DS =0000 00000000 00000000 00008000 DPL=0 <hiword>
+FS =0000 00000000 00000000 00008000 DPL=0 <hiword>
+GS =0000 00000000 00000000 00008000 DPL=0 <hiword>
+LDT=0000 00000000 00000000 00008000 DPL=0 <hiword>
+TR =0000 00000000 00000000 00008000 DPL=0 <hiword>
+GDT=     0000000000000000 00000000
+IDT=     0000000000000000 00000000
+CR0=80050033 CR2=0000000000000000 CR3=0000000000000000 CR4=00372060
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=<??> ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??
+2020-05-04T06:35:39.186799Z qemu-system-x86_64: terminating on signal 15 from pid 2155 (/usr/sbin/libvirtd)
+2020-05-04 06:35:39.386+0000: shutting down, reason=destroyed
+<<END LAYER 0 LOG TAIL>>
+
+
+I am reporting this bug here as result is very similar to that seen with QEMU seabios failure reported here: https://bugs.launchpad.net/qemu/+bug/1866870
+
+However in this case my VM Layer 1 VM is using OVMF.
+
+NOTE 1: I have also tested with Q35 v3.1 and 2.12 and get the same result.
+NOTE 2: Due to bug in FreeBSD networking code, I had to compile custom kernel with "netmap driver disabled".  This is known bug in FreeBSD that I have reported separately.
+NOTE 3: I will cross posted this bug report on FreeBSD bugzilla as well: https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=246168
+NOTE 4: Have done extensive testing of Ubuntu 20.04 Nested virtualisation with just Ubuntu hosts  and OVMF and the nested virtualisation runs correctly, so problem is specific to using FreeBSD / bhyve guest / host.
+
+Hi Ubuntu / KVM Maintainers,
+
+I have now done additional diagnostics on this bug and it appears to be triggered in nested virtualization case when apic virtualisation is available in Layer 0 HW and then passed forward to Layer 1 VM via Libvirt: <cpu mode='host-model' check='partial'> .
+
+Testing found that in case where Layer 1 FreeBSD host had this feature, see "VID,PostIntr" in "VT-x: PAT,HLT,MTF,PAUSE,EPT,UG,VPID,VID,PostIntr" from CPU Feature below:
+
+<<START LAYER 1 - FreeBSD CPU Report from dmesg.boot>>
+...
+...
+CPU: Intel Core Processor (Broadwell, IBRS) (2600.09-MHz K8-class CPU)
+  Origin="GenuineIntel"  Id=0x306d2  Family=0x6  Model=0x3d  Stepping=2
+  Features=0xf83fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,MMX,FXSR,SSE,SSE2,SS>
+  Features2=0xfffa3223<SSE3,PCLMULQDQ,VMX,SSSE3,FMA,CX16,PCID,SSE4.1,SSE4.2,x2APIC,MOVBE,POPCNT,TSCDLT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+  AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+  AMD Features2=0x121<LAHF,ABM,Prefetch>
+  Structured Extended Features=0x1c0fbb<FSGSBASE,TSCADJ,BMI1,HLE,AVX2,SMEP,BMI2,ERMS,INVPCID,RTM,RDSEED,ADX,SMAP>
+  Structured Extended Features2=0x4<UMIP>
+  Structured Extended Features3=0xac000400<MD_CLEAR,IBPB,STIBP,ARCH_CAP,SSBD>
+  XSAVE Features=0x1<XSAVEOPT>
+  IA32_ARCH_CAPS=0x8<SKIP_L1DFL_VME>
+  AMD Extended Feature Extensions ID EBX=0x1001000
+  VT-x: PAT,HLT,MTF,PAUSE,EPT,UG,VPID,VID,PostIntr
+Hypervisor: Origin = "KVMKVMKVM"
+...
+...
+<END LAYER 1 - dimes.log>>
+
+In my case with Intel Broadwell chipset this is available, in case of desktop "core i5-8250U" chip- this reports as:
+
+VT-x: PAT,HLT,MTF,PAUSE,EPT,UG,VPID
+
+For this case HW case, nested:
+Layer 0 - Ubuntu 20.04, Layer 1 - FreeBSD 12.1 with bhyve, Layer 2 - FreeBSD 12.1
+Works.
+
+Workaround is to disable APIC virtual interrupt delivery:
+
+1. Add entry into Layer 1 - FreeBSD Guest / Host: /boot/loader.conf:
+hw.vmm.vmx.use_apic_vid=0
+
+2. Reboot
+
+3. Check via sysctl that virtual_interupt_delivery is disabled:
+# sysctl hw.vmm.vmx.cap.virtual_interrupt_delivery
+hw.vmm.vmx.cap.virtual_interrupt_delivery: 0          <- should be zero
+
+
+Questions is:
+
+While FreeBSD triggers this bug, is this a KVM issue or a FreeBSD bhyve one ?
+
+In doing some searching on Web I see that there is already work being done with KVM 5.6 around APIC virtualisation and its handling. So not sure if this a potentially know problem: https://events19.linuxfoundation.org/wp-content/uploads/2017/12/Improving-KVM-x86-Nested-Virtualization-Liran-Alon-Oracle.pdf
+
+APIC Virtualisation support was introduced back in FreeBSD 11.0 way back in Sept 2016:
+
+https://www.freebsd.org/releases/11.0R/relnotes.html#hardware-virtualization
+
+Thanks to Peter Graham on FreeBSD virtualization bug tracker for helping to find source of problem.
+
+Should this BUG go to KVM / QEMU upstream ?
+
+Cheers,
+
+John Hartley.
+
+
+
+Since you were talking about Ubuntu, I moved this to the Ubuntu tracker now. If you can reproduce the problem with upstream QEMU (currently v6.0), then please open a new ticket in the new QEMU issue tracker at gitlab.com.
+
+Hi John,
+could you give it a try with the more recent virtualization stack in [1].
+Since this might as well be in the kernel and not qemu/libvirt you might also consider checking other kernel versions - not sure with your self-built driver, but what kernels have you tried and which newer ones could you try? If you can overcome the other issue in another way you might try [2] which is great to check various versions.
+
+
+That works "in place" on your 20.04 system and if better would indicate that one of the components has a fix that we only need to identify.
+
+P.S. the PPA does not yet contain qmeu 6.0 which released a few days ago, it will be june until I get to that I guess :-/
+
+[1]: https://launchpad.net/~canonical-server/+archive/ubuntu/server-backports
+[2]: https://kernel.ubuntu.com/~kernel-ppa/mainline/
+
+Hi Christian,
+
+just letting you know I have got email notifications and will re-run tests.
+It will likely take me a couple days to complete this. I will post findings once done.
+I will try against 20.04 and 21.04 to start and post on various component versions and results.
+
+Cheers,
+
+John.
+
+Hi Christian,
+
+I have re-tested with Ubuntu 21.04 (Hirsute Hippo).
+
+It took me a while to set up test environment.
+
+Summary:
+
+Ubuntu Version:
+
+$ cat /etc/*-release
+DISTRIB_ID=Ubuntu
+DISTRIB_RELEASE=21.04
+DISTRIB_CODENAME=hirsute
+DISTRIB_DESCRIPTION="Ubuntu 21.04"
+NAME="Ubuntu"
+VERSION="21.04 (Hirsute Hippo)"
+ID=ubuntu
+ID_LIKE=debian
+PRETTY_NAME="Ubuntu 21.04"
+VERSION_ID="21.04"
+HOME_URL="https://www.ubuntu.com/"
+SUPPORT_URL="https://help.ubuntu.com/"
+BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"
+PRIVACY_POLICY_URL="https://www.ubuntu.com/legal/terms-and-policies/privacy-policy"
+VERSION_CODENAME=hirsute
+UBUNTU_CODENAME=hirsute
+
+Linux Version:
+
+$ uname -a
+Linux green 5.11.0-17-generic #18-Ubuntu SMP Thu May 6 20:10:11 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+
+QEMU / Libvirt Version:
+
+$ sudo virsh version
+Compiled against library: libvirt 7.0.0
+Using library: libvirt 7.0.0
+Using API: QEMU 7.0.0
+Running hypervisor: QEMU 5.2.0
+
+Nesting Scenario:
+
+Layer 0 - Ubuntu 21.04
+Layer 1 - FreeBSD 12.2 Bhyve Host
+Layer 2 - FreeBSD 12.2 Guest
+
+Result:
+
+Virtual Machine Freezes (without work around of turning off APIC interrupt delivery as per existing diagnosis:
+
+Workaround is to disable APIC virtual interrupt delivery:
+
+1. Add entry into Layer 1 - FreeBSD Guest / Host: /boot/loader.conf:
+hw.vmm.vmx.use_apic_vid=0
+
+
+Here is the libvirt log taken from Layer 0 - Ubuntu host:
+
+<<Layer 0 - Ubuntu 21.04 QEMU / KVM Host>>
+2021-05-16 09:57:28.970+0000: starting up libvirt version: 7.0.0, package: 2ubuntu2 (Christian Ehrhardt <email address hidden> Wed, 07 Apr 2021 13:33:46 +0200), qemu version: 5.2.0Debian 1:5.2+dfsg-9ubuntu3, kernel: 5.11.0-17-generic, hostname: green.in.graphica.com.au
+LC_ALL=C \
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin \
+HOME=/var/lib/libvirt/qemu/domain-10-hive-dev-freebsd-12. \
+XDG_DATA_HOME=/var/lib/libvirt/qemu/domain-10-hive-dev-freebsd-12./.local/share \
+XDG_CACHE_HOME=/var/lib/libvirt/qemu/domain-10-hive-dev-freebsd-12./.cache \
+XDG_CONFIG_HOME=/var/lib/libvirt/qemu/domain-10-hive-dev-freebsd-12./.config \
+QEMU_AUDIO_DRV=spice \
+/usr/bin/qemu-system-x86_64 \
+-name guest=hive-dev-freebsd-12.2,debug-threads=on \
+-S \
+-object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-10-hive-dev-freebsd-12./master-key.aes \
+-blockdev '{"driver":"file","filename":"/usr/share/OVMF/OVMF_CODE_4M.fd","node-name":"libvirt-pflash0-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-pflash0-format","read-only":true,"driver":"raw","file":"libvirt-pflash0-storage"}' \
+-blockdev '{"driver":"file","filename":"/home/jbh/Documents/virtual-machines/hive.dev.freebsd/OVMF_VARS.fd","node-name":"libvirt-pflash1-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-pflash1-format","read-only":false,"driver":"raw","file":"libvirt-pflash1-storage"}' \
+-machine pc-q35-5.2,accel=kvm,usb=off,vmport=off,dump-guest-core=off,pflash0=libvirt-pflash0-format,pflash1=libvirt-pflash1-format,memory-backend=pc.ram \
+-cpu Broadwell-IBRS,vme=on,ss=on,vmx=on,pdcm=on,f16c=on,rdrand=on,hypervisor=on,arat=on,tsc-adjust=on,umip=on,md-clear=on,stibp=on,arch-capabilities=on,ssbd=on,xsaveopt=on,pdpe1gb=on,abm=on,ibpb=on,ibrs=on,amd-stibp=on,amd-ssbd=on,skip-l1dfl-vmentry=on,pschange-mc-no=on \
+-m 4096 \
+-object memory-backend-ram,id=pc.ram,size=4294967296 \
+-overcommit mem-lock=off \
+-smp 4,sockets=4,cores=1,threads=1 \
+-uuid 459ff0b9-e0d1-44d4-9862-83315419eeee \
+-no-user-config \
+-nodefaults \
+-chardev socket,id=charmonitor,fd=32,server,nowait \
+-mon chardev=charmonitor,id=monitor,mode=control \
+-rtc base=utc,driftfix=slew \
+-global kvm-pit.lost_tick_policy=delay \
+-no-hpet \
+-no-shutdown \
+-global ICH9-LPC.disable_s3=1 \
+-global ICH9-LPC.disable_s4=1 \
+-boot strict=on \
+-device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2 \
+-device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x2.0x1 \
+-device pcie-root-port,port=0x12,chassis=3,id=pci.3,bus=pcie.0,addr=0x2.0x2 \
+-device pcie-root-port,port=0x13,chassis=4,id=pci.4,bus=pcie.0,addr=0x2.0x3 \
+-device pcie-root-port,port=0x14,chassis=5,id=pci.5,bus=pcie.0,addr=0x2.0x4 \
+-device pcie-root-port,port=0x15,chassis=6,id=pci.6,bus=pcie.0,addr=0x2.0x5 \
+-device pcie-pci-bridge,id=pci.7,bus=pci.1,addr=0x0 \
+-device ich9-usb-ehci1,id=usb,bus=pcie.0,addr=0x1d.0x7 \
+-device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pcie.0,multifunction=on,addr=0x1d \
+-device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pcie.0,addr=0x1d.0x1 \
+-device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pcie.0,addr=0x1d.0x2 \
+-device virtio-serial-pci,id=virtio-serial0,bus=pci.2,addr=0x0 \
+-device ide-cd,bus=ide.0,id=sata0-0-0,bootindex=1 \
+-blockdev '{"driver":"file","filename":"/home/jbh/Documents/virtual-machines/hive.dev.freebsd/hive-hd1-01.qcow2","node-name":"libvirt-1-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-1-format","read-only":false,"driver":"qcow2","file":"libvirt-1-storage","backing":null}' \
+-device ide-hd,bus=ide.1,drive=libvirt-1-format,id=sata0-0-1,bootindex=2 \
+-netdev tap,fd=35,id=hostnet0 \
+-device vmxnet3,netdev=hostnet0,id=net0,mac=52:54:00:c8:8b:95,bus=pci.7,addr=0x1 \
+-netdev tap,fd=36,id=hostnet1 \
+-device vmxnet3,netdev=hostnet1,id=net1,mac=52:54:00:6c:c9:c1,bus=pci.7,addr=0x2 \
+-chardev pty,id=charserial0 \
+-device isa-serial,chardev=charserial0,id=serial0 \
+-chardev spicevmc,id=charchannel0,name=vdagent \
+-device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=com.redhat.spice.0 \
+-device usb-kbd,id=input2,bus=usb.0,port=3 \
+-spice port=5902,addr=127.0.0.1,disable-ticketing,image-compression=off,seamless-migration=on \
+-device qxl-vga,id=video0,ram_size=67108864,vram_size=67108864,vram64_size_mb=0,vgamem_mb=16,max_outputs=1,bus=pcie.0,addr=0x1 \
+-chardev spicevmc,id=charredir0,name=usbredir \
+-device usb-redir,chardev=charredir0,id=redir0,bus=usb.0,port=1 \
+-chardev spicevmc,id=charredir1,name=usbredir \
+-device usb-redir,chardev=charredir1,id=redir1,bus=usb.0,port=2 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.4,addr=0x0 \
+-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+-msg timestamp=on
+char device redirected to /dev/pts/2 (label charserial0)
+KVM internal error. Suberror: 1
+emulation failure
+RAX=0000000000000000 RBX=0000000000000000 RCX=0000000000000000 RDX=0000000000000f00
+RSI=0000000000000000 RDI=0000000000000000 RBP=0000000000000000 RSP=fffffe002d9f9700
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=ffffffff828fc5d9 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =003b 0000000000000000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+CS =0020 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0028 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =003b 0000000000000000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+FS =0013 0000000800b368d0 ffffffff 00c0f300 DPL=3 DS   [-WA]
+GS =001b ffffffff82611000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+LDT=0000 0000000000000000 ffffffff 00c00000
+TR =0048 ffffffff81f15e08 00002068 00008b00 DPL=0 TSS64-busy
+GDT=     ffffffff81f1c608 00000067
+IDT=     ffffffff81f14da0 00000fff
+CR0=8005003b CR2=0000000000000000 CR3=0000000043b2b6ee CR4=003726e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=50 4c 8b 67 58 4c 8b 6f 60 4c 8b 77 68 4c 8b 7f 70 48 8b 3f <0f> 01 c2 48 89 e7 b8 02 00 00 00 eb 07 b8 03 00 00 00 eb 00 41 bb 02 00 00 00 74 06 41 bb
+2021-05-16T11:49:21.487500Z qemu-system-x86_64: terminating on signal 15 from pid 1885 (/usr/sbin/libvirtd)
+2021-05-16 11:49:21.889+0000: shutting down, reason=destroyed
+<<END>>
+
+So result is unchanged with update from: 20.04 -> 21.04 and FreeBSD 12.1 -> FreeBSD 12.2
+
+NOTE: I also did testing of all 21.04 virtualization nesting:
+Layer 0 - Ubuntu 21.04
+Layer 1 - Ubuntu 21.04
+Layer 2 - Ubuntu 21.04 
+All Working OK !!
+
+Also Christian, I see your name in log:
+
+2021-05-16 09:57:28.970+0000: starting up libvirt version: 7.0.0, package: 2ubuntu2 (Christian Ehrhardt <email address hidden> Wed, 07 Apr 2021 13:33:46 +0200), qemu version: 5.2
+
+Thanks for looking into this, please let me know if there is additional testing you would like to see.
+
+Cheers,
+
+
+John.
+
+
+Thanks for the test, that ensures it still is in 5.2
+Unfortunately since a few days that isn't the very most recent version [1] as 6.0 release two weeks ago. I don't have a 6.0 version ready as Ubuntu package yet that I could ask you to try.
+
+Usually for an upstream bug report (which IMHO is the right next step) you'd want to have confirmed that the last release is affected as well. So the question IMHO should now be - how do we get you a qemu 6.0 to try.
+And if confirmed there the next step would be getting in touch with upstream at https://gitlab.com/qemu-project/qemu/-/issues
+
+How comfortable (or not) would you feel building your own qemu for a test?
+It should be something like:
+$ git clone git://git.qemu.org/qemu.git
+$ sudo vim /etc/apt/sources.list
+# edit sources.list to have "# deb-src" lines no more commented out
+$ sudo apt update
+$ sudo apt build-dep qemu
+$ cd qemu
+$ mkdir build
+$ cd build
+# you should need almost nothing for your test, so the following (or similar) should give you a quick build
+$ ../configure --disable-werror --disable-user --disable-linux-user --disable-docs --disable-guest-agent --disable-sdl --disable-gtk --disable-vnc --disable-xen --disable-brlapi --disable-fdt --disable-bluez --disable-hax --disable-vde --disable-netmap --disable-rbd --disable-libiscsi --disable-libnfs --disable-smartcard --disable-libusb --disable-usb-redir --disable-seccomp --disable-glusterfs --disable-tpm --disable-numa --disable-opengl --disable-virglrenderer --disable-xfsctl --disable-vxhs --disable-slirp --disable-blobs --target-list=x86_64-softmmu --disable-rdma --disable-pvrdma --disable-attr --disable-vhost-net --disable-vhost-vsock --disable-vhost-scsi --disable-vhost-crypto --disable-vhost-user --disable-spice --disable-qom-cast-debug --disable-vxhs --disable-bochs --disable-cloop --disable-dmg --disable-qcow1 --disable-vdi --disable-vvfat --disable-qed --disable-parallels --disable-sheepdog --disable-avx2 --disable-nettle --disable-gnutls --disable-capstone --enable-tools
+$ make
+$ sudo make install
+
+The above is untested writeup from memory (except the configure line, but that was for a different version) so expect some slight modifications to be needed.
+You can then replace the qemu in your system (back it up) at /usr/bin/qemu-system-x86_64 with that new built version for a try.
+
+I'm currently rather busy, so the delay until I can provide a 6.0 might be a bit. But if you are unable to build your own you can surely wait for that to be ready.
+
+Or - also an alternative - you can report it upstream despite not having tested in on 6.0 yet.
+They might ask for it then, but chances are that someone more familiar with acpi or bhyve immediately recognizes it and can help.
+If you happen to do so please leave me a link to the issue here so I'm able to track it.
+
+[1]: https://wiki.qemu.org/Planning/6.0
+
+Hi Christian,
+
+now I have env setup that test is pretty straight forward.
+
+Here are results:
+
+Build QEMU with following configuration:
+
+../configure --disable-werror --disable-user --disable-linux-user --disable-docs --disable-guest-agent --disable-sdl --disable-gtk --disable-vnc --disable-xen --disable-brlapi --disable-fdt --disable-hax --disable-vde --disable-netmap --disable-rbd --disable-libiscsi --disable-libnfs --disable-smartcard --disable-libusb --disable-usb-redir --disable-seccomp --disable-glusterfs --disable-tpm --disable-numa --disable-opengl --disable-virglrenderer --disable-xfsctl --disable-slirp --disable-blobs --target-list=x86_64-softmmu --disable-rdma --disable-pvrdma --disable-attr --disable-vhost-net --disable-vhost-vsock --disable-vhost-scsi --disable-vhost-crypto --disable-vhost-user --disable-spice --disable-qom-cast-debug --disable-bochs --disable-cloop --disable-dmg --disable-qcow1 --disable-vdi --disable-vvfat --disable-qed --disable-parallels --disable-avx2 --disable-nettle --disable-gnutls --disable-capstone --enable-tools
+
+Version of QEMU SYSTEM:
+
+$ qemu-system-x86_64 --version
+QEMU emulator version 6.0.50 (v6.0.0-540-g6005ee07c3)
+Copyright (c) 2003-2021 Fabrice Bellard and the QEMU Project developers
+
+Result when running Layer 2 VM on FreeBSD bhyve Layer 1:
+
+Layer 1 VM goes into pause as per original test
+
+<<LIBVIRT LOG Layer 0 - Ubuntu Host>>
+2021-05-17 12:31:09.748+0000: starting up libvirt version: 7.0.0, package: 2ubuntu2 (Christian Ehrhardt <email address hidden> Wed, 07 Apr 2021 13:33:46 +0200), qemu version: 5.2.0Debian 1:5.2+dfsg-9ubuntu3, kernel: 5.11.0-17-generic, hostname: green.in.graphica.com.au
+LC_ALL=C \
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin \
+HOME=/var/lib/libvirt/qemu/domain-3-hive-dev-freebsd-12. \
+XDG_DATA_HOME=/var/lib/libvirt/qemu/domain-3-hive-dev-freebsd-12./.local/share \
+XDG_CACHE_HOME=/var/lib/libvirt/qemu/domain-3-hive-dev-freebsd-12./.cache \
+XDG_CONFIG_HOME=/var/lib/libvirt/qemu/domain-3-hive-dev-freebsd-12./.config \
+QEMU_AUDIO_DRV=spice \
+/usr/bin/qemu-system-x86_64 \
+-name guest=hive-dev-freebsd-12.2,debug-threads=on \
+-S \
+-object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-3-hive-dev-freebsd-12./master-key.aes \
+-blockdev '{"driver":"file","filename":"/usr/share/OVMF/OVMF_CODE_4M.fd","node-name":"libvirt-pflash0-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-pflash0-format","read-only":true,"driver":"raw","file":"libvirt-pflash0-storage"}' \
+-blockdev '{"driver":"file","filename":"/home/WHO//OVMF_VARS.fd","node-name":"libvirt-pflash1-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-pflash1-format","read-only":false,"driver":"raw","file":"libvirt-pflash1-storage"}' \
+-machine pc-q35-5.2,accel=kvm,usb=off,vmport=off,dump-guest-core=off,pflash0=libvirt-pflash0-format,pflash1=libvirt-pflash1-format,memory-backend=pc.ram \
+-cpu Broadwell-IBRS,vme=on,ss=on,vmx=on,pdcm=on,f16c=on,rdrand=on,hypervisor=on,arat=on,tsc-adjust=on,umip=on,md-clear=on,stibp=on,arch-capabilities=on,ssbd=on,xsaveopt=on,pdpe1gb=on,abm=on,ibpb=on,ibrs=on,amd-stibp=on,amd-ssbd=on,skip-l1dfl-vmentry=on,pschange-mc-no=on \
+-m 4096 \
+-object memory-backend-ram,id=pc.ram,size=4294967296 \
+-overcommit mem-lock=off \
+-smp 4,sockets=4,cores=1,threads=1 \
+-uuid 459ff0b9-e0d1-44d4-9862-83315419eeee \
+-no-user-config \
+-nodefaults \
+-chardev socket,id=charmonitor,fd=31,server,nowait \
+-mon chardev=charmonitor,id=monitor,mode=control \
+-rtc base=utc,driftfix=slew \
+-global kvm-pit.lost_tick_policy=delay \
+-no-hpet \
+-no-shutdown \
+-global ICH9-LPC.disable_s3=1 \
+-global ICH9-LPC.disable_s4=1 \
+-boot strict=on \
+-device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2 \
+-device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x2.0x1 \
+-device pcie-root-port,port=0x12,chassis=3,id=pci.3,bus=pcie.0,addr=0x2.0x2 \
+-device pcie-root-port,port=0x13,chassis=4,id=pci.4,bus=pcie.0,addr=0x2.0x3 \
+-device pcie-root-port,port=0x14,chassis=5,id=pci.5,bus=pcie.0,addr=0x2.0x4 \
+-device pcie-root-port,port=0x15,chassis=6,id=pci.6,bus=pcie.0,addr=0x2.0x5 \
+-device pcie-pci-bridge,id=pci.7,bus=pci.1,addr=0x0 \
+-device ich9-usb-ehci1,id=usb,bus=pcie.0,addr=0x1d.0x7 \
+-device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pcie.0,multifunction=on,addr=0x1d \
+-device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pcie.0,addr=0x1d.0x1 \
+-device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pcie.0,addr=0x1d.0x2 \
+-device virtio-serial-pci,id=virtio-serial0,bus=pci.2,addr=0x0 \
+-device ide-cd,bus=ide.0,id=sata0-0-0,bootindex=1 \
+-blockdev '{"driver":"file","filename":"/home/WHO//VM-HD.qcow2","node-name":"libvirt-1-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-1-format","read-only":false,"driver":"qcow2","file":"libvirt-1-storage","backing":null}' \
+-device ide-hd,bus=ide.1,drive=libvirt-1-format,id=sata0-0-1,bootindex=2 \
+-netdev tap,fd=33,id=hostnet0 \
+-device vmxnet3,netdev=hostnet0,id=net0,mac=52:54:00:c8:8b:95,bus=pci.7,addr=0x1 \
+-netdev tap,fd=34,id=hostnet1 \
+-device vmxnet3,netdev=hostnet1,id=net1,mac=52:54:00:6c:c9:c1,bus=pci.7,addr=0x2 \
+-chardev pty,id=charserial0 \
+-device isa-serial,chardev=charserial0,id=serial0 \
+-chardev spicevmc,id=charchannel0,name=vdagent \
+-device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=com.redhat.spice.0 \
+-device usb-kbd,id=input2,bus=usb.0,port=3 \
+-device usb-tablet,id=input3,bus=usb.0,port=4 \
+-spice port=5901,addr=127.0.0.1,disable-ticketing,image-compression=off,seamless-migration=on \
+-device qxl-vga,id=video0,ram_size=67108864,vram_size=67108864,vram64_size_mb=0,vgamem_mb=16,max_outputs=1,bus=pcie.0,addr=0x1 \
+-chardev spicevmc,id=charredir0,name=usbredir \
+-device usb-redir,chardev=charredir0,id=redir0,bus=usb.0,port=1 \
+-chardev spicevmc,id=charredir1,name=usbredir \
+-device usb-redir,chardev=charredir1,id=redir1,bus=usb.0,port=2 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.4,addr=0x0 \
+-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+-msg timestamp=on
+char device redirected to /dev/pts/1 (label charserial0)
+KVM internal error. Suberror: 1
+emulation failure
+RAX=0000000000000000 RBX=0000000000000000 RCX=0000000000000000 RDX=0000000000000f00
+RSI=0000000000000000 RDI=0000000000000000 RBP=0000000000000000 RSP=fffffe002dc31700
+R8 =0000000000000000 R9 =0000000000000000 R10=0000000000000000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=ffffffff828fc5d9 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =003b 0000000000000000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+CS =0020 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0028 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =003b 0000000000000000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+FS =0013 0000000800b268d0 ffffffff 00c0f300 DPL=3 DS   [-WA]
+GS =001b ffffffff82611000 ffffffff 00c0f300 DPL=3 DS   [-WA]
+LDT=0000 0000000000000000 ffffffff 00c00000
+TR =0048 ffffffff81f15e08 00002068 00008b00 DPL=0 TSS64-busy
+GDT=     ffffffff81f1c608 00000067
+IDT=     ffffffff81f14da0 00000fff
+CR0=8005003b CR2=0000000000000000 CR3=00000000517b9152 CR4=003726e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=50 4c 8b 67 58 4c 8b 6f 60 4c 8b 77 68 4c 8b 7f 70 48 8b 3f <0f> 01 c2 48 89 e7 b8 02 00 00 00 eb 07 b8 03 00 00 00 eb 00 41 bb 02 00 00 00 74 06 41 bb
+2021-05-17T12:33:38.922639Z qemu-system-x86_64: terminating on signal 15 from pid 1871 (/usr/sbin/libvirtd)
+2021-05-17 12:33:39.323+0000: shutting down, reason=destroyed
+<<END LOG>>
+
+So looks like an upstream candidate.
+
+Cheers,
+
+John.
+
+
+On Mon, May 17, 2021 at 3:01 PM John Hartley <email address hidden> wrote:
+>
+> Hi Christian,
+>
+> now I have env setup that test is pretty straight forward.
+
+Glad to hear that1
+
+> $ qemu-system-x86_64 --version
+> QEMU emulator version 6.0.50 (v6.0.0-540-g6005ee07c3)
+...
+>
+> So looks like an upstream candidate.
+
+Yeah failing with this (latest release and no Ubuntu Delta applied)
+certainly unlocks you to report it there.
+As I said, once you do so it would be great to add a link here
+pointing to the issue you've filed.
+
+
+Hi Christian,
+
+I have posted issue to upstream QEMU
+
+https://gitlab.com/qemu-project/qemu/-/issues/337
+
+
+Thanks again for assistance / advise.
+
+Cheers from Oz,
+
+John.
+

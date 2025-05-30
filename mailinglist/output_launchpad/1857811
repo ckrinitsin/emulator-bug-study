@@ -1,0 +1,189 @@
+qemu user static binary seems to lack support for network namespace.
+
+Whenever I execute emerge in gentoo linux in qemu-aarch64 chroot, I see the following error message.
+
+Unable to configure loopback interface: Operation not supported
+
+If I disable emerge's network-sandbox which utilizes network namespace, the error disappears.
+
+Could you run qemu unimplemented error trace, by using "export QEMU_LOG=unimp"?
+
+You can also set the QEMU_STRACE="" to see which syscall fails.
+
+I executed "emerge" with QEMU_LOG=unimp and QEMU_STRACE="".
+
+The interesting part in emerge.log is:
+
+  23473 socket(16,,IPPROTO_IP) = 5
+  23473 bind(5,274886353720,12,0,1,274889671712) = 0
+  23473 sendto(5,275542232672,38,0,274886353960,12) = -1 errno=95 (Operation not supported)
+  23473 close(5) = 0
+  Unable to configure loopback interface: Operation not supported
+
+So you're right 16 is AF_NETLINK
+
+At QEMU level only one function returns  EOPNOTSUPP, the one managing RTM_* operations (RTM_GETLINK, RTM_GETADDR, ...) and it doesn't manage a bunch of them.
+
+Could you provide a step by step example to reproduce the problem?
+
+def _configure_loopback_interface():
+	"""
+	Configure the loopback interface.
+	"""
+
+	# We add some additional addresses to work around odd behavior in glibc's
+	# getaddrinfo() implementation when the AI_ADDRCONFIG flag is set.
+	#
+	# For example:
+	#
+	#   struct addrinfo *res, hints = { .ai_family = AF_INET, .ai_flags = AI_ADDRCONFIG };
+	#   getaddrinfo("localhost", NULL, &hints, &res);
+	#
+	# This returns no results if there are no non-loopback addresses
+	# configured for a given address family.
+	#
+	# Bug: https://bugs.gentoo.org/690758
+	# Bug: https://sourceware.org/bugzilla/show_bug.cgi?id=12377#c13
+
+	# Avoid importing this module on systems that may not support netlink sockets.
+	from portage.util.netlink import RtNetlink
+
+	try:
+		with RtNetlink() as rtnl:
+			ifindex = rtnl.get_link_ifindex(b'lo')
+			rtnl.set_link_up(ifindex)
+			rtnl.add_address(ifindex, socket.AF_INET, '10.0.0.1', 8)
+			if _has_ipv6():
+				rtnl.add_address(ifindex, socket.AF_INET6, 'fd::1', 8)
+	except EnvironmentError as e:
+		writemsg("Unable to configure loopback interface: %s\n" % e.strerror, noiselevel=-1)
+
+If I execute _configure_loopback_interface in a qemu-aarch64 chroot, I see the following error.
+
+Unable to configure loopback interface: Operation not supported
+
+https://bugs.gentoo.org/703276 explains the issue.
+
+You can obtain portage source code from https://gentoo.osuosl.org/distfiles/portage-2.3.84.tar.bz2
+
+I've copied the file portage-2.3.84/build/lib.linux-x86_64-3.7/portage/util/netlink.py from portage to my local directory and run the following script:
+
+cat > rtnetlink.py <<EOF
+import socket
+
+__has_ipv6 = None
+
+def _has_ipv6():
+        """
+        Test that both userland and kernel support IPv6, by attempting
+        to create a socket and listen on any unused port of the IPv6
+        ::1 loopback address.
+
+        @rtype: bool
+        @return: True if IPv6 is supported, False otherwise.
+        """
+        global __has_ipv6
+
+        if __has_ipv6 is None:
+                if socket.has_ipv6:
+                        sock = None
+                        try:
+                                # With ipv6.disable=0 and ipv6.disable_ipv6=1, socket creation
+                                # succeeds, but then the bind call fails with this error:
+                                # [Errno 99] Cannot assign requested address.
+                                sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+                                sock.bind(('::1', 0))
+                        except EnvironmentError:
+                                __has_ipv6 = False
+                        else:
+                                __has_ipv6 = True
+                        finally:
+                                # python2.7 sockets do not support context management protocol
+                                if sock is not None:
+                                        sock.close()
+                else:
+                        __has_ipv6 = False
+
+        return __has_ipv6
+
+def _configure_loopback_interface():
+        """
+        Configure the loopback interface.
+        """
+
+        from netlink import RtNetlink
+        try:
+                with RtNetlink() as rtnl:
+                        ifindex = rtnl.get_link_ifindex(b'lo')
+                        rtnl.set_link_up(ifindex)
+                        rtnl.add_address(ifindex, socket.AF_INET, '10.0.0.1', 8)
+                        if _has_ipv6():
+                                rtnl.add_address(ifindex, socket.AF_INET6, 'fd::1', 8)
+        except EnvironmentError as e:
+                print("Unable to configure loopback interface: %s\n" % e.strerror)
+
+_configure_loopback_interface()
+EOF
+
+And I have no error in an aarch64/ubunut eoan chroot.
+
+sudo QEMU_STRACE= unshare --net chroot chroot/arm64/eoan python3 rtnetlink.py
+...
+675051 socket(PF_NETLINK,,NETLINK_ROUTE) = 3
+675051 bind(3,{nl_family=AF_NETLINK,nl_pid=0,nl_groups=0}, 12) = 0
+675051 sendto(3,274891222784,38,0,274886293096,12) = 38
+...
+
+sudo strace -yyy unshare --net chroot chroot/arm64/eoan python3 rtnetlink.py
+
+..
+socket(AF_NETLINK, SOCK_DGRAM|SOCK_CLOEXEC, NETLINK_ROUTE) = 3<NETLINK:[26260481]>
+bind(3<NETLINK:[26260481]>, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 0
+sendto(3<NETLINK:[26260481]>, {{len=38, type=0x12 /* NLMSG_??? */, flags=NLM_F_REQUEST, seq=1, pid=0}, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06\x00\x03\x00\x6c\x6f"}, 38, 0, {sa_family=AF_NETLINK, nl_pid=0, nl_groups=00000000}, 12) = 38
+...
+
+So I need to know which version you are using (qemu, kernel host).
+
+
+
+qemu-4.0.0
+
+> uname -a
+Linux gentoo 4.19.97-gentoo #3 SMP PREEMPT Mon Feb 10 15:09:44 KST 2020 x86_64 AMD FX(tm)-8300 Eight-Core Processor AuthenticAMD GNU/Linux
+
+Could you run something like "sudo strace -yyy unshare --net chroot ..." with your failing binary to see what returns the host kernel?
+
+Can you rephrase your question? I don't know what to do with your question.
+
+I need the strace result of _configure_loopback_interface in a qemu-aarch64 chroot.
+
+But as strace cannot be started in the chroot you must strace the "chroot" command and its children.
+
+So something like "sudo strace -yyy chroot <your chroot directory> <your test path>"
+
+I just called _configure_loopback_interface in a qemu-aarch64 chroot, and the error is not reproducible with qemu-4.2.0. Has it been fixed?
+
+Yes, it's fixed in v4.2.0, and with the help of your test program I've bisect to the fix:
+
+commit 1645fb5a1e537f85eda744bfa6e9d3dda047ba28
+Author: Shu-Chun Weng <email address hidden>
+Date:   Thu Oct 17 17:19:20 2019 -0700
+
+    Fix unsigned integer underflow in fd-trans.c
+    
+    In any of these `*_for_each_*` functions, the last entry in the buffer (so the
+    "remaining length in the buffer" `len` is equal to the length of the
+    entry `nlmsg_len`/`nla_len`/etc) has size that is not a multiple of the
+    alignment, the aligned lengths `*_ALIGN(*_len)` will be greater than `len`.
+    Since `len` is unsigned (`size_t`), it underflows and the loop will read
+    pass the buffer.
+    
+    This may manifest as random EINVAL or EOPNOTSUPP error on IO or network
+    system calls.
+    
+    Signed-off-by: Shu-Chun Weng <email address hidden>
+    Reviewed-by: Laurent Vivier <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Laurent Vivier <email address hidden>
+
+

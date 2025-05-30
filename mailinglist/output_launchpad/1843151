@@ -1,0 +1,224 @@
+Regression: QEMU 4.1.0 qxl and KMS resoluiton only 4x10
+
+Host is Arch Linux.  linux 5.2.13, qemu 4.1.0.
+
+Guest is Arch Linux Sept 2019 ISO.  linux 5.2.11.
+
+Have replicated this both on a system using amdgpu and one using integrated ASPEED graphics.
+
+Downgrading from 4.1.0 to 4.0.0 works as usual, see: https://www.youtube.com/watch?v=NyMdcYwOCvY
+
+Going back to 4.1.0 reproduces, see: https://www.youtube.com/watch?v=H3nGG2Mk6i0
+
+4.1.0 displays fine until KMS kicks in.
+
+Hi,
+  Can you give the full qemu commandline you're using on 4.1.0 please?
+(If you're starting it using libvirt/virsh then please include the xml description file for the VM).
+
+
+Finding a minimal case did shed some light on this.
+
+Using QEMU's native graphics window, this works fine:
+
+$ /usr/bin/qemu-system-x86_64 \
+   -m 1G \
+   -blockdev raw,node-name=install_iso,read-only=on,file.driver=file,file.filename=/mnt/losable/ISOs/archlinux-2019.09.01-x86_64.iso \
+   -device ide-cd,drive=install_iso,bus=ide.0,bootindex=0
+
+But, introducing spice reproduces the problem:
+
+$ /usr/bin/qemu-system-x86_64 \
+   -m 1G \
+   -blockdev raw,node-name=install_iso,read-only=on,file.driver=file,file.filename=/mnt/losable/ISOs/archlinux-2019.09.01-x86_64.iso \
+   -spice unix,addr=/tmp/spice.qxl.sock,disable-ticketing \
+   -device ide-cd,drive=install_iso,bus=ide.0,bootindex=0 \
+   -vga qxl
+
+$ remote-viewer "spice+unix:///tmp/spice.qxl.sock"
+
+I've been running remote-viewer (from virt-viewer package) since around March 13, version 8.0 since then.  It's only when upgrading QEMU from 4.0.0 to 4.1.0 that introduces the problem.
+
+Running remote-viewer this way also shows that it outputs these, right when KMS changes resolution:
+
+(remote-viewer:15090): GLib-GObject-WARNING **: 23:56:03.914: value "64" of type 'gint' is invalid or out of range for property 'desktop-width' of type 'gint'
+
+(remote-viewer:15090): GLib-GObject-WARNING **: 23:56:03.915: value "64" of type 'gint' is invalid or out of range for property 'desktop-height' of type 'gint'
+
+When downgrading to QEMU 4.0.0, remote-viewer STILL outputs these lines regarding desktop-width and height, when KMS changes resolution.
+
+In case it helps, below are spice-debug logs from remote-viewer.  I've included the whole log, but also added a bunch of spacing and a header showing the second worth of output correlating with the KMS resolution change.
+
+QEMU 4.0.0 without the bug: http://ix.io/1USn
+
+QEMU 4.1.0 with the bug: http://ix.io/1USo
+
+So, it's always possible the fix might need to be in remote-viewer, but at minimum, the case it would need to handle properly wasn't being given to it until QEMU 4.1.0.
+
+Comparing the spice debug logs, where I see this with QEMU 4.0.0 without the bug:
+
+(remote-viewer:19270): GSpice-DEBUG: 00:05:21.201: channel-display.c:1979 display-2:0: received new monitors config from guest: n: 1/4
+(remote-viewer:19270): GSpice-DEBUG: 00:05:21.201: channel-display.c:1997 display-2:0: monitor id: 0, surface id: 0, +0+0-1024x768
+
+I see this with QEMU 4.1.0 with the bug:
+
+(remote-viewer:19896): GSpice-DEBUG: 00:07:40.019: channel-display.c:1975 display-2:0: received empty monitor config
+(remote-viewer:19896): GSpice-DEBUG: 00:07:40.049: channel-cursor.c:542 cursor-4:0: cursor_handle_reset, init_done: 1
+(remote-viewer:19896): GSpice-DEBUG: 00:07:40.049: channel-display.c:1951 display-2:0: 0: FIXME primary destroy, but is display really disabled?
+
+Sorry, in comment #2 for the native graphics window command line, I copied from the wrong trial.  The argument for QXL should have been included, because that works with a native graphics window:
+
+   (...bootindex=0) \
+   -vga qxl
+
+Hi James,
+  OK, thanks - some questions:
+    a) What version of spice-server have you got on your host?
+    b) Does swapping the '-vga qxl' for '-device qxl-vga,max_outputs=1' help? (try with and without the max_outputs=1)
+    c) Are you able to do bisect builds to try and track down which commit broke it?
+
+
+
+a) spice 0.14.2.  Also spice-gtk 0.37, and spice-protocol 0.14.0.
+
+b) Swapping with "-device qxl-vga,max_outputs=1" does fix the problem.  Swapping with "-device qxl-vga" still has the bug.
+
+c) Knowing b, would the bisect still help?  If needed, sure, I will.
+
+OK that's interesting - I've got another bug I've been following that's also fixed by (b).
+
+A bisect would still be interesting; but one place to start might be to try before and after commit 
+be812c0
+
+Bisection is not going well at all with this code base!
+
+Before your last reply, I started, and the first between 4.0.0 and 4.1.0 is aae6500972 which fails compilation:
+
+==========
+
+...
+  CC      stubs/pci-host-piix.o
+  CC      stubs/ram-block.o
+  CC      stubs/ramfb.o
+  CC      stubs/fw_cfg.o
+  CC      stubs/semihost.o
+  CC      qemu-keymap.o
+  CC      util/filemonitor-stub.o
+
+Warning, treated as error:
+/build/qemu-bisect/src/qemu/docs/interop/bitmaps.rst:202:Could not lex literal_block as "json". Highlighting skipped.
+  CC      ui/input-keymap.o
+  CC      contrib/elf2dmp/main.o
+  CC      contrib/elf2dmp/addrspace.o
+  CC      contrib/elf2dmp/download.o
+  CC      contrib/elf2dmp/pdb.o
+  CC      contrib/elf2dmp/qemu_elf.o
+  CC      contrib/ivshmem-client/ivshmem-client.o
+  CC      contrib/ivshmem-client/main.o
+  CC      contrib/ivshmem-server/ivshmem-server.o
+
+==========
+
+I tried just marking it as good and hoping it was a more recent regression, instead of even doing a skip, but efa85a4d1a fails with the same error.  I double checked that 4.0.0 and 4.1.0 still get past that spot for me, and they do.
+
+I tried your suggestion, be812c0, but that compiled with this error:
+
+==========
+
+  CC      crypto/cipher.o
+  CC      crypto/tlscreds.o
+  CC      crypto/tlscredsanon.o
+/build/qemu-bisect/src/qemu/block/gluster.c: In function ‘qemu_gluster_co_pwrite_zeroes’:
+/build/qemu-bisect/src/qemu/block/gluster.c:994:52: warning: passing argument 4 of ‘glfs_zerofill_async’ from incompatible pointer type [-Wincompatible-pointer
+-types]
+  994 |     ret = glfs_zerofill_async(s->fd, offset, size, gluster_finish_aiocb, &acb);
+      |                                                    ^~~~~~~~~~~~~~~~~~~~
+      |                                                    |
+      |                                                    void (*)(struct glfs_fd *, ssize_t,  void *) {aka void (*)(struct glfs_fd *, long int,  void *)}
+In file included from /build/qemu-bisect/src/qemu/block/gluster.c:12:
+/usr/include/glusterfs/api/glfs.h:993:73: note: expected ‘glfs_io_cbk’ {aka ‘void (*)(struct glfs_fd *, long int,  struct glfs_stat *, struct glfs_stat *, void
+ *)’} but argument is of type ‘void (*)(struct glfs_fd *, ssize_t,  void *)’ {aka ‘void (*)(struct glfs_fd *, long int,  void *)’}
+  993 | glfs_zerofill_async(glfs_fd_t *fd, off_t length, off_t len, glfs_io_cbk fn,
+      |                                                             ~~~~~~~~~~~~^~
+/build/qemu-bisect/src/qemu/block/gluster.c: In function ‘qemu_gluster_do_truncate’:
+/build/qemu-bisect/src/qemu/block/gluster.c:1035:13: error: too few arguments to function ‘glfs_ftruncate’
+ 1035 |         if (glfs_ftruncate(fd, offset)) {
+      |             ^~~~~~~~~~~~~~
+In file included from /build/qemu-bisect/src/qemu/block/gluster.c:12:
+/usr/include/glusterfs/api/glfs.h:768:1: note: declared here
+  768 | glfs_ftruncate(glfs_fd_t *fd, off_t length, struct glfs_stat *prestat,
+      | ^~~~~~~~~~~~~~
+/build/qemu-bisect/src/qemu/block/gluster.c:1046:13: error: too few arguments to function ‘glfs_ftruncate’
+ 1046 |         if (glfs_ftruncate(fd, offset)) {
+      |             ^~~~~~~~~~~~~~
+
+==========
+
+So, I looked at configure and saw a "--disable-glusterfs" option, and tried it.  It still failed with:
+
+==========
+
+  GEN     it.mo
+  GEN     bg.mo
+  GEN     fr_FR.mo
+  GEN     zh_CN.mo
+  GEN     de_DE.mo
+  GEN     hu.mo
+  GEN     tr.mo
+for obj in hu.mo tr.mo it.mo bg.mo fr_FR.mo zh_CN.mo de_DE.mo; do \
+    base=$(basename $obj .mo); \
+    install -d /build/qemu-bisect/pkg/qemu-bisect/usr/share/locale/$base/LC_MESSAGES; \
+    install -m644 $obj /build/qemu-bisect/pkg/qemu-bisect/usr/share/locale/$base/LC_MESSAGES/qemu.mo; \
+done
+make[1]: Leaving directory '/build/qemu-bisect/src/build-full/po'
+install -d -m 0755 "/build/qemu-bisect/pkg/qemu-bisect/usr/share/qemu/keymaps"
+set -e; for x in da     en-gb  et  fr     fr-ch  is  lt  no  pt-br  sv ar      de     en-us  fi  fr-be  hr     it  lv  nl         pl  ru     th de-ch  es     fo  fr-ca  hu     ja  mk  pt  sl     tr bepo    cz; do \
+        install -c -m 0644 /build/qemu-bisect/src/qemu/pc-bios/keymaps/$x "/build/qemu-bisect/pkg/qemu-bisect/usr/share/qemu/keymaps"; \
+done
+install -c -m 0644 /build/qemu-bisect/src/build-full/trace-events-all "/build/qemu-bisect/pkg/qemu-bisect/usr/share/qemu/trace-events-all"
+for d in aarch64-softmmu alpha-softmmu arm-softmmu cris-softmmu hppa-softmmu i386-softmmu lm32-softmmu m68k-softmmu microblazeel-softmmu microblaze-softmmu mips64el-softmmu mips64-softmmu mipsel-softmmu mips-softmmu moxie-softmmu nios2-softmmu or1k-softmmu ppc64-softmmu ppc-softmmu riscv32-softmmu riscv64-softmmu s390x-softmmu sh4eb-softmmu sh4-softmmu sparc64-softmmu sparc-softmmu tricore-softmmu unicore32-softmmu x86_64-softmmu xtensaeb-softmmu xtensa-softmmu aarch64_be-linux-user aarch64-linux-user alpha-linux-user armeb-linux-user arm-linux-user cris-linux-user hppa-linux-user i386-linux-user m68k-linux-user microblazeel-linux-user microblaze-linux-user mips64el-linux-user mips64-linux-user mipsel-linux-user mips-linux-user mipsn32el-linux-user mipsn32-linux-user nios2-linux-user
+or1k-linux-user ppc64abi32-linux-user ppc64le-linux-user ppc64-linux-user ppc-linux-user riscv32-linux-user riscv64-linux-user s390x-linux-user sh4eb-linux-user sh4-linux-user sparc32plus-linux-user sparc64-linux-user sparc-linux-user tilegx-linux-user x86_64-linux-user xtensaeb-linux-user xtensa-linux-user; do \
+make --no-print-directory --quiet BUILD_DIR=/build/qemu-bisect/src/build-full TARGET_DIR=$d/ -C $d install || exit 1 ; \
+        done
+make: Leaving directory '/build/qemu-bisect/src/build-full'
+rm: cannot remove 'qemu/block-gluster.so': No such file or directory
+
+==========
+
+All of these builds are in clean chroot environments, so they're starting from source scratch builds without interference between previous attempts.
+
+P.S. Looks like I can use --disable-docs to hopefully get around the json parsing error, but that still doesn't help with the gluster error or that something is still looking the .so given --disable-glusterfs.
+
+hmm, disable-glusterfs *should* work around that; sometimes it's worth nuking the build directory and trying a fresh configure with these things.
+
+
+Sorry, my #8 was really long.  All builds I've done were in clean chroots, so starting from scratch with just git source, with no interference from other builds.  Also later in #8, I show that --disable-glusterfs doesn't work because some part of the build looks for the .so that was never built.
+
+Luckily, be812c0 was easy enough to just manually revert on top of 4.1.0.
+
+And, good news.  (I hope!)  4.1.0 with be812c0 manually reverted on top of it prevents the bug, even WITHOUT "max_outputs=1".
+
+James:  Freedy proposed a fix for the bug I was looking at with a spice fix:
+   https://lists.freedesktop.org/archives/spice-devel/2019-September/050859.html
+That's in the spice-server package.
+
+If you can check that it also fixes your bug that would be great.
+
+Yes, I first replicated the issue by removing "max_outputs=1", then patched spice server, and the issue no longer happens.
+
+QEMU 4.1.0 still changed something.  If I understand correctly, it's now in some circumstances saying there are 0 monitors, even though there's a graphic card?
+
+Fixing this in spice to effectively ignore being told 0, and go with 1 instead, gets around the bug, but still makes me think there's something wrong in QEMU 4.1.0.  Granted, perhaps with this spice fix, it might not cause any negative effects anymore.
+
+But, I don't know if there are any third party applications especially on Windows that don't use upstream spice-server and might be thrown off by this in a similar way.  So, I wonder if QEMU 4.1.0 should still have something fixed.
+
+Hi James,
+  The change in QEMU in 4.1 is that it's using a newer spice interface;  Freddy is on our spice team and we chatted about whether to change QEMU but they thought it best to fix Spice to be more tolerant; so I'm happy to go with that recommendation.
+
+Has this ever been fixed on the QEMU or Spice side?
+
+Anyway, the QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

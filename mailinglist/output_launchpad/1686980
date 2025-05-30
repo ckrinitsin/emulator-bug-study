@@ -1,0 +1,88 @@
+qemu is very slow when adding 16,384 virtio-scsi drives
+
+qemu runs very slowly when adding many virtio-scsi drives.  I have attached a small reproducer shell script which demonstrates this.
+
+Using perf shows the following stack trace taking all the time:
+
+    72.42%    71.15%  qemu-system-x86  qemu-system-x86_64       [.] drive_get
+            |          
+             --72.32%--drive_get
+                       |          
+                        --1.24%--__irqentry_text_start
+                                  |          
+                                   --1.22%--smp_apic_timer_interrupt
+                                             |          
+                                              --1.00%--local_apic_timer_interrupt
+                                                        |          
+                                                         --1.00%--hrtimer_interrupt
+                                                                   |          
+                                                                    --0.83%--__hrtimer_run_queues
+                                                                              |          
+                                                                               --0.64%--tick_sched_timer
+
+    21.70%    21.34%  qemu-system-x86  qemu-system-x86_64       [.] blk_legacy_dinfo
+            |
+            ---blk_legacy_dinfo
+
+     3.65%     3.59%  qemu-system-x86  qemu-system-x86_64       [.] blk_next
+            |
+            ---blk_next
+
+
+
+The first place where it ages an insane amount of time is simply processing -drive options. The stack trace I see is this
+
+(gdb) bt
+#0  0x00005583b596719a in drive_get (type=type@entry=IF_NONE, bus=bus@entry=0, unit=unit@entry=2313) at blockdev.c:223
+#1  0x00005583b59679bd in drive_new (all_opts=0x5583b890e080, block_default_type=<optimized out>) at blockdev.c:996
+#2  0x00005583b5971641 in drive_init_func (opaque=<optimized out>, opts=<optimized out>, errp=<optimized out>)
+    at vl.c:1154
+#3  0x00005583b5c1149a in qemu_opts_foreach (list=<optimized out>, func=0x5583b5971630 <drive_init_func>, opaque=0x5583b9980030, errp=0x0) at util/qemu-option.c:1114
+#4  0x00005583b5830d30 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4499
+
+
+We're iterating over every -drive option. Now because we're using if=none, and thus unit==0, line 996 of blockdev.c looks calling drive_get() until we find a matching drive, in order to identify the unit number. So we have a loop over every drive, calling drive_new which loops over every drive calling drive_get which loops over every drive. So about O(N*N*N) 
+
+I instrumented drive_new to time how long 1000 creations took with current code:
+
+1000 drive_new() in 0 secs
+1000 drive_new() in 2 secs
+1000 drive_new() in 18 secs
+1000 drive_new() in 61 secs
+
+As a quick hack you can just disable the drive_get() calls when if=none. They're mostly just used to fill in default unit_id, but that's not really required for if=none. That said, if no id= parameter is set, then the code does expect unit_id to be valid, so not sure how to fully fix that.
+
+Anyway, with this hack applied it is much faster, but there is still some kind of N*N complexity going on, because drive_new() gets slower & slower as each drive is created - just not nearly as badly as before.
+
+1000 drive_new() in 0 secs
+1000 drive_new() in 0 secs
+1000 drive_new() in 0 secs
+1000 drive_new() in 1 secs
+1000 drive_new() in 1 secs
+1000 drive_new() in 1 secs
+1000 drive_new() in 2 secs
+1000 drive_new() in 2 secs
+1000 drive_new() in 2 secs
+1000 drive_new() in 4 secs
+1000 drive_new() in 4 secs
+1000 drive_new() in 6 secs
+1000 drive_new() in 8 secs
+1000 drive_new() in 8 secs
+
+
+I added further instrumentation and got this profile of where the remaining time goes
+
+1000x drive_new 18.347secs
+-> 1000x blockdev_init 18.328secs
+   -> 1000x monitor_add_blk 4.515secs
+      -> 1000x blk_by_name 1.545secs
+      -> 1000x bdrv_find_node 2.968secs
+   -> 1000x blk_new_open 13.786secs
+      -> 1000x bdrv_open 13.783secs
+
+These numbers are all increasing as we process more & more -drive args, so there's some O(N) factor in blk_by_name, bdrv_find_node and bdrv_open
+
+Is this faster nowadays if you use the new -blockdev parameter instead of -drive?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

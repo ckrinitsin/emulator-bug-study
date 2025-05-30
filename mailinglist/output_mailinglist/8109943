@@ -1,0 +1,404 @@
+[Qemu-devel] [BUG] Windows 7 got stuck easily while run PCMark10 application
+
+Hiï¼
+
+We hit a bug in our test while run PCMark 10 in a windows 7 VM,
+The VM got stuck and the wallclock was hang after several minutes running
+PCMark 10 in it.
+It is quite easily to reproduce the bug with the upstream KVM and Qemu.
+
+We found that KVM can not inject any RTC irq to VM after it was hang, it fails 
+to
+Deliver irq in ioapic_set_irq() because RTC irq is still pending in ioapic->irr.
+
+static int ioapic_set_irq(struct kvm_ioapic *ioapic, unsigned int irq,
+                  int irq_level, bool line_status)
+{
+â¦ â¦
+         if (!irq_level) {
+                  ioapic->irr &= ~mask;
+                  ret = 1;
+                  goto out;
+         }
+â¦ â¦
+         if ((edge && old_irr == ioapic->irr) ||
+             (!edge && entry.fields.remote_irr)) {
+                  ret = 0;
+                  goto out;
+         }
+
+According to RTC spec, after RTC injects a High level irq, OS will read CMOSâs
+register C to to clear the irq flag, and pull down the irq electric pin.
+
+For Qemu, we will emulate the reading operation in cmos_ioport_read(),
+but Guest OS will fire a write operation before to tell which register will be 
+read
+after this write, where we use s->cmos_index to record the following register 
+to read.
+
+But in our test, we found that there is a possible situation that Vcpu fails to 
+read
+RTC_REG_C to clear irq, This could happens while two VCpus are writing/reading
+registers at the same time, for example, vcpu 0 is trying to read RTC_REG_C,
+so it write RTC_REG_C first, where the s->cmos_index will be RTC_REG_C,
+but before it tries to read register C, another vcpu1 is going to read RTC_YEAR,
+it changes s->cmos_index to RTC_YEAR by a writing action.
+The next operation of vcpu0 will be lead to read RTC_YEAR, In this case, we 
+will miss
+calling qemu_irq_lower(s->irq) to clear the irq. After this, kvm will never 
+inject RTC irq,
+and Windows VM will hang.
+static void cmos_ioport_write(void *opaque, hwaddr addr,
+                              uint64_t data, unsigned size)
+{
+    RTCState *s = opaque;
+
+    if ((addr & 1) == 0) {
+        s->cmos_index = data & 0x7f;
+    }
+â¦â¦
+static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
+                                 unsigned size)
+{
+    RTCState *s = opaque;
+    int ret;
+    if ((addr & 1) == 0) {
+        return 0xff;
+    } else {
+        switch(s->cmos_index) {
+
+According to CMOS spec, âany write to PROT 0070h should be followed by an 
+action to PROT 0071h or the RTC
+Will be RTC will be left in an unknown stateâ, but it seems that we can not 
+ensure this sequence in qemu/kvm.
+
+Any ideas ?
+
+Thanks,
+Hailiang
+
+Pls see the trace of kvm_pio:
+
+       CPU 1/KVM-15567 [003] .... 209311.762579: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762582: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x89
+       CPU 1/KVM-15567 [003] .... 209311.762590: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x17
+       CPU 0/KVM-15566 [005] .... 209311.762611: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0xc
+       CPU 1/KVM-15567 [003] .... 209311.762615: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762619: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x88
+       CPU 1/KVM-15567 [003] .... 209311.762627: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x12
+       CPU 0/KVM-15566 [005] .... 209311.762632: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x12
+       CPU 1/KVM-15567 [003] .... 209311.762633: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 0/KVM-15566 [005] .... 209311.762634: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0xc           <--- Firstly write to 0x70, cmo_index = 0xc & 
+0x7f = 0xc
+       CPU 1/KVM-15567 [003] .... 209311.762636: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x86       <-- Secondly write to 0x70, cmo_index = 0x86 & 
+0x7f = 0x6, cover the cmo_index result of first time
+       CPU 0/KVM-15566 [005] .... 209311.762641: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x6      <--  vcpu0 read 0x6 because cmo_index is 0x6 now
+       CPU 1/KVM-15567 [003] .... 209311.762644: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x6     <-  vcpu1 read 0x6
+       CPU 1/KVM-15567 [003] .... 209311.762649: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762669: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x87
+       CPU 1/KVM-15567 [003] .... 209311.762678: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x1
+       CPU 1/KVM-15567 [003] .... 209311.762683: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762686: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x84
+       CPU 1/KVM-15567 [003] .... 209311.762693: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x10
+       CPU 1/KVM-15567 [003] .... 209311.762699: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762702: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x82
+       CPU 1/KVM-15567 [003] .... 209311.762709: kvm_pio: pio_read at 0x71 size 
+1 count 1 val 0x25
+       CPU 1/KVM-15567 [003] .... 209311.762714: kvm_pio: pio_read at 0x70 size 
+1 count 1 val 0xff
+       CPU 1/KVM-15567 [003] .... 209311.762717: kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x80
+
+
+Regards,
+-Gonglei
+
+From: Zhanghailiang
+Sent: Friday, December 01, 2017 3:03 AM
+To: address@hidden; address@hidden; Paolo Bonzini
+Cc: Huangweidong (C); Gonglei (Arei); wangxin (U); Xiexiangyou
+Subject: [BUG] Windows 7 got stuck easily while run PCMark10 application
+
+Hiï¼
+
+We hit a bug in our test while run PCMark 10 in a windows 7 VM,
+The VM got stuck and the wallclock was hang after several minutes running
+PCMark 10 in it.
+It is quite easily to reproduce the bug with the upstream KVM and Qemu.
+
+We found that KVM can not inject any RTC irq to VM after it was hang, it fails 
+to
+Deliver irq in ioapic_set_irq() because RTC irq is still pending in ioapic->irr.
+
+static int ioapic_set_irq(struct kvm_ioapic *ioapic, unsigned int irq,
+                  int irq_level, bool line_status)
+{
+â¦ â¦
+         if (!irq_level) {
+                  ioapic->irr &= ~mask;
+                  ret = 1;
+                  goto out;
+         }
+â¦ â¦
+         if ((edge && old_irr == ioapic->irr) ||
+             (!edge && entry.fields.remote_irr)) {
+                  ret = 0;
+                  goto out;
+         }
+
+According to RTC spec, after RTC injects a High level irq, OS will read CMOSâs
+register C to to clear the irq flag, and pull down the irq electric pin.
+
+For Qemu, we will emulate the reading operation in cmos_ioport_read(),
+but Guest OS will fire a write operation before to tell which register will be 
+read
+after this write, where we use s->cmos_index to record the following register 
+to read.
+
+But in our test, we found that there is a possible situation that Vcpu fails to 
+read
+RTC_REG_C to clear irq, This could happens while two VCpus are writing/reading
+registers at the same time, for example, vcpu 0 is trying to read RTC_REG_C,
+so it write RTC_REG_C first, where the s->cmos_index will be RTC_REG_C,
+but before it tries to read register C, another vcpu1 is going to read RTC_YEAR,
+it changes s->cmos_index to RTC_YEAR by a writing action.
+The next operation of vcpu0 will be lead to read RTC_YEAR, In this case, we 
+will miss
+calling qemu_irq_lower(s->irq) to clear the irq. After this, kvm will never 
+inject RTC irq,
+and Windows VM will hang.
+static void cmos_ioport_write(void *opaque, hwaddr addr,
+                              uint64_t data, unsigned size)
+{
+    RTCState *s = opaque;
+
+    if ((addr & 1) == 0) {
+        s->cmos_index = data & 0x7f;
+    }
+â¦â¦
+static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
+                                 unsigned size)
+{
+    RTCState *s = opaque;
+    int ret;
+    if ((addr & 1) == 0) {
+        return 0xff;
+    } else {
+        switch(s->cmos_index) {
+
+According to CMOS spec, âany write to PROT 0070h should be followed by an 
+action to PROT 0071h or the RTC
+Will be RTC will be left in an unknown stateâ, but it seems that we can not 
+ensure this sequence in qemu/kvm.
+
+Any ideas ?
+
+Thanks,
+Hailiang
+
+On 01/12/2017 08:08, Gonglei (Arei) wrote:
+>
+First write to 0x70, cmos_index = 0xc & 0x7f = 0xc
+>
+Â Â Â Â Â Â  CPU 0/KVM-15566 kvm_pio: pio_write at 0x70 size 1 count 1 val 0xc>
+>
+Second write to 0x70, cmos_index = 0x86 & 0x7f = 0x6> Â Â Â Â Â Â  CPU 1/KVM-15567
+>
+kvm_pio: pio_write at 0x70 size 1 count 1 val 0x86> vcpu0 read 0x6 because
+>
+cmos_index is 0x6 now:> Â Â Â Â Â Â  CPU 0/KVM-15566 kvm_pio: pio_read at 0x71 size
+>
+1 count 1 val 0x6> vcpu1 read 0x6:> Â Â Â Â Â Â  CPU 1/KVM-15567 kvm_pio: pio_read
+>
+at 0x71 size 1 count 1 val 0x6
+This seems to be a Windows bug.  The easiest workaround that I
+can think of is to clear the interrupts already when 0xc is written,
+without waiting for the read (because REG_C can only be read).
+
+What do you think?
+
+Thanks,
+
+Paolo
+
+I also think it's windows bug, the problem is that it doesn't occur on xen 
+platform. And there are some other works need to be done while reading REG_C. 
+So I wrote that patch.
+
+Thanks,
+Gonglei
+åä»¶äººï¼Paolo Bonzini
+æ¶ä»¶äººï¼é¾ç£,å¼ æµ·äº®,qemu-devel,Michael S. Tsirkin
+æéï¼é»ä¼æ ,çæ¬£,è°¢ç¥¥æ
+æ¶é´ï¼2017-12-02 01:10:08
+ä¸»é¢:Re: [BUG] Windows 7 got stuck easily while run PCMark10 application
+
+On 01/12/2017 08:08, Gonglei (Arei) wrote:
+>
+First write to 0x70, cmos_index = 0xc & 0x7f = 0xc
+>
+CPU 0/KVM-15566 kvm_pio: pio_write at 0x70 size 1 count 1 val 0xc>
+>
+Second write to 0x70, cmos_index = 0x86 & 0x7f = 0x6>        CPU 1/KVM-15567
+>
+kvm_pio: pio_write at 0x70 size 1 count 1 val 0x86> vcpu0 read 0x6 because
+>
+cmos_index is 0x6 now:>        CPU 0/KVM-15566 kvm_pio: pio_read at 0x71 size
+>
+1 count 1 val 0x6> vcpu1 read 0x6:>        CPU 1/KVM-15567 kvm_pio: pio_read
+>
+at 0x71 size 1 count 1 val 0x6
+This seems to be a Windows bug.  The easiest workaround that I
+can think of is to clear the interrupts already when 0xc is written,
+without waiting for the read (because REG_C can only be read).
+
+What do you think?
+
+Thanks,
+
+Paolo
+
+On 01/12/2017 18:45, Gonglei (Arei) wrote:
+>
+I also think it's windows bug, the problem is that it doesn't occur on
+>
+xen platform.
+It's a race, it may just be that RTC PIO is faster in Xen because it's
+implemented in the hypervisor.
+
+I will try reporting it to Microsoft.
+
+Thanks,
+
+Paolo
+
+>
+Thanks,
+>
+Gonglei
+>
+*åä»¶äººï¼*Paolo Bonzini
+>
+*æ¶ä»¶äººï¼*é¾ç£,å¼ æµ·äº®,qemu-devel,Michael S. Tsirkin
+>
+*æéï¼*é»ä¼æ ,çæ¬£,è°¢ç¥¥æ
+>
+*æ¶é´ï¼*2017-12-02 01:10:08
+>
+*ä¸»é¢:*Re: [BUG] Windows 7 got stuck easily while run PCMark10 application
+>
+>
+On 01/12/2017 08:08, Gonglei (Arei) wrote:
+>
+> First write to 0x70, cmos_index = 0xc & 0x7f = 0xc
+>
+> Â Â Â Â Â Â  CPU 0/KVM-15566 kvm_pio: pio_write at 0x70 size 1 count 1 val 0xc>
+>
+> Second write to 0x70, cmos_index = 0x86 & 0x7f = 0x6> Â Â Â Â Â Â  CPU 1/KVM-15567
+>
+> kvm_pio: pio_write at 0x70 size 1 count 1 val 0x86> vcpu0 read 0x6 because
+>
+> cmos_index is 0x6 now:> Â Â Â Â Â Â  CPU 0/KVM-15566 kvm_pio: pio_read at 0x71
+>
+> size 1 count 1 val 0x6> vcpu1
+>
+read 0x6:> Â Â Â Â Â Â  CPU 1/KVM-15567 kvm_pio: pio_read at 0x71 size 1 count
+>
+1 val 0x6
+>
+This seems to be a Windows bug.Â  The easiest workaround that I
+>
+can think of is to clear the interrupts already when 0xc is written,
+>
+without waiting for the read (because REG_C can only be read).
+>
+>
+What do you think?
+>
+>
+Thanks,
+>
+>
+Paolo
+
+On 2017/12/2 2:37, Paolo Bonzini wrote:
+On 01/12/2017 18:45, Gonglei (Arei) wrote:
+I also think it's windows bug, the problem is that it doesn't occur on
+xen platform.
+It's a race, it may just be that RTC PIO is faster in Xen because it's
+implemented in the hypervisor.
+No, In Xen, it does not has such problem because it injects the RTC irq without
+checking whether its previous irq been cleared or not, which we do has such 
+checking
+in KVM.
+
+static int ioapic_set_irq(struct kvm_ioapic *ioapic, unsigned int irq,
+        int irq_level, bool line_status)
+{
+   ... ...
+    if (!irq_level) {
+        ioapic->irr &= ~mask; -->clear the RTC irq in irr, Or we will can not 
+inject RTC irq.
+        ret = 1;
+        goto out;
+    }
+
+I agree that we move the operation of clearing RTC irq from cmos_ioport_read() 
+to
+cmos_ioport_write() to ensure the action been done.
+
+Thanks,
+Hailiang
+I will try reporting it to Microsoft.
+
+Thanks,
+
+Paolo
+Thanks,
+Gonglei
+*åä»¶äººï¼*Paolo Bonzini
+*æ¶ä»¶äººï¼*é¾ç£,å¼ æµ·äº®,qemu-devel,Michael S. Tsirkin
+*æéï¼*é»ä¼æ ,çæ¬£,è°¢ç¥¥æ
+*æ¶é´ï¼*2017-12-02 01:10:08
+*ä¸»é¢:*Re: [BUG] Windows 7 got stuck easily while run PCMark10 application
+
+On 01/12/2017 08:08, Gonglei (Arei) wrote:
+First write to 0x70, cmos_index = 0xc & 0x7f = 0xc
+        CPU 0/KVM-15566 kvm_pio: pio_write at 0x70 size 1 count 1 val 0xc> Second write to 
+0x70, cmos_index = 0x86 & 0x7f = 0x6>        CPU 1/KVM-15567 kvm_pio: pio_write at 0x70 
+size 1 count 1 val 0x86> vcpu0 read 0x6 because cmos_index is 0x6 now:>        CPU 
+0/KVM-15566 kvm_pio: pio_read at 0x71 size 1 count 1 val 0x6> vcpu1
+read 0x6:>        CPU 1/KVM-15567 kvm_pio: pio_read at 0x71 size 1 count
+1 val 0x6
+This seems to be a Windows bug.  The easiest workaround that I
+can think of is to clear the interrupts already when 0xc is written,
+without waiting for the read (because REG_C can only be read).
+
+What do you think?
+
+Thanks,
+
+Paolo
+.
+

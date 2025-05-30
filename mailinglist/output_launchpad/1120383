@@ -1,0 +1,147 @@
+incremental live block migration of qemu 1.3.1 doesn't work
+
+We tested qemu 1.3.1 for live migration of block device. It failed with error.   Since qemu-kvm 1.2.0 is ok for this test, we think this problem is introduced by new qemu 1.3.x releases.
+
+To reproduce:
+
+1. compile qemu 1.3.1:
+    # cd qemu-1.3.1
+    # ./configure --prefix=/usr --sysconfdir=/etc --target-list=x86_64-softmmu
+    # make; make install
+
+2. prepare source(172.16.1.13):
+    # qemu-img create -f qcow2 os.img -b /home/reno/wheezyx64     ###Note: wheezyx64 is a template image for Debian Wheezy 
+    # qemu-system-x86_64 -hda os.img -m 512 --enable-kvm -vnc :51 -monitor stdio
+
+3. prepare destination(172.16.1.14):
+    # qemu-img create -f qcow2 os.img -b /home/reno/wheezyx64    
+    # qemu-system-x86_64 -hda os.img -m 512 --enable-kvm -vnc :51 -incoming tcp:0:4444
+
+4. do live migrate:
+    on source monitor command prompt, input:
+    (qemu) migrate -i tcp:172.16.1.14:4444
+
+monitor command will quit immediately and on destination host, there are errors thrown:
+    Receiving block device images
+    Co-routine re-entered recursively
+    Aborted
+
+On Sat, Feb 9, 2013 at 3:46 PM, Reno Gan <email address hidden> wrote:
+> Public bug reported:
+>
+> We tested qemu 1.3.1 for live migration of block device. It failed with
+> error.   Since qemu-kvm 1.2.0 is ok for this test, we think this problem
+> is introduced by new qemu 1.3.x releases.
+
+Thanks for reporting this bug.  It is a known issue and a fix is being
+worked on for the QEMU 1.4 release.
+
+Stefan
+
+
+On Sat, Feb 9, 2013 at 3:46 PM, Reno Gan <email address hidden> wrote:
+> Public bug reported:
+>
+> We tested qemu 1.3.1 for live migration of block device. It failed with
+> error.   Since qemu-kvm 1.2.0 is ok for this test, we think this problem
+> is introduced by new qemu 1.3.x releases.
+
+I have posted fixes to the qemu-devel mailing list.
+
+You can try them like this:
+git clone -b block-migration-fixes-for-1.4
+git://github.com/stefanha/qemu.git qemu
+cd qemu
+./configure --target-list=x86_64-softmmu
+make
+
+
+I have tried this patch and it works.  Thanks for your work and can't wait 1.4 coming out
+
+Another thing i want to mention about live block migration, though i don't know if this is really an issue of qemu or downstream libvirt. 
+
+When I was testing live migration of qemu-kvm-1.2.0 for long run, i found a problem that block data are not completed transferred to target host.  I traced that and found block migration thinks migration is completed when "block_mig_state.submitted == 0",  but actually in some cases, data are not really transferred yet.
+
+I think the reasonable judgement for whether block migration is completed is "block_mig_state.submitted == 0 && block_mig_state.read_done == 0", that is all data have been transferred. 
+
+I don't see anything about this in block-migration-fixes-for-1.4. Maybe it has been addressed somewhere else, but if it is not, please consider this issue and make sure data is integrated during block migration.
+
+On Sun, Feb 10, 2013 at 3:48 AM, Reno Gan <email address hidden> wrote:
+> Another thing i want to mention about live block migration, though i
+> don't know if this is really an issue of qemu or downstream libvirt.
+>
+> When I was testing live migration of qemu-kvm-1.2.0 for long run, i
+> found a problem that block data are not completed transferred to target
+> host.  I traced that and found block migration thinks migration is
+> completed when "block_mig_state.submitted == 0",  but actually in some
+> cases, data are not really transferred yet.
+>
+> I think the reasonable judgement for whether block migration is
+> completed is "block_mig_state.submitted == 0 &&
+> block_mig_state.read_done == 0", that is all data have been transferred.
+>
+> I don't see anything about this in block-migration-fixes-for-1.4. Maybe
+> it has been addressed somewhere else, but if it is not, please consider
+> this issue and make sure data is integrated during block migration.
+
+Is there a way to reproduce this issue easily?
+
+How do you know that not all data has been transferred?
+
+Stefan
+
+
+If you want to reproduce it, you can refer to my test case in this bug description, only differences are:
+  1) make sure "os.img" is big enough, for example, > 300M
+  2) write a script to migrate it in a loop:
+       a) migrate from A to B
+       b) shutdown guest on B and start it again
+       c) check if guest os is healthy. (I use guestfs to do this, you can use ssh to write a simple file in the guest file system)
+
+If error happens, the guest os will be mounted as read-only and a lot of root file system errors will be thrown out in syslog. 
+
+I checked the image size from A to B and noticed that image size is shrinked dramatically. For example, if source size is 300M, only 10M is left on host B after migration.  
+
+I also print out values of "block_mig_state.submitted", "block_mig_state.read_done", and "block_mig_state.transferred", and found that if error happened, "submitted" is zero and "read_done" is not zero.
+
+For example, if 52 blocks are to be migrated from A to B, when migration is completed, the three values will be:
+     submitted = 0,  read_done = 40,  transferred = 12
+
+That is : a lot of data are actually "readed" but not "transferred", only part of data are migrated.
+
+
+On Sun, Feb 10, 2013 at 3:48 AM, Reno Gan <email address hidden> wrote:
+> Another thing i want to mention about live block migration, though i
+> don't know if this is really an issue of qemu or downstream libvirt.
+>
+> When I was testing live migration of qemu-kvm-1.2.0 for long run, i
+> found a problem that block data are not completed transferred to target
+> host.  I traced that and found block migration thinks migration is
+> completed when "block_mig_state.submitted == 0",  but actually in some
+> cases, data are not really transferred yet.
+>
+> I think the reasonable judgement for whether block migration is
+> completed is "block_mig_state.submitted == 0 &&
+> block_mig_state.read_done == 0", that is all data have been transferred.
+>
+> I don't see anything about this in block-migration-fixes-for-1.4. Maybe
+> it has been addressed somewhere else, but if it is not, please consider
+> this issue and make sure data is integrated during block migration.
+
+You are right.  Thanks for pointing out this bug.
+
+I have changed it to:
++    /* Complete when bulk transfer is done and all dirty blocks have been
++     * transferred.
++     */
++    return block_mig_state.bulk_completed &&
++           block_mig_state.submitted == 0 &&
++           block_mig_state.read_done == 0;
+
+Stefan
+
+
+That's great, thanks
+
+If I've got the comments right, this bug has been fixed, so closing this now. If there is an issue remaining, please open a new bug.
+

@@ -1,0 +1,101 @@
+qemu-user child process hangs when forking due to glib allocation
+
+I and others have recently been using qemu-user for RISCV64 extensively. We have had many hangs. We have found that hangs happen in process with multiple threads and forking. For example
+`cargo` (a tool for the Rust compiler).
+
+It does not matter if there are a lot of calls to fork. What seems to matter most is that there are many threads running. So this happens more often on a CPU with a massive number of cores, and if nothing else is really running. The hang happens in the child process of the fork.
+
+To reproduce the problem, I have attached an example of C++ program to run through qemu-user.
+
+Here are the stacks of the child processes that hanged. This is for qemu c973f06521b07af0f82893b75a1d55562fffb4b5 with glib 2.66.4
+
+-------
+Thread 1:
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007f54e190c77c in g_mutex_lock_slowpath (mutex=mutex@entry=0x7f54e1dc7600 <allocator+96>) at ../glib/gthread-posix.c:1462
+#2  0x00007f54e190d222 in g_mutex_lock (mutex=mutex@entry=0x7f54e1dc7600 <allocator+96>) at ../glib/gthread-posix.c:1486
+#3  0x00007f54e18e39f2 in magazine_cache_pop_magazine (countp=0x7f54280e6638, ix=2) at ../glib/gslice.c:769
+#4  thread_memory_magazine1_reload (ix=2, tmem=0x7f54280e6600) at ../glib/gslice.c:845
+#5  g_slice_alloc (mem_size=mem_size@entry=40) at ../glib/gslice.c:1058
+#6  0x00007f54e18f06fa in g_tree_node_new (value=0x7f54d4066540 <code_gen_buffer+419091>, key=0x7f54d4066560 <code_gen_buffer+419123>) at ../glib/gtree.c:517
+#7  g_tree_insert_internal (tree=0x555556aed800, key=0x7f54d4066560 <code_gen_buffer+419123>, value=0x7f54d4066540 <code_gen_buffer+419091>, replace=0) at ../glib/gtree.c:517
+#8  0x00007f54e186b755 in tcg_tb_insert (tb=0x7f54d4066540 <code_gen_buffer+419091>) at ../tcg/tcg.c:534
+#9  0x00007f54e1820545 in tb_gen_code (cpu=0x7f54980b4b60, pc=274906407438, cs_base=0, flags=24832, cflags=-16252928) at ../accel/tcg/translate-all.c:2118
+#10 0x00007f54e18034a5 in tb_find (cpu=0x7f54980b4b60, last_tb=0x7f54d4066440 <code_gen_buffer+418835>, tb_exit=0, cf_mask=524288) at ../accel/tcg/cpu-exec.c:462
+#11 0x00007f54e1803bd9 in cpu_exec (cpu=0x7f54980b4b60) at ../accel/tcg/cpu-exec.c:818
+#12 0x00007f54e1735a4c in cpu_loop (env=0x7f54980bce40) at ../linux-user/riscv/cpu_loop.c:37
+#13 0x00007f54e1844b22 in clone_func (arg=0x7f5402f3b080) at ../linux-user/syscall.c:6422
+#14 0x00007f54e191950a in start_thread (arg=<optimized out>) at pthread_create.c:477
+#15 0x00007f54e19a52a3 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+
+Thread 2:
+#1  0x00007f54e18a8d6e in qemu_futex_wait (f=0x7f54e1dc7038 <rcu_call_ready_event>, val=4294967295) at /var/home/valentin/repos/qemu/include/qemu/futex.h:29
+#2  0x00007f54e18a8f32 in qemu_event_wait (ev=0x7f54e1dc7038 <rcu_call_ready_event>) at ../util/qemu-thread-posix.c:460
+#3  0x00007f54e18c0196 in call_rcu_thread (opaque=0x0) at ../util/rcu.c:258
+#4  0x00007f54e18a90eb in qemu_thread_start (args=0x7f5428244930) at ../util/qemu-thread-posix.c:521
+#5  0x00007f54e191950a in start_thread (arg=<optimized out>) at pthread_create.c:477
+#6  0x00007f54e19a52a3 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+-------
+
+Thread 1 seems to be the really hanged process.
+
+The problem is that glib is used in many places. Allocations are done through g_slice. g_slice has a global state that is not fork safe.
+
+So even though the cpu thread is set to exclusive before forking, it is not enough. Because there are other uses of glib data structures that are not part of the cpu loop (I think). So it seems not to be synchronized by `start_exclusive`, `end_exclusive`.
+
+So if one of the use of glib data structure is used during the fork, an allocation might lock a mutex in g_slice.
+
+When the cpu loop resumes in forked process, then the use of any glib data structure might just hang on a locked mutex in g_slice.
+
+So as a work-around we have starting using is setting environment `G_SLICE=always-malloc`. This resolves the hangs.
+
+I have opened an issue upstream: https://gitlab.gnome.org/GNOME/glib/-/issues/2326
+
+As fork documentation says, the child should be async-signal-safe. However, glibc's malloc is safe in fork child even though it is not async-signal-safe. So it is not that obvious where the responsability is. Should glib handle this case like malloc does? Or should qemu not use glib in the fork child?
+
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+Re-opened as https://gitlab.com/qemu-project/qemu/-/issues/285
+
+As a quick win, we ought to call setenv("G_SLICE", "always-malloc", 1) during startup to avoid the specific scenario you hit.
+
+A more general solution is likely to be non-trivial. 
+
+glib is such a fundamental part of QEMU that is is hard to avoid its usage.
+
+The async-signal safety issues only matter when the program is multi-threaded, but in practice that's not much help as its rare to be truely single threaded.
+
+The nature of what QEMU is trying to emulate also means there's potentially quite a lot we have to deal with betwen fork+exec. Assuming we can't remove the need to run stuff in between fork+exec, we're left with a long term game of whack-a-mole fixing problems as they are reported.  
+
+Closing this ticket on Launchpad, since it has been moved to the Gitlab tracker now (thanks, Valentin!)
+

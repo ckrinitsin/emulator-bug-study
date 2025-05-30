@@ -1,0 +1,799 @@
+Unable to reboot s390x KVM machine after initial deploy
+
+MAAS version: 2.6.1 (7832-g17912cdc9-0ubuntu1~18.04.1)
+Arch: S390x
+
+Appears that MAAS can not find the s390x bootloader to boot from the disk, not sure how maas determines this.  However this was working in the past. I had originally thought that if the maas machine was deployed then it defaulted to boot from disk, (Which does work as expected) 
+
+
+Reproduce: 
+
+- Deploy Disco on S390x KVM instance
+- Reboot it
+
+on the KVM console...
+
+Connected to domain s2lp6g001
+Escape character is ^]
+done
+  Using IPv4 address: 10.246.75.160
+  Using TFTP server: 10.246.72.3
+  Bootfile name: 'boots390x.bin'
+  Receiving data:  0 KBytes
+  TFTP error: file not found: boots390x.bin
+Trying pxelinux.cfg files...
+  Receiving data:  0 KBytes
+  Receiving data:  0 KBytes
+Failed to load OS from network
+
+
+==> /var/log/maas/rackd.log <==
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] boots390x.bin requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/65a9ca43-9541-49be-b315-e2ca85936ea2 requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/01-52-54-00-e5-d7-bb requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF64BA0 requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF64BA requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF64B requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF64 requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF6 requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0AF requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0A requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/0 requested by 10.246.75.160
+2020-01-14 18:21:24 provisioningserver.rackdservices.tftp: [info] s390x/default requested by 10.246.75.160
+
+
+
+Powering off the machine after its initial deployment renders the machine unusable. 
+
+Workaround:
+Release & Redeploy again. 
+
+Please note that I have updated MAAS to version 2.6.2 from the proposed PPA and this problem still exists. 
+
+boots390x.bin is a place holder, the file shouldn't exist. Its defined as a way to allow MAAS to know the architecture of the machine being booted. The bootloader itself is shipped with kvm. You do need a newer version of kvm. Bionic should work I can't remember if it was backported to Xenial.
+
+I forgot to add each Pod/kvm host has to have Bionic or newer. This blog post explains it pretty well
+
+http://ubuntu-on-big-iron.blogspot.com/2019/08/maas-kvm-on-s390x-part1.html
+
+Hey Lee,
+I took a look at that document. I want to make a few points here.  This has worked in the past, earlier versions of MAAS. Nothing has ever changed on my lpar that is hosting the VM's. 
+The host lpar is Bionic, 18.04. This was working for months and suddenly stopped, the only change in my labs have been me updating the maas servers to newer versions.
+
+According to libvirt documentations the s390x arch only respects the first <OS> <boot> param in the XML.
+  <os>
+    <type arch='s390x' machine='s390-ccw-virtio-bionic'>hvm</type>
+    <boot dev='network'/>
+    <boot dev='hd'/>
+  </os>
+
+In normal circumstances, net boot fails and the VM default to the HD, but on s390 that's not the case. Once net boot fails then
+
+Connected to domain s2lp6g001
+Escape character is ^]
+done
+  Using IPv4 address: 10.246.75.177
+  Using TFTP server: 10.246.72.3
+  Bootfile name: 'boots390x.bin'
+  Receiving data:  0 KBytes
+  TFTP error: file not found: boots390x.bin
+Trying pxelinux.cfg files...
+  Receiving data:  0 KBytes
+  Receiving data:  0 KBytes
+Failed to load OS from network
+
+
+your stuck there in the off state forever.  Changing the XML so that the VM boots from <HD> first works. however that's not really acceptable in this use case.
+
+I would imagine that for this to work MAAS-dhcp would have to instruct the s390x VM to boot from "local" (disk) once it's already deployed. All by means of the /var/lib/maas/dhcpd.conf
+
+Is that not how this is designed to work? 
+
+https://libvirt.org/formatdomain.html#elementsOS
+
+You are correct that the XML shouldn't have to be changed to work with MAAS. All architectures MAAS currently supports always boot from the network. MAAS gives the network boot loader a config file which tells it if it should boot into an ephemeral environment over the network or local boot.
+
+From the log you posted MAAS is doing everything it should do. MAAS specifies boots390x.bin as a place holder so we know what architecture is booting[1]. When the kvm provided bootloader runs MAAS returns an empty config file because that should instruct the kvm bootloader to boot from disk[2].
+
+I added the qemu-kvm project as the only thing I can think of is qemu-kvm has updated its bootloader which broke MAAS. Do you know which version of qemu-kvm previously worked?
+
+[1] https://git.launchpad.net/maas/tree/src/provisioningserver/boot/s390x.py#n76
+[2] https://git.launchpad.net/maas/tree/src/provisioningserver/boot/s390x.py#n129
+
+qemu-kvm doesn't exist for years, I have marked it for qemu instead.
+Thanks Frank for making me aware.
+
+Sean got everything right in comment #6, it can only boot one and that is the first boot entry.
+There is no fallback/fallthrough on s390x.
+
+If you stick with global boot options the host would needs to change the XML to boot fro disk in this case. (BTW that is the case since the beginnign the comment is from libvirt 3.5 somewhere around zesty I think).
+
+P.S. if this ever worked it was a bug that is not to be relied upon (but I'd wonder)
+
+But that doesn't mean it won't work, just not with that XML format.
+I've never tested it but I think you might be able to get away with a proper bootorder config.
+An example can be found here [1] that you might try (do not implement it directly, give it a test please)
+
+[1]: https://libvirt.org/git/?p=libvirt.git;a=blob;f=tests/qemuxml2xmloutdata/machine-loadparm-multiple-disks-nets-s390.xml;h=c4e08fd4401bf5bf448ee45ab8890b3e44057f97;hb=HEAD
+
+I tried the above workaround mentioned by Christian last week also, I did not mention that in comment #6.  
+
+I tried using the boot order configuration as outlined in the example(comment #9) 
+
+After the machine deploys, the same symptom occurs. So we are sort of stuck again still.
+
+
+Domain s2lp6g001 started
+
+Connected to domain s2lp6g001
+Escape character is ^]
+done
+  Using IPv4 address: 10.246.75.152
+  Using TFTP server: 10.246.72.3
+  Bootfile name: 'boots390x.bin'
+  Receiving data:  0 KBytes
+  TFTP error: file not found: boots390x.bin
+Trying pxelinux.cfg files...
+  Receiving data:  0 KBytes
+  Receiving data:  0 KBytes
+Failed to load OS from network
+
+
+Please note# https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1790901
+
+
+First check - as assumed - the old style config always failed.
+It went into netboot, netboot fails and then it bails out.
+
+root@testkvm-bionic-from:~# virsh start netboot --console
+Domain netboot started
+Connected to domain netboot
+Escape character is ^]
+done
+  Using IPv4 address: 192.168.122.33
+  Using TFTP server: 192.168.122.1
+Trying pxelinux.cfg files...
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  Receiving data:  0 KBytes
+Repeating TFTP read request...
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  Receiving data:  0 KBytes
+Repeating TFTP read request...
+  TFTP error: ICMP ERROR "port unreachable"
+Failed to load OS from network
+
+root@testkvm-bionic-from:~# 
+root@testkvm-bionic-from:~# virsh list --all
+ Id    Name                           State
+----------------------------------------------------
+ -     netboot                        shut off
+
+
+
+-- -- -- -- 
+
+The suggested config with bootindex (lets see if that would work on s390x)
+
+root@testkvm-bionic-from:~# virsh start netboot --console
+Domain netboot started
+Connected to domain netboot
+Escape character is ^]
+done
+  Using IPv4 address: 192.168.122.33
+  Using TFTP server: 192.168.122.1
+Trying pxelinux.cfg files...
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  Receiving data:  0 KBytes
+Repeating TFTP read request...
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  TFTP error: ICMP ERROR "port unreachable"
+  Receiving data:  0 KBytes
+Repeating TFTP read request...
+  TFTP error: ICMP ERROR "port unreachable"
+Failed to load OS from network
+
+by that confirming SFeole again (comment #9 this time).
+
+So no easy workarounds present.
+
+TBH I'd really want to see how this worked as we didn't push anything to Bionic that would have changed this recently.
+
+I checked and the only change in that regard is really old.
+It was for bug 1790901 which was a prereq for real IPXE on s390x.
+So I doubt that MAAS could have worked before that.
+Never the less to be sure I was trying the old verson (which needed an odd bundle of kernel+initrd to build into what you reply on netboot).
+
+But even that - if netboot is failing - it does not fall through (as I'd expected, but I wanted to be sure).
+
+root@testkvm-bionic-from:~# virsh start netboot --console
+Domain netboot started
+Connected to domain netboot
+Escape character is ^]
+done
+  Using IPv4 address: 192.168.122.33
+  Requesting file "" via TFTP from 192.168.122.1
+  Receiving data:  0 KBytesICMP ERROR "port unreachable"
+Failed to load OS from network
+
+I took the time and recreated a MAAS setup (latest stable 2.2) on s390x and it looks like this:
+- I could start a deployment and ran through the states:
+   - Power On, Commissioning (Performing PXE boot)
+   - Power On, Commissioning (Gathering Information)
+   - Power On, Ready
+   - Power Off, Ready
+  (I may have have missed some states in between.)
+- Power Off, Ready is the final state at that point
+  and on the console it's:
+$ virsh list --all
+ Id    Name                           State
+----------------------------------------------------
+ -     vm1                            shut off
+- xml VM definition is:
+$ virsh dumpxml vm1
+<domain type='kvm'>
+  <name>vm1</name>
+  <uuid>0f7d1d61-9368-4bfe-8c65-c709e90e8780</uuid>
+  <memory unit='KiB'>1048576</memory>
+  <currentMemory unit='KiB'>1048576</currentMemory>
+  <vcpu placement='static'>1</vcpu>
+  <os>
+    <type arch='s390x' machine='s390-ccw-virtio-bionic'>hvm</type>
+    <boot dev='network'/>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/libvirt/maas-images/6addbfeb-ff2c-4350-b34d-11a56ea34f1d'/>
+      <target dev='vda' bus='virtio'/>
+      <serial>6addbfeb-ff2c-4350-b34d-11a56ea34f1d</serial>
+      <address type='ccw' cssid='0xfe' ssid='0x0' devno='0x0002'/>
+    </disk>
+    <interface type='network'>
+      <mac address='52:54:00:ea:11:5f'/>
+      <source network='default'/>
+      <model type='virtio'/>
+      <address type='ccw' cssid='0xfe' ssid='0x0' devno='0x0001'/>
+    </interface>
+    <console type='pty'>
+      <log file='/var/log/libvirt/qemu/vm1-serial0.log' append='off'/>
+      <target type='sclp' port='0'/>
+    </console>
+    <memballoon model='virtio'>
+      <address type='ccw' cssid='0xfe' ssid='0x0' devno='0x0000'/>
+    </memballoon>
+    <panic model='s390'/>
+  </devices>
+</domain>
+
+So it largely looks like assumed (after initially reading the bug),
+PXE itself seems to work, but the boot issue it due to:
+    <boot dev='network'/>
+    <boot dev='hd'/>
+
+That confirms the situation (on s390x and MAAS 2.6.2)m but it still raises the question why it seem to have worked with 2.6.0?
+
+The general issue with multiple boot elements on s390x was indeed already identified back in 2017, and a ticket was opened and reverse mirrored to IBM (so it should never have worked that way):
+LP 1736511 (and btw. RH ticket is referenced there as well)
+
+
+I asked around a bit without going into the "why" and got confirmation from IBM that fallthrough from netboot never existed.
+In addition a RH engineer jumped in and said that they have this bug as well and would appreciate if IBM would implement it (that is the RH ticket I added to the other bug Frank has mentioned above).
+
+This makes it even more puzzling how this ever worked, Frank is trying to test a 2.6.0 build Adam has set up ...
+
+The S390X KVM boot driver in MAAS really hasn't changed since it was committed in 2018[1]. I doubt changing the version of MAAS will show it working. I would try using older versions of qemu.
+
+[1] https://git.launchpad.net/maas/log/src/provisioningserver/boot/s390x.py
+
+It took some time (due to travel), but I was now able to do a setup based on the old 2.6.0 version [2.6.0 (7803-g6fc5f26eb-0ubuntu1~18.04.1)] for testing.
+
+And with the combination:
+
+$ apt-cache policy maas
+maas:
+  Installed: 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1
+  Candidate: 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1
+  Version table:
+ *** 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1 500
+        500 http://ppa.launchpad.net/maas-maintainers/testing/ubuntu bionic/main s390x Packages
+        100 /var/lib/dpkg/status
+     2.4.2-7034-g2f5deb8b8-0ubuntu1 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic-updates/main s390x Packages
+     2.4.0~beta2-6865-gec43e47e6-0ubuntu1 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic/main s390x Packages
+and:
+$ apt-cache policy qemu
+qemu:
+  Installed: (none)
+  Candidate: 1:2.11+dfsg-1ubuntu7.21
+  Version table:
+     1:2.11+dfsg-1ubuntu7.21 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic-updates/universe s390x Packages
+     1:2.11+dfsg-1ubuntu7.20 500
+        500 http://ports.ubuntu.com/ubuntu-ports bionic-security/universe s390x Packages
+     1:2.11+dfsg-1ubuntu7 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic/universe s390x Packages
+the system seems to successful commissions, similar to the latest maas 2.6.2 version (see above).
+But then the VM ends again in state Ready / off.
+
+virsh shows the VM as shutoff:
+ubuntu@s1lp11:~$ sudo -H -u maas bash -c 'virsh -c qemu+ssh://ubuntu@192.168.122.1/system list --all'
+ubuntu@192.168.122.1's password: 
+ Id    Name                           State
+----------------------------------------------------
+ -     vm1                            shut off
+
+The os element looks like this - with the two entries:
+  <os>
+    <type arch='s390x' machine='s390-ccw-virtio-bionic'>hvm</type>
+    <boot dev='network'/>
+    <boot dev='hd'/>
+  </os>
+
+A manual start (with the help of virsh, console enabled) shows that it network boots (see attachment).
+
+Removing the network entry and booting didn't work - looks like no OS deployed on disk yet.
+
+To sum it up - also not working on this 2.6.0 env. that I've just created.
+
+
+I doubled check today again with sfeole and he confirmed that it worked for him as well (and not only for me) when he just started using MAAS KVM on s390x and had his initial setup...
+
+Anyway, I'm now sure on how much effort we should spent on recreating the old situation (I may try some old qemu/libvirt version - in case they are still available and in the archive -- maybe MAAS pulls in further packages that need to be back-dated, too ?!),
+but I think in parallel we should check if this can be solve on the latest MAAS versions, to get the kt testing unblocked.
+
+Is there an option to make it work - like with MAAS changing the xml config?
+
+I think that an upstream solution for LP 1736511 will just take way to long ...
+
+@Lee, do you think that the boot log from comment #18 looks fine?
+https://bugs.launchpad.net/ubuntu-z-systems/+bug/1859656/+attachment/5323507/+files/boot_console.txt
+
+What would be the usual next step for MAAS KVM on s390x if the above is successful (me not really knowing the exact internal flow)?
+Is it then netbooting again and redirecting to the disk (same on all platforms)?
+
+In between I found the time to setup an env. build upon older releases:
+
+$ lsb_release -a
+No LSB modules are available.
+Distributor ID:	Ubuntu
+Description:	Ubuntu 18.04.1 LTS
+Release:	18.04
+Codename:	bionic
+
+$ dpkg -l | grep -i qemu
+ii  qemu-block-extra:s390x                1:2.11+dfsg-1ubuntu7                   s390x        extra block backend modules for qemu-system and qemu-utils
+ii  qemu-kvm                              1:2.11+dfsg-1ubuntu7                   s390x        QEMU Full virtualization on x86 hardware
+ii  qemu-system-common                    1:2.11+dfsg-1ubuntu7                   s390x        QEMU full system emulation binaries (common files)
+ii  qemu-system-s390x                     1:2.11+dfsg-1ubuntu7                   s390x        QEMU full system emulation binaries (s390x)
+ii  qemu-utils                            1:2.11+dfsg-1ubuntu7                   s390x        QEMU utilities
+
+$ apt-cache policy maas
+maas:
+  Installed: 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1
+  Candidate: 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1
+  Version table:
+ *** 2.6.0-7803-g6fc5f26eb-0ubuntu1~18.04.1 500
+        500 http://ppa.launchpad.net/maas-maintainers/testing/ubuntu bionic/main s390x Packages
+        100 /var/lib/dpkg/status
+     2.4.2-7034-g2f5deb8b8-0ubuntu1 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic-updates/main s390x Packages
+        500 http://ports.ubuntu.com/ubuntu-ports bionic-updates/main s390x Packages
+        500 http://aus.ports.ubuntu.com/ubuntu-ports bionic-updates/main s390x Packages
+     2.4.0~beta2-6865-gec43e47e6-0ubuntu1 500
+        500 http://us.ports.ubuntu.com/ubuntu-ports bionic/main s390x Packages
+        500 http://ports.ubuntu.com/ubuntu-ports bionic/main s390x Packages
+
+In this environment MAAS is not able to Commission ("Failed commissioning").
+Trying to start the vm manually with virsh ends up with:
+
+$ virsh start vm1 --console
+Domain vm1 started
+Connected to domain vm1
+Escape character is ^]
+done
+  Using IPv4 address: 192.168.122.102
+  Requesting file "boots390x.bin" via TFTP from 192.168.122.1
+  Receiving data:  0 KBytesfile not found: boots390x.bin
+Failed to load OS from network
+
+So that is expecting, since the qemu packages version 1:2.11+dfsg-1ubuntu7 were initially used - the GA version, that's not known to work - the needed patch came later.
+
+The first qemu packages that should be good are the ones with version 1:2.11+dfsg-1ubuntu7.7.
+But (after discussing with cpaelzer) the qemu packages didn't really changed since 1:2.11+dfsg-1ubuntu7.7, I thought that I now upgrade to the latest ones (1:2.11+dfsg-1ubuntu7.22):
+
+$ sudo apt install qemu-block-extra qemu-kvm qemu-system-common qemu-system-s390x qemu-utils 
+Reading package lists... Done
+Building dependency tree       
+Reading state information... Done
+Suggested packages:
+  debootstrap
+Recommended packages:
+  sharutils
+The following packages will be upgraded:
+  qemu-block-extra qemu-kvm qemu-system-common qemu-system-s390x qemu-utils
+5 upgraded, 0 newly installed, 0 to remove and 167 not upgraded.
+Need to get 3,249 kB of archives.
+After this operation, 32.8 kB of additional disk space will be used.
+Get:1 http://us.ports.ubuntu.com/ubuntu-ports bionic-proposed/main s390x qemu-utils s390x 1:2.11+dfsg-1ubuntu7.22 [811 kB]
+Get:2 http://us.ports.ubuntu.com/ubuntu-ports bionic-proposed/main s390x qemu-system-common s390x 1:2.11+dfsg-1ubuntu7.22 [671 kB]
+Get:3 http://us.ports.ubuntu.com/ubuntu-ports bionic-proposed/main s390x qemu-block-extra s390x 1:2.11+dfsg-1ubuntu7.22 [37.3 kB]
+Get:4 http://us.ports.ubuntu.com/ubuntu-ports bionic-proposed/main s390x qemu-kvm s390x 1:2.11+dfsg-1ubuntu7.22 [12.5 kB]
+Get:5 http://us.ports.ubuntu.com/ubuntu-ports bionic-proposed/main s390x qemu-system-s390x s390x 1:2.11+dfsg-1ubuntu7.22 [1,717 kB]
+Fetched 3,249 kB in 0s (8,360 kB/s)        
+(Reading database ... 67530 files and directories currently installed.)
+Preparing to unpack .../qemu-utils_1%3a2.11+dfsg-1ubuntu7.22_s390x.deb ...
+Unpacking qemu-utils (1:2.11+dfsg-1ubuntu7.22) over (1:2.11+dfsg-1ubuntu7) ...
+Preparing to unpack .../qemu-system-common_1%3a2.11+dfsg-1ubuntu7.22_s390x.deb .
+..
+Unpacking qemu-system-common (1:2.11+dfsg-1ubuntu7.22) over (1:2.11+dfsg-1ubuntu
+7) ...
+Preparing to unpack .../qemu-block-extra_1%3a2.11+dfsg-1ubuntu7.22_s390x.deb ...
+Unpacking qemu-block-extra:s390x (1:2.11+dfsg-1ubuntu7.22) over (1:2.11+dfsg-1ub
+untu7) ...
+Preparing to unpack .../qemu-kvm_1%3a2.11+dfsg-1ubuntu7.22_s390x.deb ...
+Unpacking qemu-kvm (1:2.11+dfsg-1ubuntu7.22) over (1:2.11+dfsg-1ubuntu7) ...
+Preparing to unpack .../qemu-system-s390x_1%3a2.11+dfsg-1ubuntu7.22_s390x.deb ..
+.
+Unpacking qemu-system-s390x (1:2.11+dfsg-1ubuntu7.22) over (1:2.11+dfsg-1ubuntu7
+) ...
+Setting up qemu-block-extra:s390x (1:2.11+dfsg-1ubuntu7.22) ...
+Setting up qemu-utils (1:2.11+dfsg-1ubuntu7.22) ...
+Processing triggers for man-db (2.8.3-2) ...
+Setting up qemu-system-common (1:2.11+dfsg-1ubuntu7.22) ...
+Setting up qemu-system-s390x (1:2.11+dfsg-1ubuntu7.22) ...
+Setting up qemu-kvm (1:2.11+dfsg-1ubuntu7.22) ...
+
+And with that the Commissioning worked and ended correctly,
+and I was also able to complete a Deployment afterwards.
+
+I deployed 19.04 (disco, since I think that Sean faced the issue while he tried to deploy disco, too) and it worked. The system (vm1) came up and I was able to login:
+
+$ ssh ubuntu@192.168.122.201 
+The authenticity of host '192.168.122.201 (192.168.122.201)' can't be established.
+ECDSA key fingerprint is SHA256:WMeXfn4hIAc38WUnXqPuhASMLjiig+uzdhqfkjzR7mI.
+Are you sure you want to continue connecting (yes/no)? yes
+Warning: Permanently added '192.168.122.201' (ECDSA) to the list of known hosts.
+Welcome to Ubuntu 19.04 (GNU/Linux 5.0.0-38-generic s390x)
+
+ * Documentation:  https://help.ubuntu.com
+ * Management:     https://landscape.canonical.com
+ * Support:        https://ubuntu.com/advantage
+
+  System information as of Mon Feb 10 10:44:33 UTC 2020
+
+  System load:  0.19              Processes:           95
+  Usage of /:   42.4% of 7.27GB   Users logged in:     0
+  Memory usage: 15%               IP address for enc1: 192.168.122.201
+  Swap usage:   0%
+
+4 updates can be installed immediately.
+4 of these updates are security updates.
+
+
+
+The programs included with the Ubuntu system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Ubuntu comes with ABSOLUTELY NO WARRANTY, to the extent permitted by
+applicable law.
+
+To run a command as administrator (user "root"), use "sudo <command>".
+See "man sudo_root" for details.
+
+ubuntu@vm1:~$
+
+
+
+The one that currently is deployed is using the same "list network and hd" which should not work.
+It will boot network but should not internally fall back to disk.
+ 10   <os>                                                                           
+ 11     <type arch='s390x' machine='s390-ccw-virtio-bionic'>hvm</type>               
+ 12     <boot dev='network'/>                                                        
+ 13     <boot dev='hd'/>                                                             
+ 14   </os>
+
+Now lets understand how/what works here...
+
+Qemu is given both boot options (we know it will ignore the second ... or at least we think and are told so).
+   ... -boot strict=on ... id=virtio-disk0,bootindex=2 ... mac=52:54:00:02:a3:f9,devno=fe.0.0001,bootindex=1
+
+I'd expect this one to "just" netboot, but we need to understand how it got "up" from there.
+Fortunately there was a full log of the serial console on disk.
+
+Attaching files from this test ...
+
+
+
+
+
+Here are the interesting bits from the log:
+
+   1 LOADPARM=[........]^M                                                            
+   2 Network boot device detected^M                                                   
+   3 ^M                                                                               
+   4 Network boot starting...^M                                                       
+   5   Using MAC address: 52:54:00:02:a3:f9^M                                         
+   6   Requesting information via DHCP:     ^H^H^H010^H^H^H^Hdone^M                   
+   7   Using IPv4 address: 192.168.122.102^M                                          
+   8   Using TFTP server: 192.168.122.1^M                                             
+   9   Bootfile name: 'boots390x.bin'^M                                               
+  10   Receiving data:  0 KBytes^M                                                    
+  11   TFTP error: file not found: boots390x.bin^M                                    
+  12 Trying pxelinux.cfg files...^M^M                                                 
+...
+  14 TFTP: Received s390x/01-52-54-00-02-a3-f9 (581 bytes)^M                      
+  15 Loading pxelinux.cfg entry 'execute'^M                                           
+...
+  17   TFTP: Received ubuntu/s390x/ga-19.04/disco/daily/boot-kernel (4318 KBytes)^M   
+...
+  19   TFTP: Received ubuntu/s390x/ga-19.04/disco/daily/boot-initrd (19360 KBytes)^M  
+  20 Network loading done, starting kernel...^M                                       
+  21 ^M                                                                               
+  22 [    0.439873] Linux version 5.0.0-38-generic (buildd@bos02-s390x-020) (gcc version 8.3.0 (Ubuntu 8.3.0-6ubuntu1)) #41-Ubuntu SMP Tue Dec 3 00:26:40 UTC 2019 (Ubuntu 5.0.0-38.41-generic      5.0.21)
+
+...
+
+38 ^M[    0.451953] Kernel command line: nomodeset ro root=squash:http://192.168.122.1:5248/images/ubuntu/s390x/ga-19.04/disco/daily/squashfs ip=::::vm1:BOOTIF ip6=off overlayroot=tmpfs ov     erlayroot_cfgdisk=disabled cc:{'datasource_list': ['MAAS']}end_cc cloud-config-url=http://192-168-122-0--24.maas-internal:5248/MAAS/metadata/latest/by-id/wpr3yp/?op=get_preseed apparmor     =0 log_host=192.168.122.1 log_port=5247 --- console=tty1 console=ttyS0 BOOTIF=01-52-54-00-02-a3-f9
+
+...
+
+ 155 Begin: Mounting root file system ... Begin: Running /scripts/local-top ... IP-Config: enc1 hardware address 52:54:00:02:a3:f9 mtu 1500 DHCP RARP^M
+ 156 hostname vm1 IP-Config: no response after 2 secs - giving up^M                   
+ 157 IP-Config: enc1 hardware address 52:54:00:02:a3:f9 mtu 1500 DHCP RARP^M          
+ 158 hostname vm1 hostname vm1 IP-Config: enc1 complete (dhcp from 192.168.122.1):^M  
+ 159  address: 192.168.122.102  broadcast: 192.168.122.255  netmask: 255.255.255.0   ^M
+ 160  gateway: 192.168.122.254  dns0     : 192.168.122.1    dns1   : 10.245.236.13   ^M
+ 161  domain : maas                                                            ^M     
+ 162  rootserver: 192.168.122.1 rootpath: ^M                                          
+ 163  filename  : lpxelinux.0^M                                                       
+ 164 :: root=squash:http://192.168.122.1:5248/images/ubuntu/s390x/ga-19.04/disco/daily/squashfs^M
+ 165 :: mount_squash downloading http://192.168.122.1:5248/images/ubuntu/s390x/ga-19.04/disco/daily/squashfs to /root.tmp.img^M
+ 166 Connecting to 192.168.122.1:5248 (192.168.122.1:5248)^M                          
+ 167 ^Mroot.tmp.img          21% |******                         | 66726k  0:00:03 ETA^Mroot.tmp.img          98% |****************************** |   296M  0:00:00 ETA^Mroot.tmp.img              100% |*******************************|   301M  0:00:00 ETA^M
+ 168 :: mount -t squashfs -o loop  '/root.tmp.img' '/root.tmp'^M                      
+ 169 done.
+
+
+
+^^ all of this seems to be the initial deployment ^^
+We see curtin doing its things as instructed by maas.
+
+
+Later on we see the reboot after install then
+
+1362 -----END SSH HOST KEY KEYS-----^M                                                
+1363 [  202.776296] cloud-init[1567]: Cloud-init v. 19.3-41-gc4735dd3-0ubuntu1~19.04.1 running 'modules:final' at Mon, 10 Feb 2020 10:42:08 +0000. Up 114.97 seconds.^M
+1364 [  202.776472] cloud-init[1567]: Cloud-init v. 19.3-41-gc4735dd3-0ubuntu1~19.04.1 finished at Mon, 10 Feb 2020 10:43:36 +0000. Datasource DataSourceMAAS [http://192-168-122-0--24.maas-i     nternal:5248/MAAS/metadata/curtin].  Up 202.74 seconds^M
+1365 [^[[0;32m  OK  ^[[0m] Started ^[[0;1;39mExecute cloud user/final scripts^[[0m.^M 
+1366 [^[[0;32m  OK  ^[[0m] Reached target ^[[0;1;39mCloud-init target^[[0m.^M         
+1367 [^[[0;32m  OK  ^[[0m] Stopped target ^[[0;1;39mGraphical Interface^[[0m.^M       
+1368 [^[[0;32m  OK  ^[[0m] Stopped target ^[[0;1;39mCloud-init target^[[0m.
+
+...
+
+1487 [^[[0;32m  OK  ^[[0m] Reached target ^[[0;1;39mReboot^[[0m.^M                    
+1488 LOADPARM=[        ]^M                                                            
+1489 Using virtio-blk.^M                                                              
+1490 Using SCSI scheme.^M                                                             
+1491 .....^M                                                                          
+1492 [    0.412847] Linux version 5.0.0-38-generic (buildd@bos02-s390x-020) (gcc version 8.3.0 (Ubuntu 8.3.0-6ubuntu1)) #41-Ubuntu SMP Tue Dec 3 00:26:40 UTC 2019 (Ubuntu 5.0.0-38.41-generic      5.0.21)
+
+
+...
+
+the rest is the startup until a login:
+
+1967 vm1 login:
+
+
+But this does NOT use "fallback from failed network boot".
+It used a valid netboot (into the deployment) and then reboot
+
+The assumption from here was that this only appeared to be working due to:
+
+a) Deploy = netboot + reboot from disk = working
+
+but at the same time
+
+b) Start = netboot (fail) + no fallback = fail
+
+
+To get that from Maas UI we stopped the guest (it went down as expected).
+Then from Maas we said "power on" again.
+
+There on (b) it failed as maas didn't provide it with an install image.
+If you track it in the console you see:
+
+$virsh start vm1 --console
+setlocale: No such file or directory
+Domain vm1 started
+Connected to domain vm1
+Escape character is ^]
+done
+  Using IPv4 address: 192.168.122.102
+  Using TFTP server: 192.168.122.1
+  Bootfile name: 'boots390x.bin'
+  Receiving data:  0 KBytes
+  TFTP error: file not found: boots390x.bin
+Trying pxelinux.cfg files...
+  Receiving data:  0 KBytes
+  Receiving data:  0 KBytes
+Failed to load OS from network
+
+Maas tries a few times as we see the guest flip between "shut off" and "paused" state.
+But then fives up.
+
+The super-TL;DR matching the current insights is:
+- deploy s390x Maas-KVM @ s390x worked and still does
+- poweroff/poweron s390x Maas-KVM @ s390x never worked and still does not
+
+To fix the latter we either need
+a) upstream to implement a fallback to the next boot mechanism
+b) maas to modify the XML after deploy to boot from disk
+
+I flipped 
+    <boot dev='hd'/>
+    <boot dev='network'/>
+
+to
+
+    <boot dev='hd'/>
+    <boot dev='network'/>
+
+And JFH started it from the MAAS UI again.
+Now things work (obviously as expected)
+
+@sfeole - after initial deployment just do the change to your guest XMLs you see in comment #27
+
+@maas - as I said in comment #26 (and before) this needs coding in maas to switch the XML content (or waiting a long time on IBM)
+
+OR
+Maas can boot from network (always) and if not deploying just issue a "reboot from disk" command
+
+My understanding from the MAAS design was that the suggestion in comment #29 "Maas can boot from network (always) and if not deploying just issue a "reboot from disk" command" was the intended design.
+
+...and the "reboot from disk" command was the supply of an empty (zero byte?) pxelinux.cfg.
+
+But I'll let Lee respond and correct.
+
+@paelzer,  Aye and thanks for your comment #27 ,  I was already aware of that, and yes that does work. However, it's a shoddy workaround at best and if this is going to be a solution to be presented to a customer MAAS would be scoffed at.
+
+I'm aware of the issue at hand here, I think the problem existing now, is that a decision needs to be made moving forward how to fix this.  I was about to suggest that what makes the most sense IMO and is the least invasive is the suggest by @paelzer from comment #29
+
+Maas can boot from network (always) and if not deploying just issue a "reboot from disk" command
+
+
+
+To add to this discussion today, I noticed that some of the maas deployments for s390x are working. I took a look and I was able to successfully deploy 19.10/18.04/20.04  
+
+I have not changed anything on the MAAS host,  I have not upgraded / altered any packages.
+I have not upgraded libvirt,
+
+The only thing that's different to my knowledge is that the images maas is booting our -dailies and updated quite often. 
+
+I don't have free time today to look into this, however now i'm wondering what has changed. 
+
+Here is my pkg versions as things are now.
+
+maas:
+  Installed: 2.6.2-7841-ga10625be3-0ubuntu1~18.04.1
+  Candidate: 2.6.2-7841-ga10625be3-0ubuntu1~18.04.1
+
+On the s390x Lpar,  Bionic, Linux s2lp6 4.15.0-74-generic #84-Ubuntu SMP Thu Dec 19 08:05:42 UTC 2019 s390x s390x s390x GNU/Linux
+
+
+ubuntu@s2lp6:~$ dpkg -l | grep libvirt
+ii  libvirt-clients                       4.0.0-1ubuntu8.14                   s390x        Programs for the libvirt library
+ii  libvirt-daemon                        4.0.0-1ubuntu8.14                   s390x        Virtualization daemon
+ii  libvirt-daemon-driver-storage-rbd     4.0.0-1ubuntu8.14                   s390x        Virtualization daemon RBD storage driver
+ii  libvirt-daemon-system                 4.0.0-1ubuntu8.14                   s390x        Libvirt daemon configuration files
+ii  libvirt0:s390x                        4.0.0-1ubuntu8.14                   s390x        library for interfacing with different virtualization systems
+ii  python-libvirt                        4.0.0-1                             s390x        libvirt Python bindings
+ii  uvtool-libvirt                        0~git140-0ubuntu1                   all          Library and tools for using Ubuntu Cloud Images with libvirt
+
+
+After looking at the original description it does appear that I upgraded maas since originally filing this bug, that upgrade was done to workaround a different issue which was resolved since 2.6.1
+
+After discussing, I realise I had a misunderstanding in comment #30 that I'd like to correct.
+
+I had incorrectly assumed that feeding the PXEBooting KVM guest a zero length pxelinux.cfg file *instructed* it to boot from the local disk.
+
+I now realise that is incorrect. Feeding the PXEBooting KVM guest a zero length pxelinux.cfg file only tells the guest to *fail* it's netboot attempt.
+
+It's at this stage that the architecture specific behaviour kicks in.
+
+On amd64, the netboot failure will force the KVM guest to move down to it's second specified boot option, namely the local disk.
+
+However, s390x will NEVER move to it's second specified boot option. If the first boot option (netbooting) fails, it abandons the attempt and powers the guest off.
+
+IBM has been informed of this difference in behaviour, but it is unlikely to be able to address it soon.
+
+
+It would appear that this bug is once again causing problems with some of our automated testing.  
+S390x KVM deployments are failing for Focal. When attempting to investigate a big I found that it is indeed this bug. 
+
+Our MAAS Server is Version:
+
+maas:
+  Installed: 2.7.0-8232-g.6e1dba4ab-0ubuntu1~18.04.1
+  Candidate: 2.7.0-8232-g.6e1dba4ab-0ubuntu1~18.04.1
+  Version table:
+
+
+I've attached the console log of the -KVM machine deploying.
+
+On MAAS the rack controller reports the following:
+sfeole@bsg75:~$ cat focal-s390x-maas.txt 
+==> rackd.log <==
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] boots390x.bin requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/65a9ca43-9541-49be-b315-e2ca85936ea2 requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/01-52-54-00-e5-d7-bb requested by 10.246.75.177
+
+==> regiond.log <==
+2020-04-09 14:14:59 maasserver.rpc.leases: [info] Lease update: commit for 10.246.75.177 on 52:54:0:e5:d7:bb at 2020-04-09 14:14:59 (lease time: 600s)
+
+==> rackd.log <==
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/0AF64BB1 requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/0AF64BB requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/0AF64B requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/0AF64 requested by 10.246.75.177
+2020-04-09 14:14:59 provisioningserver.rackdservices.tftp: [info] s390x/0AF6 requested by 10.246.75.177
+2020-04-09 14:15:00 provisioningserver.rackdservices.tftp: [info] s390x/0AF requested by 10.246.75.177
+2020-04-09 14:15:00 provisioningserver.rackdservices.tftp: [info] s390x/0A requested by 10.246.75.177
+2020-04-09 14:15:00 provisioningserver.rackdservices.tftp: [info] s390x/0 requested by 10.246.75.177
+2020-04-09 14:15:00 provisioningserver.rackdservices.tftp: [info] s390x/default requested by 10.246.75.177
+
+
+
+Also, please note that the libvirt version did not change on the s390x Virtual Machine Host. 
+
+On S390x VM Host
+
+ii  libvirt-clients                       4.0.0-1ubuntu8.14                   s390x        Programs for the libvirt library
+ii  libvirt-daemon                        4.0.0-1ubuntu8.14                   s390x        Virtualization daemon
+ii  libvirt-daemon-driver-storage-rbd     4.0.0-1ubuntu8.14                   s390x        Virtualization daemon RBD storage driver
+ii  libvirt-daemon-system                 4.0.0-1ubuntu8.14                   s390x        Libvirt daemon configuration files
+ii  libvirt0:s390x                        4.0.0-1ubuntu8.14                   s390x        library for interfacing with different virtualization systems
+ii  python-libvirt                        4.0.0-1                             s390x        libvirt Python bindings
+
+
+
+I still think that #29 could be a viable fix for this.
+
+Maybe this will 'automagically' get fixed and change if MAAS got rebased on LXD.
+LXD 4.2 comes with KVM support for s390x and the MAAS version that is going to be based on LXD is (iirc) 2.9?
+
+Is this issue reproducible on MAAS 3.2 or later, with LXD-based VMs? MAAS behaviour and LXD versions have significantly changed since this issue was submitted.
+
+I cannot test and tell you that yet, since it requires a new system (z13 with DPM or later).
+We recently got one of these, but we still need some more peripherals before we can use MAAS on it.
+I expect that it will take still some month until we are there and able to retry ...
+

@@ -1,0 +1,423 @@
+cmake hangs with qemu-arm-static
+
+I'm using git commit 3e7ecd976b06f... configured with --target-list=arm-linux-user --static in a chroot environment to compile some things. I ran into this problem with both pcl and opencv-2.3.1. cmake consistently freezes at some point during its execution, though in a different spot each time, usually during a step when it's searching for some libraries. For instance, pcl most commonly stops after:
+
+[snip]
+-- Boost version: 1.46.1
+-- Found the following Boost libraries:
+--   system
+--   filesystem
+--   thread
+--   date_time
+-- checking for module 'eigen3'
+--   found eigen3, version 3.0.1
+
+which is perplexing because it freezes after finding what it wants, not during the search. When it does get past that point, it does so almost immediately but freezes somewhere else. 
+
+I'm using 64-bit Ubuntu 11.10 with kernel release 3.0.0-16-generic with an Intel i5.
+
+I have found several places cmake may hang, with either qemu-arm-static or mipsel, and in debian (testing) as well as in Ubuntu.  One of them is the cmake check for c++ compiler, which can be overridden.  Things that use cmake's pkg_check_modules and pkg-config files will also hang.  Curiously, outside of cmake, equivs also will similarly hang if used.  All these things can make it very difficult to use qemu user static driven chroot's or qemu pbuilder for pkg building at present.
+
+
+I am also having this issue with latest qemu on quantal using an armhf chroot.
+
+cmake will occasionally finish, but mostly it just hangs, most often in the pkg_check bits.
+
+I can confirm that this is still an issue even with latest qemu-linaro, from Quantal (1.2.0-2012.09-0ubuntu1).
+
+If you can provide a simple straightforward reproduce case that would be useful.
+
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+Peter, if you try to run the cmake file for lp:unity you should hit it.
+
+On 25 November 2012 20:40, Tim Penhey <email address hidden> wrote:
+> Peter, if you try to run the cmake file for lp:unity you should hit it.
+
+I'm afraid that's way too little detail. Assume I know nothing about
+launchpad, cmake or unity, and give me a set of instructions I
+can run on a machine which isn't necessarily running ubuntu to
+reproduce this, preferably with as small and limited a repro case
+as possible. At least, it should be a command line that starts
+out "qemu <some stuff>"...
+
+thanks
+-- PMM
+
+
+Peter, I have qemu chrootable test case under which you could fire one command to hit the bug reliably. Only issue is, are you willing to take a peek at 100M extractable tarball? If not, I'll try to create a smaller one.
+
+On 28 November 2012 08:42, Janne Karhunen <email address hidden> wrote:
+> Peter, I have qemu chrootable test case under which you could fire one
+> command to hit the bug reliably. Only issue is, are you willing to take
+> a peek at 100M extractable tarball? If not, I'll try to create a smaller
+> one.
+
+Yeah, 100M repro case tarball is manageable.
+
+-- PMM
+
+
+Ok, test case attached (80M tar). This hugely stripped one is not 100% reproducer, but do few loops and you will hit it. Instructions for using:
+- extract, chroot
+- cd /home/abuild/rpmbuild
+- su abuild
+- export RPM_BUILD_ROOT=$PWD
+- rpmbuild -ba SOURCES/libshortcut.spec
+
+
+Mind you, when you hit the bug it just hangs and cmake test errors are just to speed up the process of hitting the bug (if cmake just fails you did not hit the bug). Feel free to try with any qemu variant, they all hang similarly when bug is hit. I think that root had some suse 1.2 one inside.
+
+That test case seems to have very weak reproducibility -- I think I saw a hang perhaps once in 30+ runs. That's not really usable for debugging, I'm afraid :-(
+
+
+If that is the case for you (for me it reproduces it every 4-5 runs or so), there are two options:
+1) put while(true) loop around the rpmbuild and you will hit it always, or
+2) I can wrap up a bit bigger cmake usecase that systematically hits it. Warn you though, size will jump to 200M.
+
+I'll take the bigger usecase, please. It's pretty hard to debug race conditions that don't manifest often enough to let you do useful logging. 
+
+From the time or two I caught it hanging, it looks like qemu is sleeping in poll, and there's a zombie child process. I wonder if what's happening is that the SIGCHLD is coming in just before syscall.c executes the poll syscall, so that qemu queues the signal for delivery to the guest (but never actually delivers it) and then enters a poll syscall that won't return (because the SIGCHLD has already arrived). If so, fixing this would require the significant redesign sketched out here:
+http://lists.gnu.org/archive/html/qemu-devel/2011-12/msg00384.html
+
+
+Actually I just managed to interact with a hung qemu under a debugger sufficiently to confirm what is happening here.
+
+CMake's code for running child processes (in kwsys/ProcessUNIX.c) does this:
+"On UNIX, a child process is forked to exec the program.  Three output pipes are read by the parent process using a select call to block until data are ready.  Two of the pipes are stdout and stderr for the child.  The third is a special pipe populated by a signal handler to indicate that a child has terminated.  This is used in conjunction with the timeout on the select call to implement a timeout for program even when it closes stdout and stderr and at the same time avoiding races."
+
+So (assuming no timeout set up) we can get the following race:
+ * spawn child process
+ * parent gets to point of making select() syscall
+ * this takes the parent process into qemu's linux-user/main.c code
+ * child process exits
+ * host kernel sends SIGCHLD to parent
+ * qemu's signal handler queues this SIGCHLD and does a cpu_exit, which will make the parent take the signal at the next basic block
+ * parent code (still inside main.c or syscall.c) does the actual host select() syscall
+ * this blocks forever, because the thing that would wake it up is the signal handler writing to the pipe we're selecting on, but we will never run the signal handler until select exits
+
+Fixing this bug will indeed require the significant rework I referred to in comment #14, I'm afraid. Don't hold your breath...
+
+
+> this blocks forever, because the thing that would wake it up is the signal handler writing to the pipe we're selecting on, but we will never run the signal handler until select exits
+
+Duh, makes sense, have to think about this. Thank you for great analysis :)
+
+Apparently have to dig into qemu's code to understand this better, but first thought was that do you think it would be possible to add some crude hack bit in qemu's signal handler which we could 'almost atomically' check prior to entering system poll/select/read/whatnot ? This bit would tell there are user signals queued and handlers should be executed first.. ?
+
+On 1 December 2012 10:29, Janne Karhunen <email address hidden> wrote:
+>> this blocks forever, because the thing that would wake it up is the
+> signal handler writing to the pipe we're selecting on, but we will never
+> run the signal handler until select exits
+>
+> Duh, makes sense, have to think about this. Thank you for great analysis
+> :)
+>
+> Apparently have to dig into qemu's code to understand this better, but
+> first thought was that do you think it would be possible to add some
+> crude hack bit in qemu's signal handler which we could 'almost
+> atomically' check prior to entering system poll/select/read/whatnot ?
+> This bit would tell there are user signals queued and handlers should be
+> executed first.. ?
+
+Nope, it's still not going to be non-racy that way (and it would still
+be a pretty invasive change so it doesn't really make it easier either
+I think).
+
+-- PMM
+
+
+
+On 01.12.2012, at 12:27, Peter Maydell wrote:
+
+> On 1 December 2012 10:29, Janne Karhunen <email address hidden> wrote:
+>>> this blocks forever, because the thing that would wake it up is the
+>> signal handler writing to the pipe we're selecting on, but we will never
+>> run the signal handler until select exits
+>> 
+>> Duh, makes sense, have to think about this. Thank you for great analysis
+>> :)
+>> 
+>> Apparently have to dig into qemu's code to understand this better, but
+>> first thought was that do you think it would be possible to add some
+>> crude hack bit in qemu's signal handler which we could 'almost
+>> atomically' check prior to entering system poll/select/read/whatnot ?
+>> This bit would tell there are user signals queued and handlers should be
+>> executed first.. ?
+> 
+> Nope, it's still not going to be non-racy that way (and it would still
+> be a pretty invasive change so it doesn't really make it easier either
+> I think).
+
+Could you please try and see if this patch makes a difference?
+
+http://repo.or.cz/w/qemu/agraf.git/patch/489924aa0115dc6cfcd4e91b0747da4ff8425d1f
+
+
+Alex
+
+
+
+On 3 December 2012 21:20, Alexander Graf <email address hidden> wrote:
+> Could you please try and see if this patch makes a difference?
+>
+> http://repo.or.cz/w/qemu/agraf.git/patch/489924aa0115dc6cfcd4e91b0747da4ff8425d1f
+
+I think the answer will turn out to be "no" (though it's worth
+testing anyway), because the syscall we're blocking in in this
+case is select(), which is a syscall which will exit when a
+signal arrives anyway. That is, I think we're really hitting
+the race condition of the signal arriving while we're in QEMU's
+C code, rather than the stuck-in-blocking-syscall of the boehm
+GC case.
+
+-- PMM
+
+
+So I guess 'raciness' of my proposed patch would only depend on how small I could squeeze the section between 'sigpending' flag comparison and actual syscall entering?
+
+Yes. You can never shut the window completely trying to do it that way, which is why you need fix the problem properly instead.
+
+
+And what would break if we make poll timeout instantly in case there are signals pending and restart the given syscall after handlers run?
+
+Moreover, is there even a need to restart anything, just make it async call in case signals were pending?
+
+Never mind, async/zero timeout call would suffer from same (albeit now tiny) race. It would make this far less invasive as a change though.
+
+On 4 December 2012 11:21, Janne Karhunen <email address hidden> wrote:
+> And what would break if we make poll timeout instantly in case there are
+> signals pending and restart the given syscall after handlers run?
+
+If there are signals pending in the host kernel poll will *already*
+return immediately. If there is a signal pending in the QEMU signal
+queue (because the host kernel just delivered it to us) then there
+will always be a window between the point where you say "ok, queue
+is empty" and actually doing the host syscall, where a signal could
+be delivered and put in the queue. You cannot fix this bug in the way
+you are trying to: you must handle this case by longjumping out of
+the signal handler. I've already sketched the correct design for
+fixing this.
+
+[to anybody in the peanut gallery who is thinking about pselect()
+now: yes, you could perhaps hack something up with that, but it would
+still be a big patch with a bunch of corner cases to review, and
+it would only fix this bug for this particular syscall, not in
+general.]
+
+-- PMM
+
+
+Just out of interest tried how far the timeout hackery can go working around the issue. Well, looks like it goes quite far: having previously reproduced the hang in 4-5 runs and in under a minute, now have had this running without a hang for an hour. I will also test the patch under OBS worker(s) and if it solves the issue there as well, I will attach it as a workaround for time being for those interested. However, Peter is right and this is not a final solution of any kind: just a workaround.
+
+Some kind of semi-workaround patch attached. It seems to leave this kind of race window for me (for select which is worse):
+
+   0x000000006004bf98 <+136>:   xor    %r8d,%r8d
+   0x000000006004bf9b <+139>:   test   %eax,%eax
+   0x000000006004bf9d <+141>:   jne    0x6004c2b7 <do_select+935>
+   0x000000006004bfa3 <+147>:   mov    0x20(%rsp),%r14
+   0x000000006004bfa8 <+152>:   mov    0x246d8(%r14),%esi
+   0x000000006004bfaf <+159>:   test   %esi,%esi
+   0x000000006004bfb1 <+161>:   je     0x6004bfb8 <do_select+168>
+   0x000000006004bfb3 <+163>:   lea    0x40(%rsp),%r8
+   0x000000006004bfb8 <+168>:   mov    0x28(%rsp),%rdx
+   0x000000006004bfbd <+173>:   mov    %r11,%rsi
+   0x000000006004bfc0 <+176>:   mov    %ebx,%edi
+   0x000000006004bfc2 <+178>:   callq  0x6012df90 <select>
+
+I think it could still be narrowed some, but this makes it unlikely enough for me for time being...
+
+The attachment "racy workaround patch" of this bug report has been identified as being a patch.  The ubuntu-reviewers team has been subscribed to the bug report so that they can review the patch.  In the event that this is in fact not a patch you can resolve this situation by removing the tag 'patch' from the bug report and editing the attachment so that it is not flagged as a patch.  Additionally, if you are member of the ubuntu-reviewers team please also unsubscribe the team from this bug report.
+
+[This is an automated message performed by a Launchpad user owned by Brian Murray.  Please contact him regarding any issues with the action taken in this bug report.]
+
+I have tested cmake.patch but it doesn't work for me.
+It didn't hang but it failed to run gmake.
+I applied this patch onto qemu-1.3.
+
+[   52s] -- Detecting CXX compiler ABI info
+[   53s] CMake Error: Generator: execution of make failed. Make command was: /usr/bin/gmake "cmTryCompileExec/fast"
+[   53s] -- Detecting CXX compiler ABI info - failed
+
+Luke Kim: quite unlikely that above patch would cause the issue you see..  are you sure something else did not break in your environment? Can you execute that same make manually?
+
+I wouldn't mind giving this patch a test if given some instructions on doing so. 
+
+I am also unable to compile pcl because of this bug.
+
+Janne Karhunen: Do you think if it is correct that return 0 when ts->signal_pending is true and select() returns '0' (timeout)? Because the caller doesn't expect to return select() with 0, should we return other error values such as EINTR?
+When I modified you patch to return EINTR if select() return '0' when ts->signal_pending is true, it worked fine with me.
+
+LK: Ok, good catch, that might be more suitable option. Thanks,
+
+Isn't it fixed yet with latest qemu 2.1 rc?
+
+No; this is a a complicated issue to fix that basically requires a significant restructuring of the linux-user code. Nobody's done that yet and as far as I know nobody's said they plan to do so either.
+
+
+It's just excellent illustration why I hate pipes.
+
+So CMake guys can remove this crap from their code and use socketpair() or like instead.
+
+https://lists.tizen.org/pipermail/dev/2014-July/003424.html
+
+What cmake is doing is an entirely legitimate and well-recognized Unix idiom for converting signals into effects on filedescriptors for select(), and there's no reason for them to change it. This is absolutely a bug in QEMU, it's just one that's not easy for us to fix. (Using socketpair would not help here. You'd have to use signalfd(), which of course is much less portable.)
+
+
+Most rececnt qemu-devel discussion and a promising looking approach (ie it would work whereas my idea linked from comment #14 would not):
+http://lists.gnu.org/archive/html/qemu-devel/2014-02/msg04569.html
+
+
+the above patch still applies with qemu 2.4, but then it fails to build with the following error:
+
+x86_64-pc-linux-gnu-gcc -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/tcg -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/tcg/i386 -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-headers -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/user-build/linux-headers -I. -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0 -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/include -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user -Ilinux-user -m64 -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -Wstrict-prototypes -Wredundant-decls -Wall -Wundef -Wwrite-strings -Wmissing-prototypes -fno-strict-aliasing -fno-common  -Wendif-labels -Wmissing-include-dirs -Wempty-body -Wnested-externs -Wformat-security -Wformat-y2k -Winit-self -Wignored-qualifiers -Wold-style-declaration -Wold-style-definition -Wtype-limits -fstack-protector-strong  -I../linux-headers -I.. -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/target-i386 -DNEED_CPU_H -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/include -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user/x86_64 -I/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user -MMD -MP -MT linux-user/syscall.o -MF linux-user/syscall.d -pthread -I/usr/include/glib-2.0 -I/usr/lib64/glib-2.0/include   -march=native -mtune=generic -O2 -pipe  -c -o linux-user/syscall.o /var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user/syscall.c
+/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user/syscall.c: In function ‘do_select’:
+/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user/syscall.c:1010:34: error: ‘thread_env’ undeclared (first use in this function)
+     TaskState *ts = (TaskState *)thread_env->opaque;
+                                  ^
+/var/tmp/portage/app-emulation/qemu-2.4.0-r1/work/qemu-2.4.0/linux-user/syscall.c:1010:34: note: each undeclared identifier is reported only once for each function it appears in
+
+anybody so kind to tell me how to fix it?
+thank you.
+
+Recent patchseries which I think ought to be a proper fix for this bug:
+https://lists.gnu.org/archive/html/qemu-devel/2015-09/msg01388.html
+It does need some more work to address review comments but it's sound in principle.
+
+
+thank you peter, do you know if timothy has a github account?
+i'm too lazy to copy&paste the 34 patches by hand from the mailing list...
+
+ok, i've found a better place for patchset download:
+
+https://patchwork.ozlabs.org/project/qemu-devel/list/?submitter=Timothy+Baldwin&q=linux-user
+
+unfortunately cmake still hangs in a way that even sending SIGCHLD doesn't wake it up, i have to send SIGKILL to stop it and consequently breaking the build process...
+
+please let me know if there's something else i could try.
+
+thank you.
+
+Does anybody have a reliable reproduce case for this bug? I have some patches I'd like to test which I think should fix it, but I cannot get the test case attached in comment #10 to hang at all, even without the fixes.
+
+
+iirc i've was able to reproduce this bug every time while compiling kdelibs4 on a chrooted arm image
+
+I was hoping for a "run this command" level of reproducer :-)
+
+Alternatively, if anybody's conveniently able to build and test a new QEMU with whatever was failing for them, you can try the git branch
+https://git.linaro.org/people/peter.maydell/qemu-arm.git sigrace-fixes
+
+
+I get a hang doing this most times in an emulated ARM chroot with qemu-arm-static (Raspbian). Host machine is x86_64 Ubuntu 16.04 running qemu 2.5.0.
+
+git clone --depth 1 https://github.com/libretro/picodrive.git
+cd picodrive && 
+git submodule update --init
+
+
+Thanks for that report of a hang running git. I've been able to identify and fix the bug (it is a different problem to the issue that was causing cmake to hang) and have sent a patch:
+http://patchwork.ozlabs.org/patch/631708/
+That fix will hopefully make it into QEMU 2.7.
+
+
+That's great news - thanks very much. This will make working on RetroPie development in a chroot much easier (we have workarounds to avoid using git because of this issue).
+
+Please try the latest qemu git HEAD, Timothys and Peters fixes have been merged in. 
+
+A prebuilt package of qemu-user built statically at:
+
+http://repo.linaro.org/ubuntu/linaro-tools/pool/main/q/qemu/qemu-user-static_2.6.0+git931+g9bbbf64-1linarojessie1_amd64.deb
+
+
+
+That's great! it works for me. Thanks a lot.
+
+I'm going to mark this bug as 'fix committed', because changes which should fix both the cmake and the git hang are now in QEMU git master. If people have test cases for things which still fail on current git master, please open fresh bugs for them.
+
+
+
+I'm so sorry that
+cmake still hang with my Ubuntu 12.04 and openSUSE 12.3 machine.
+and the hanging point has changed. cmake hung at select() with old qemu. but now cmake hang at pselect6() with new qemu.
+And also I could continue build by sending SIGCHLD to hanging qemu. but now cmake still hang even I send SIGCHLD to hanging qemu.
+
+Please can you (a) double check that you're definitely running the correct new QEMU and (b) provide exact reproduction instructions so I can investigate the hang.
+
+
+I test with b66e10e4c9ae738412b9742db49457f6b703e349 before.
+I test with 14c7d99333e4a474c65bdae6f99aa8837e8078e6 today and no hang.
+But I had to revert 4fb8320a2efb2216c7ddcc929ad0362f4e285681 which causes segfault.
+
+Please provide exact reproduction instructions -- I need enough information that I can completely replicate your setup and what you're doing: exactly how you've set up any chroot or whatever other guest setup you have, what cmake command you're running, and so on.
+
+
+chroot env. attached (120M tar).
+I hope you can reproduce with this chroot.
+
+Instructions to reproduce
+- extract, chroot
+- su - abuild
+- cd /home/abuild/rpmbuild/BUILD/cmake-2.8.5/armv7l-tizen-linux-gnueabi/
+- Bootstrap.cmk/cmake .. -CBootstrap.cmk/InitialCacheFlags.cmake '-GUnix Makefiles' -DCMAKE_BOOTSTRAP=1
+
+Thanks for that test case; unfortunately it works fine for me (both with current git master and with commit b66e10e4c9ae7384).
+
+Can you tell me what host machine you're running this on, and in particular whether it is 32 bit or 64 bit? Commit b66e10e4c9ae7384 will fix this hang for x86-64 (64-bit intel) hosts, but it will only be fixed for 32-bit intel hosts by commit 3e904d6ade7 (which also fixes this for aarch64, arm, ppc64 and s390x hosts).
+
+If you are using a 32-bit x86 host that would explain the failure-vs-success that you report in comment #56. I suspect from looking at the qemu binaries that were in your test case tarball that you are using 32-bit.
+
+
+Thanks for your feedback.
+I was running this on intel i7 Ubuntu 64bit.
+but I used 32bit qemu as you suspected.
+
+OK, so the behaviour you saw is expected since we didn't fix 32-bit hosts until a bit later; but they should both be fixed now.
+
+Hello, Peter Maydell
+we have new qemu-arm hang issue.
+I guess you are busy for new qemu 2.7 release.
+But, could you please help us if you have time?
+
+https://bugs.launchpad.net/qemu/+bug/1617929
+
+Very thank you in advance :-)
+
+Fixes should be part of QEMU v2.7.0, e.g.:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=014628a705bdaf31c09915
+... so setting the status to "Fix Released" now.
+
+I am seeing the same symptoms as the original poster. I'm building the opencv package in a debian stretch armfh chroot on a ubuntu bionic amd64 host. So, I'm guessing that the race condition wasn't entirely fixed or there has been some sort of regression.
+
+Steps to reproduce:
+
+# on ubuntu bionic amd64 host
+sudo apt-add-repository ppa:ev3dev/tools
+# assuming apt-add-repository does apt update now
+sudo apt install pbuilder-ev3dev git
+git clone --depth=1 https://github.com/ev3dev/opencv
+cd opencv
+OS=debian ARCH=armhf DIST=stretch pbuilder-ev3dev base
+OS=debian ARCH=armhf DIST=stretch pbuilder-ev3dev dev-build
+
+That means our assumption taken in comment #63 that it was fixed in http://git.qemu.org/?p=qemu.git;a=commitdiff;h=014628a705bdaf31c09915 either was wrong (unset fix released) - or this is a similar but not the same issue (which would imply a new bug since this already has plenty of potentially mismatching history).
+
+Given the time this was considered closed I'd vote for a new bug to analyze things from scratch.
+@David - would you mind opening a new bug?
+
+@TJ - before considering backporting something of the current solution to xenial, (all other releases are >=2.7) would you mind testing e.g. qemu 2.10 via [1].
+Also a trivial reproducer will help to make this SRUable, like David added his (for the probably new issue). Or is the one in comment #58 representing your case as well?
+
+[1]: https://wiki.ubuntu.com/OpenStack/CloudArchive#Pike
+
+I have filed a new bug: https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1764555
+
+What's the status of this bug? I see LP: #1764555 has been marked as invalid as the test environment was tainted - does this imply the fix was correct and everything is working as intended?
+The bug is marked for 16.04.5. If it's still something we intent to get released for the point-release we would need someone to prepare an SRU as soon as possible.
+
+From upstream QEMU's point of view the status of this bug is "it's an old bug report that tended to accumulate 'this seems like it's the same as my bug' extra comments; we have fixed the underlying cause of the original bug,  so leave this one closed and file new ones with proper reproducer instructions if necessary".
+
+LP: #1764555 was closed because it was "bug submitter was still running the old QEMU version and didn't realise it".
+
+

@@ -1,0 +1,265 @@
+Malformed audio and video output stuttering after upgrade to QEMU 3.0
+
+My host is an x86_64 Arch Linux OS with a recompiled 4.18.10 hardened kernel, running a few KVM guests with varying OSes and configurations managed through a Libvirt stack.
+
+Among these guests I have two Windows 10 VMs with VGA passthrough and PulseAudio-backed virtual audio devices.
+
+After upgrading to QEMU 3.0.0, both of the Win10 guests started showing corrupted audio output in the form of unnatural reproduction speed and occasional but consistently misplaced audio fragments originating from what seems to be a circular buffer wrapping over itself (misbehaviour detected by starting some games with known OSTs and dialogues: soundtracks sound accelerated and past dialogue lines start replaying middle-sentence until the next line starts playing).
+
+In addition, the video output of the malfunctioning VMs regularly stutters roughly twice a second for a fraction of a second (sync'ed with the suspected buffer wrapping and especially pronounced during not-pre-rendered cutscenes), toghether with mouse freezes that look like actual input misses more than simple lack of screen refreshes.
+
+
+The issue was succesfully reproduced without the managing stack, directly with the following command line, on the most capable Windows guest:
+
+ QEMU_AUDIO_DRV=pa
+ QEMU_PA_SERVER=127.0.0.1
+ /usr/bin/qemu-system-x86_64 -name guest=win10_gms,debug-threads=on \
+ -machine pc-i440fx-3.0,accel=kvm,usb=off,vmport=off,dump-guest-core=off \                                                                                                                                           
+ -cpu host,hv_time,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_vendor_id=123456789abc,kvm=off \          
+ -drive file=/usr/share/ovmf/x64/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on \       
+ -drive file=/var/lib/libvirt/qemu/nvram/win10_gms_VARS.fd,if=pflash,format=raw,unit=1 \
+ -m 5120 \                                                                              
+ -realtime mlock=off \
+ -smp 3,sockets=1,cores=3,threads=1 \
+ -uuid 39b56ee2-6bae-4009-9108-7be26d5d63ac \
+ -display none \                             
+ -no-user-config \
+ -nodefaults \    
+ -rtc base=localtime,driftfix=slew \                                                                                                                                                                                 
+ -global kvm-pit.lost_tick_policy=delay \                                                                  
+ -no-hpet \                              
+ -no-shutdown \
+ -global PIIX4_PM.disable_s3=1 \
+ -global PIIX4_PM.disable_s4=1 \
+ -boot strict=on \              
+ -device ich9-usb-ehci1,id=usb,bus=pci.0,addr=0x4.0x7 \
+ -device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pci.0,multifunction=on,addr=0x4 \
+ -device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pci.0,addr=0x4.0x1 \             
+ -device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pci.0,addr=0x4.0x2 \
+ -device ahci,id=sata0,bus=pci.0,addr=0x9 \                                 
+ -drive file=/dev/vms/win10_gaming,format=raw,if=none,id=drive-virtio-disk0,cache=none,aio=native \
+ -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x5,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on \
+ -drive file=/dev/sr0,format=raw,if=none,id=drive-sata0-0-0,media=cdrom,readonly=on \                                    
+ -device ide-cd,bus=sata0.0,drive=drive-sata0-0-0,id=sata0-0-0 \                     
+ -device intel-hda,id=sound0,bus=pci.0,addr=0x3 \                                                                                                                                                                    
+ -device hda-duplex,id=sound0-codec0,bus=sound0.0,cad=0 \                                             
+ -device usb-host,hostbus=2,hostaddr=3,id=hostdev0,bus=usb.0,port=1 \
+ -device vfio-pci,host=01:00.0,id=hostdev1,bus=pci.0,addr=0x6 \      
+ -device vfio-pci,host=01:00.1,id=hostdev2,bus=pci.0,addr=0x7 \
+ -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x8 \   
+ -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+ -msg timestamp=on
+
+
+By "purposedly misconfiguring" the codepaths and replacing "pc-i440fx-3.0" with "pc-i440fx-2.11" (basically reverting the config changes I needed to do in order to update the domain definitions), the stuttering seems to disappear (or at least becomes negligible) and the audio output, despite becoming incredibly distorted, is consistent in every other way, with in-order dialogues and (perceived) correct tempo.
+
+
+In order to exclude eventual misconfigurations in the host's audio processing pipeline, I proceeded to update the domain definition's codepath of another guest running Ubuntu 18.04 with a completely different hardware configuration (no video card passthrough and no PulseAudio backconnection, just a plain emulated VirtIO display and Spice audio device).
+
+The audio issue presented itself again in the form of slightly sped up audio playback from Internet videos interleaved with occasional "quenches" of playing speed.
+Stutters are difficult to detect because of the poor refresh rate of the emulated VGA adapter, but I wouldn't be surprised to find them here too (actually, I *think* I sensed them, but I'm not sure enough to assess their existence).
+
+Once again, by reverting to the old 2.11 directive everything is back to normal.
+
+
+
+Given the fact that no official upgrade directives regarding required sampling rate, period or sheduling adjustments were stated or handed-out to administrators, I decided to report this behaviour as a bug.
+I hope this is the appropriate channel and that I didn't annoy anyone (this is my first proper bug report, please forgive me for any innaccuracy).
+
+Hi,
+  Hmm - if you say that changing hte -achine back to pc-i440fx-2.11 is helping then it should be something related to one of the compatibility entries for the machine type; but I don't see anything obvious related to audio or timing.
+To narrow it down a little, is pc-i440fx-2.12 good or bad?
+
+Sorry for the late response.
+
+By switching to 2.12 no noticeable change happens in respect to the 2.11 machine type: distorted audio but correct timing and no overlapping.
+
+
+By the way, the stuttering looks less consistent than I previously thought: today it appears even with the 2.11 setting, but it DOES NOT appear on the other Windows VM, even if that machine has less allocated resources and runs with the i440fx-3.0 (same audio issues are still there, tho).
+
+Looks like it varies both with guest's and host's loads. Maybe it showed after the update because of new CPU bug mitigations being introduced in the kernel (the update to QEMU was carried out during a full system upgrade; you know, rolling release OSes...), or maybe they are due to differences in pagefault occurrencies (now I'm running on a freshly-booted system, last time it was something like 34 days in uptime; and this is strange on its own accord).
+
+Therefore I think the stuttering problem requires a little bit more investigation on my side and might be an entirely different problem, although the nearly perfect sync between stutters and audio overlaps seems suspicious.
+
+Update:
+
+Rolled back from 3.0.0-2 to 2.12.1-1: audio output working correctly, stuttering still present.
+Rolled back from 2.12.1-1 to 2.11.1-2: audio output working correctly, stuttering still present.
+
+So, the audio issues definitely surfaced with QEMU 3.0.0, but the constant ~0.5s interval stuttering looks like something more indepth.
+
+This evening I'll try rolling back on each revision of 2.11 to see if stutters are QEMU-related or not. If that doesn't give any hint, then I'm going to start fiddling with the kernel configuration in order to uncover any possible interference between guest emulation and host CPU scheduling (probably gonna crank-up the timer frequency, in case that helps).
+
+UPDATE 2 (STUTTERING ELIMINATED, AUDIO ISSUES _STILL_ PRESENT)
+
+I think I've tracked down the source of the stuttering that affected my machine, and it doesn't seem to be QEMU-related.
+I'm going to write something about it here anyway, waiting to report it to other, more appropriate channels, hoping that it could help someone else out there.
+
+
+QUICK FIX:
+toggle the `kvm=off` flag off, perform a boot/shutdown cycle, toggle it back on, boot again.
+
+
+POSSIBLE EXPLANATION:
+During the week of panicking trial&error troubleshooting between the discovery of the audio issue and this report's filling, I let Windows perform an update.
+
+It downloaded and installed KB4100347.
+
+Now, by the looks of things this update naively checks the MSR for hipervisor signatures and, not finding any because of the KVM hidden state flag, it carries on with its duties of putting in place whatever microcode-powered mitigations for Spectre V2 it is instructed to set up.
+Being the CPU really a virtual one, the process, unsurprisingly, fails, and the OS is left with some sort of software gimmick which tries to compensate for those unsupported functions.
+
+To my surprise, it seems that the MSR check is implemented as a persistent trigger and, as soon as it detects an hypervisor signature, it permanently removes the mitigation routines, leaving a smoothly running VM.
+
+I've performed 3 reboots since I toggled the flag off and on again, and the performance are consistent.
+
+Obviously, this explanation is just a wild guess, but I find it believable enough and in line with my experience.
+
+
+
+As I stated in the title, though, *the audio corruption is still well present* under QEMU 3.0, and eliminating the stuttering didn't help, leaving me with the original and most important problem.
+
+ok, so lets forget about the stuttering and just concentrate on what broke in 3.0
+Can you try building the bleeding edge qemu and see if the problem still exists ?
+
+Dave
+
+Built QEMU at commit 53a19a9a5f9811a911e9b69ef36afb0d66b5d85c (with --audio-drv-list=pa):
+
+nothing changes, audio still malfunctioning.
+
+OK, so in that case you'll need to do a git bisect to figure out what the first change was that broke it.
+If 3.0 is at one end and is bad, pick the last known good version (on the problem that you can reliably repeat) and do the bisect between them - if we're lucky we'll land on something obviously audio, windows or timing related.
+
+GIT BISECT RESULTS
+
+So, I managed to run the git bisection and ended up having to do it twice: once looking for the first commit that broke audio (turns out a major total breakage occurs before the original diagnosed issue appeared), then to spot the origin of the main issue (I ignored the other form of malfunctioning, marking it as 'good').
+
+---AUDIO BREAKAGE BISECT LOG---
+
+git bisect start
+# bad: [53a19a9a5f9811a911e9b69ef36afb0d66b5d85c] s390x/tcg: always enable AFP for linux-user
+git bisect bad 53a19a9a5f9811a911e9b69ef36afb0d66b5d85c
+# good: [4743c23509a51bd4ee85cc272287a41917d1be35] Update version for v2.12.0 release
+git bisect good 4743c23509a51bd4ee85cc272287a41917d1be35
+# bad: [7f9ddf64d5fe5bfaa91ae0ec52217d86f4d86452] target/arm: Implement SVE Floating Point Accumulating Reduction Group
+git bisect bad 7f9ddf64d5fe5bfaa91ae0ec52217d86f4d86452
+# good: [cc9743c236cce8a35449e3ef67140287b68bb705] iscsi: Query and save device designator when opening
+git bisect good cc9743c236cce8a35449e3ef67140287b68bb705
+# good: [1e05197f24c49d52f339de9053bb1d17082f1be3] translate-all: iterate over TBs in a page with PAGE_FOR_EACH_TB
+git bisect good 1e05197f24c49d52f339de9053bb1d17082f1be3
+# good: [2aeba0d007d33efa12a6339bb140aa634e0d52eb] target/arm: Strict alignment for ARMv6-M and ARMv8-M Baseline
+git bisect good 2aeba0d007d33efa12a6339bb140aa634e0d52eb
+# bad: [00928a421d47f49691cace1207481b7aad31b1f1] Merge remote-tracking branch 'remotes/pmaydell/tags/pull-target-arm-20180626' into staging
+git bisect bad 00928a421d47f49691cace1207481b7aad31b1f1
+# bad: [35e238c9330669882487f9929e0aa97900431853] Merge remote-tracking branch 'remotes/kraxel/tags/audio-20180625-pull-request' into staging
+git bisect bad 35e238c9330669882487f9929e0aa97900431853
+# good: [c52e53f429aa562539f5da2e7c21c66c6f9a8a16] Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-3.0-20180622' into staging
+git bisect good c52e53f429aa562539f5da2e7c21c66c6f9a8a16
+# good: [be25fcc4d2faeb3ffa8db813272963bae659c4c2] MAINTAINERS: Update QAPI stanza for commit fb0bc835e56
+git bisect good be25fcc4d2faeb3ffa8db813272963bae659c4c2
+# good: [518d23a976b7dad77cfef3e41c3531ac89229b00] Merge remote-tracking branch 'remotes/ehabkost/tags/python-next-pull-request' into staging
+git bisect good 518d23a976b7dad77cfef3e41c3531ac89229b00
+# bad: [8ced0669237b2bbedac3e4ce6fcf7aaaafaae663] audio/hda: tweak timer adjust logic
+git bisect bad 8ced0669237b2bbedac3e4ce6fcf7aaaafaae663
+# bad: [0a373bb310c1533e24aa5e3edbf206507fb342ea] audio/hda: turn some dprintfs into trace points
+git bisect bad 0a373bb310c1533e24aa5e3edbf206507fb342ea
+# bad: [280c1e1cdb24d80ecdfcdfc679ccc5e8ed7af45d] audio/hda: create millisecond timers that handle IO
+git bisect bad 280c1e1cdb24d80ecdfcdfc679ccc5e8ed7af45d
+# first bad commit: [280c1e1cdb24d80ecdfcdfc679ccc5e8ed7af45d] audio/hda: create millisecond timers that handle IO
+
+---END---
+
+
+---ORIGINAL ISSUE BISECT LOG---
+
+git bisect start
+# bad: [35e238c9330669882487f9929e0aa97900431853] Merge remote-tracking branch 'remotes/kraxel/tags/audio-20180625-pull-request' into staging
+git bisect bad 35e238c9330669882487f9929e0aa97900431853
+# good: [c52e53f429aa562539f5da2e7c21c66c6f9a8a16] Merge remote-tracking branch 'remotes/dgibson/tags/ppc-for-3.0-20180622' into staging
+git bisect good c52e53f429aa562539f5da2e7c21c66c6f9a8a16
+# good: [cc2ae7c9de14efd72c6205825eb7cd980ac09c11] target/arm: Introduce ARM_FEATURE_M_MAIN
+git bisect good cc2ae7c9de14efd72c6205825eb7cd980ac09c11
+# good: [be25fcc4d2faeb3ffa8db813272963bae659c4c2] MAINTAINERS: Update QAPI stanza for commit fb0bc835e56
+git bisect good be25fcc4d2faeb3ffa8db813272963bae659c4c2
+# good: [518d23a976b7dad77cfef3e41c3531ac89229b00] Merge remote-tracking branch 'remotes/ehabkost/tags/python-next-pull-request' into staging
+git bisect good 518d23a976b7dad77cfef3e41c3531ac89229b00
+# good: [8ced0669237b2bbedac3e4ce6fcf7aaaafaae663] audio/hda: tweak timer adjust logic
+git bisect good 8ced0669237b2bbedac3e4ce6fcf7aaaafaae663
+# bad: [bc753dc09ff33d99bc9004d7286c50de1d5bece6] audio/hda: enable new timer code by default.
+git bisect bad bc753dc09ff33d99bc9004d7286c50de1d5bece6
+# good: [4501ee16c76e89e0a2b2beb95f3b93f965997391] audio/hda: detect output buffer overruns
+git bisect good 4501ee16c76e89e0a2b2beb95f3b93f965997391
+# first bad commit: [bc753dc09ff33d99bc9004d7286c50de1d5bece6] audio/hda: enable new timer code by default.
+
+---END---
+
+
+I'm attaching both of them, just in case someone wants to replay them.
+
+One thing that I'd like to point out is that the thing I called "total breakage" looks extremely similar to what happens when I set a 2.12 machine on a 3.0 QEMU: complete distortion.
+Do I have to study it more in order to see if it really produces the same effect?
+
+
+Anyway, I'm sorry if such a simple matter took this long but, during one of the initial bisections, an accidental misconfiguration in the testing environment completely wasted the guest I was using (permanent Windows startup failure-level of wasted...).
+I had to recover a few things and reinstall as many.
+
+
+
+Oh and yeah, I just kind of realized that the original issue simply appears after the new timers are being activated by default.
+Well, that should have been pretty obvious.
+I'll try to actuvate them at compile time and see where this path leads to.
+
+And sorry for misclicking on the information type settings.
+
+Ran through the commits included in the audio code merge, with the following results:
+
+[commit 280c1e1cdb24d80ecdfcdfc679ccc5e8ed7af45d]
+audio/hda: create millisecond timers that handle IO
+
+Audio stream gets progressively more and more corrupted, breaking completely between 30'' and 1' after continuous sound start.
+No problems playing short sounds.
+
+--
+
+[commit 0a373bb310c1533e24aa5e3edbf206507fb342ea]
+audio/hda: turn some dprintfs into trace points
+
+No changes from the previous commit, of course.
+
+--
+
+[commit 8ced0669237b2bbedac3e4ce6fcf7aaaafaae663]
+audio/hda: tweak timer adjust logic
+
+First time audio looks really good on this guest; the new code is working, by the look of things.
+
+--
+
+[commit 4501ee16c76e89e0a2b2beb95f3b93f965997391]
+audio/hda: detect output buffer overruns
+
+First time issue presents itself.
+
+--
+
+So, I assume that commit 4501ee16c76e89e0a2b2beb95f3b93f965997391 introduced some kind of overrun control which mishandles the buffer, at least in my setup.
+From a quick and ignorant git diff between this and the previous commit, I can see that the new detector could drop the buffer too early, or maybe it misconfigures the st->buft_start property.
+
+These last tests were performed by manually toggling the use-timer property on from inside the source code; I hope this doesn't invalidate their outcome, though.
+
+As of now I have no clue on how to patch this thing, since I do not understand the interactions between the various emulator's components.
+
+any change with the attached patch?
+
+All issues solved by the patch.
+No clicks or glitches detected.
+Thank you.
+
+Will this be upstreamed?
+
+https://patchwork.ozlabs.org/patch/995566/
+
+Ok then, keeping an eye out for the eventual acceptance in the official repo, so that I can change the bug report status.
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=6cdc2d189cb60a9d13e
+

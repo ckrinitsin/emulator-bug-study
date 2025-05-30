@@ -1,0 +1,78 @@
+Qemu locks up when incoming serial fills up
+
+I'm using Windows, I'm not sure if this happens on Linux, but for all I know it does. To repro, fire up any image (ideally one that does almost nothing, and doesn't read the serial port), and use the option "-serial pipe:mypipe". Then use Putty or something else to connect to that named pipe so Qemu starts up. Now start typing into Putty. For a VM image that never reads the serial port, upon typing the 16th character Qemu stops executing instructions in the guest (as evidenced either by being unable to step in gdb, seeing that "info registers" in the monitor always reports the same value, or just by observing that the guest is hung). For OS images that do regularly read the serial port, this may require pasting >16 bytes into Putty at once. This occurs with more than just Putty, use anything that can write at a named pipe.
+
+I would have expected that bytes get dropped, or even more ideally blocked at the sender's side of the named pipe. I would not expect that the entire VM stops. You seem to be able to unwedge the VM by switching to the monitor and running "i /1c 0x3f8" until you've pulled enough out of buffer that it's happy to run again. Interestingly, all bytes seem to come through (more than just the 16) when read from the monitor.
+
+I haven't been able to get a source environment set up, but I have tried a few of the Windows binaries. This repros in 1.4.1, 1.3.0, 1.2, and 1.0, the most recent build I found that did not have this behavior was 0.15.0.
+
+Maybe I'm missing something very obvious, and if so, I apologize in advance. I'm also happy to create an OS image that highlights this problem if it would help.
+
+Some food for thought:
+ * os_host_main_loop_wait quickly calls "unlock IO thread", poll, "lock IO thread".
+ * win_chr_pipe_poll calls PeekNamedPipe, which would report data available, satisfying the poll.
+ * win_chr_read_poll calls qemu_chr_be_can_write, which I think calls serial_can_receive1, which might say sorry, no space.
+ * win_chr_read would then bail as s->max_size is zero, skipping the call to ReadFile.
+
+So perhaps the poll was satisfied, but no data was ever read from that pipe, putting it in a tight loop? The non-Windows version of os_host_main_loop_wait has some sort of MAX_MAIN_LOOP_SPIN valve in which the comment suggests the VCPU threads could starve. Could this be happening in the Windows version as well?
+
+I think I am seeing the same symptoms when I let two QEMU instances talk to each other over pipe serial.
+
+The following patch gets things moving again for me. It only reports that the poll was satisfied if there was data that could be written to the destination. While it successfully opens up a window where the I/O thread is unlocked (previously there was no such window, hence the hang), it's far from ideal. 
+
+Someone with more familiarity than me could consider an approach where descriptors that have responded to the poll but are unable to be acted on are temporarily disabled or removed from the list. This would allow the main thread to quiet back down, rather than aggressively spinning locking and unlocking the global mutex, which puts a drag on the VCPU threads that need to acquire the same lock and do real work.
+
+The line numbers here might not line up, but you get the idea.
+
+--- qemu-char.c.orig2   2013-05-19 22:27:16 -0700
++++ qemu-char.c 2013-05-19 23:49:38 -0700
+@@ -1650,6 +1650,7 @@
+
+ static int win_chr_poll(void *opaque)
+ {
++    int available;
+     CharDriverState *chr = opaque;
+     WinCharState *s = chr->opaque;
+     COMSTAT status;
+@@ -1658,9 +1659,9 @@
+     ClearCommError(s->hcom, &comerr, &status);
+     if (status.cbInQue > 0) {
+         s->len = status.cbInQue;
+-        win_chr_read_poll(chr);
++        available = win_chr_read_poll(chr);
+         win_chr_read(chr);
+-        return 1;
++        return available != 0;
+     }
+     return 0;
+ }
+@@ -1692,6 +1693,7 @@
+
+ static int win_chr_pipe_poll(void *opaque)
+ {
++    int available;
+     CharDriverState *chr = opaque;
+     WinCharState *s = chr->opaque;
+     DWORD size;
+@@ -1699,9 +1701,9 @@
+     PeekNamedPipe(s->hcom, NULL, 0, NULL, &size, NULL);
+     if (size > 0) {
+         s->len = size;
+-        win_chr_read_poll(chr);
++        available = win_chr_read_poll(chr);
+         win_chr_read(chr);
+-        return 1;
++        return available != 0;
+     }
+     return 0;
+ }
+
+It seems the same problem with windbg #1225187
+
+The patch above does not solve the problem.
+
+
+I think there have been quite a lot of fixes during the last releases of QEMU in this area ... could you please try again to see whether you can still reproduce this problem with the latest version of QEMU (currently v2.9.0)?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

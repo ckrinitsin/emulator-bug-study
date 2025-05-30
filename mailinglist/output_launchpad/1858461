@@ -1,0 +1,185 @@
+Please refactor linux-user/mips/cpu_loop.c
+
+Hello. I am working with qemu on test images. I've added a new syscall (436) to qemu but received ENOSYS from mips application.
+
+Please open "linux-user/mips/cpu_loop.c". I've added at the end of "mips_syscall_args" the following:
+
+```
+MIPS_SYS(sys_getdents64_x32, 3)
+```
+
+But
+
+```
+syscall_num = env->active_tc.gpr[2] - 4000;
+if (syscall_num >= sizeof(mips_syscall_args)) {
+  ret = -TARGET_ENOSYS;
+```
+
+returns -TARGET_ENOSYS
+
+We can see that "linux-user/mips/cpu_loop.c" differs a lot from "linux-user/arm/cpu_loop.c". Arm has it's own "ARM_NR_BASE" and etc.
+
+Can you please refactor mips cpu loop in the same way as arm? Thank you.
+
+Added workaround for now
+
+Please do not use previous workaround in prod, it is bad, just proof of concept.
+
+It looks like nobody is maintaining syscall list. It is not possible to trust it.
+
+We have "arch/mips/kernel/syscalls/syscall_o32.tbl", we need to create generator. Generator should provide maximum possible number of arguments for syscall. For example:
+
+> sync_file_range  sys_sync_file_range  sys32_sync_file_range
+
+"sys_sync_file_range" has 4 arguments, "sys32_sync_file_range" - 7 arguments. Maximum value - 7 should be stored inside our table.
+
+The problem is that some syscalls in kernel code is prefixed by SYSCALL_DEFINE{N} or COMPAT_SYSCALL_DEFINE{N}. but some (like "sys_sync_file_range" and "sys32_sync_file_range") are not prefixed.
+
+So I think we may have a generator that provides "WAT?" if it don't know the arguments count and require to update value manualy.
+
+
+
+I've found a reliable way to generate syscall arguments count table.
+
+cd /usr/src/linux
+make clean
+make CONFIG_DEBUG_INFO=y CONFIG_DEBUG_INFO_SPLIT=y CONFIG_DEBUG_INFO_DWARF4=y
+llvm-dwarfdump -debug-info --name ksys_getdents64 --show-children --recurse-depth=1 fs/readdir.dwo
+
+0x00013738: DW_TAG_subprogram
+              DW_AT_name        ("ksys_getdents64")
+              ...
+
+0x00013752:   DW_TAG_formal_parameter
+              ...
+
+0x00013766:   DW_TAG_formal_parameter
+              ...
+
+0x00013779:   DW_TAG_formal_parameter
+              ...
+
+We can count "DW_TAG_formal_parameter" for syscall and it that's it.
+
+Unfortunately we can generate only very short table of syscalls using this method. Most of the syscalls are missing from "dwo" files. =(
+
+It is possible to do the following:
+
+cd /usr/src/linux
+make clean
+make CC=clang
+~/workspace/CastXML/build/bin/castxml -nostdinc -isystem /usr/lib/clang/9.0.1/include -I./arch/x86/include -I./arch/x86/include/generated  -I./include -I./arch/x86/include/uapi -I./arch/x86/include/generated/uapi -I./include/uapi -include ./include/linux/kconfig.h -D__KERNEL__ arch/x86/entry/syscall_32.c --castxml-output=1 -o /tmp/syscall_32.xml
+
+It generates all information including params about 32bit syscalls for current amd64 platform. Unfortunately cross compilation of generic kernel using mips clang toolchain is almost impossible today. It is an idea for future. So today we have to parse "include/linux/syscalls.h", "include/linux/compat.h", "arch/mips/kernel/linux32.c", etc without respect to config and syntax.
+
+
+
+There is already a pending patch for mips that will handle the syscall in question. Will provide drtails tommorow.
+
+Andrew,
+
+Please take a look at the patch:
+
+http://patchwork.ozlabs.org/patch/1217454/
+
+Once you apply the patch, it should be straightforward to add getdents64_x32() (right after clone3()) for all MIPS ABIs.
+
+The thing is, kernel folks recently made some rearrangements of syscall numbers, so that all architectures have in future "similar" syscall numbers, but that required some "holes" in syscall numbers schemes for virtuall all archs, and for MIPS among them. That is why ne array in linux-user/mips/cpu_loop.c has some elements defined just as "0" - they are there just to adjust syscall numbers to be in accordance with the new scheme.
+
+Please let us know if you are able to work with such solution or not.
+
+Happy New Year!
+
+Aleksandar
+
+Hello, thank you. I want to introduce another patch with syscalls related generator. Please review it.
+
+I think about the following development flow:
+
+1. Kernel updates and maintains "tbl".
+2. Qemu developer wants to implement new syscall (like clone3) in "linux-user/syscall.c".
+3. Developer clones new kernel into some directory and runs generators.
+4. All syscall related stuff will be updated immediately.
+
+I think it will very straightforward solution. Qemu won't hardcode kernel related stuff and all linkage between kernel and qemu will be very easy.
+
+
+
+I've just written these generators in ruby, but it can be rewritten in python, perl, etc.
+
+On Wed, 8 Jan 2020 at 17:06, puchuu <email address hidden> wrote:
+> I think about the following development flow:
+>
+> 1. Kernel updates and maintains "tbl".
+> 2. Qemu developer wants to implement new syscall (like clone3) in "linux-user/syscall.c".
+> 3. Developer clones new kernel into some directory and runs generators.
+> 4. All syscall related stuff will be updated immediately.
+
+That seems like quite a lot of effort, given that we don't really
+have to update the set of syscall number #defines very often.
+At the moment it's just "somebody submits a patch which
+updates the list of #defines every so often". (And if you want
+to actually implement a new syscall then the the actual
+implementation is the bulk of the work anyhow.)
+
+In particular if you really want to proceed down the path of
+suggesting scripts for doing the update then I think we would
+want something that works for all our architectures, not just MIPS.
+
+thanks
+-- PMM
+
+
+After applying my patch it seems like another issue was fixed: "emerge" inside qemu has no permissions bug. Without that patch I was able to reproduce "emerge" program can't apply any patch (permission denied). So it looks like old hardcoded table has some wrong values that are not compatible with current kernel.
+
+So I think that generator is super critical for mips. With that patch I am able to "emerge app-arch/gzip" inside qemu, works perfect. I will try to rebuild a complete image inside qemu.
+
+http://patchwork.ozlabs.org/patch/1217454/
+
+I want to say that this patch is not safe. Zero values around "MIPS_SYS" means that syscall can be processed but arguments won't be received from stack (please see cpu loop switch). So when main code will receive a new syscall support - mips will become broken. I can recommend to use -1 intead and add additional check for "nb_args".
+
+Andrew,
+
+Thanks for your input regarding linked patch. The patch is still under review, and it is normal for patches under review to perhaps have some faults, and that is improved in the process of reviewing - that is, among other things, one of benefits of open source development. I will  take into account your opinion, and fix the patch in the next version of the series.
+
+As far your ideas on other improvements, my advice is to submit them to the QEMU devel list - possibly as a short series of patches. Try to organize your changes in several patches, each representing a logical unit. For example:
+
+   - one patch could be titled "linux-user: mips: Refactor enumerating of syscall numbers"
+   - the second patch could be "linux-user: Automate updating syscall numbers" (but, yes, this should work preferably for all targets, as Peter said)
+   - the third patch could be "linux-user: Fix execution of program 'emerge'" (I am not sure if there is a separate portion of code that fixes that)
+   - etc. - whatever you think should be fixed/improved
+
+As Thomas said, follow https://wiki.qemu.org/Contribute/SubmitAPatch . For each patch, provide background information, problem that is fixed with the patch, and why is the way you propose good.
+
+Also, can you please add more info on "emerge" problem, so that I can repro it with the current QEMU. I would prefer to know the roots cause, rather than just accept that the problem disappeared.
+
+I have certain concerns over a refactoring that changes the behavior. Refactorings in general should not do it, and if they still do, one should at least have a clear explanation. That is why I want more details on "emerge" problem. 
+
+Sure, I will try to reproduce permissions issue and create a new issue later. I will try to provide small patches too.
+
+I've created a question on kernel bugzilla. https://bugzilla.kernel.org/show_bug.cgi?id=206135 They should know that applications wants much more than "tbl" provides.
+
+I've created a new patches for getdents bug https://sourceware.org/bugzilla/show_bug.cgi?id=23960 and I can't reproduce python permissions issue anymore. My mips image built with qemu user works perfect.
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'invalid' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/241
+
+

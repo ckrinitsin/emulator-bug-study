@@ -1,0 +1,297 @@
+ External modules retreval using Go1.15 on s390x appears to have checksum and ECDSA verification issues
+
+We are observing issue while building go-runner image and we suspect it is due to QEMU version being used. As referred in below issue:
+https://github.com/golang/go/issues/40949
+
+We tried to build go-runner image using go1.15 and register QEMU (docker run --rm --privileged multiarch/qemu-user-static@sha256:c772ee1965aa0be9915ee1b018a0dd92ea361b4fa1bcab5bbc033517749b2af4 --reset -p yes) as mentioned in PR https://github.com/kubernetes/release/pull/1499. We observed below failure during build:
+
+-------------------------------------------------------------------------------------------------------------
+ERROR: executor failed running [/bin/sh -c CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH}     go build -ldflags '-s -w -buildid= -extldflags "-static"'     -o go-runner ${package}]: buildkit-runc did not terminate successfully
+------
+ > [builder 7/7] RUN CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH}     go build -ldflags '-s -w -buildid= -extldflags "-static"'     -o go-runner .:
+------
+failed to solve: rpc error: code = Unknown desc = executor failed running [/bin/sh -c CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH}     go build -ldflags '-s -w -buildid= -extldflags "-static"'     -o go-runner ${package}]: buildkit-runc did not terminate successfully
+Makefile:52: recipe for target 'container' failed
+make: *** [container] Error 1
+-------------------------------------------------------------------------------------------------------------
+
+> We are observing issue while building go-runner image and we suspect it is due to QEMU version
+> being used. As referred in below issue:
+> https://github.com/golang/go/issues/40949
+
+This issue says the problem was due to https://bugs.launchpad.net/qemu/+bug/1847232/  which was fixed in QEMU 4.2.  The commenters there say to try using this newer QEMU to see if it fixes it, and I don't see any confirmation that this has been tried yet.
+
+IOW, please test with latest QEMU and report back if the problem still occurrs.
+
+Yes we have observed that the issue persist in later QEMU version too.
+
+Can you provide a *simple* way to demonstrate the problem. ie some simple Go demo program, that doens't involve building kubernetes.
+
+We followed below steps to reproduce the error:
+
+1) Create new folder 
+$ mkdir -p example.com/hello
+$ cd example.com/hello
+
+2) Create file hello.go as below;
+$ cat hello.go
+package main
+import (
+    "fmt"
+    "rsc.io/quote"
+)
+func main() {
+    fmt.Println(quote.Hello())
+}
+
+3) Create file go.mod as below
+$ cat go.mod
+module example.com/hello
+go 1.15
+
+4) Create Dockerfile as below:
+$ cat Dockerfile
+# Build the manager binary
+FROM golang:1.15
+WORKDIR /workspace
+# Copy the sources
+COPY hello.go ./
+COPY go.mod ./
+# Allow fallback to 'direct' for GOPROXY
+#
+# The GOPROXY environment variable now supports skipping proxies that return
+# errors. Proxy URLs may now be separated with either commas (,) or pipe
+# characters (|). If a proxy URL is followed by a comma, the go command will
+# only try the next proxy in the list after a 404 or 410 HTTP response. If a
+# proxy URL is followed by a pipe character, the go command will try the next
+# proxy in the list after any error. Note that the default value of GOPROXY
+# remains https://proxy.golang.org,direct, which does not fall back to direct
+# in case of errors.
+#
+# ref: https://golang.org/doc/go1.15#go-command
+ENV GOPROXY="https://proxy.golang.org|direct"
+RUN go env
+
+# Cache the go build
+RUN go build .
+
+5) Register QEMU and create buildx instance
+$ docker run --rm --privileged multiarch/qemu-user-static@sha256:c772ee1965aa0be9915ee1b018a0dd92ea361b4fa1bcab5bbc033517749b2af4 --reset -p yes
+$ docker buildx create --name multiarch-go-runner --use
+
+6) Error observed while building image
+$ docker buildx build --load --progress plain --platform linux/s390x -t go_chk3 .
+#1 [internal] booting buildkit
+#1 pulling image moby/buildkit:buildx-stable-1
+#1 pulling image moby/buildkit:buildx-stable-1 1.4s done
+#1 creating container buildx_buildkit_multiarch-go-runner0
+#1 creating container buildx_buildkit_multiarch-go-runner0 1.3s done
+#1 DONE 2.7s
+#2 [internal] load .dockerignore
+#2 transferring context: 2B done
+#2 DONE 0.1s
+#3 [internal] load build definition from Dockerfile
+#3 transferring dockerfile: 1.50kB done
+#3 DONE 0.1s
+#4 [internal] load metadata for docker.io/library/golang:1.15
+#4 DONE 4.1s
+#7 [internal] load build context
+#7 transferring context: 206B done
+#7 DONE 0.1s
+#5 [1/6] FROM docker.io/library/golang:1.15@sha256:4c3279e05a0131c0565466ac...
+#5 resolve docker.io/library/golang:1.15@sha256:4c3279e05a0131c0565466ac538755f104d8d936efbc4c30ba7d717c73f3e2c2 done
+#5 sha256:4c3279e05a0131c0565466ac538755f104d8d936efbc4c30ba7d717c73f3e2c2 2.36kB / 2.36kB done
+#5 sha256:c5e175e434734f93e9b75f245f05578e7a12cedffed20cae845f57a3c7139b95 0B / 155B 0.1s
+#5 sha256:f2b199a6d9adcfa5f879ec8042306ab2f919623f8018d0d7a6f4e9dade5e1a71 0B / 48.97MB 0.1s
+#5 sha256:5615f13ce6c82698ac5df02b39113e3a8949db1a7a7f7f5d07c9265ee15b79d0 0B / 7.39MB 0.1s
+#5 sha256:8ee3c4544ee6e2d4cd23f1b47d6fde1775c25fab9a77851b118074afa00c9f4f 1.79kB / 1.79kB done
+#5 sha256:356049cf27ce547d544a426484dee88b17a1abb2c51e359a15c3565b2f0d33f0 6.18kB / 6.18kB done
+#5 sha256:23ffecb808bd421be3db88ff08f67b19f28c1ffe0d4c157be3fcff3360f527bc 0B / 9.88MB 0.1s
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 0B / 56.74MB 0.1s
+#5 sha256:44e2ce491a55134d5e4118405670fcc19b140898dc8ac62156e47a49f52e9f2d 0B / 51.38MB 0.3s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 0B / 101.17MB 0.3s
+#5 sha256:c5e175e434734f93e9b75f245f05578e7a12cedffed20cae845f57a3c7139b95 155B / 155B 1.6s done
+#5 sha256:5615f13ce6c82698ac5df02b39113e3a8949db1a7a7f7f5d07c9265ee15b79d0 3.16MB / 7.39MB 1.8s
+#5 sha256:23ffecb808bd421be3db88ff08f67b19f28c1ffe0d4c157be3fcff3360f527bc 1.75MB / 9.88MB 1.8s
+#5 sha256:f2b199a6d9adcfa5f879ec8042306ab2f919623f8018d0d7a6f4e9dade5e1a71 19.48MB / 48.97MB 2.1s
+#5 sha256:5615f13ce6c82698ac5df02b39113e3a8949db1a7a7f7f5d07c9265ee15b79d0 7.39MB / 7.39MB 1.9s done
+#5 sha256:23ffecb808bd421be3db88ff08f67b19f28c1ffe0d4c157be3fcff3360f527bc 9.88MB / 9.88MB 1.9s done
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 20.79MB / 56.74MB 2.1s
+#5 sha256:44e2ce491a55134d5e4118405670fcc19b140898dc8ac62156e47a49f52e9f2d 19.40MB / 51.38MB 2.1s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 19.54MB / 101.17MB 2.1s
+#5 sha256:f2b199a6d9adcfa5f879ec8042306ab2f919623f8018d0d7a6f4e9dade5e1a71 37.71MB / 48.97MB 2.4s
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 35.35MB / 56.74MB 2.4s
+#5 sha256:44e2ce491a55134d5e4118405670fcc19b140898dc8ac62156e47a49f52e9f2d 38.91MB / 51.38MB 2.4s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 39.22MB / 101.17MB 2.4s
+#5 sha256:f2b199a6d9adcfa5f879ec8042306ab2f919623f8018d0d7a6f4e9dade5e1a71 45.15MB / 48.97MB 2.5s
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 43.24MB / 56.74MB 2.5s
+#5 sha256:44e2ce491a55134d5e4118405670fcc19b140898dc8ac62156e47a49f52e9f2d 47.92MB / 51.38MB 2.5s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 48.30MB / 101.17MB 2.5s
+#5 sha256:f2b199a6d9adcfa5f879ec8042306ab2f919623f8018d0d7a6f4e9dade5e1a71 48.97MB / 48.97MB 2.7s done
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 56.74MB / 56.74MB 2.8s
+#5 sha256:44e2ce491a55134d5e4118405670fcc19b140898dc8ac62156e47a49f52e9f2d 51.38MB / 51.38MB 2.7s done
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 66.70MB / 101.17MB 2.8s
+#5 sha256:e060fbdc544cffa8f72ebc5c629d0fd77e9f0ea787a2eec80f4a77dd0833d747 56.74MB / 56.74MB 3.0s done
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 77.91MB / 101.17MB 3.0s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 88.63MB / 101.17MB 3.1s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 99.91MB / 101.17MB 3.3s
+#5 sha256:69157c3b9bc7dad5a676fdc6700b95a1a9dbcffc7ccfb7cd20d91f16be6e9ffd 101.17MB / 101.17MB 3.6s done
+#5 unpacking docker.io/library/golang:1.15@sha256:4c3279e05a0131c0565466ac538755f104d8d936efbc4c30ba7d717c73f3e2c2
+#5 unpacking docker.io/library/golang:1.15@sha256:4c3279e05a0131c0565466ac538755f104d8d936efbc4c30ba7d717c73f3e2c2 17.8s done
+#5 DONE 22.8s
+#6 [2/6] WORKDIR /workspace
+#6 DONE 2.6s
+#8 [3/6] COPY hello.go ./
+#8 DONE 0.2s
+#9 [4/6] COPY go.mod ./
+#9 DONE 0.1s
+#10 [5/6] RUN go env
+#10 1.711 GO111MODULE=""
+#10 1.711 GOARCH="s390x"
+#10 1.711 GOBIN=""
+#10 1.711 GOCACHE="/root/.cache/go-build"
+#10 1.711 GOENV="/root/.config/go/env"
+#10 1.711 GOEXE=""
+#10 1.711 GOFLAGS=""
+#10 1.711 GOHOSTARCH="s390x"
+#10 1.712 GOHOSTOS="linux"
+#10 1.712 GOINSECURE=""
+#10 1.712 GOMODCACHE="/go/pkg/mod"
+#10 1.712 GONOPROXY=""
+#10 1.712 GONOSUMDB=""
+#10 1.712 GOOS="linux"
+#10 1.712 GOPATH="/go"
+#10 1.713 GOPRIVATE=""
+#10 1.713 GOPROXY="https://proxy.golang.org|direct"
+#10 1.713 GOROOT="/usr/local/go"
+#10 1.713 GOSUMDB="sum.golang.org"
+#10 1.713 GOTMPDIR=""
+#10 1.713 GOTOOLDIR="/usr/local/go/pkg/tool/linux_s390x"
+#10 1.713 GCCGO="gccgo"
+#10 1.713 AR="ar"
+#10 1.713 CC="s390x-linux-gnu-gcc"
+#10 1.713 CXX="g++"
+#10 1.713 CGO_ENABLED="1"
+#10 1.713 GOMOD="/workspace/go.mod"
+#10 1.714 CGO_CFLAGS="-g -O2"
+#10 1.714 CGO_CPPFLAGS=""
+#10 1.714 CGO_CXXFLAGS="-g -O2"
+#10 1.714 CGO_FFLAGS="-g -O2"
+#10 1.714 CGO_LDFLAGS="-g -O2"
+#10 1.714 PKG_CONFIG="pkg-config"
+#10 1.714 GOGCCFLAGS="-fPIC -m64 -march=z196 -pthread -fmessage-length=0 -fdebug-prefix-map=/tmp/go-build803398483=/tmp/go-build -gno-record-gcc-switches"
+#10 DONE 1.8s
+#11 [6/6] RUN go build .
+#11 0.567 go: finding module for package rsc.io/quote
+#11 8.056 go: downloading rsc.io/quote v1.5.2
+#11 9.080 hello.go:5:5: <email address hidden>: verifying module: <email address hidden>: Get "https://<email address hidden>": tls: invalid signature by the server certificate: ECDSA verification failure
+#11 ERROR: executor failed running [/bin/sh -c go build .]: buildkit-runc did not terminate successfully
+------
+ > [6/6] RUN go build .:
+------
+failed to solve: rpc error: code = Unknown desc = executor failed running [/bin/sh -c go build .]: buildkit-runc did not terminate successfully
+
+
+I remember we had these "ECDSA verification failure" issues in older QEMU versions, but these were fixed.
+
+I just tired building the go file under Fedora 32 running under latest upstream qemu-system-s390x, and using latest go binaries from https://golang.org/dl/:
+
+[root@atomic-00 hello]# uname -a
+Linux atomic-00 5.8.11-200.fc32.s390x #1 SMP Wed Sep 23 13:36:15 UTC 2020 s390x s390x s390x GNU/Linux
+
+[root@atomic-00 hello]# go version
+go version go1.15.7 linux/s390x
+
+[root@atomic-00 hello]# go build
+go: downloading rsc.io/quote v1.5.2
+go: downloading rsc.io/sampler v1.3.0
+go: downloading golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c
+
+[root@atomic-00 hello]# ./hello 
+Hello, world.
+
+Can you double check that you are really using latest upstream QEMU in your more-advanced cross-build?
+
+we still observe the same failure even after using latest qemu image i.e https://hub.docker.com/layers/multiarch/qemu-user-static/latest/images/sha256-14ef83[…]27699811f89338b129faa3bd9eb52cd696bc3d84aa81a?context=explore
+
+I started looking at the issue.Could reproduce issue with steps mentioned in comment #4 
+@David Hildenbrand (davidhildenbrand)  could you please let me know what exact qemu version/image you used? and you followed exact steps as mentioned in comment #4?
+
+Any update?
+
+It's still an issue using qemu-6.0.0-rc4. If you remove the environment variable ENV GOPROXY="https://proxy.golang.org|direct" you get a different error:
+
+ => ERROR [6/6] RUN go build .                                                                                                                                                                                                 5.8s
+------
+ > [6/6] RUN go build .:
+#10 0.854 go: finding module for package rsc.io/quote
+#10 4.138 fatal error: grew heap, but no adequate free space found
+#10 4.159
+#10 4.159 runtime stack:
+#10 4.163 runtime.throw(0x62abce, 0x2b)
+#10 4.172       /usr/local/go/src/runtime/panic.go:1116 +0x70
+#10 4.183 runtime.(*mheap).allocSpan(0x9d5c60, 0x10000, 0x100000000000000, 0x9f1920, 0x96c720)
+#10 4.199       /usr/local/go/src/runtime/mheap.go:1166 +0x896
+
+
+
+Hello @davidhildenbrand, I have been looking into this bug recently. So far, I noticed a few things:
+
+1: Similarly as described in comment #5, I also had success building the go file described in the reproducing steps in #4 using Ubunutu-20.04 with recent qemu-system-s390x (I did it 1 - 2 weeks ago, so it is likely qemu-6.0rc2 or rc3)
+
+2: Similarly as described in commment #9, when qemu-user-static is used, there are "ECDSA verification failure". The failure is using multiarch/qemu-user-static with qemu-s390x 6.0.0-rc3 statically built from source and copied in when building the container
+
+3: Debugging in a container has been really difficult for me, so I used chroot and debootstrap to emulate a full s390x file system on a x86 host and copy the qemu-s390x binary in. I find that I can still reproduce the error similarly as the container. However, I also find that if I turn the vector instruction off with vx=off and split the go command into multiple steps, I am no longer able to reproduce the error. The reason for splitting the commands is that it looks like go build first calls go mod tidy, then calls go tool compile to compile the program. Through experimentation, those appear to call some other binary so the vx=off is dropped. 
+
+———————————— Build steps ————————————
+root@skewered1:~/example.com/hello# ls                                                                                 
+go.mod  hello.go                                                                                                       
+root@skewered1:~/example.com/hello# vim go.mod                                                                                                                                                      
+root@skewered1:~/example.com/hello# ls                                                                                 
+go.mod  hello.go                                                                                                       
+root@skewered1:~/example.com/hello# uname -a                                                                           
+Linux xxx (hidden) 5.4.0-72-generic #80-Ubuntu SMP Mon Apr 12 17:35:00 UTC 2021 s390x GNU/Linux              
+root@skewered1:~/example.com/hello# file /usr/bin/qemu-s390x-6.0rc5-static                                             
+/usr/bin/qemu-s390x-6.0rc5-static: ELF 64-bit LSB shared object, x86-64, version 1 (GNU/Linux), dynamically linked, Bui
+ldID[sha1]=28d90b247aa25813da5b24d07707863f089a78eb, for GNU/Linux 3.2.0, stripped                                     
+root@skewered1:~/example.com/hello# /usr/bin/qemu-s390x-6.0rc5-static --version
+qemu-s390x version 5.2.95 (v6.0.0-rc5)                     
+Copyright (c) 2003-2021 Fabrice Bellard and the QEMU Project developers
+root@skewered1:~/example.com/hello#                        
+root@skewered1:~/example.com/hello# go version                                  
+                                                                                                                      
+go version go1.15.11 linux/s390x                                                                                       
+root@skewered1:~/example.com/hello#                                                                                    
+root@skewered1:~/example.com/hello# which go                                                        
+/usr/local/go/bin/go
+root@skewered1:~/example.com/hello# /usr/bin/qemu-s390x-6.0rc5-static /usr/local/go/bin/go build . 
+go: finding module for package rsc.io/quote
+hello.go:4:5: module rsc.io/quote: Get "https://proxy.golang.org/rsc.io/quote/@v/list": tls: invalid signature by the server certificate: ECDSA verification failure
+root@skewered1:~/example.com/hello# /usr/bin/qemu-s390x-6.0rc5-static -cpu qemu,vx=off /usr/local/go/bin/go mod tidy 
+go: finding module for package rsc.io/quote
+go: downloading rsc.io/quote v1.5.2
+go: found rsc.io/quote in rsc.io/quote v1.5.2
+go: downloading rsc.io/sampler v1.3.0
+go: downloading golang.org/x/text v0.0.0-20170915032832-14c0d48ead0c
+root@skewered1:~/example.com/hello# /usr/bin/qemu-s390x-6.0rc5-static -cpu qemu,vx=off /usr/local/go/bin/go build .  
+root@skewered1:~/example.com/hello# ls
+go.mod  go.sum  hello  hello.go
+root@skewered1:~/example.com/hello# file hello
+hello: ELF 64-bit MSB executable, IBM S/390, version 1 (SYSV), statically linked, not stripped
+root@skewered1:~/example.com/hello# ./hello 
+Hello, world.
+
+4: The above findings make me think that there is some discrepancy between vector instructions handling for qemu user mode vs system mode. Additionally, running tests with vx=off in go/src/crypto/ecdsa will make the test pass while without vx=off, there remains to be a problem. Currently, I am looking into the go source code hoping to narrow down the problem. It looks like the difference (between qemu-user and s390x native host) happens during initTable() function at crypto/elliptic/p256_s390x.go. 
+
+I hope the above findings make sense. It will be great if you can share some possible insights for where that discrepancy (between qemu-user and qemu-system) could be. Much appreciated.
+
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/281
+
+

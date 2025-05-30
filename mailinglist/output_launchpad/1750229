@@ -1,0 +1,740 @@
+virtio-blk-pci regression: softlock in guest kernel at module loading
+
+Hello,
+
+I am running qemu from master git branch on x86_64 host with kernel is 4.4.114. I've found that commit
+
+    9a4c0e220d8a "hw/virtio-pci: fix virtio behaviour"
+
+introduces an regression with the following command:
+
+    qemu-system-x86_64 -enable-kvm -nodefaults -no-reboot -nographic -vga none -runas qemu -kernel .build.kernel.kvm -initrd .build.initrd.kvm -append 'panic=1 softlockup_panic=1 no-kvmclock nmi_watchdog=0 console=ttyS0 root=/dev/disk/by-id/virtio-0' -m 2048 -drive file=./root,format=raw,if=none,id=disk,serial=0,cache=unsafe -device virtio-blk-pci,drive=disk -serial stdio -smp 2
+
+Starting from this commit to master the following happens with a wide variety of guest kernels (4.4 to 4.15):
+
+[   62.428107] BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=-20 stuck for 59s!
+[   62.437426] Showing busy workqueues and worker pools:
+[   62.443117] workqueue events: flags=0x0
+[   62.447512]   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/256
+[   62.448161]     pending: check_corruption
+[   62.458570] workqueue kblockd: flags=0x18
+[   62.463082]   pwq 1: cpus=0 node=0 flags=0x0 nice=-20 active=3/256
+[   62.463082]     in-flight: 4:blk_mq_run_work_fn
+[   62.463082]     pending: blk_mq_run_work_fn, blk_mq_timeout_work
+[   62.474831] pool 1: cpus=0 node=0 flags=0x0 nice=-20 hung=59s workers=2 idle: 214
+[   62.492121] INFO: rcu_preempt detected stalls on CPUs/tasks:
+[   62.492121]  Tasks blocked on level-0 rcu_node (CPUs 0-1): P4
+[   62.492121]  (detected by 0, t=15002 jiffies, g=-130, c=-131, q=32)
+[   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+[   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+[   62.492121] Call Trace:
+[   62.492121]  <IRQ>
+[   62.492121]  sched_show_task+0xdf/0x100
+[   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+[   62.492121]  rcu_check_callbacks+0x93d/0x9d0
+[   62.492121]  ? tick_sched_do_timer+0x40/0x40
+[   62.492121]  update_process_times+0x28/0x50
+[   62.492121]  tick_sched_handle+0x22/0x70
+[   62.492121]  tick_sched_timer+0x34/0x70
+[   62.492121]  __hrtimer_run_queues+0xcc/0x250
+[   62.492121]  hrtimer_interrupt+0xab/0x1f0
+[   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+[   62.492121]  apic_timer_interrupt+0xa2/0xb0
+[   62.492121]  </IRQ>
+[   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+[   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+[   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+[   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+[   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+[   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+[   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+[   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+[   62.492121]  vp_notify+0x12/0x20
+[   62.492121]  virtqueue_notify+0x18/0x30
+[   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+[   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+[   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+[   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+[   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+[   62.492121]  process_one_work+0x1e3/0x420
+[   62.492121]  worker_thread+0x2b/0x3d0
+[   62.492121]  ? process_one_work+0x420/0x420
+[   62.492121]  kthread+0x113/0x130
+[   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+[   62.492121]  ret_from_fork+0x3a/0x50
+[   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+[   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+[   62.492121] Call Trace:
+[   62.492121]  <IRQ>
+[   62.492121]  sched_show_task+0xdf/0x100
+[   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+[   62.492121]  rcu_check_callbacks+0x972/0x9d0
+[   62.492121]  ? tick_sched_do_timer+0x40/0x40
+[   62.492121]  update_process_times+0x28/0x50
+[   62.492121]  tick_sched_handle+0x22/0x70
+[   62.492121]  tick_sched_timer+0x34/0x70
+[   62.492121]  __hrtimer_run_queues+0xcc/0x250
+[   62.492121]  hrtimer_interrupt+0xab/0x1f0
+[   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+[   62.492121]  apic_timer_interrupt+0xa2/0xb0
+[   62.492121]  </IRQ>
+[   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+[   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+[   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+[   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+[   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+[   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+[   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+[   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+[   62.492121]  vp_notify+0x12/0x20
+[   62.492121]  virtqueue_notify+0x18/0x30
+[   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+[   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+[   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+[   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+[   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+[   62.492121]  process_one_work+0x1e3/0x420
+[   62.492121]  worker_thread+0x2b/0x3d0
+[   62.492121]  ? process_one_work+0x420/0x420
+[   62.492121]  kthread+0x113/0x130
+[   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+[   62.492121]  ret_from_fork+0x3a/0x50
+
+Another important thing is that the commit works well on other hardware with the same setup (same host kernel, same qemu command line and host kernel binaries). How could I try to find the issue reason?
+
+
+
+
+
+
+
+Well, I've found that on qemu side VirtQueue for virtio_blk device
+infinitely calls virtio_blk_handle_vq() where virtio_blk_get_request()
+(virtqueue_pop() in essens) always returns NULL.
+
+2018-02-18 15:26 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+> ** Attachment added: ".build.kernel.kvm"
+>    https://bugs.launchpad.net/qemu/+bug/1750229/+attachment/5057653/+files/.build.kernel.kvm
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1750229
+>
+> Title:
+>   virtio-blk-pci regression: softlock in guest kernel at module loading
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   Hello,
+>
+>   I am running qemu from master git branch on x86_64 host with kernel is
+>   4.4.114. I've found that commit
+>
+>       9a4c0e220d8a "hw/virtio-pci: fix virtio behaviour"
+>
+>   introduces an regression with the following command:
+>
+>       qemu-system-x86_64 -enable-kvm -nodefaults -no-reboot -nographic
+>   -vga none -runas qemu -kernel .build.kernel.kvm -initrd
+>   .build.initrd.kvm -append 'panic=1 softlockup_panic=1 no-kvmclock
+>   nmi_watchdog=0 console=ttyS0 root=/dev/disk/by-id/virtio-0' -m 2048
+>   -drive file=./root,format=raw,if=none,id=disk,serial=0,cache=unsafe
+>   -device virtio-blk-pci,drive=disk -serial stdio -smp 2
+>
+>   Starting from this commit to master the following happens with a wide
+>   variety of guest kernels (4.4 to 4.15):
+>
+>   [   62.428107] BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=-20 stuck for 59s!
+>   [   62.437426] Showing busy workqueues and worker pools:
+>   [   62.443117] workqueue events: flags=0x0
+>   [   62.447512]   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/256
+>   [   62.448161]     pending: check_corruption
+>   [   62.458570] workqueue kblockd: flags=0x18
+>   [   62.463082]   pwq 1: cpus=0 node=0 flags=0x0 nice=-20 active=3/256
+>   [   62.463082]     in-flight: 4:blk_mq_run_work_fn
+>   [   62.463082]     pending: blk_mq_run_work_fn, blk_mq_timeout_work
+>   [   62.474831] pool 1: cpus=0 node=0 flags=0x0 nice=-20 hung=59s workers=2 idle: 214
+>   [   62.492121] INFO: rcu_preempt detected stalls on CPUs/tasks:
+>   [   62.492121]  Tasks blocked on level-0 rcu_node (CPUs 0-1): P4
+>   [   62.492121]  (detected by 0, t=15002 jiffies, g=-130, c=-131, q=32)
+>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>   [   62.492121] Call Trace:
+>   [   62.492121]  <IRQ>
+>   [   62.492121]  sched_show_task+0xdf/0x100
+>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>   [   62.492121]  rcu_check_callbacks+0x93d/0x9d0
+>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>   [   62.492121]  update_process_times+0x28/0x50
+>   [   62.492121]  tick_sched_handle+0x22/0x70
+>   [   62.492121]  tick_sched_timer+0x34/0x70
+>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>   [   62.492121]  </IRQ>
+>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>   [   62.492121]  vp_notify+0x12/0x20
+>   [   62.492121]  virtqueue_notify+0x18/0x30
+>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>   [   62.492121]  process_one_work+0x1e3/0x420
+>   [   62.492121]  worker_thread+0x2b/0x3d0
+>   [   62.492121]  ? process_one_work+0x420/0x420
+>   [   62.492121]  kthread+0x113/0x130
+>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>   [   62.492121]  ret_from_fork+0x3a/0x50
+>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>   [   62.492121] Call Trace:
+>   [   62.492121]  <IRQ>
+>   [   62.492121]  sched_show_task+0xdf/0x100
+>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>   [   62.492121]  rcu_check_callbacks+0x972/0x9d0
+>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>   [   62.492121]  update_process_times+0x28/0x50
+>   [   62.492121]  tick_sched_handle+0x22/0x70
+>   [   62.492121]  tick_sched_timer+0x34/0x70
+>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>   [   62.492121]  </IRQ>
+>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>   [   62.492121]  vp_notify+0x12/0x20
+>   [   62.492121]  virtqueue_notify+0x18/0x30
+>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>   [   62.492121]  process_one_work+0x1e3/0x420
+>   [   62.492121]  worker_thread+0x2b/0x3d0
+>   [   62.492121]  ? process_one_work+0x420/0x420
+>   [   62.492121]  kthread+0x113/0x130
+>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>   [   62.492121]  ret_from_fork+0x3a/0x50
+>
+>   Another important thing is that the commit works well on other
+>   hardware with the same setup (same host kernel, same qemu command line
+>   and host kernel binaries). How could I try to find the issue reason?
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1750229/+subscriptions
+
+
+
+-- 
+With best regards,
+Matwey V. Kornilov
+
+
+virtqueue_pop() returns NULL due to virtio_queue_empty_rcu() returns
+true all the time.
+
+2018-02-20 14:47 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+> Well, I've found that on qemu side VirtQueue for virtio_blk device
+> infinitely calls virtio_blk_handle_vq() where virtio_blk_get_request()
+> (virtqueue_pop() in essens) always returns NULL.
+>
+> 2018-02-18 15:26 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>> ** Attachment added: ".build.kernel.kvm"
+>>    https://bugs.launchpad.net/qemu/+bug/1750229/+attachment/5057653/+files/.build.kernel.kvm
+>>
+>> --
+>> You received this bug notification because you are subscribed to the bug
+>> report.
+>> https://bugs.launchpad.net/bugs/1750229
+>>
+>> Title:
+>>   virtio-blk-pci regression: softlock in guest kernel at module loading
+>>
+>> Status in QEMU:
+>>   New
+>>
+>> Bug description:
+>>   Hello,
+>>
+>>   I am running qemu from master git branch on x86_64 host with kernel is
+>>   4.4.114. I've found that commit
+>>
+>>       9a4c0e220d8a "hw/virtio-pci: fix virtio behaviour"
+>>
+>>   introduces an regression with the following command:
+>>
+>>       qemu-system-x86_64 -enable-kvm -nodefaults -no-reboot -nographic
+>>   -vga none -runas qemu -kernel .build.kernel.kvm -initrd
+>>   .build.initrd.kvm -append 'panic=1 softlockup_panic=1 no-kvmclock
+>>   nmi_watchdog=0 console=ttyS0 root=/dev/disk/by-id/virtio-0' -m 2048
+>>   -drive file=./root,format=raw,if=none,id=disk,serial=0,cache=unsafe
+>>   -device virtio-blk-pci,drive=disk -serial stdio -smp 2
+>>
+>>   Starting from this commit to master the following happens with a wide
+>>   variety of guest kernels (4.4 to 4.15):
+>>
+>>   [   62.428107] BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=-20 stuck for 59s!
+>>   [   62.437426] Showing busy workqueues and worker pools:
+>>   [   62.443117] workqueue events: flags=0x0
+>>   [   62.447512]   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/256
+>>   [   62.448161]     pending: check_corruption
+>>   [   62.458570] workqueue kblockd: flags=0x18
+>>   [   62.463082]   pwq 1: cpus=0 node=0 flags=0x0 nice=-20 active=3/256
+>>   [   62.463082]     in-flight: 4:blk_mq_run_work_fn
+>>   [   62.463082]     pending: blk_mq_run_work_fn, blk_mq_timeout_work
+>>   [   62.474831] pool 1: cpus=0 node=0 flags=0x0 nice=-20 hung=59s workers=2 idle: 214
+>>   [   62.492121] INFO: rcu_preempt detected stalls on CPUs/tasks:
+>>   [   62.492121]  Tasks blocked on level-0 rcu_node (CPUs 0-1): P4
+>>   [   62.492121]  (detected by 0, t=15002 jiffies, g=-130, c=-131, q=32)
+>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>   [   62.492121] Call Trace:
+>>   [   62.492121]  <IRQ>
+>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>   [   62.492121]  rcu_check_callbacks+0x93d/0x9d0
+>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>   [   62.492121]  update_process_times+0x28/0x50
+>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>   [   62.492121]  </IRQ>
+>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>   [   62.492121]  vp_notify+0x12/0x20
+>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>   [   62.492121]  kthread+0x113/0x130
+>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>   [   62.492121] Call Trace:
+>>   [   62.492121]  <IRQ>
+>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>   [   62.492121]  rcu_check_callbacks+0x972/0x9d0
+>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>   [   62.492121]  update_process_times+0x28/0x50
+>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>   [   62.492121]  </IRQ>
+>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>   [   62.492121]  vp_notify+0x12/0x20
+>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>   [   62.492121]  kthread+0x113/0x130
+>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>
+>>   Another important thing is that the commit works well on other
+>>   hardware with the same setup (same host kernel, same qemu command line
+>>   and host kernel binaries). How could I try to find the issue reason?
+>>
+>> To manage notifications about this bug go to:
+>> https://bugs.launchpad.net/qemu/+bug/1750229/+subscriptions
+>
+>
+>
+> --
+> With best regards,
+> Matwey V. Kornilov
+
+
+
+-- 
+With best regards,
+Matwey V. Kornilov
+
+
+Well, last_avail_idx equals to shadow_avail_idx and both of them are 1
+at the qemu side. So, only one request is transferred.
+I wonder why, probably something is badly cached, but new avail_idx
+(which is supposed to become 2) is never shown up.
+
+2018-02-20 15:49 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+> virtqueue_pop() returns NULL due to virtio_queue_empty_rcu() returns
+> true all the time.
+>
+> 2018-02-20 14:47 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>> Well, I've found that on qemu side VirtQueue for virtio_blk device
+>> infinitely calls virtio_blk_handle_vq() where virtio_blk_get_request()
+>> (virtqueue_pop() in essens) always returns NULL.
+>>
+>> 2018-02-18 15:26 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>>> ** Attachment added: ".build.kernel.kvm"
+>>>    https://bugs.launchpad.net/qemu/+bug/1750229/+attachment/5057653/+files/.build.kernel.kvm
+>>>
+>>> --
+>>> You received this bug notification because you are subscribed to the bug
+>>> report.
+>>> https://bugs.launchpad.net/bugs/1750229
+>>>
+>>> Title:
+>>>   virtio-blk-pci regression: softlock in guest kernel at module loading
+>>>
+>>> Status in QEMU:
+>>>   New
+>>>
+>>> Bug description:
+>>>   Hello,
+>>>
+>>>   I am running qemu from master git branch on x86_64 host with kernel is
+>>>   4.4.114. I've found that commit
+>>>
+>>>       9a4c0e220d8a "hw/virtio-pci: fix virtio behaviour"
+>>>
+>>>   introduces an regression with the following command:
+>>>
+>>>       qemu-system-x86_64 -enable-kvm -nodefaults -no-reboot -nographic
+>>>   -vga none -runas qemu -kernel .build.kernel.kvm -initrd
+>>>   .build.initrd.kvm -append 'panic=1 softlockup_panic=1 no-kvmclock
+>>>   nmi_watchdog=0 console=ttyS0 root=/dev/disk/by-id/virtio-0' -m 2048
+>>>   -drive file=./root,format=raw,if=none,id=disk,serial=0,cache=unsafe
+>>>   -device virtio-blk-pci,drive=disk -serial stdio -smp 2
+>>>
+>>>   Starting from this commit to master the following happens with a wide
+>>>   variety of guest kernels (4.4 to 4.15):
+>>>
+>>>   [   62.428107] BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=-20 stuck for 59s!
+>>>   [   62.437426] Showing busy workqueues and worker pools:
+>>>   [   62.443117] workqueue events: flags=0x0
+>>>   [   62.447512]   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/256
+>>>   [   62.448161]     pending: check_corruption
+>>>   [   62.458570] workqueue kblockd: flags=0x18
+>>>   [   62.463082]   pwq 1: cpus=0 node=0 flags=0x0 nice=-20 active=3/256
+>>>   [   62.463082]     in-flight: 4:blk_mq_run_work_fn
+>>>   [   62.463082]     pending: blk_mq_run_work_fn, blk_mq_timeout_work
+>>>   [   62.474831] pool 1: cpus=0 node=0 flags=0x0 nice=-20 hung=59s workers=2 idle: 214
+>>>   [   62.492121] INFO: rcu_preempt detected stalls on CPUs/tasks:
+>>>   [   62.492121]  Tasks blocked on level-0 rcu_node (CPUs 0-1): P4
+>>>   [   62.492121]  (detected by 0, t=15002 jiffies, g=-130, c=-131, q=32)
+>>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>>   [   62.492121] Call Trace:
+>>>   [   62.492121]  <IRQ>
+>>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>>   [   62.492121]  rcu_check_callbacks+0x93d/0x9d0
+>>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>>   [   62.492121]  update_process_times+0x28/0x50
+>>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>>   [   62.492121]  </IRQ>
+>>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>>   [   62.492121]  vp_notify+0x12/0x20
+>>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>>   [   62.492121]  kthread+0x113/0x130
+>>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>>   [   62.492121] Call Trace:
+>>>   [   62.492121]  <IRQ>
+>>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>>   [   62.492121]  rcu_check_callbacks+0x972/0x9d0
+>>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>>   [   62.492121]  update_process_times+0x28/0x50
+>>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>>   [   62.492121]  </IRQ>
+>>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>>   [   62.492121]  vp_notify+0x12/0x20
+>>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>>   [   62.492121]  kthread+0x113/0x130
+>>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>>
+>>>   Another important thing is that the commit works well on other
+>>>   hardware with the same setup (same host kernel, same qemu command line
+>>>   and host kernel binaries). How could I try to find the issue reason?
+>>>
+>>> To manage notifications about this bug go to:
+>>> https://bugs.launchpad.net/qemu/+bug/1750229/+subscriptions
+>>
+>>
+>>
+>> --
+>> With best regards,
+>> Matwey V. Kornilov
+>
+>
+>
+> --
+> With best regards,
+> Matwey V. Kornilov
+
+
+
+-- 
+With best regards,
+Matwey V. Kornilov
+
+
+The same story with 4.15.4 host kernel.
+
+2018-02-21 11:58 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+> Well, last_avail_idx equals to shadow_avail_idx and both of them are 1
+> at the qemu side. So, only one request is transferred.
+> I wonder why, probably something is badly cached, but new avail_idx
+> (which is supposed to become 2) is never shown up.
+>
+> 2018-02-20 15:49 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>> virtqueue_pop() returns NULL due to virtio_queue_empty_rcu() returns
+>> true all the time.
+>>
+>> 2018-02-20 14:47 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>>> Well, I've found that on qemu side VirtQueue for virtio_blk device
+>>> infinitely calls virtio_blk_handle_vq() where virtio_blk_get_request()
+>>> (virtqueue_pop() in essens) always returns NULL.
+>>>
+>>> 2018-02-18 15:26 GMT+03:00 Matwey V. Kornilov <email address hidden>:
+>>>> ** Attachment added: ".build.kernel.kvm"
+>>>>    https://bugs.launchpad.net/qemu/+bug/1750229/+attachment/5057653/+files/.build.kernel.kvm
+>>>>
+>>>> --
+>>>> You received this bug notification because you are subscribed to the bug
+>>>> report.
+>>>> https://bugs.launchpad.net/bugs/1750229
+>>>>
+>>>> Title:
+>>>>   virtio-blk-pci regression: softlock in guest kernel at module loading
+>>>>
+>>>> Status in QEMU:
+>>>>   New
+>>>>
+>>>> Bug description:
+>>>>   Hello,
+>>>>
+>>>>   I am running qemu from master git branch on x86_64 host with kernel is
+>>>>   4.4.114. I've found that commit
+>>>>
+>>>>       9a4c0e220d8a "hw/virtio-pci: fix virtio behaviour"
+>>>>
+>>>>   introduces an regression with the following command:
+>>>>
+>>>>       qemu-system-x86_64 -enable-kvm -nodefaults -no-reboot -nographic
+>>>>   -vga none -runas qemu -kernel .build.kernel.kvm -initrd
+>>>>   .build.initrd.kvm -append 'panic=1 softlockup_panic=1 no-kvmclock
+>>>>   nmi_watchdog=0 console=ttyS0 root=/dev/disk/by-id/virtio-0' -m 2048
+>>>>   -drive file=./root,format=raw,if=none,id=disk,serial=0,cache=unsafe
+>>>>   -device virtio-blk-pci,drive=disk -serial stdio -smp 2
+>>>>
+>>>>   Starting from this commit to master the following happens with a wide
+>>>>   variety of guest kernels (4.4 to 4.15):
+>>>>
+>>>>   [   62.428107] BUG: workqueue lockup - pool cpus=0 node=0 flags=0x0 nice=-20 stuck for 59s!
+>>>>   [   62.437426] Showing busy workqueues and worker pools:
+>>>>   [   62.443117] workqueue events: flags=0x0
+>>>>   [   62.447512]   pwq 0: cpus=0 node=0 flags=0x0 nice=0 active=1/256
+>>>>   [   62.448161]     pending: check_corruption
+>>>>   [   62.458570] workqueue kblockd: flags=0x18
+>>>>   [   62.463082]   pwq 1: cpus=0 node=0 flags=0x0 nice=-20 active=3/256
+>>>>   [   62.463082]     in-flight: 4:blk_mq_run_work_fn
+>>>>   [   62.463082]     pending: blk_mq_run_work_fn, blk_mq_timeout_work
+>>>>   [   62.474831] pool 1: cpus=0 node=0 flags=0x0 nice=-20 hung=59s workers=2 idle: 214
+>>>>   [   62.492121] INFO: rcu_preempt detected stalls on CPUs/tasks:
+>>>>   [   62.492121]  Tasks blocked on level-0 rcu_node (CPUs 0-1): P4
+>>>>   [   62.492121]  (detected by 0, t=15002 jiffies, g=-130, c=-131, q=32)
+>>>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>>>   [   62.492121] Call Trace:
+>>>>   [   62.492121]  <IRQ>
+>>>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>>>   [   62.492121]  rcu_check_callbacks+0x93d/0x9d0
+>>>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>>>   [   62.492121]  update_process_times+0x28/0x50
+>>>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>>>   [   62.492121]  </IRQ>
+>>>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>>>   [   62.492121]  vp_notify+0x12/0x20
+>>>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>>>   [   62.492121]  kthread+0x113/0x130
+>>>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>>>   [   62.492121] kworker/0:0H    R  running task        0     4      2 0x80000000
+>>>>   [   62.492121] Workqueue: kblockd blk_mq_run_work_fn
+>>>>   [   62.492121] Call Trace:
+>>>>   [   62.492121]  <IRQ>
+>>>>   [   62.492121]  sched_show_task+0xdf/0x100
+>>>>   [   62.492121]  rcu_print_detail_task_stall_rnp+0x48/0x69
+>>>>   [   62.492121]  rcu_check_callbacks+0x972/0x9d0
+>>>>   [   62.492121]  ? tick_sched_do_timer+0x40/0x40
+>>>>   [   62.492121]  update_process_times+0x28/0x50
+>>>>   [   62.492121]  tick_sched_handle+0x22/0x70
+>>>>   [   62.492121]  tick_sched_timer+0x34/0x70
+>>>>   [   62.492121]  __hrtimer_run_queues+0xcc/0x250
+>>>>   [   62.492121]  hrtimer_interrupt+0xab/0x1f0
+>>>>   [   62.492121]  smp_apic_timer_interrupt+0x62/0x150
+>>>>   [   62.492121]  apic_timer_interrupt+0xa2/0xb0
+>>>>   [   62.492121]  </IRQ>
+>>>>   [   62.492121] RIP: 0010:iowrite16+0x1d/0x30
+>>>>   [   62.492121] RSP: 0018:ffffa477c034fcc8 EFLAGS: 00010292 ORIG_RAX: ffffffffffffff11
+>>>>   [   62.492121] RAX: ffffffffa24fbdb0 RBX: ffff92a1f8f82000 RCX: 0000000000000001
+>>>>   [   62.492121] RDX: ffffa477c0371000 RSI: ffffa477c0371000 RDI: 0000000000000000
+>>>>   [   62.492121] RBP: 0000000000000001 R08: 0000000000000000 R09: 0000000001080020
+>>>>   [   62.492121] R10: ffffdc7cc1e4fc00 R11: 0000000000000000 R12: 0000000000000000
+>>>>   [   62.492121] R13: 0000000000000000 R14: ffff92a1f93f0000 R15: ffff92a1f8e1aa80
+>>>>   [   62.492121]  ? vp_synchronize_vectors+0x60/0x60
+>>>>   [   62.492121]  vp_notify+0x12/0x20
+>>>>   [   62.492121]  virtqueue_notify+0x18/0x30
+>>>>   [   62.492121]  virtio_queue_rq+0x2f5/0x300 [virtio_blk]
+>>>>   [   62.492121]  blk_mq_dispatch_rq_list+0x7e/0x4a0
+>>>>   [   62.492121]  blk_mq_do_dispatch_sched+0x4a/0xd0
+>>>>   [   62.492121]  blk_mq_sched_dispatch_requests+0x106/0x170
+>>>>   [   62.492121]  __blk_mq_run_hw_queue+0x80/0x90
+>>>>   [   62.492121]  process_one_work+0x1e3/0x420
+>>>>   [   62.492121]  worker_thread+0x2b/0x3d0
+>>>>   [   62.492121]  ? process_one_work+0x420/0x420
+>>>>   [   62.492121]  kthread+0x113/0x130
+>>>>   [   62.492121]  ? kthread_create_worker_on_cpu+0x50/0x50
+>>>>   [   62.492121]  ret_from_fork+0x3a/0x50
+>>>>
+>>>>   Another important thing is that the commit works well on other
+>>>>   hardware with the same setup (same host kernel, same qemu command line
+>>>>   and host kernel binaries). How could I try to find the issue reason?
+>>>>
+>>>> To manage notifications about this bug go to:
+>>>> https://bugs.launchpad.net/qemu/+bug/1750229/+subscriptions
+>>>
+>>>
+>>>
+>>> --
+>>> With best regards,
+>>> Matwey V. Kornilov
+>>
+>>
+>>
+>> --
+>> With best regards,
+>> Matwey V. Kornilov
+>
+>
+>
+> --
+> With best regards,
+> Matwey V. Kornilov
+
+
+
+-- 
+With best regards,
+Matwey V. Kornilov
+
+
+This has been fixed in the kernel
+
+

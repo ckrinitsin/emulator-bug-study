@@ -1,0 +1,72 @@
+colo: pvm flush failed after svm killed
+
+Hi,
+   Primary vm flush failed after killing svm, which leads primary vm guest filesystem unavailable.
+
+qemu versoin: 5.2.0
+host/guest os: CentOS Linux release 7.6.1810 (Core)
+
+Reproduce steps:
+1. create colo vm following https://github.com/qemu/qemu/blob/master/docs/COLO-FT.txt
+2. kill secondary vm (don't remove nbd child from quorum on primary vm)and wait for a minute. the interval depends on guest os.
+result: primary vm file system shutdown because of flush cache error.
+
+After serveral tests, I found that qemu-5.0.0 worked well, and it's the commit https://git.qemu.org/?p=qemu.git;a=commit;h=883833e29cb800b4d92b5d4736252f4004885191(block: Flush all children in generic code) leads this change, and both virtio-blk and ide turned out to be bad.
+
+I think it's nbd(replication) flush failed leads bdrv_co_flush(quorum_bs) failed, here is the call stack.
+#0  bdrv_co_flush (bs=0x56242b3cc0b0=nbd_bs) at ../block/io.c:2856
+#1  0x0000562428b0f399 in bdrv_co_flush (bs=0x56242b3c7e00=replication_bs) at ../block/io.c:2920
+#2  0x0000562428b0f399 in bdrv_co_flush (bs=0x56242a4ad800=quorum_bs) at ../block/io.c:2920
+#3  0x0000562428b70d56 in blk_do_flush (blk=0x56242a4ad4a0) at ../block/block-backend.c:1672
+#4  0x0000562428b70d87 in blk_aio_flush_entry (opaque=0x7fd0980073f0) at ../block/block-backend.c:1680
+#5  0x0000562428c5f9a7 in coroutine_trampoline (i0=-1409269904, i1=32721) at ../util/coroutine-ucontext.c:173
+
+While i am not sure whether i use colo inproperly? Can we assume that nbd child of quorum immediately removed right after svm crashed? Or it's really a bug? Does the following patch fix? Help is needed! Thanks a lot！
+
+diff --git a/block/quorum.c b/block/quorum.c
+index cfc1436..f2c0805 100644
+--- a/block/quorum.c
++++ b/block/quorum.c
+@@ -1279,7 +1279,7 @@ static BlockDriver bdrv_quorum = {
+     .bdrv_dirname                       = quorum_dirname,
+     .bdrv_co_block_status               = quorum_co_block_status,
+ 
+-    .bdrv_co_flush_to_disk              = quorum_co_flush,
++    .bdrv_co_flush                      = quorum_co_flush,
+ 
+     .bdrv_getlength                     = quorum_getlength,
+
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+https://git.qemu.org/?p=qemu.git;a=commit;h=5529b02da2dcd1ef6bc6cd42d4fbfb537fe2276f
+

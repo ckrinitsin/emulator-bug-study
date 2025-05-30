@@ -1,0 +1,65 @@
+Incorrect handling of aarch64 ldp in some cases
+
+In some cases the ldp instruction (and presumably other multi-register loads and stores) can behave incorrectly.
+
+Given the following instruction:
+ldp x0, x1, [x0]
+
+This will load two 64 bit values from memory, however if each location to load is on a different page and the second page is unmapped this will raise an exception. When this happens x0 has already been updated so after the exception handler has run the operating system will try to rerun the instruction. QEMU will now try to perform an invalid load and raise a new exception.
+
+I believe this is incorrect as section D.1.14.5 of the ARMv8 reference manual B.a states that, on taking an exception, registers used in the generation of addresses are restored to their initial value, so x0 shouldn't be changed, where x1 can be un an unknown state.
+
+I found the issue running FreeBSD with the cortex-strings implementation of memcpy. This uses a similar instruction when copying between 64 and 96 bytes.
+
+I've observed this on:
+QEMU emulator version 2.5.0 (Debian 1:2.5+dfsg-5ubuntu10.14), Copyright (c) 2003-2008 Fabrice Bellard
+
+And checked I still get the same behaviour on:
+QEMU emulator version 2.9.94 (v2.10.0-rc4-dirty)
+Git revision: 248b23735645f7cbb503d9be6f5bf825f2a603ab
+
+On 25 August 2017 at 14:50, Andrew <email address hidden> wrote:
+> Given the following instruction:
+> ldp x0, x1, [x0]
+>
+> This will load two 64 bit values from memory, however if each location
+> to load is on a different page and the second page is unmapped this will
+> raise an exception. When this happens x0 has already been updated
+
+Yes, this is a QEMU bug. disas_ldst_pair() should not let the
+first load go directly to the target integer register but instead
+postpone updating the register until after the second load.
+We can safely do this only for the integer load case because
+float/vector registers can't be used in address generation so
+they're OK to become UNKNOWN.
+(D1.14.5 is about interrupts and exceptions that happen during
+a multiple-register load or store; for straightforward synchronous
+data aborts D1.13.4 is what you want, but the requirements are the
+same in any case.)
+
+We got this right for the load/store exclusive pair, so it's only
+the plain load pair that needs fixing I think.
+
+thanks
+-- PMM
+
+
+This might be the cause for my bugreport: https://bugs.launchpad.net/qemu/+bug/1711316
+
+Marked mine as a duplicate of this, please correct me if I'm wrong.
+
+
+Yes, D1.13.4 is what I want, I'm not completely familiar with this part of the document.
+
+Based on my reading of gen_load_exclusive I agree that it looks correct, and loading to a float/vector won't affect the address generation.
+
+I have worked around this in FreeBSD my switching the order of the registers in the affected load & store, but still have an image I can test a fix with.
+
+Richard Henderson has posted a patch which should fix this: http://patchwork.ozlabs.org/patch/806051/
+
+
+That patch seems to have fixed the issue. I don't get the segfault I was previously getting without the patch.
+
+This fix has now been committed to master as commit 3e4d91b94ce400326fae0 and will be in QEMU 2.11 (and possibly in some stable releases before that).
+
+
