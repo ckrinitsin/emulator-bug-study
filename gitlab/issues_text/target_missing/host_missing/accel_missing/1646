@@ -1,0 +1,61 @@
+fstrim dont work after live migrate
+Description of problem:
+We have use lvm thin pool and after live migration non-shared storage fstrim cannot free data usage Data% without reboot, after reboot fstim work fine
+
+```
+  LV      VG Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  p639937 vm Vwi-aotz--  30.00g pool        99.35
+
+virsh qemu-agent-command p639937 '{"execute":"guest-fstrim"}'
+{"return":{"paths":[{"minimum":0,"path":"/","trimmed":0}]}}
+
+virsh shutdown p639937
+Domain 'p639937' is being shutdown
+
+virsh start p639937
+Domain 'p639937' started
+
+virsh qemu-agent-command p639937 '{"execute":"guest-fstrim"}'
+{"return":{"paths":[{"minimum":0,"path":"/","trimmed":29178654720}]}}
+
+lvs|grep p639937
+  p639937 vm Vwi-aotz--  30.00g pool        9.58
+```
+
+On source host before migration:
+```
+  LV      VG Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  p639937 vm Vwi-a-tz-- 30.00g pool        9.48
+```
+
+migration script 
+```
+SSH_OPTS='-o StrictHostKeyChecking=no -o PasswordAuthentication=no '
+MIGR_OPTS="--live --copy-storage-all --verbose --persistent --undefinesource"
+ssh $SSH_OPTS $HOST -t "[ -b /dev/vm/$ACCT ] || /usr/sbin/lvcreate -V${SIZE}G -T vm/pool -n$ACCT" || f_print_err "Error: creation lvm"
+virsh migrate $MIGR_OPTS $ACCT qemu+ssh://$SERV/system  tcp://local.$SERV/ || f_print_err "Error on step: virsh migrate"
+echo "Waiting for trim start..."
+sleep 10
+ssh $SSH_OPTS $HOST -t "/usr/bin/virsh qemu-agent-command $ACCT --timeout 60 '{\"execute\":\"guest-fstrim\"}' >/dev/null 2>&1"
+```
+
+Disc config:
+```
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw' cache='none' io='threads' discard='unmap'/>
+      <source dev='/dev/vm/p639937'/>
+      <backingStore/>
+      <target dev='sda' bus='scsi'/>
+      <iotune>
+        <write_bytes_sec>104857600</write_bytes_sec>
+        <write_bytes_sec_max>524288000</write_bytes_sec_max>
+        <write_bytes_sec_max_length>120</write_bytes_sec_max_length>
+      </iotune>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+```
+
+Sometimes trimming working after migration, bit this is very rare.
+We have try rescanning disc, drop caches on vm after migration, but didnt help.
+
+Inside vm's ext4 fs and almalinux 8/ubuntu 20+/debian 10-11

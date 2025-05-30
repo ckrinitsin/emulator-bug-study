@@ -1,0 +1,63 @@
+"Missing character write event in the replay log" when trying rr=replay with snapshot
+Description of problem:
+Probably best to just illustrate with commands. Happy path:
+
+```sh
+rm replay.bin snapshots.qcow2; qemu-img create -f qcow2 snapshots.qcow2 256M
+
+~/src/qemu/build/qemu-system-x86_64  -nodefaults -nographic -serial stdio \
+    -icount shift=auto,rr=record,rrfile=replay.bin,rrsnapshot=init \
+    -drive file=snapshots.qcow2,if=none,id=rr \
+    -kernel ./.kunit/arch/x86/boot/bzImage -append "nokaslr console=ttyS0"
+
+# It runs, guest kernel crashes when realising it has no rootfs, all good
+du -sh snapshots.qcow2 # 976K
+
+# Repeat same command just switched to rr=replay
+~/src/qemu/build/qemu-system-x86_64  -nodefaults -nographic -serial stdio \
+    -icount shift=auto,rr=replay,rrfile=replay.bin,rrsnapshot=init \
+    -drive file=snapshots.qcow2,if=none,id=rr \
+    -kernel ./.kunit/arch/x86/boot/bzImage -append "nokaslr console=ttyS0"
+# Much slower, but same result. All good
+```
+
+But, I want to take a snapshot later in boot.
+
+```sh
+rm replay.bin snapshots.qcow2; qemu-img create -f qcow2 snapshots.qcow2 256M
+
+# This time, running with debug. Also have to switch to -monitor stdio because of
+# https://gitlab.com/qemu-project/qemu/-/issues/2790
+~/src/qemu/build/qemu-system-x86_64  -nodefaults -nographic -monitor stdio \
+    -icount shift=auto,rr=record,rrfile=replay.bin,rrsnapshot=init \
+    -drive file=snapshots.qcow2,if=none,id=rr \
+    -kernel ./.kunit/arch/x86/boot/bzImage -append "nokaslr console=ttyS0" \
+    -s -S
+
+# In another terminal, attach a debugger, set a breakpoint, continue to the breakpoint
+gdb -ex "target remote localhost:1234" .kunit/vmlinux
+(gdb) hb start_kernel
+(gdb) continue
+
+# When the breakpoint is hit, back in the first terminal:
+(qemu) savevm test
+(qemu) quit
+
+du -sh snapshots.qcow2 # 21M
+
+# Now try to replay again
+~/src/qemu/build/qemu-system-x86_64  -nodefaults -nographic -serial stdio \
+            -icount shift=auto,rr=replay,rrfile=replay.bin,rrsnapshot=init \
+            -drive file=snapshots.qcow2,if=none,id=rr \
+            -kernel ./.kunit/arch/x86/boot/bzImage -append "nokaslr console=ttyS0"
+```
+
+Result:
+
+```
+qemu-system-x86_64: Missing character write event in the replay log (insn total 1598039/586 left, event 886 is EVENT_INSTRUCTION)
+fish: Job 1, '~/src/qemu/build/qemu-system-x8…' terminated by signal     -icount shift=auto,rr=repla… (    -drive file=snapshots.qcow2…)
+fish: Job     -kernel ./.kunit/arch/x86/b…, 'SIGABRT' terminated by signal Abort ()
+```
+
+Exit code is 134.

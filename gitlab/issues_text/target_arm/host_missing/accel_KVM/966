@@ -1,0 +1,58 @@
+simple code line is so slow on rv6(rust os) than ubuntu
+Description of problem:
+[Simple code line for getppid](https://github.com/kaist-cp/rv6/blob/main/kernel-rs/src/proc/procs.rs#L470) takes so long time(About 0.08 microsec, which is about 70% time of ubuntu getppid() syscall) on kernel. So we wonder if there is a problem with the qemu or kvm side settings.
+Steps to reproduce:
+```
+git clone https://github.com/kaist-cp/rv6
+cd rv6
+make clean
+RUST_MODE=release TARGET=arm GIC_VERSION=3 KVM=yes make qemu
+```
+Additional information:
+We are currently working on the [rv6 project](https://github.com/kaist-cp/rv6) which is porting MIT's educational operating system [xv6](https://github.com/mit-pdos/xv6-public) to Rust.<br> Our code is located [here](https://github.com/kaist-cp/rv6/tree/main/kernel-rs).
+We use qemu and [qemu's virt platform](https://qemu.readthedocs.io/en/latest/system/arm/virt.html) to execute rv6, and it works well with using qemu.
+Executing command on arm machine is this:
+```
+RUST_MODE=release TARGET=arm KVM=yes GIC_VERSION=3; # compile
+qemu-system-aarch64 -machine virt -kernel kernel/kernel -m 128M -smp 1 -nographic -drive file=fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -cpu host -enable-kvm -machine gic-version=3
+```
+Now, we are comparing the speed(exactly, elapsed wall clock time) of system call of qemu+rv6+kvm and qemu+ubuntu 18.04+kvm with [lmbench](http://lmbench.sourceforge.net/).
+For ubuntu, qemu command is this:
+```
+qemu-system-aarch64 -cpu host -enable-kvm -device rtl8139,netdev=net0 -device virtio-scsi-device -device scsi-cd,drive=cdrom -device virtio-blk-device,drive=hd0 -drive "file=${iso},id=cdrom,if=none,media=cdrom" -drive "if=none,file=${img_snapshot},id=hd0" -m 2G -machine "virt,gic-version=3,its=off" -netdev user,id=net0 -nographic -pflash "$flash0" -pflash "$flash1" -smp 1
+``` 
+Now, our goal is to make rv6 perform similar or faster than ubuntu for relatively simple system call like getppid(). <br>
+Relatively simple system call means, for example, in the case of getppid(), the actual system call execution part is so simple. So it mainly measures the time for user space -> kernel space -> user space. <br>
+And we thought that on getppid() syscall, rv6 could show similar performance or more faster than ubuntu cause it's simple system.<br>
+**The most important problem** is that, although it will be described later, a [simple code line for getppid](https://github.com/kaist-cp/rv6/blob/main/kernel-rs/src/proc/procs.rs#L470) takes so long time(About 0.08 microsec, which is about 70% time of ubuntu getppid() syscall) on kernel. So we wonder if there is a problem with the qemu or kvm side settings.
+
+First, the measured performance result for lmbench's "lat_syscall null" which executes internally getppid() is:
+ - rv6, Rust opt-level: 1, smp 3(qemu), gcc optimization level: -O -> average 1.662 microsec
+ - ubuntu, smp 3, gcc optimization level: -O -> average 0.126 microsec
+So we see that rv6 is so slower than ubuntu over 10x.
+
+To find the bottleneck of rv6, we use [linux perf](https://perf.wiki.kernel.org/index.php/Main_Page) and divided execution path into 4 stages. <br>
+Stage 1: Call getppid in the user space  to  until just before the trap handler is called<br>
+Stage 2: From after stage 1 to until just before the start of code specific to sys_getppid.<br>
+Stage 3: From after stage 2 to [end of actual sys_getppid function](https://github.com/kaist-cp/rv6/blob/main/kernel-rs/src/proc/procs.rs#L468-L473)<br>
+Stage 4: From after stage 3 to the point which getppid syscall returns on user space<br>
+The result with perf was:
+  - ubuntu: 0.042 microsec/ 0.0744 microsec / 0.00985 microsec / 0 -> total 0.126 microsec
+  - rv6:  ?   /   ?   /  0.3687 microsec  / ?  -> 1.662 microsec
+  - we made assumption for ubuntu stage 4 time is zero.
+  - The question mark is, on rv6 we couldn't use perf so only stage 3 time is measured for right now, but checked stage 3 part manually.
+
+So from the result, it can be confirmed that the rv6's stage 3 already consumes more than 3 times of ubuntu's syscall total time, and at least 30 times more than ubuntu's stage 3.
+This is so bad, so we tried several things to inspect the problem:
+  - Check whether rv6's timer interrupt affects execution time: The interval is 100ms which is so big, so it seems not related.
+  - To check user space's execution speed, we made simple quick sort program and check rv6's user space speed is significantly slower than ubuntu.
+     - When running 100,000 times, rv6(smp 1, opt-level 1)'s execution time: 3.2s vs ubuntu(smp 1)'s execution time: 2.7s.
+     - Although it is 20% slower, it is judged that there is almost no difference compared to the lmbench result. So we thought it is no big problem.
+
+  - Next we checked rv6's stage 3's code. https://github.com/kaist-cp/rv6/blob/main/kernel-rs/src/proc/procs.rs#L468
+    - The lock is held twice at line 469 and line 472, whereas ubuntu's same code part, lock is held only once. So first if we change the structure to hold lock only once, there will be improvement in speed. we noticed that.
+    - **Also there's a big problem on 470 line.** We measured time for 470 line with CNTPCT_EL0 register, and it was found that at least 0.08 microsec was consumed in the corresponding line.
+       - So ubuntu's stage 3 consumes about 0.01 microsec, but only line 470 of rv6, which does not have complicated logic(it also doesn't hold lock) consumes about 8 times that ubuntu's stage 3.
+       - So we concluded that there may be a problem with the kvm setting on the kernel side or other settings.
+
+So do you have any idea for this problem? Thank you for your help.

@@ -1,0 +1,84 @@
+device_del return is already in the process of unplug frequently
+Description of problem:
+recently we update qemu 6.1.1 to qemu 7.1.0, and run into an issue with the following error:
+
+command '{ "execute": "device_del", "arguments": { "id": "virtio-diskX" } }' for VM "id" failed ({ "return": {"class": "GenericError", "desc": "Device virtio-diskX is already in the process of unplug"} }).
+
+The issue is reproducible. With a few seconds delay before hot-unplug, hot-unplug just works fine.
+
+After a few digging, we found that the commit 9323f892b39 may incur the issue.
+------------------ 
+    failover: fix unplug pending detection
+   
+    Failover needs to detect the end of the PCI unplug to start migration
+    after the VFIO card has been unplugged.
+   
+    To do that, a flag is set in pcie_cap_slot_unplug_request_cb() and reset in
+    pcie_unplug_device().
+   
+    But since
+        17858a169508 ("hw/acpi/ich9: Set ACPI PCI hot-plug as default on Q35")
+    we have switched to ACPI unplug and these functions are not called anymore
+    and the flag not set. So failover migration is not able to detect if card
+    is really unplugged and acts as it's done as soon as it's started. So it
+    doesn't wait the end of the unplug to start the migration. We don't see any
+    problem when we test that because ACPI unplug is faster than PCIe native
+    hotplug and when the migration really starts the unplug operation is
+    already done.
+   
+    See c000a9bd06ea ("pci: mark device having guest unplug request pending")
+        a99c4da9fc2a ("pci: mark devices partially unplugged")
+   
+    Signed-off-by: Laurent Vivier <lvivier@redhat.com>
+    Reviewed-by: Ani Sinha <ani@anisinha.ca>
+    Message-Id: <20211118133225.324937-4-lvivier@redhat.com>
+    Reviewed-by: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+------------------  
+The purpose is for detecting the end of the PCI device hot-unplug. However, we feel the error confusing. How is it possible that a disk "is already in the process of unplug" during the first hot-unplug attempt? So far as I know, the issue was also encountered by libvirt, but they simply ignored it:
+
+    https://bugzilla.redhat.com/show_bug.cgi?id=1878659
+   
+Hence, a question is: should we have the line below in  acpi_pcihp_device_unplug_request_cb()?
+
+   pdev->qdev.pending_deleted_event = true;
+   
+It would be great if you as the author could give us a few hints.
+
+Thank you very much for your reply!
+
+Sincerely,
+
+Yu Zhang @ Compute Platform IONOS
+
+
+The issue is reproducible in our own stack, which is not quite easy to describe in a few command lines. We simplified it a bit by a script instead. Although it's not able to reproduce, it could be somewhat helpful to understand the issue.
+ 
+```
+#!/bin/bash
+
+HOME=~
+QEMU=$HOME/qemu/bin/qemu-system-x86_64
+DISK1=$HOME/img/disk1.qcow2
+DISK4=$HOME/img/disk4.qcow2
+DISK5=$HOME/img/disk5.qcow2
+
+$QEMU \
+  -cpu host -enable-kvm -m 2048 -smp 2 \
+  -object iothread,id=iothread1 \
+  -drive file=$DISK1,if=none,id=drive-virtio-disk1,format=qcow2,snapshot=off,discard=on,cache=none \
+  -device virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk1,iothread=iothread1,num-queues=1,discard=on,id=virtio-disk1 \
+  -object iothread,id=iothread4 \
+  -drive file=$DISK4,if=none,id=drive-virtio-disk4,format=qcow2,snapshot=off,discard=on,cache=none \
+  -device virtio-blk-pci,bus=pci.0,addr=0x5,drive=drive-virtio-disk4,iothread=iothread4,num-queues=1,discard=on,id=virtio-disk4 \
+  -object iothread,id=iothread5 \
+  -drive file=$DISK5,if=none,id=drive-virtio-disk5,format=qcow2,snapshot=off,discard=on,cache=none \
+  -device virtio-blk-pci,bus=pci.0,addr=0x6,drive=drive-virtio-disk5,iothread=iothread5,num-queues=1,discard=on,id=virtio-disk5 \
+  -qmp unix:./qmp-sock,server,nowait &
+
+sleep 5
+
+echo '{"execute":"qmp_capabilities"}{"execute": "device_del","arguments": { "id": "virtio-disk5"}}{"execute": "query-block"}' | nc -U -w 1 ./qmp-sock
+echo '{"execute":"qmp_capabilities"}{"execute": "device_del","arguments": { "id": "virtio-disk5"}}{"execute": "query-block"}' | nc -U -w 1 ./qmp-sock```
+Additional information:
+Possible workaround: https://lore.kernel.org/qemu-devel/20230403131833-mutt-send-email-mst@kernel.org/T/#t

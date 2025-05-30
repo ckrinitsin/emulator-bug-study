@@ -1,0 +1,40 @@
+Floppy controller returns the wrong thing for multitrack reads which span tracks
+Description of problem:
+I've just discovered that the Minix 1 and 2 operating systems no longer boot on qemu.
+
+Investigation reveals the following:
+
+- when Minix reads a 1024-byte block from disk, it issues a two-sector multitrack read to the FDC.
+- if the FDC runs out of sectors when it's on head 0, it automatically switches to head 1 (this is correct).
+- if the FDC runs out of sectors when it's on head 1, it stops the transfer (which is what is supposed to happen).
+
+What qemu does for the latter case is that it will automatically seek to the next track and switch to head 0. It then sets the SEEK COMPLETE bit in the status register. Minix sees this but isn't expecting it, because this shouldn't be emitted for reads and writes, and fails thinking it's an error.
+
+For example, here's the logging for such a transfer:
+
+```
+FLOPPY: Start transfer at 0 1 4f 11 (2878)
+FLOPPY: direction=1 (1024 - 10240)
+FLOPPY: copy 512 bytes (1024 0 10240) 0 pos 1 4f (17-0x00000b3e 0x00167c00)
+FLOPPY: seek to next sector (1 4f 11 => 2878)     <--- reads the last sector of head 1 track 0x4f
+FLOPPY: copy 512 bytes (1024 512 10240) 0 pos 1 4f (18-0x00000b3f 0x00167e00)
+FLOPPY: seek to next sector (1 4f 12 => 2879)     <--- attempt to move to the next sector, which fails
+FLOPPY: seek to next track (0 50 01 => 2879)      <--- moved to next track, which shouldn't happen
+FLOPPY: end transfer 1024 1024 10240
+FLOPPY: transfer status: 00 00 00 (20)            <--- status report
+```
+
+Transfer status 20 is the SEEK COMPLETE bit. For a normal head switch, that should be 04 (with the NOW ON HEAD 1 bit set).
+
+For reference, see page 5-13 of the uPD765 datasheet here: https://www.cpcwiki.eu/imgs/f/f3/UPD765_Datasheet_OCRed.pdf It says:
+
+> IF MT is high, a multitrack operation is performed.
+> If MT = 1 after finishing read/write operation on side 0,
+> FDC will automatically start command searching for sector
+> 1 on side 1
+Steps to reproduce:
+1. `qemu-system-i386 --fda images/minix-2.0-root-720kB.img`
+2. Press = to boot.
+3. Observe the 'Unrecoverable Read` errors as the ramdisk is loaded. (The system will still boot, but will then crash if you try to do anything due to a corrupt ramdisk.)
+
+[minix-2.0-root-720kB.img.bz2](/uploads/77d34db96f353d92cdb2d01928b8fc01/minix-2.0-root-720kB.img.bz2)

@@ -1,0 +1,52 @@
+Booting EFI shell from GRUB using "chainloader" in Qemu with UEFI boot shows video artifacts if we have all_video, gfxterm
+Steps to reproduce:
+- Start Qemu in UEFI mode, i. e. `qemu-system-x86_64 -bios OVMF.fd ...`
+- Qemu should load GRUB from the disk as the first thing after firmware
+- GRUB should run commands `loadfont unicode; insmod all_video; terminal_output gfxterm` (note: this is perfectly ordinary sequence executed by Debian's default configuration)
+- Then GRUB should execute EFI shell using `chainloader` command
+
+If we do all this, then instead of EFI shell we will see broken image. I. e. video output will be completely broken/mangled/damaged. But EFI shell will still respond to commands. If we type "exit", then we will exit from EFI shell back to GRUB.
+
+I will repeat: my configuration is not special at all. `loadfont unicode; insmod all_video; terminal_output gfxterm` are absolutely ordinary commands executed by Debian's GRUB default setup. So, essentially this bug means this: if I add EFI shell to GRUB menu in Debian, then this new menu entry will not work properly if I try to boot in Qemu in UEFI mode.
+
+Okay, now let me give you more detailed steps to reproduce.
+
+- Execute the following script on Linux x86_64 host:
+```bash
+#!/bin/bash
+# This script was tested on Debian trixie (as on 2024-09-07) with the following packages installed:
+# dosfstools grub-efi-amd64-bin qemu-system-x86 ovmf efi-shell-x64
+set -e
+DIR="$(mktemp -d /tmp/qemu-bug-XXXXXX)"
+truncate --size=100M "$DIR/disk"
+echo ',+,' | sfdisk --label gpt "$DIR/disk"
+LOOP="$(losetup --find --show --partscan --nooverlap "$DIR/disk")"
+sleep 1
+mkfs.vfat "${LOOP}p1"
+mkdir "$DIR/root"
+mount "${LOOP}p1" "$DIR/root"
+losetup --detach "$LOOP"
+mkdir -p "$DIR/root/EFI/boot" "$DIR/root/boot/grub/fonts"
+grub-mkimage --format=x86_64-efi --output="$DIR/root/EFI/boot/bootx64.efi" --prefix=/boot/grub part_gpt fat
+cp -r /usr/lib/grub/x86_64-efi "$DIR/root/boot/grub"
+cp /usr/share/efi-shell-x64/shellx64.efi "$DIR/root/boot"
+cp /usr/share/grub/unicode.pf2 "$DIR/root/boot/grub/fonts"
+cat << "EOF" > "$DIR/root/boot/grub/grub.cfg"
+loadfont unicode
+insmod all_video
+terminal_output gfxterm
+menuentry "EFI shell" {
+  chainloader /boot/shellx64.efi
+}
+EOF
+umount "$DIR/root"
+qemu-system-x86_64 -m 2048 -bios OVMF.fd -drive file="$DIR/disk",format=raw
+```
+- When you see Qemu window, choose "EFI shell" menu entry in GRUB menu
+- You will immediately see damaged video output instead of proper EFI shell
+
+This bug doesn't reproduce on real hardware, i. e. without Qemu!!! I. e. this is Qemu bug. Qemu task is to duplicate real hardware behaviour. On real hardware there is no this bug, so Qemu should not have it, either.
+
+Note: if I remove `loadfont unicode; insmod all_video; terminal_output gfxterm`, then the bug disappears.
+
+Also note: if I replace `all_video` with `efi_gop`, then the bug disappears, too. So, workaround is to use `efi_gop` instead of `all_video` in UEFI mode. But I still believe the bug is in Qemu, because `all_video` doesn't cause any problems on real hardware, so Qemu should work, too.

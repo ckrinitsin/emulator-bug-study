@@ -1,0 +1,39 @@
+mirror block job memory leak
+Description of problem:
+After creating a background mirror job, and then the connection to the mirror target storage be interrupted and writing cannot be performed, the qemu process memory will increase significantly every time the mirror job performs a write. When the target stroage is restored, the data writing will be completed normally, but the memory will not be reduced.
+Steps to reproduce:
+1. start a virtual machine with libvirt(virsh start file)
+2. add a target mirror block dev, configure io timeout to 2 sec(virsh qemu-monitor-command file --pretty '{"execute": "blockdev-add", "arguments": {"driver": "raw", "cache": {"direct": true}, "node-name": "node-target","file": {"driver": "rbd", "conf":"/etc/ceph/ceph.node53.conf", "pool": "test", "image": "rbd1", "auth-client-required": ["none"], "server": [{"host": "10.0.12.53", "port": "6789"}]}}}')
+3. create a background mirror block job(virsh qemu-monitor-command file --pretty '{ "execute": "blockdev-mirror", "arguments": {"device": "libvirt-1-format", "target": "node-target", "sync": "full", "copy-mode": "background", "on-target-error": "ignore", "job-id": "job0"}}')
+4. wait for the initial full synchronization to complete
+5. write a large number of random ios in the virtual machine with the fio program(fio -filename=/dev/vdb -direct=1 -iodepth 1 -thread -rw=randwrite -ioengine=psync -bs=4k -size=4G -numjobs=1 -runtime=300 -group_reporting -name=sep)
+6. break the connection with the remote storage or shutdown the remote storage while fio program is running(if the connection is interrupted first and then written io, the probability of reproduce is very low)
+7. qemu will report an error indicating that io writing failed and try to write again(qemu-kvm: rbd request failed: cmd 1 offset 1421803520 bytes 1048576 flags 0 task.ret -110 (Connection timed out))
+8. use the numastat command to continuously observe the memory usage of the process and find that the heap memory has increased significantly.
+
+```
+Per-node process memory usage (in MBs) for PID 946492 (qemu-kvm)
+                           Node 0           Total
+                  --------------- ---------------
+Huge                      2048.00         2048.00
+Heap                      2698.13         2698.13
+Stack                        0.71            0.71
+Private                    781.48          781.48
+----------------  --------------- ---------------
+Total                     5528.32         5528.32
+
+after a while
+
+Per-node process memory usage (in MBs) for PID 1059068 (qemu-kvm)
+                           Node 0           Total
+                  --------------- ---------------
+Huge                      2048.00         2048.00
+Heap                     21769.94        21769.94
+Stack                        0.71            0.71
+Private                    827.22          827.22
+----------------  --------------- ---------------
+Total                    24645.87        24645.87
+```
+Additional information:
+libvirt xml:
+[file.xml](/uploads/82ff2e410183f94fde7cbaf19e7911dc/file.xml)

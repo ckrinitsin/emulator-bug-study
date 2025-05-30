@@ -1,0 +1,18 @@
+Race condition during QEMU exit cleanup can lead to deadlock
+Description of problem:
+During the cleanup phase of QEMU exiting, there is a small race condition window that can lead QEMU to lock up completely:
+In the main QEMU thread, during the exit, the thread will execute the 'qemu_cleanup' function, which calls 'do_vm_stop', which calls 'pause_all_vcpus'. This method tries to (as the name suggests) stop/pause all the vcpu threads. At the same time, the vcpu thread might have just existed it's main mttcg exec loop, which means it will enter 'qemu_wait_io_event'. At this point, the following race condition can occur:
+- vcpu_thread - cpus.c:416 <= enters qemu_wait_io_event
+- shutdown_thread - cpus.c:555 <= enters pause_all_vcpus
+- vcpu_thread - cpus.c:418 <= cpu_thread_is_idle returns true, cpu->stop not set yet
+- shutdown_thread - cpus.c:560/561 <= sets cpu->stop and kicks the vcpu, but it's not waiting on cpu->halt_cond yet, so nothing happens
+- vcpu_thread - cpus.c:423 <= starts waiting on cpu->halt_cond
+- shutdown_thread - cpus.c:570 <= not all vcpus paused, so enters while loop
+- shutdown_thread - cpus.c:571 <= starts waiting on qemu_pause_cond
+- **deadlock**
+
+In my case, my plugin registers qemu_plugin_vcpu_idle_cb, so the race window is extended significantly in the vcpu thread (cpus.c:421) but I believe it can happen with the smaller race window as well.
+
+Note that this explanation is just based on my understanding of the code, and the final state of QEMU during the deadlock after I attached: The main thread (thread 1) was waiting on qemu_pause_cond in pause_all_vcpus, and the vcpu was waiting on cpu->halt_cond in qemu_wait_io_event, with no one else to wake either of them up. (This was following an exit that was triggered by a timeout signal)
+Steps to reproduce:
+This is a race condition, so I don't have a reliable reproducer.

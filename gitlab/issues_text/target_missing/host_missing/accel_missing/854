@@ -1,0 +1,62 @@
+rsync to ext4-fs on dynamic expanding qcow2 fails
+Description of problem:
+Firstly, this issue does not seem to happen when the virtual-disk is dd-raw-img or fixed qcow2 (preallocation=falloc). The guest-kernel has multiple tracebacks during rsync to dst folder on ext4-fs on qcow2. 
+I ctrl-C-ed the rsync process after the first traceback, which happened after copying around 52 GiB. 
+On a previous run, wherein I had let it continue, somewhere near the end, around 83 GiB, dmesg would bloat with a zillion trace-backs and stall. The sha256sum verify seems to have succeeded for all files copied so far and correctly gives error "Failed open or read" on subsequent files that were not copied. 
+In this test, the partial-rsync completed files were not corrupted. However, as qemu's disk emulation allocates blocks, qemu may be inducing paging-bugs into the guest-kernel. Paging issues like these may also lead to corruption. The guest-kernel should see the same full emulated disk regardless of whether qemu provided a fixed disk, dynamic disk, or even a different type of virtual-disk-format. The guest-vm should not detect/perceive any difference between them.
+
+There may be upcoming trouble round the 5.17 corner.
+
+It is beyond me to figure out if this is due to
+* qemu-6.2 block code
+* guest-kernel ( kernel-5.17 folio/page management or ntfs3 driver or something else )  
+
+It may be necessary to ascertain if this is a new bug on account of qemu not being ready for folio type page-management or a bug in upstream kernel.org. My apologies in advance if it turns out that this is not a qemu bug.
+
+There there does seem to be some problem with qemu dealing with expanding virtual disks, with bugs that show up only if the underlying virtual-disk is dynamic and expanding.
+
+I just think that storage/block-code should be made rock solid with a much higher priority than adding new features.
+If storage code is undependable, then qemu/vm cannot be used, and there is no point in any other feature. qcow2 in particular is the qemu's native virtual-disk format.
+
+I had to stop testing on Issue #727 , Issue #814 , on account of what I thought was a bug in 5.15 kernels. I filed the bug as "fs/ntfs3: page_cache_ra_unbounded on rsync from ntfs3 to ext4" https://bugzilla.kernel.org/show_bug.cgi?id=215460 . I assume that bug is different because it happens even on raw image. 
+
+setup is as follows:
+- Host: Fedora-35 with kernel-5.17.0-0.rc2.83.fc35.x86_64 self-built from srpm ( https://koji.fedoraproject.org/koji/buildinfo?buildID=1910212 )
+- Guest: Fedora-Workstation-Live-x86_64-Rawhide-20220201.n.0.iso with 5.17.0-0.rc2.83.fc36.x86_64 ( https://koji.fedoraproject.org/koji/buildinfo?buildID=1910892 )  
+- qemu: 6.2.0 (qemu-6.2.0-2.fc35.1) self-built from srpm  ( https://koji.fedoraproject.org/koji/buildinfo?buildID=1897713 )
+- hda: qcow2(dyn) with ext4 and also 4 combinations of raw_img/fixed_qcow2 with ext4/ntfs3
+- hdb: vhdx, ntfs3 (pre-prepared sgdata https://gitlab.com/qemu-project/qemu/-/issues/727#note_739930694 )  
+
+qcow2 image is created as follows:
+``` 
+[root@sirius ~]# qemu-img create -f qcow2 /mnt/a16/gkpics01.qcow2 99723771904
+Formatting '/mnt/a16/gkpics01.qcow2', fmt=qcow2 cluster_size=65536 extended_l2=off compression_type=zlib size=99723771904 lazy_refcounts=off refcount_bits=16 
+```
+
+qemu command is as follows:
+``` 
+[root@sirius ~]# qemu-system-x86_64 -cpu qemu64 -m 4096 -machine "type=q35" -accel "kvm" -smp "sockets=1,cores=8,threads=1" -boot "d" -cdrom "/vol/15KJ_Images/transcend/Fedora-Workstation-Live-x86_64-Rawhide-20220201.n.0.iso" -hda "/mnt/a16/gkpics01.raw" -hdb "/vol/15KJ_Images/test/sgdata.vhdx" -device "virtio-vga" -display "gtk,gl=on" -rtc "base=utc" -net "user" -device "virtio-net,netdev=vmnic" -netdev "user,id=vmnic,net=192.168.20.0/24,dns=192.168.20.3,dhcpstart=192.168.20.15" 
+```
+Steps to reproduce:
+1. Inside booted vm, use gdisk to partition /dev/sda1 if necessary
+2. ```dmesg -w (in another pty)``` 
+3. ```mkfs.ext4 /dev/sda1 -L fs_gkpics001``` 
+4. ```mkdir /mnt/a /mnt/b``` 
+5. ```mount -t ext4 /dev/sda1 /mnt/a``` 
+6. ```mount -t ntfs3 /dev/sdb2 /mnt/b```
+7. rsync testdata: ```(sdate=`date` ; echo "$sdate" ; cd /mnt/b ; rsync -avH ./photos001 /mnt/a | tee /tmp/rst.txt ; echo "$sdate" ; date )``` 
+8. ```umount /mnt/a ; ``` 
+9. ```mount -t ext4 /dev/sda1 /mnt/a``` 
+10. verify: ```(sdate=`date` ; echo "$sdate" ; cd /mnt/a/photos001 ; sha256sum -c ./find.CHECKSUM --quiet ; echo "$sdate" ; date )``` 
+11. ```umount /mnt/a ; umount /mnt/b;```
+Additional information:
+**Test attempts**
+- Bug does not happen with 5.17.0-0.rc2.83/qemu-6.2.0-2/5.17.0-0.rc2.83/ExFAT/rawimg/ext4 with vhdx/ntfs3/sgdata 
+- Bug does not happen with 5.17.0-0.rc2.83/qemu-6.2.0-2/5.17.0-0.rc2.83/ExFAT/rawimg/ntfs3 with vhdx/ntfs3/sgdata 
+- Bug does not happen with 5.17.0-0.rc2.83/qemu-6.2.0-2/5.17.0-0.rc2.83/ExFAT/qcow2(fixed)/ext4 with vhdx/ntfs3/sgdata 
+- Bug does not happen with 5.17.0-0.rc2.83/qemu-6.2.0-2/5.17.0-0.rc2.83/ExFAT/qcow2(fixed)/ntfs3 with vhdx/ntfs3/sgdata 
+- Bug **does** happen with 5.17.0-0.rc2.83/qemu-6.2.0-2/5.17.0-0.rc2.83/ExFAT/**qcow2(dyn)**/ext4 with vhdx/ntfs3/sgdata 
+- Bug does not happen directly on Host with 5.17.0-0.rc2.83/ExFat with ntfs3/sgdata
+- Bug does not happen directly on Host with 5.17.0-0.rc2.83/ntfs3 with ntfs3/sgdata
+
+Also filed a linux-kernel bug titled "during rsync, vm guest kernel trace arising from memcg_kmem_charge_page alloc_pages" https://bugzilla.kernel.org/show_bug.cgi?id=215563

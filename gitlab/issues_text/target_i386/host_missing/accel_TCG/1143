@@ -1,0 +1,78 @@
+Breakpoints missed when a function is split into two memory pages.
+Description of problem:
+Qemu seems to ignore some breakpoints when the start of a function is 
+in another page than where the breakpoint is set. 
+
+In my case, I've a function `__gnat_debug_raise_exception` which starts at `0x10bff2` and I've set with gdb a breakpoint at `0x10c00e` (in another page). 
+While running with `qemu -d in_asm,exec`, I can see that the whole function is executed at once and that no breakpoint is fired.
+
+```
+(gdb) b *0x00108fbc
+(gdb) b *0x0010c00e
+(gdb) target remote :1234 
+(gdb) c
+
+Trace 0: 0x7f277c0174c0 [0000000000000000/0000000000108fb9/0040c0b0/ff000201] ada__exceptions__complete_occurrence
+----------------
+
+// gdb hits first breakpoint here. 
+Breakpoint 3, 0x0000000000108fbc ....
+(gdb) ni
+
+IN: ada__exceptions__complete_occurrence
+0x00108fbc:  e8 31 30 00 00           callq    0x10bff2
+
+Trace 0: 0x7f277c000100 [0000000000000000/0000000000108fbc/0040c0b0/ff000e01] ada__exceptions__complete_occurrence
+----------------
+IN: __gnat_debug_raise_exception
+0x0010bff2:  55                       pushq    %rbp
+0x0010bff3:  48 89 e5                 movq     %rsp, %rbp
+0x0010bff6:  48 89 7d f8              movq     %rdi, -8(%rbp)
+0x0010bffa:  48 89 d1                 movq     %rdx, %rcx
+0x0010bffd:  48 89 f0                 movq     %rsi, %rax
+0x0010c000:  48 89 fa                 movq     %rdi, %rdx
+0x0010c003:  48 89 ca                 movq     %rcx, %rdx
+0x0010c006:  48 89 45 e0              movq     %rax, -0x20(%rbp)
+0x0010c00a:  48 89 55 e8              movq     %rdx, -0x18(%rbp)
+0x0010c00e:  48 8b 45 e0              movq     -0x20(%rbp), %rax
+0x0010c012:  90                       nop      
+0x0010c013:  5d                       popq     %rbp
+0x0010c014:  c3                       retq     
+
+Trace 0: 0x7f277c000100 [0000000000000000/000000000010bff2/0040c0b0/ff000000] __gnat_debug_raise_exception
+Digging a bit more, it seems that it seems related to 
+
+// gdb ni stop here. Breakpoints at 0x10c00e have been ignored. 
+```
+
+Note that if I'm setting another breakpoint at `0x0010bffd` (thus not at the start of the function but still in the same page), the execution 
+will be executed step by step and the breakpoint at 0x10c00e will be triggered normally. 
+
+
+```
+IN: ada__exceptions__complete_occurrence
+0x00108fbc:  e8 31 30 00 00           callq    0x10bff2
+
+Trace 0: 0x7f6af4000100 [0000000000000000/0000000000108fbc/0040c0b0/ff000e01] ada__exceptions__complete_occurrence
+----------------
+IN: __gnat_debug_raise_exception
+0x0010bff2:  55                       pushq    %rbp
+
+Trace 0: 0x7f6af4000100 [0000000000000000/000000000010bff2/0040c0b0/ff000201] __gnat_debug_raise_exception
+----------------
+IN: __gnat_debug_raise_exception
+0x0010bff3:  48 89 e5                 movq     %rsp, %rbp
+
+Trace 0: 0x7f6af4000280 [0000000000000000/000000000010bff3/0040c0b0/ff000201] __gnat_debug_raise_exception
+----------------
+IN: __gnat_debug_raise_exception
+0x0010bff6:  48 89 7d f8              movq     %rdi, -8(%rbp)
+...
+```
+
+I've dug a bit into qemu translator code and I guess `check_for_breakpoint` should check that the whole function is in the same page before skipping step by step. But I'm not sure if it's possible because the TB is created after `check_for_breakpoint` IIUC. 
+
+Sadly as of now, I don't have a C reproducer. I can try to provide you my "foo" program which is an Ada program. But maybe if you've a better idea how to reproduce that or an idea of to fix that, I'll be glad to help you.  
+
+Thanks, 
+Clément

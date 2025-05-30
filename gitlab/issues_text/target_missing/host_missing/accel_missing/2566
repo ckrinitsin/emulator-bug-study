@@ -1,0 +1,119 @@
+Plugin deadlock with qemu_plugin_register_vcpu_mem_cb introduced prior to v8.1.0
+Description of problem:
+Between v8.0.5 and v8.1.0 a bug was introduced where a TCG plugin calling `qemu_plugin_register_vcpu_mem_cb` can cause a deadlock. This bug is still present in the current head of master (a66f28df650166ae8b50c992eea45e7b247f4143).
+
+I was able to reproduce this reliably (>95% of the time) testing with the minimal plugin shown below. In more limited testing, I found the logic in the (in-tree) hotpages plugin will also trigger this deadlock.
+
+I tested with the Ubuntu Bionic qcow from [here](https://panda.re/qcows/linux/ubuntu/1804/x86_64/bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2), but don't think there's anything particularly special about this qcow.
+
+
+A minimal plugin to trigger the deadlock is as follows. To build the plugin, you'll need to add a `NAMES += customtest` line into `contrib/plugins/Makefile.
+
+contrib/plugins/customtest.c:
+```
+#include <qemu-plugin.h>
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
+
+static void vcpu_mem(unsigned int cpu_index, qemu_plugin_meminfo_t info,
+                     uint64_t vaddr, void *udata)
+{}
+
+
+static void vcpu_tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
+{
+    struct qemu_plugin_insn *insn;
+    size_t n = qemu_plugin_tb_n_insns(tb);
+
+    for (size_t i = 0; i < n; i++) {
+        insn = qemu_plugin_tb_get_insn(tb, i);
+
+        /* Register callback on memory read or write */
+        qemu_plugin_register_vcpu_mem_cb(insn, vcpu_mem,
+                                         QEMU_PLUGIN_CB_NO_REGS,
+                                         QEMU_PLUGIN_MEM_R, NULL);
+    }
+}
+
+QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
+                                           const qemu_info_t *info, int argc,
+                                           char **argv)
+{
+    qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans);
+
+    return 0;
+}
+```
+Steps to reproduce:
+1. From the current head of `master` (a66f28df650166ae8b50c992eea45e7b247f4143)
+2. Add the above plugin to the contrib/plugins directory and update the `contrib/plugins/Makefile` with `NAMES += customtest` so it will be built.
+3. `../configure --enable-plugins --target-list=x86_64-softmmu`
+4. `make && make plugins`
+5. `wget https://panda.re/qcows/linux/ubuntu/1804/x86_64/bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2`
+6. Launch the guest with `./qemu-system-x86_64 -m 1G -plugin contrib/plugins/libcustomtest.so bionic-server-cloudimg-amd64-noaslr-nokaslr.qcow2 -nographic -d plugin`, and wait a moment. There will be no output after the initial "Booting from Hard Disk" mesasge. Switch to the monitor with `ctrl+a c` type `quit` and press enter, qemu fails to exit because of the deadlock.
+Additional information:
+* I tested and saw the bug on the following commits/tags: current head of master (a66f28df650166ae8b50c992eea45e7b247f4143), v9.1.0, v9.0.0, and v8.2.6, v8.1.0.
+* I tested and saw no bug on the following tags: v8.0.5, v8.0.4, v8.0.0
+* If `qemu_plugin_register_vcpu_mem_cb` is called with a fourth argument of `0` instead of `QEMU_PLUGIN_MEM_R`, the guest did not hang (at least on the current head of master).
+* The monitor can still be reached with `ctrl+a c` after the deadlock, but running the `quit` command does not terminate the emulator (I don't think this is related to #1195 since things start hanging before the shutdown begins)
+
+Gdb shows the following backtraces (from the head of master) across the running threads. It seems that thread 3 and thread 2 are stuck, though I'm not too familiar with what they're doing.
+```
+(gdb) thread apply all bt
+
+Thread 3 (Thread 0x7f9677fff640 (LWP 754761) "qemu-system-x86"):
+#0  __futex_abstimed_wait_common64 (private=0, cancel=true, abstime=0x0, op=393, expected=0, futex_word=0x55a9c1047748 <exclusive_cond+40>) at ./nptl/futex-internal.c:57
+#1  __futex_abstimed_wait_common (cancel=true, private=0, abstime=0x0, clockid=0, expected=0, futex_word=0x55a9c1047748 <exclusive_cond+40>) at ./nptl/futex-internal.c:87
+#2  __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x55a9c1047748 <exclusive_cond+40>, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x0, private=private@entry=0) at ./nptl/futex-internal.c:139
+#3  0x00007f968280aa41 in __pthread_cond_wait_common (abstime=0x0, clockid=0, mutex=0x55a9c1047660 <qemu_cpu_list_lock>, cond=0x55a9c1047720 <exclusive_cond>) at ./nptl/pthread_cond_wait.c:503
+#4  ___pthread_cond_wait (cond=cond@entry=0x55a9c1047720 <exclusive_cond>, mutex=mutex@entry=0x55a9c1047660 <qemu_cpu_list_lock>) at ./nptl/pthread_cond_wait.c:627
+#5  0x000055a9bff8ce9f in qemu_cond_wait_impl (cond=0x55a9c1047720 <exclusive_cond>, mutex=0x55a9c1047660 <qemu_cpu_list_lock>, file=0x55a9bffc37b6 "../cpu-common.c", line=221) at ../util/qemu-thread-posix.c:225
+#6  0x000055a9bf8fc7b7 in start_exclusive () at ../cpu-common.c:221
+#7  start_exclusive () at ../cpu-common.c:192
+#8  0x000055a9bfc2f981 in ptw_setl_slow (new=23069091, old=23069059, in=0x7f9677ffa540) at ../target/i386/tcg/sysemu/excp_helper.c:112
+#9  ptw_setl (set=<optimized out>, old=23069059, in=0x7f9677ffa540) at ../target/i386/tcg/sysemu/excp_helper.c:130
+#10 ptw_setl (set=<optimized out>, old=23069059, in=0x7f9677ffa540) at ../target/i386/tcg/sysemu/excp_helper.c:121
+#11 mmu_translate (env=env@entry=0x55a9c2ab3bc0, in=in@entry=0x7f9677ffa5f0, out=out@entry=0x7f9677ffa5c0, err=err@entry=0x7f9677ffa5d0, ra=ra@entry=140283034940586) at ../target/i386/tcg/sysemu/excp_helper.c:412
+#12 0x000055a9bfc2fe4f in get_physical_address (ra=<optimized out>, err=<optimized out>, out=<optimized out>, mmu_idx=<optimized out>, access_type=<optimized out>, addr=25041848, env=<optimized out>) at ../target/i386/tcg/sysemu/excp_helper.c:583
+#13 x86_cpu_tlb_fill (cs=0x55a9c2ab1400, addr=25041848, size=<optimized out>, access_type=MMU_DATA_LOAD, mmu_idx=5, probe=<optimized out>, retaddr=140283034940586) at ../target/i386/tcg/sysemu/excp_helper.c:603
+#14 0x000055a9bfd92a59 in tlb_fill (retaddr=140283034940586, mmu_idx=5, access_type=MMU_DATA_LOAD, size=<optimized out>, addr=25041848, cpu=0x55a9c2ab1450) at ../accel/tcg/cputlb.c:1237
+#15 mmu_lookup1 (cpu=cpu@entry=0x55a9c2ab1400, data=data@entry=0x7f9677ffa750, mmu_idx=5, access_type=access_type@entry=MMU_DATA_LOAD, ra=ra@entry=140283034940586) at ../accel/tcg/cputlb.c:1634
+#16 0x000055a9bfd92b71 in mmu_lookup (cpu=cpu@entry=0x55a9c2ab1400, addr=addr@entry=25041848, oi=oi@entry=37, ra=ra@entry=140283034940586, type=type@entry=MMU_DATA_LOAD, l=l@entry=0x7f9677ffa750) at ../accel/tcg/cputlb.c:1724
+#17 0x000055a9bfd937b0 in do_ld4_mmu (cpu=cpu@entry=0x55a9c2ab1400, addr=addr@entry=25041848, oi=oi@entry=37, ra=140283034940586, ra@entry=37, access_type=access_type@entry=MMU_DATA_LOAD) at ../accel/tcg/cputlb.c:2356
+#18 0x000055a9bfd96afa in cpu_ldl_mmu (ra=37, oi=37, addr=25041848, env=0x55a9c2ab3bc0) at ../accel/tcg/ldst_common.c.inc:160
+#19 cpu_ldl_le_mmuidx_ra (env=env@entry=0x55a9c2ab3bc0, addr=25041848, mmu_idx=mmu_idx@entry=5, ra=ra@entry=140283034940586) at ../accel/tcg/ldst_common.c.inc:298
+#20 0x000055a9bfc9a639 in popl (sa=<synthetic pointer>) at ../target/i386/tcg/seg_helper.c:88
+#21 helper_ret_protected (env=0x55a9c2ab3bc0, shift=1, is_iret=0, addend=0, retaddr=140283034940586) at ../target/i386/tcg/seg_helper.c:2031
+#22 0x00007f96307734aa in code_gen_buffer ()
+#23 0x000055a9bfd855f6 in cpu_tb_exec (cpu=cpu@entry=0x55a9c2ab1400, itb=itb@entry=0x7f96307733c0 <code_gen_buffer+7811987>, tb_exit=tb_exit@entry=0x7f9677ffadd8) at ../accel/tcg/cpu-exec.c:458
+#24 0x000055a9bfd85b4c in cpu_loop_exec_tb (tb_exit=0x7f9677ffadd8, last_tb=<synthetic pointer>, pc=<optimized out>, tb=0x7f96307733c0 <code_gen_buffer+7811987>, cpu=0x55a9c2ab1400) at ../accel/tcg/cpu-exec.c:908
+#25 cpu_exec_loop (cpu=cpu@entry=0x55a9c2ab1400, sc=sc@entry=0x7f9677ffae70) at ../accel/tcg/cpu-exec.c:1022
+#26 0x000055a9bfd86351 in cpu_exec_setjmp (cpu=cpu@entry=0x55a9c2ab1400, sc=sc@entry=0x7f9677ffae70) at ../accel/tcg/cpu-exec.c:1039
+#27 0x000055a9bfd86b0e in cpu_exec (cpu=cpu@entry=0x55a9c2ab1400) at ../accel/tcg/cpu-exec.c:1065
+#28 0x000055a9bfdaafa4 in tcg_cpu_exec (cpu=cpu@entry=0x55a9c2ab1400) at ../accel/tcg/tcg-accel-ops.c:78
+#29 0x000055a9bfdab0ff in mttcg_cpu_thread_fn (arg=arg@entry=0x55a9c2ab1400) at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#30 0x000055a9bff8c2d1 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:541
+#31 0x00007f968280bac3 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#32 0x00007f968289d850 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 2 (Thread 0x7f967d990640 (LWP 754759) "qemu-system-x86"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x000055a9bff8d5b2 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /home/user/git/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0x55a9c1079588 <rcu_call_ready_event>) at ../util/qemu-thread-posix.c:464
+#3  0x000055a9bff97d82 in call_rcu_thread (opaque=opaque@entry=0x0) at ../util/rcu.c:278
+#4  0x000055a9bff8c2d1 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:541
+#5  0x00007f968280bac3 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#6  0x00007f968289d850 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+
+Thread 1 (Thread 0x7f967dc035c0 (LWP 754758) "qemu-system-x86"):
+#0  0x00007f968288fcce in __ppoll (fds=0x55a9c382dd00, nfds=5, timeout=<optimized out>, timeout@entry=0x7ffeadbd44d0, sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:42
+#1  0x000055a9bffa4e05 in ppoll (__ss=0x0, __timeout=0x7ffeadbd44d0, __nfds=<optimized out>, __fds=<optimized out>) at /usr/include/x86_64-linux-gnu/bits/poll2.h:64
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=timeout@entry=54822346) at ../util/qemu-timer.c:351
+#3  0x000055a9bffa1ed6 in os_host_main_loop_wait (timeout=54822346) at ../util/main-loop.c:305
+#4  main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:589
+#5  0x000055a9bfb47217 in qemu_main_loop () at ../system/runstate.c:826
+#6  0x000055a9bfee421b in qemu_default_main () at ../system/main.c:37
+#7  0x00007f96827a0d90 in __libc_start_call_main (main=main@entry=0x55a9bf8f9790 <main>, argc=argc@entry=9, argv=argv@entry=0x7ffeadbd46e8) at ../sysdeps/nptl/libc_start_call_main.h:58
+#8  0x00007f96827a0e40 in __libc_start_main_impl (main=0x55a9bf8f9790 <main>, argc=9, argv=0x7ffeadbd46e8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffeadbd46d8) at ../csu/libc-start.c:392
+#9  0x000055a9bf8fa7b5 in _start ()
+```

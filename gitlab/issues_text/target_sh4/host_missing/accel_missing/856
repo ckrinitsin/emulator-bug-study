@@ -1,0 +1,61 @@
+Occasional deadlock in linux-user (sh4) when running threadcount test
+Description of problem:
+
+Steps to reproduce:
+1. docker run --rm -it -u (id -u) -v $HOME:$HOME -w (pwd) qemu/debian-all-test-cross /bin/bash
+2. '../../configure' '--cc=clang' '--cxx=clang++' '--disable-system' '--target-list-exclude=microblazeel-linux-user,aarch64_be-linux-user,i386-linux-user,m68k-linux-user,mipsn32el-linux-user,xtensaeb-linux-user' '--extra-cflags=-fsanitize=undefined' '--extra-cflags=-fno-sanitize-recover=undefined'
+3. make; make build-tcg
+4. retry.py -n 400 -c -- timeout --foreground 90 ./qemu-sh4 -plugin ./tests/plugin/libinsn.so -d plugin ./tests/tcg/sh4-linux-user/threadcount
+
+Failure rate on hackbox:
+
+```
+Results summary:
+0: 397 times (99.25%), avg time 0.686 (0.00 varience/0.01 deviation)
+124: 3 times (0.75%), avg time 90.559 (0.00 varience/0.01 deviation)
+```
+
+It seems to fail more frequently on Gitlabs CI
+Additional information:
+Without the timeout you end up with a deadlock. The following backtrace was found, stepping in gdb unwedges the hang:
+
+```
+(gdb) info threads
+  Id   Target Id         Frame 
+* 1    LWP 15894 "qemu-sh4" safe_syscall_base () at ../../common-user/host/x86_64/safe-syscall.inc.S:75
+  2    LWP 15994 "qemu-sh4" 0x00007f956b800f59 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+  3    LWP 15997 "qemu-sh4" safe_syscall_base () at ../../common-user/host/x86_64/safe-syscall.inc.S:75
+(gdb) bt
+#0  safe_syscall_base () at ../../common-user/host/x86_64/safe-syscall.inc.S:75
+#1  0x0000560ee17196e4 in safe_futex (uaddr=0x58e8, op=-513652411, val=<optimized out>, timeout=0xf0, uaddr2=<optimized out>, val3=582) at ../../linux-user/syscall.c:681
+#2  do_safe_futex (uaddr=0x58e8, op=-513652411, val=<optimized out>, timeout=0xf0, uaddr2=<optimized out>, val3=582) at ../../linux-user/syscall.c:7757
+#3  0x0000560ee170c8d9 in do_syscall1 (cpu_env=<optimized out>, num=<optimized out>, arg1=<optimized out>, arg2=<optimized out>, arg3=22760, arg4=<optimized out>, arg5=<optimized out>, arg6=240, arg7=0, arg8=0) at /home/alex.bennee/lsrc/qemu.git/include/exec/cpu_ldst.h:90
+#4  0x0000560ee170220c in do_syscall (cpu_env=<optimized out>, num=<optimized out>, arg1=<optimized out>, arg2=<optimized out>, arg3=<optimized out>, arg4=<optimized out>, arg5=<optimized out>, arg6=<optimized out>, arg7=<optimized out>, arg8=<optimized out>) at ../../linux-user/syscall.c:13239
+#5  0x0000560ee1626111 in cpu_loop (env=0x560ee294b028) at ../../linux-user/sh4/cpu_loop.c:43
+#6  0x0000560ee16ee37d in main (argc=-493657104, argv=0x7ffdcaf52028, envp=<optimized out>) at ../../linux-user/main.c:883
+(gdb) thread 2
+[Switching to thread 2 (LWP 15994)]
+#0  0x00007f956b800f59 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+(gdb) bt
+#0  0x00007f956b800f59 in syscall () from target:/lib/x86_64-linux-gnu/libc.so.6
+#1  0x0000560ee1847bd6 in qemu_futex_wait (f=<optimized out>, val=<optimized out>) at /home/alex.bennee/lsrc/qemu.git/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=0x560ee2738974 <rcu_call_ready_event>) at ../../util/qemu-thread-posix.c:481
+#3  0x0000560ee18539a2 in call_rcu_thread (opaque=<optimized out>) at ../../util/rcu.c:261
+#4  0x0000560ee1847f17 in qemu_thread_start (args=0x560ee2933eb0) at ../../util/qemu-thread-posix.c:556
+#5  0x00007f956b8f6fa3 in start_thread () from target:/lib/x86_64-linux-gnu/libpthread.so.0
+#6  0x00007f956b8064cf in clone () from target:/lib/x86_64-linux-gnu/libc.so.6
+(gdb) thread 3
+[Switching to thread 3 (LWP 15997)]
+#0  safe_syscall_base () at ../../common-user/host/x86_64/safe-syscall.inc.S:75
+75              cmp     $-4095, %rax
+(gdb) bt
+#0  safe_syscall_base () at ../../common-user/host/x86_64/safe-syscall.inc.S:75
+#1  0x0000560ee17196e4 in safe_futex (uaddr=0x2, op=-513652411, val=<optimized out>, timeout=0x3f7fcdc4, uaddr2=<optimized out>, val3=582) at ../../linux-user/syscall.c:681
+#2  do_safe_futex (uaddr=0x2, op=-513652411, val=<optimized out>, timeout=0x3f7fcdc4, uaddr2=<optimized out>, val3=582) at ../../linux-user/syscall.c:7757
+#3  0x0000560ee170c8d9 in do_syscall1 (cpu_env=<optimized out>, num=<optimized out>, arg1=<optimized out>, arg2=<optimized out>, arg3=2, arg4=<optimized out>, arg5=<optimized out>, arg6=1065340356, arg7=0, arg8=0) at /home/alex.bennee/lsrc/qemu.git/include/exec/cpu_ldst.h:90
+#4  0x0000560ee170220c in do_syscall (cpu_env=<optimized out>, num=<optimized out>, arg1=<optimized out>, arg2=<optimized out>, arg3=<optimized out>, arg4=<optimized out>, arg5=<optimized out>, arg6=<optimized out>, arg7=<optimized out>, arg8=<optimized out>) at ../../linux-user/syscall.c:13239
+#5  0x0000560ee1626111 in cpu_loop (env=0x560ee2a2c2d8) at ../../linux-user/sh4/cpu_loop.c:43
+#6  0x0000560ee171728f in clone_func (arg=<optimized out>) at ../../linux-user/syscall.c:6608
+#7  0x00007f956b8f6fa3 in start_thread () from target:/lib/x86_64-linux-gnu/libpthread.so.0
+#8  0x00007f956b8064cf in clone () from target:/lib/x86_64-linux-gnu/libc.so.6
+```

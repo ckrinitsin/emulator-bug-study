@@ -1,0 +1,39 @@
+Aarch64: VTCR.T0SZ / iasize test for Aarch32 guests wrong
+Description of problem:
+With QEMU 8 we are no longer able to execute Aarch32 guest code on an Aarch64 host. We use virtualization for the QEMU guest:
+- The QEMU guest kernel (L4Re kernel) runs at EL2 in AArch64 mode.
+- The L4Re guest code runs at EL1 in AAarch32 mode.
+
+It seems that the check for T0SZ / iasize in `ptw.c` / `check_s2_mmu_setup()` is too strict:
+```
+if (is_aa64) {
+    /*
+     * AArch64.S2InvalidTxSZ: While we checked tsz_oob near the top of
+     * get_phys_addr_lpae, that used aa64_va_parameters which apply
+     * to aarch64.  If Stage1 is aarch32, the min_txsz is larger.
+     * See AArch64.S2MinTxSZ, where min_tsz is 24, translated to
+     * inputsize is 64 - 24 = 40.
+     */
+    if (iasize < 40 && !arm_el_is_aa64(&cpu->env, 1)) {
+        goto fail;
+    }
+```
+The above test fails for us when executing Aarch32 EL1 code on Aarch64 EL2.
+
+Please note that the comment talks about `S2MinTxSZ` / `min_tsz`, so if the **minimum** value of `T0SZ` is 24, then the **maximum** value of `iasize` is `64-24=40` so the following comparison would be more appropriate (I replaces `<` by `>`):
+```
+if (iasize > 40 && !arm_el_is_aa64(&cpu->env, 1)) {
+    goto fail;
+}
+```
+However, the minimum value of `VTCR_EL2.T0SZ` is either 16 or 12, see `VTCR_EL2.DS`:
+- `VTCR_EL2.DS=0b0`: **minimum** value of `VTCR_EL2.T0SZ` is 16 => **maximum** value of `iasize` is 48,
+- `VTCR_EL2.DS=0b1`: **minimum** value of `VTCR_EL2.T0SZ` is 12 => **maximum** value of `iasize` is 52.
+
+Regarding the minimum of `iasize` / maximum of `VTCR_EL2.T0SZ`, see `ID_AA64MMFR_EL1.ST`:
+- `ID_AA64MMFR2_EL1.ST=0b0000`: **maximum** value of `VTCR_EL2.T0SZ` is 39 => **minimum** value of `iasize` is 25,
+- `ID_AA64MMFR2_EL1.ST=0b0001`: **maximum** value of `VTCR_EL2.T0SZ` is 48 => **minimum** value of `iasize` is 16 (or 47/17 for 64KiB granules).
+
+Our system executes Aarch32 EL1 code fine on Aarch64 EL2 if I weaken the comparison.
+Additional information:
+Sorry for not providing a test build but I'm not sure if it's worth to provide a custom build of our L4Re system, but I will happily provide one if you insist.

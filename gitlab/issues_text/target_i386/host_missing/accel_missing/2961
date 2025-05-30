@@ -1,0 +1,31 @@
+isapc: RTC refactor caused regression in qemu>=8.2 (broke Xenix, maybe others)
+Description of problem:
+I've been playing a bit with retro UNIXes and wanted to try a Xenix install.
+
+There are several webpages giving hints for installing Xenix under old versions of QEMU.  The good news: most of the workarounds and tweaks they mention seem to be no longer needed.  Starting with a Homebrew-supplied qemu 10.0.0 on my laptop I was able to do a basic install _without_ having to tweak the floppy geometry or anything like that.
+
+The bad news: once the install was complete and I tried to reboot from the harddrive it hangs at the...
+```
+Boot
+:
+```
+...prompt.  It doesn't respond to any keystrokes at this point.  This prompt is printed by the second-stage loader (called `/boot` on the Xenix filesystem) which is a real-mode 8086 binary.
+
+To debug this further I moved to a more familiar Linux developer environment and found that the qemu that is stock with Debian 12.10 (7.2.15) did *not* exhibit the same problem!
+
+I manually bisected through the released versions and found that it definitely broke some time in the 8.2 release cycle: 8.1.5 worked, 8.2.0rc0 did not.  I then did a git checkout and started building qemu, using `git bisect` to find the guilty commit.
+
+Soon I came across 56b1f50e3c101bfe5f52bac73de0e88438de11bd from @shentey -- a change which moved connecting the RTC's ISA interrupt from `pc_basic_device_init()` down into `*_realize()` when a Southbridge is configured.  I was able to confirm that before this commit I could boot, but after it I could not.
+
+I verified using gdb that `pc_basic_device_init()` is being called but the functions that the initialization had moved to were not (or at least weren't called *yet*). So after this change this RTC irq wasn't being wired up, which apparently broke the second-stage Xenix loader.
+
+I then went back to git tip and found that reverting the 56b1f50e3c1 commit was enough to fix the problem there as well.
+
+I don't know enough about the qemu internals to judge whether the original change made sense.  Therefore, I won't claim that reverting it is the correct approach to fix the bug.  However, it did work for me.
+
+The Southbridge code has been reorged a little since 8.2 but the functional revert is still pretty straightfoward.  Here is the diff I used:
+[revert-56b1f50e3c1.patch](/uploads/573754b8af3d7ddb97d5f973cb0003db/revert-56b1f50e3c1.patch)
+Steps to reproduce:
+1. Install Xenix 2.3.4 from https://archive.org/details/sco-xenix-386-and-extras
+2. After some enjoyable floppy juggling, be amazed at how smoothly the install went
+3. Try to boot from the harddrive afterwards and weep

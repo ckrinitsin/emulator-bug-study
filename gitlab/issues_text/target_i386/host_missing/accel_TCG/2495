@@ -1,0 +1,72 @@
+A bug in x86-64 MMX instructions
+Description of problem:
+It seems QEMU emits invalid TCG when lifting MMX instructions with redundant REX prefixes. For example, when lifting `490f7ec0 (movq r8, mm0)`, QEMU generates the following valid TCG.
+
+```
+ ---- 00000000004011f2 0000000000000000
+ call enter_mmx,$0x0,$0,env
+ ld_i64 loc0,env,$0x270
+ mov_i64 r8,loc0
+ mov_i64 rip,$0x4011f6
+ exit_tb $0x0
+ set_label $L0
+ exit_tb $0x7f84f82ec143
+```
+
+However, after changing the value of the rex prefix to `4f` , so the instruction becomes `4f0f7ec0 (rex.WRXB movq r8, mm0)`, the lifted TCG is changed to:
+
+```
+ ---- 00000000004011f2 0000000000000000
+ call enter_mmx,$0x0,$0,env
+ ld_i64 loc0,env,$0x2f0 // The offset to MM0 is changed
+ mov_i64 r8,loc0
+ mov_i64 rip,$0x4011f6
+ exit_tb $0x0
+ set_label $L0
+ exit_tb $0x7f98e82ec143
+```
+
+I have observed this bug in numerous MMX instructions. For example, `410fdaff (rex.B pminub mm7, mm7)` is lifted to the wrong TCGs.
+
+It seems this bug looks similar to #2474.
+Steps to reproduce:
+1. Write `test.c` 
+```
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+uint8_t i_R8[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+uint8_t i_MM0[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+uint8_t o_R8[8];
+
+void __attribute__ ((noinline)) show_state() {
+    printf("R8: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%02x ", o_R8[i]);
+    }
+    printf("\n");
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        ".intel_syntax noprefix\n"
+        "mov r8, qword ptr [rip + i_R8]\n"
+        "movq mm0, qword ptr [rip + i_MM0]\n"
+        ".byte 0x4f, 0x0f, 0x7e, 0xc0\n"
+        "mov qword ptr [rip + o_R8], r8\n"
+        ".att_syntax\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+    return 0;
+}
+```    
+2. Compile `test.bin` using this command: `gcc-12 -O2 -no-pie ./test.c -o ./test.bin`
+3. Run QEMU using this command: `qemu-x86_64 ./test.bin` 
+4. The program, runs on top of the buggy QEMU, prints the value of R8 as `00 00 00 00 00 00 00 00`. It should print `ff ff ff ff ff ff ff ff` after the bug is fixed.
+Additional information:
+

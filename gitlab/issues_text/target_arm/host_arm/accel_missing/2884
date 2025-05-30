@@ -1,0 +1,35 @@
+Questions about vfio-pci
+Description of problem:
+When I use VFIO-PCI to pass through an hns3 device and load the driver to the VM to enable the hns3 network port, there is a possibility that the failure occurs.
+Steps to reproduce:
+1. Start the VM and load the hns3 driver.
+2. enable net port
+
+   `ifconfig eth0 10.10.10.10/24 up`
+3. ping host
+
+   `ping 10.10.10.11 -c 3`
+Additional information:
+I have the following findings:
+
+1. The problem can be reproduced in different kernel versions and QEMU versions.
+2. The problem does not recur when the number of vCPUs is 1.
+3. It is irrelevant to the GIC version.
+
+the hns3 relately logic:
+
+![image.png](/uploads/523c6fd8d564d4d48ba5c930fd811478/image.png){width="394" height="285"}
+
+If the VM has two vCPUs, "ifconfig eth0 10.10.10.10/24 up" command performs two sequential enable_irq operations(vector_num=2). The enable_irq will trap into KVM for interrupt configuration and exit to QEMU for PCI device emulation. When emulating interrupt enabling in QEMU, vfio\_\[intx/msi/msix\]\_enable calls vfio_disable_interrupts to disable all interrupts on the vdev.
+
+![image.png](/uploads/e51baf6ee3a533332a3107a133184f11/image.png){width="455" height="266"}
+
+vfio_disable_interrupts in QEMU calls the kernel vfio driver interface vfio_pci_set_irqs_ioctl
+
+![image.png](/uploads/e4534c4e0b7033eb13e2ccfda558f505/image.png){width="404" height="127"}
+
+dump stack as above. and then its_irq_domain_deactivate will call its_send_discard to discard the interrupt on the device.
+
+If an interrupt is handled after the first enable_irq but the second enable_irq discards it, this inconsistency leads to network port enablement failures.
+
+It puzzles me. why does the vfio-pci disable all interrupts of the device before enabling irqs?

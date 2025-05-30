@@ -1,0 +1,39 @@
+TCG: probe_access() has inconsistent behavior
+Description of problem:
+In full-system mode, probe_access() will return NULL when the flag is TLB_MMIO.
+
+accel/tcg/cputlb.c: probe_access_internal()
+```
+    if (unlikely(flags & ~(TLB_WATCHPOINT | TLB_NOTDIRTY | TLB_CHECK_ALIGNED))
+        || (access_type != MMU_INST_FETCH && force_mmio)) {
+        *phost = NULL;
+        return TLB_MMIO;
+    }
+```
+But in linux-user mode, it will return correct address when the flag is TLB_MMIO.
+
+accel/tcg/user-exec.c: probe_access()
+```
+    return size ? g2h(env_cpu(env), addr) : NULL;
+```
+This will lead to some different behaviors, like cbo.zero in RISC-V.
+
+target/riscv/op_helper.c: helper_cbo_zero()
+```
+    mem = probe_write(env, address, cbozlen, mmu_idx, ra);
+
+    if (likely(mem)) {
+        memset(mem, 0, cbozlen);
+    } else {
+        for (int i = 0; i < cbozlen; i++) {
+            cpu_stb_mmuidx_ra(env, address + i, 0, mmu_idx, ra);
+        }
+    }
+```
+When the current instruction has memory callback by plugin:
+
+Full-system mode uses slow-path(cpu_stb_mmuidx_ra) and inject mem_cbs correctly.
+
+Linux-user mode uses fast-path(memset) and doesn't inject callbacks.
+
+To ensure consistent results, probe_access() should return NULL when the flag is TLB_MMIO in linux-user mode.

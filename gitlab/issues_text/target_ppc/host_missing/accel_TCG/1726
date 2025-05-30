@@ -1,0 +1,97 @@
+qemu-system-ppc64 option -smp 2 broken with commit 20b6643324a79860dcdfe811ffe4a79942bca21e
+Description of problem:
+I was trying to boot rhel9 image with upstream qemu-system-ppc64 -smp 2 option and observed a segfault (qemu crash).
+After doing a git bisect, I found the first bad commit which introduced this issue is below:
+```
+[qemu]# git bisect good
+20b6643324a79860dcdfe811ffe4a79942bca21e is the first bad commit
+commit 20b6643324a79860dcdfe811ffe4a79942bca21e
+Author: Richard Henderson <richard.henderson@linaro.org>
+Date:   Mon Dec 5 17:45:02 2022 -0600
+
+    tcg/ppc: Reorg goto_tb implementation
+    
+    The old ppc64 implementation replaces 2 or 4 insns, which leaves a race
+    condition in which a thread could be stopped at a PC in the middle of
+    the sequence, and when restarted does not see the complete address
+    computation and branches to nowhere.
+    
+    The new implemetation replaces only one insn, swapping between
+    
+            b       <dest>
+    and
+            mtctr   r31
+    
+    falling through to a general-case indirect branch.
+    
+    Reviewed-by: Alex Bennée <alex.bennee@linaro.org>
+    Signed-off-by: Richard Henderson <richard.henderson@linaro.org>
+
+ tcg/ppc/tcg-target.c.inc | 152 +++++++++++++----------------------------------
+ tcg/ppc/tcg-target.h     |   3 +-
+ 2 files changed, 41 insertions(+), 114 deletions(-)
+[qemu]# 
+```
+Steps to reproduce:
+1. Run the qemu command line mentioned
+2. Wait for the qemu to crash.
+Additional information:
+git bisect log:
+```
+[root@ltcden6-lp2 qemu]# git bisect log
+git bisect start
+# status: waiting for both good and bad commits
+# bad: [b455ce4c2f300c8ba47cba7232dd03261368a4cb] Merge tag 'q800-for-8.1-pull-request' of https://github.com/vivier/qemu-m68k into staging
+git bisect bad b455ce4c2f300c8ba47cba7232dd03261368a4cb
+# status: waiting for good commit(s), bad commit known
+# good: [b247dba067bf2808de6395ff09ff0cb220ed7c95] tests/avocado: add explicit timeout for ppc64le TCG tests
+git bisect good b247dba067bf2808de6395ff09ff0cb220ed7c95
+# bad: [3db629f03e8caf39526cd0415dac16a6a6484107] Merge tag 'pull-request-2023-02-27' of https://gitlab.com/thuth/qemu into staging
+git bisect bad 3db629f03e8caf39526cd0415dac16a6a6484107
+# good: [777fa06376ce0249c76d0d852e8f7ed103a63864] Merge tag 'pull-loongarch-20221202' of https://gitlab.com/gaosong/qemu into staging
+git bisect good 777fa06376ce0249c76d0d852e8f7ed103a63864
+# bad: [c66ffcd5358ba88e93e1ffb15ae42ca52dab12a8] target/riscv/cpu: set cpu->cfg in register_cpu_props()
+git bisect bad c66ffcd5358ba88e93e1ffb15ae42ca52dab12a8
+# good: [bc92f261519d5c77c70cf2ebcf0a3b9a414d82d0] hw/intc: sifive_plic: Fix the pending register range check
+git bisect good bc92f261519d5c77c70cf2ebcf0a3b9a414d82d0
+# good: [aa96ab7c9df59c615ca82b49c9062819e0a1c287] Merge tag 'pull-request-2023-01-09' of https://gitlab.com/thuth/qemu into staging
+git bisect good aa96ab7c9df59c615ca82b49c9062819e0a1c287
+# good: [a8d6abe1292e1db1ad9be5b2b124b9c01bcda094] Merge tag 'mips-20230113' of https://github.com/philmd/qemu into staging
+git bisect good a8d6abe1292e1db1ad9be5b2b124b9c01bcda094
+# bad: [ef4f031fab7b070816454949a1b6b6c7aa3cf503] Merge tag 'pull-tcg-20230117' of https://gitlab.com/rth7680/qemu into staging
+git bisect bad ef4f031fab7b070816454949a1b6b6c7aa3cf503
+# good: [0fe1c98da9d9abb8e5dc4a67c7e3bcf19aad1e85] tcg: Change tb_target_set_jmp_target arguments
+git bisect good 0fe1c98da9d9abb8e5dc4a67c7e3bcf19aad1e85
+# good: [701ed34833f53880ba38bde09b0846d01fc16d66] Merge tag 'pull-request-2023-01-18' of https://gitlab.com/thuth/qemu into staging
+git bisect good 701ed34833f53880ba38bde09b0846d01fc16d66
+# bad: [20b6643324a79860dcdfe811ffe4a79942bca21e] tcg/ppc: Reorg goto_tb implementation
+git bisect bad 20b6643324a79860dcdfe811ffe4a79942bca21e
+# good: [90c0fee3a28b25d23081b3c435762cadde813ec4] tcg: Always define tb_target_set_jmp_target
+git bisect good 90c0fee3a28b25d23081b3c435762cadde813ec4
+# good: [d59d83a1c38869b1e1a4f957eb939aaa8a342721] tcg/aarch64: Reorg goto_tb implementation
+git bisect good d59d83a1c38869b1e1a4f957eb939aaa8a342721
+# first bad commit: [20b6643324a79860dcdfe811ffe4a79942bca21e] tcg/ppc: Reorg goto_tb implementation
+```
+
+gdb backtrace output:
+
+```
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  0x00007fff4becfa8c in ?? ()
+[Current thread is 1 (Thread 0x7fff9e80e780 (LWP 31456))]
+(gdb) bt
+#0  0x00007fff4becfa8c in  ()
+#1  0x00007fff5682d044 in code_gen_buffer ()
+#2  0x000000013e3224ec in cpu_tb_exec (cpu=cpu@entry=0x16144fb70, itb=itb@entry=0x7fff5682cf00 <code_gen_buffer+111332932>, tb_exit=tb_exit@entry=0x7fff9e80d7f0) at ../accel/tcg/cpu-exec.c:438
+#3  0x000000013e322ad4 in cpu_loop_exec_tb (tb_exit=0x7fff9e80d7f0, last_tb=<synthetic pointer>, pc=13835058055286981664, tb=0x7fff5682cf00 <code_gen_buffer+111332932>, cpu=<optimized out>)
+    at ../accel/tcg/cpu-exec.c:871
+#4  cpu_exec_loop (cpu=cpu@entry=0x16144fb70, sc=sc@entry=0x7fff9e80d940) at ../accel/tcg/cpu-exec.c:981
+#5  0x000000013e3234e8 in cpu_exec_setjmp (cpu=cpu@entry=0x16144fb70, sc=sc@entry=0x7fff9e80d940) at ../accel/tcg/cpu-exec.c:1012
+#6  0x000000013e323e64 in cpu_exec (cpu=0x16144fb70) at ../accel/tcg/cpu-exec.c:1038
+#7  0x000000013e35bba0 in tcg_cpus_exec (cpu=0x16144fb70) at ../accel/tcg/tcg-accel-ops.c:69
+#8  0x000000013e35bd90 in mttcg_cpu_thread_fn (arg=0x16144fb70) at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#9  0x000000013e57193c in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:505
+#10 0x00007fffa12aa0f0 in start_thread (arg=0x7fff9e80e780) at pthread_create.c:443
+#11 0x00007fffa1352ec8 in clone () at ../sysdeps/unix/sysv/linux/powerpc/powerpc64/clone.S:107
+```
+For any further additional information contact me at : anushree.mathur@linux.vnet.ibm.com

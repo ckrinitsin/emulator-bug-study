@@ -1,0 +1,82 @@
+In-guest ROCm tests fail with multiple AMD GPUs passed through (bisected to SeaBIOS update)
+Description of problem:
+We got a report of a VM setup with 8 passed-through AMD GPUs that works well with QEMU 8.1.5, but has issues with QEMU 8.2.2 (see below for details). A QEMU bisect points to commit [14f5a7ba](https://gitlab.com/qemu-project/qemu/-/commit/14f5a7bae4cb5ca45a03e16b5bb0c5d766fd51b7) which updated the seabios snapshot.
+Even though Proxmox VE comes with its own packaged QEMU versions, for bisecting we used the [upstream repository](https://gitlab.com/qemu-project/qemu).
+
+Bisecting seabios between rel-1.16.2 and rel-1.16.3 brought the following 2 commits to attention:
+
+[bcfed7e2](https://gitlab.com/qemu-project/seabios/-/commit/bcfed7e270776ab5595cafc6f1794bea0cae1c6c) move 64bit pci window to end of address space
+
+[96a8d130](https://gitlab.com/qemu-project/seabios/-/commit/96a8d130a8c2e908e357ce62cd713f2cc0b0a2eb) be less conservative with the 64bit pci io window
+
+
+
+Since bcfed7e2 resulted in KVM errors when trying to start the guest, we could not narrow it down to a single commit. With 96a8d130 the issues in the guest began.
+
+The issues in the guest were reproduced by running some ROCm tests in the guest using all 8 GPUs. We had no insight into the tests in question, they, as well as the test setup, were provided by one of our customers. The failing test was a DeepSpeed test using all 8 GPUs.
+
+We're not sure if it's a driver issue in the guest (AMDGPU and ROCm 6.1.x and 6.2.1 tested), a hardware issue or a seabios issue. Since we narrowed it down to these commits (QEMU, seabios) we wanted to open an issue here first. 
+
+The in-guest kernel warning received seems to indicate an issue with the driver::
+```
+kernel: ------------[ cut here ]------------
+kernel: WARNING: CPU: 2 PID: 149 at /tmp/amd.eT2ZshuE/ttm/ttm_bo.c:687 amdttm_bo_unpin+0x72/0x90 [amdttm]
+kernel: Modules linked in: veth tls xt_conntrack nft_chain_nat xt_MASQUERADE nf_nat nf_conntrack_netlink nf_conntrack nf_defrag_ipv6 nf_defrag_ipv4 xfrm_user xfrm_algo xt_addrtype nft_compat n>
+kernel:  libahci video wmi i2c_algo_bit hid_generic usbhid hid aesni_intel crypto_simd cryptd
+kernel: CPU: 2 PID: 149 Comm: kworker/2:1 Tainted: G           OE      6.8.0-45-generic #45-Ubuntu
+kernel: Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.16.3-0-ga6ed6b701f0a-prebuilt.qemu.org 04/01/2014
+kernel: Workqueue: kfd_process_wq kfd_process_wq_release [amdgpu]
+kernel: RIP: 0010:amdttm_bo_unpin+0x72/0x90 [amdttm]
+kernel: Code: 89 de e8 01 56 00 00 48 8b bb 60 01 00 00 48 81 c7 40 08 00 00 e8 6e 72 89 d2 48 8b 5d f8 c9 31 c0 31 f6 31 ff e9 79 54 b5 d2 <0f> 0b 48 8b 5d f8 c9 31 c0 31 f6 31 ff e9 67 54 b5>
+kernel: RSP: 0018:ffffa03380687ca0 EFLAGS: 00010246
+kernel: RAX: 0000000000000000 RBX: ffff8ed6191b6848 RCX: 0000000000000000
+kernel: RDX: 0000000000000000 RSI: 0000000000000000 RDI: ffff8ed6191b6848
+kernel: RBP: ffffa03380687ca8 R08: 0000000000000000 R09: 0000000000000000
+kernel: R10: 0000000000000000 R11: 0000000000000000 R12: ffff8ed62268ef38
+kernel: R13: ffff8ed6014fc800 R14: ffff8ed6015f0400 R15: ffff8ed60109b000
+kernel: FS:  0000000000000000(0000) GS:ffff8ef4ff700000(0000) knlGS:0000000000000000
+kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+kernel: CR2: 00007f923c000020 CR3: 00000106f083c006 CR4: 0000000000770ef0
+kernel: PKRU: 55555554
+kernel: Call Trace:
+kernel:  <TASK>
+kernel:  ? show_regs+0x6d/0x80
+kernel:  ? __warn+0x89/0x160
+kernel:  ? amdttm_bo_unpin+0x72/0x90 [amdttm]
+kernel:  ? report_bug+0x17e/0x1b0
+kernel:  ? handle_bug+0x51/0xa0
+kernel:  ? exc_invalid_op+0x18/0x80
+kernel:  ? asm_exc_invalid_op+0x1b/0x20
+kernel:  ? amdttm_bo_unpin+0x72/0x90 [amdttm]
+kernel:  amdgpu_bo_unpin+0x1f/0xb0 [amdgpu]
+kernel:  amdgpu_amdkfd_gpuvm_unpin_bo+0x35/0xd0 [amdgpu]
+kernel:  amdgpu_amdkfd_gpuvm_free_memory_of_gpu+0x3ea/0x460 [amdgpu]
+kernel:  kfd_process_device_free_bos+0xb7/0x150 [amdgpu]
+kernel:  kfd_process_wq_release+0x2db/0x410 [amdgpu]
+kernel:  process_one_work+0x16f/0x350
+kernel:  worker_thread+0x306/0x440
+kernel:  ? srso_alias_return_thunk+0x5/0xfbef5
+kernel:  ? _raw_spin_unlock_irqrestore+0x11/0x60
+kernel:  ? __pfx_worker_thread+0x10/0x10
+kernel:  kthread+0xf2/0x120
+kernel:  ? __pfx_kthread+0x10/0x10
+kernel:  ret_from_fork+0x47/0x70
+kernel:  ? __pfx_kthread+0x10/0x10
+kernel:  ret_from_fork_asm+0x1b/0x30
+kernel:  </TASK>
+kernel: ---[ end trace 0000000000000000 ]---
+```
+
+Does anyone have an idea how to troubleshoot this further? If any more information or logs are required, we can try to provide them.
+Steps to reproduce:
+Sadly we can't provide steps since we only had the customer's setup that included a proprietary docker image.
+Additional information:
+We used the options `-chardev pipe,path=qemudebugpipe,id=seabios -device isa-debugcon,iobase=0x402,chardev=seabios` specified in [0] to gather some debug logs from seabios:
+
+The non-working one is from commit `96a8d130` while the working one is from an earlier version.
+
+[seabios.log](/uploads/4d7f43213c631fb5cf6aea519bfd79ad/seabios.log)
+[seabios_working.log](/uploads/978e6c56ff8784bb5639963c9fb0c93f/seabios_working.log)
+
+
+[0] https://gitlab.com/qemu-project/seabios/-/blob/master/docs/Debugging.md?ref_type=heads

@@ -20,4 +20,14 @@ def output_issue(issue : dict) -> None:
     target_label = find_label(labels, "target")
     host_label = find_label(labels, "host")
     accel_label = find_label(labels, "accel")
-    write_file(f"issues/{target_label}/{host_label}/{accel_label}/{issue_id}.toml", toml_string)
+    write_file(f"issues_toml/{target_label}/{host_label}/{accel_label}/{issue_id}.toml", toml_string)
+
+    text_path = f"issues_text/{target_label}/{host_label}/{accel_label}/{issue_id}"
+    write_file(text_path, issue['title'] + "\n")
+    with open(text_path, "a") as file:
+        if issue['description'] != "n/a":
+            file.write("Description of problem:\n" + issue['description'] + "\n")
+        if issue['reproduce'] != "n/a":
+            file.write("Steps to reproduce:\n" + issue['reproduce'] + "\n")
+        if issue['additional'] != "n/a":
+            file.write("Additional information:\n" + issue['additional'] + "\n")

@@ -1,0 +1,1357 @@
+segfault/errors in gdbstub with linux userspace emulator (qemu-riscv64), from racy behavior with singal handler?
+Description of problem:
+Often, qemu segfaults, sometimes GDB just spits out a wall of "Ignoring packet error, continuing..." and ~hangs: I don't get a GDB command prompt quickly, if at all, and when I ctrl-c I see "The target is not responding to GDB commands. Stop debugging it? (y or n)".
+Steps to reproduce:
+1. Run the `testb3` binary from below as described
+2. Connect via GDB and `continue`
+3. Multiple threads (independently) SIGABRT themselves when they fail their test(s), which happens quickly on my machine (which has 16 physical cores)
+Additional information:
+From the coredump, it looks like there's a lot of cooks in the gdbstub kitchen:
+
+```
+  Id   Target Id                           Frame 
+* 1    Thread 0x7febc02ef6c0 (LWP 3922802) gdb_next_attached_cpu () at ../qemu-8.0.0/gdbstub/gdbstub.c:282
+  2    Thread 0x7febc06db6c0 (LWP 3922792) safe_syscall_base ()
+    at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+  3    Thread 0x7febc03b26c0 (LWP 3922799) 0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+  4    Thread 0x7febc0f5d6c0 (LWP 3922751) 0x00007febc16e80dd in syscall () from /usr/lib/libc.so.6
+  5    Thread 0x7febc0f5ebc0 (LWP 3922750) safe_syscall_base ()
+    at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+  6    Thread 0x7febc01696c0 (LWP 3922808) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  7    Thread 0x7febc04f76c0 (LWP 3922794) 0x00007febc16f1d4c in send () from /usr/lib/libc.so.6
+  8    Thread 0x7febc026d6c0 (LWP 3922804) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  9    Thread 0x7febc01aa6c0 (LWP 3922807) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  10   Thread 0x7febc075c6c0 (LWP 3922793) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  11   Thread 0x7febc04756c0 (LWP 3922796) 0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+  12   Thread 0x7febc01eb6c0 (LWP 3922806) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  13   Thread 0x7febc022c6c0 (LWP 3922805) 0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+  14   Thread 0x7febc03f36c0 (LWP 3922798) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  15   Thread 0x7febc04346c0 (LWP 3922797) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  16   Thread 0x7febc03716c0 (LWP 3922800) 0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+  17   Thread 0x7febc04b66c0 (LWP 3922795) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  18   Thread 0x7febc02ae6c0 (LWP 3922803) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+  19   Thread 0x7febc03306c0 (LWP 3922801) 0x00007febc16de96c in read () from /usr/lib/libc.so.6
+```
+
+Each of those `read` and `send` threads look something similar to this one:
+
+```
+Thread 19 (Thread 0x7febc03306c0 (LWP 3922801)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+```
+
+Which, at a guess, seems like there's maybe 20 different concurrent processes fighting over the singular [gdbstub state](https://gitlab.com/qemu-project/qemu/-/blob/master/gdbstub/gdbstub.c#L57)? Specifically, they're all stomping on each other by writing to the same [buffer](https://gitlab.com/qemu-project/qemu/-/blob/master/gdbstub/user.c#L136) and advancing the [current CPU list pointer](https://gitlab.com/qemu-project/qemu/-/blob/master/gdbstub/gdbstub.c#L1422), which causes the "bad packet" cross-talk and the segfault respectively.
+
+<details><summary>full backtrace</summary>
+
+```
+(gdb) thread apply all bt full
+
+Thread 19 (Thread 0x7febc03306c0 (LWP 3922801)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 18 (Thread 0x7febc02ae6c0 (LWP 3922803)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 17 (Thread 0x7febc04b66c0 (LWP 3922795)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 16 (Thread 0x7febc03716c0 (LWP 3922800)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 15 (Thread 0x7febc04346c0 (LWP 3922797)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 14 (Thread 0x7febc03f36c0 (LWP 3922798)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 13 (Thread 0x7febc022c6c0 (LWP 3922805)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 12 (Thread 0x7febc01eb6c0 (LWP 3922806)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 11 (Thread 0x7febc04756c0 (LWP 3922796)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 10 (Thread 0x7febc075c6c0 (LWP 3922793)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 9 (Thread 0x7febc01aa6c0 (LWP 3922807)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 8 (Thread 0x7febc026d6c0 (LWP 3922804)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 7 (Thread 0x7febc04f76c0 (LWP 3922794)):
+#0  0x00007febc16f1d4c in send () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a994a in gdb_put_buffer () at ../qemu-8.0.0/gdbstub/user.c:82
+No locals.
+#2  0x00005582273aad23 in gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:161
+No locals.
+#3  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#4  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#5  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#6  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#7  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#8  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#9  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#10 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#11 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#12 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#13 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#14 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#15 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#16 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#17 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#18 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 6 (Thread 0x7febc01696c0 (LWP 3922808)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 5 (Thread 0x7febc0f5ebc0 (LWP 3922750)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+No locals.
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+No locals.
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+No locals.
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+No locals.
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+No locals.
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+No locals.
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+No locals.
+#7  0x000055822728bfa1 in main () at ../qemu-8.0.0/linux-user/main.c:962
+No locals.
+
+Thread 4 (Thread 0x7febc0f5d6c0 (LWP 3922751)):
+#0  0x00007febc16e80dd in syscall () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273cdcb3 in qemu_futex_wait () at /usr/src/debug/qemu/qemu-8.0.0/include/qemu/futex.h:29
+No locals.
+#2  qemu_event_wait () at ../qemu-8.0.0/util/qemu-thread-posix.c:464
+No locals.
+#3  0x00005582273d83ad in call_rcu_thread () at ../qemu-8.0.0/util/rcu.c:261
+No locals.
+#4  0x00005582273cde58 in qemu_thread_start () at ../qemu-8.0.0/util/qemu-thread-posix.c:541
+No locals.
+#5  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#6  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 3 (Thread 0x7febc03b26c0 (LWP 3922799)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 2 (Thread 0x7febc06db6c0 (LWP 3922792)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+No locals.
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+No locals.
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+No locals.
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+No locals.
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+No locals.
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+No locals.
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+No locals.
+#7  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#8  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#9  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 1 (Thread 0x7febc02ef6c0 (LWP 3922802)):
+#0  gdb_next_attached_cpu () at ../qemu-8.0.0/gdbstub/gdbstub.c:282
+No locals.
+#1  0x00005582273ab774 in handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1411
+No locals.
+#2  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#3  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#4  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#5  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#6  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#7  gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#8  gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#9  0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#10 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#11 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#12 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#13 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#14 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#15 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+(gdb) thread apply all bt 
+
+Thread 19 (Thread 0x7febc03306c0 (LWP 3922801)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 18 (Thread 0x7febc02ae6c0 (LWP 3922803)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 17 (Thread 0x7febc04b66c0 (LWP 3922795)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 16 (Thread 0x7febc03716c0 (LWP 3922800)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 15 (Thread 0x7febc04346c0 (LWP 3922797)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 14 (Thread 0x7febc03f36c0 (LWP 3922798)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 13 (Thread 0x7febc022c6c0 (LWP 3922805)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 12 (Thread 0x7febc01eb6c0 (LWP 3922806)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 11 (Thread 0x7febc04756c0 (LWP 3922796)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 10 (Thread 0x7febc075c6c0 (LWP 3922793)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 9 (Thread 0x7febc01aa6c0 (LWP 3922807)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 8 (Thread 0x7febc026d6c0 (LWP 3922804)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 7 (Thread 0x7febc04f76c0 (LWP 3922794)):
+#0  0x00007febc16f1d4c in send () from /usr/lib/libc.so.6
+#1  0x00005582273a994a in gdb_put_buffer () at ../qemu-8.0.0/gdbstub/user.c:82
+#2  0x00005582273aad23 in gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:161
+#3  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+#4  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+#5  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#6  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#7  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#8  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#9  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#10 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#11 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#12 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#13 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#14 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#15 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#16 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#17 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#18 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 6 (Thread 0x7febc01696c0 (LWP 3922808)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 5 (Thread 0x7febc0f5ebc0 (LWP 3922750)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+#7  0x000055822728bfa1 in main () at ../qemu-8.0.0/linux-user/main.c:962
+
+Thread 4 (Thread 0x7febc0f5d6c0 (LWP 3922751)):
+#0  0x00007febc16e80dd in syscall () from /usr/lib/libc.so.6
+#1  0x00005582273cdcb3 in qemu_futex_wait () at /usr/src/debug/qemu/qemu-8.0.0/include/qemu/futex.h:29
+#2  qemu_event_wait () at ../qemu-8.0.0/util/qemu-thread-posix.c:464
+#3  0x00005582273d83ad in call_rcu_thread () at ../qemu-8.0.0/util/rcu.c:261
+#4  0x00005582273cde58 in qemu_thread_start () at ../qemu-8.0.0/util/qemu-thread-posix.c:541
+#5  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#6  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 3 (Thread 0x7febc03b26c0 (LWP 3922799)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 2 (Thread 0x7febc06db6c0 (LWP 3922792)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+#7  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#8  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#9  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+
+Thread 1 (Thread 0x7febc02ef6c0 (LWP 3922802)):
+#0  gdb_next_attached_cpu () at ../qemu-8.0.0/gdbstub/gdbstub.c:282
+#1  0x00005582273ab774 in handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1411
+#2  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#3  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+#4  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+#5  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+#6  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+#7  gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+#8  gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+#9  0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+#10 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+#11 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+#12 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+#13 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+#14 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+#15 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+(gdb) thread apply all bt full
+
+Thread 19 (Thread 0x7febc03306c0 (LWP 3922801)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 18 (Thread 0x7febc02ae6c0 (LWP 3922803)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 17 (Thread 0x7febc04b66c0 (LWP 3922795)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 16 (Thread 0x7febc03716c0 (LWP 3922800)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 15 (Thread 0x7febc04346c0 (LWP 3922797)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 14 (Thread 0x7febc03f36c0 (LWP 3922798)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 13 (Thread 0x7febc022c6c0 (LWP 3922805)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 12 (Thread 0x7febc01eb6c0 (LWP 3922806)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 11 (Thread 0x7febc04756c0 (LWP 3922796)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 10 (Thread 0x7febc075c6c0 (LWP 3922793)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 9 (Thread 0x7febc01aa6c0 (LWP 3922807)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 8 (Thread 0x7febc026d6c0 (LWP 3922804)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 7 (Thread 0x7febc04f76c0 (LWP 3922794)):
+#0  0x00007febc16f1d4c in send () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a994a in gdb_put_buffer () at ../qemu-8.0.0/gdbstub/user.c:82
+No locals.
+#2  0x00005582273aad23 in gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:161
+No locals.
+#3  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#4  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#5  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#6  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#7  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#8  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#9  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#10 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#11 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#12 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#13 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#14 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#15 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#16 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#17 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#18 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 6 (Thread 0x7febc01696c0 (LWP 3922808)):
+#0  0x00007febc16de96c in read () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273ae6ce in read () at /usr/include/bits/unistd.h:38
+No locals.
+#2  gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:148
+No locals.
+#3  0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#4  0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#5  0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#6  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#7  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#8  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 5 (Thread 0x7febc0f5ebc0 (LWP 3922750)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+No locals.
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+No locals.
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+No locals.
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+No locals.
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+No locals.
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+No locals.
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+No locals.
+#7  0x000055822728bfa1 in main () at ../qemu-8.0.0/linux-user/main.c:962
+No locals.
+
+Thread 4 (Thread 0x7febc0f5d6c0 (LWP 3922751)):
+#0  0x00007febc16e80dd in syscall () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273cdcb3 in qemu_futex_wait () at /usr/src/debug/qemu/qemu-8.0.0/include/qemu/futex.h:29
+No locals.
+#2  qemu_event_wait () at ../qemu-8.0.0/util/qemu-thread-posix.c:464
+No locals.
+#3  0x00005582273d83ad in call_rcu_thread () at ../qemu-8.0.0/util/rcu.c:261
+No locals.
+#4  0x00005582273cde58 in qemu_thread_start () at ../qemu-8.0.0/util/qemu-thread-posix.c:541
+No locals.
+#5  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#6  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 3 (Thread 0x7febc03b26c0 (LWP 3922799)):
+#0  0x00007febc16f1b1c in recv () from /usr/lib/libc.so.6
+No symbol table info available.
+#1  0x00005582273a9882 in recv () at /usr/include/bits/socket2.h:38
+No locals.
+#2  gdb_get_char () at ../qemu-8.0.0/gdbstub/user.c:39
+No locals.
+#3  0x00005582273aad28 in gdb_got_immediate_ack () at ../qemu-8.0.0/gdbstub/user.c:62
+No locals.
+#4  gdb_put_packet_binary () at ../qemu-8.0.0/gdbstub/gdbstub.c:164
+No locals.
+#5  0x00005582273ab768 in gdb_put_strbuf () at ../qemu-8.0.0/gdbstub/gdbstub.c:181
+No locals.
+#6  handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1410
+No locals.
+#7  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#8  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#9  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#10 0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#11 0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#12 gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#13 gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#14 0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#15 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#16 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#17 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#18 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#19 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#20 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 2 (Thread 0x7febc06db6c0 (LWP 3922792)):
+#0  safe_syscall_base () at ../qemu-8.0.0/common-user/host/x86_64/safe-syscall.inc.S:75
+No locals.
+#1  0x00005582274134c2 in safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:678
+No locals.
+#2  do_safe_futex () at ../qemu-8.0.0/linux-user/syscall.c:7804
+No locals.
+#3  do_futex () at ../qemu-8.0.0/linux-user/syscall.c:7891
+No locals.
+#4  0x00005582274191fa in do_syscall1.constprop.0 () at ../qemu-8.0.0/linux-user/syscall.c:12476
+No locals.
+#5  0x00005582273a2a22 in do_syscall () at ../qemu-8.0.0/linux-user/syscall.c:13375
+No locals.
+#6  0x000055822729644c in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:55
+No locals.
+#7  0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#8  0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#9  0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+Thread 1 (Thread 0x7febc02ef6c0 (LWP 3922802)):
+#0  gdb_next_attached_cpu () at ../qemu-8.0.0/gdbstub/gdbstub.c:282
+No locals.
+#1  0x00005582273ab774 in handle_query_threads () at ../qemu-8.0.0/gdbstub/gdbstub.c:1411
+No locals.
+#2  0x000055822741cb78 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#3  0x00005582273abad6 in handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1673
+No locals.
+#4  handle_gen_query () at ../qemu-8.0.0/gdbstub/gdbstub.c:1661
+No locals.
+#5  0x000055822741cbb3 in process_string_cmd.constprop.0 () at ../qemu-8.0.0/gdbstub/gdbstub.c:838
+No locals.
+#6  0x00005582273ae272 in run_cmd_parser () at ../qemu-8.0.0/gdbstub/gdbstub.c:856
+No locals.
+#7  gdb_handle_packet () at ../qemu-8.0.0/gdbstub/gdbstub.c:1953
+No locals.
+#8  gdb_read_byte () at ../qemu-8.0.0/gdbstub/gdbstub.c:2113
+No locals.
+#9  0x00005582273ae6ec in gdb_handlesig () at ../qemu-8.0.0/gdbstub/user.c:153
+No locals.
+#10 0x00005582273919fb in handle_pending_signal () at ../qemu-8.0.0/linux-user/signal.c:1042
+No locals.
+#11 0x0000558227391dd2 in process_pending_signals () at ../qemu-8.0.0/linux-user/signal.c:1153
+No locals.
+#12 0x00005582272964b8 in cpu_loop () at ../qemu-8.0.0/linux-user/riscv/cpu_loop.c:93
+No locals.
+#13 0x00005582273a1d15 in clone_func () at ../qemu-8.0.0/linux-user/syscall.c:6621
+No locals.
+#14 0x00007febc166dbb5 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+#15 0x00007febc16efd90 in ?? () from /usr/lib/libc.so.6
+No symbol table info available.
+
+```
+
+</details>
+
+
+
+- coredump
+    - [core.qemu-riscv64.1000.efb558e6104b4cc5bfa37605fc9af294.3922750.1685497956000000.zst](/uploads/071fc96520ca4008941044802c176d6a/core.qemu-riscv64.1000.efb558e6104b4cc5bfa37605fc9af294.3922750.1685497956000000.zst)
+    - [qemu-riscv64](/uploads/f203d5aed8559d80c2d66e439bb4dddf/qemu-riscv64) (the binary the coredump was generated from)
+    - download both, extract corefile, use `DEBUGINFOD_URLS=https://debuginfod.archlinux.org gdb /path/to/qemu-riscv64 -c /tmp/coredump` to debug
+- reproducer
+    - [testb3.tar.xz](/uploads/84bdbb547e01527c3d804e0d88c6c9fe/testb3.tar.xz) (includes testb3 + sysroot to work with command line above)
+    - This binary is a cross-compiled `testb3` from [WebKit](https://github.com/WebKit/WebKit/blob/9755847ab1d40841374b2467b3036d943b723183/Source/JavaScriptCore/b3/testb3_1.cpp#L927) ; sorry, that's about all I know about it so far
+    - A GDB you might use to connect is [SiFive's](https://static.dev.sifive.com/dev-tools/riscv64-unknown-elf-gcc-8.1.0-2019.01.0-x86_64-linux-ubuntu14.tar.gz). I got more consistent segfaults with a more recent gdb (12.1), but I'm not sure how to tell you how to get that `gdb` besides "creating a riscv64 poky distribution" (what I did), which is likely not helpful.

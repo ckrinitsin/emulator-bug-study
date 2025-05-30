@@ -1,0 +1,42 @@
+Can't bind PCI device behind a PCI bridge (No such device)
+Description of problem:
+Qemu fails to assign the device with :
+```
+qemu-system-x86_64: -device vfio-pci,host=3b:00.0: vfio 0000:3b:00.0: error getting device from group 72: No such device
+Verify all devices in group 72 are bound to vfio-<bus> or pci-stub and not already in use
+```
+
+Looking at strace, we can see that the device is behind a PCI bridge:
+```
+lstat("/sys", {st_mode=S_IFDIR|0555, st_size=0, ...}) = 0
+lstat("/sys/bus", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/bus/pci", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/bus/pci/devices", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/bus/pci/devices/0000:3b:00.0", {st_mode=S_IFLNK|0777, st_size=0, ...}) = 0
+readlink("/sys/bus/pci/devices/0000:3b:00.0", "../../../devices/pci0000:3a/0000"..., 4095) = 53
+lstat("/sys/devices", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/devices/pci0000:3a", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/devices/pci0000:3a/0000:3a:02.0", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/devices/pci0000:3a/0000:3a:02.0/0000:3b:00.0", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/devices/pci0000:3a/0000:3a:02.0/0000:3b:00.0/subsystem", {st_mode=S_IFLNK|0777, st_size=0, ...}) = 0
+readlink("/sys/devices/pci0000:3a/0000:3a:02.0/0000:3b:00.0/subsystem", "../../../../bus/pci", 4095) = 19
+lstat("/sys/bus", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+lstat("/sys/bus/pci", {st_mode=S_IFDIR|0755, st_size=0, ...}) = 0
+ioctl(14, VFIO_GROUP_GET_DEVICE_FD, 0x56267b3b1320) = -1 ENODEV (No such device)
+```
+
+The issue is that the PCI bridge `0000:3a:02.0`, is used by "pcieport" kernel driver and not "vfio-pci".
+After manually unbinding the PCI bridge from it's driver and binding it to vfio-pci qemu successfully attaches it to the VM.
+
+I saw online that qemu is suposed to automaticly unbind devices from the host, make them available to the VM and restore them to their previous state once the VM is shutdown. 
+This is not happening here.
+Steps to reproduce:
+1. Have a PCI device behind a PCI bridge
+2. Launch a VM with the PCI device attached
+3. Observe similar error messages
+Additional information:
+After reading [kernel vfio doc](https://www.kernel.org/doc/html/latest/driver-api/vfio.html#vfio-usage-example), I can see that `ls -l /sys/bus/pci/devices/0000:3b:00.0/iommu_group/devices` was supposed to list the PCI bridge, but it is not the case for me.
+
+I could only notice the presence of the bridge by looking in the `/sys/bus/pci/devices/0000:3b:00.0` symlink.
+
+Maybe qemu misses it because of that ?

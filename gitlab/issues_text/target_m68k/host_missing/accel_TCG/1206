@@ -1,0 +1,96 @@
+68k: movew %sp@+,%sr does not restore USP if switching from Supervisor to User mode
+Description of problem:
+Debugging issues with MacOS under qemu-system-m68k shows that the `movew %sp@+,%sr` instruction does not restore USP if switching from Supervisor to User mode. I've created a reproducer at https://gitlab.com/mcayland/qemu/-/commits/68k-move-to-sr-bug ([diff from git master](https://gitlab.com/mcayland/qemu/-/commit/fbcd078946c0e582bf8f1ac9a5a3a31cda2e6c38.diff)) which uses the following code snippet:
+
+```
+0x40800000 in MYROM ()
+warning: shared library handler failed to enable breakpoint
+(gdb) disas $pc $pc+0x20
+Dump of assembler code from 0x40800000 to 0x40800020:
+0x40800000 <MYROM+0>:   lea 0x6000,%a0
+0x40800006 <MYROM+6>:   movel %a0,%usp
+0x40800008 <MYROM+8>:   movew %sr,%d0
+0x4080000a <MYROM+10>:  andiw #8191,%d0
+0x4080000e <MYROM+14>:  movew %d0,%sp@-
+0x40800010 <MYROM+16>:  movew %sp@+,%sr
+0x40800012 <MYROM+18>:  bras 0x40800012 <MYROM+18>
+```
+
+Initially the ISP is set to 0x1000 in supervisor mode: the code above loads 0x6000 into %usp, moves the SR register into d0, clears the supervisor bit, and pushes the new SR value onto the stack. Finally the `movew %sp@+,%sr` instruction is executed which switches from supervisor mode to user mode but the resulting %sp is still the ISP value and not the USP:
+
+```
+0x40800000 in MYROM ()
+warning: shared library handler failed to enable breakpoint
+(gdb) stepi
+0x40800006 in MYROM ()
+(gdb) 
+0x40800008 in MYROM ()
+(gdb) 
+0x4080000a in MYROM ()
+(gdb) 
+0x4080000e in MYROM ()
+(gdb)
+0x40800010 in MYROM ()
+(gdb)
+0x40800010 in MYROM ()
+(gdb) i r $ps $sp
+ps             0x2700   9984
+sp             0xffe    0xffe
+(gdb) stepi      
+0x40800012 in MYROM ()
+(gdb) i r $ps $sp
+ps             0x700    1792
+sp             0x1000   0x1000    <-- should be 0x6000
+```
+
+Analysis with gdb shows that the `set_sr` helper is calling `m68k_switch_sp()` correctly but the resulting value is not seen in the guest:
+
+```
+Thread 3 "qemu-system-m68" hit Breakpoint 1, m68k_switch_sp (env=0x62d000030ae0) at ../target/m68k/helper.c:462
+462         env->sp[env->current_sp] = env->aregs[7];
+(gdb) p/x env->aregs[7]
+$1 = 0xffe
+(gdb) n
+463         if (m68k_feature(env, M68K_FEATURE_M68000)) {
+(gdb) 
+464             if (env->sr & SR_S) {
+(gdb) 
+472                 new_sp = M68K_USP;
+(gdb) 
+478         env->aregs[7] = env->sp[new_sp];
+(gdb) 
+479         env->current_sp = new_sp;
+(gdb) 
+480     }
+(gdb) p/x env->aregs[7]
+$2 = 0x6000
+```
+
+The bug seems to be caused by the post-increment operator clobbering the stack pointer with the ISP after the instruction has been translated:
+
+```
+IN: 
+0x40800010:  movew %sp@+,%sr
+
+OP:
+ ld_i32 tmp0,env,$0xfffffffffffffff0
+ brcond_i32 tmp0,$0x0,lt,$L0
+
+ ---- 40800010 00000000
+ mov_i32 tmp0,$0x1
+ st_i32 tmp0,env,$0xfffffffffffffc18
+ qemu_ld_i32 tmp0,A7,leuw,0
+ bswap16_i32 tmp0,tmp0,iz,oz
+ add_i32 tmp3,A7,$0x2
+ call set_sr,$0x0,$0,env,tmp0
+ mov_i32 CC_OP,$0x1
+ mov_i32 PC,$0x40800012
+ mov_i32 A7,tmp3
+ exit_tb $0x0
+ set_label $L0
+ exit_tb $0x7fe118f30043
+```
+
+Here tmp3 which is generated from the ISP is written back to A7 **after** `set_sr` has switched the stack pointer. This appears to be part of the `delay_set_areg` mechanism which was introduced in 8a1e52b69d ("target-m68k: Delay autoinc writeback").
+
+From what I can see it isn't possible to easily change the order of the `set_sr` helper and applying the post-increment since the post-increment is handled automatically after the instruction is translated as part of `do_writebacks()`.

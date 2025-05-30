@@ -1,0 +1,59 @@
+Heap-use-after-free in remote_object_finalize
+Description of problem:
+While I was working with `QIOChannel` in my downstream QEMU fork, I looked at `hw/remote/remote-obj.c` as a usage example.
+
+I did the same thing to `remote_object_finalize` function in order to free the QIOChannel when the connection closed:
+
+```c
+    if (o->ioc) {
+        qio_channel_shutdown(o->ioc, QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
+        qio_channel_close(o->ioc, NULL);
+    }
+
+    object_unref(OBJECT(o->ioc));
+```
+
+After the connection is closed for a while, my program SIGSEGV:
+
+```
+Thread 2 Crashed:
+0   qemu-system-aarch64           	0x000000010164513c qemu_coroutine_get_aio_context + 12 (qemu-coroutine.c:203)
+1   qemu-system-aarch64           	0x000000010145ad82 qio_channel_restart_read + 50
+2   qemu-system-aarch64           	0x0000000101614c8a aio_dispatch_handler + 378 (aio-posix.c:332)
+3   qemu-system-aarch64           	0x0000000101613fad aio_dispatch_handlers + 125 (aio-posix.c:372)
+4   qemu-system-aarch64           	0x0000000101613ef3 aio_dispatch + 51 (aio-posix.c:383)
+5   qemu-system-aarch64           	0x0000000101631e18 aio_ctx_dispatch + 104 (async.c:307)
+6   libglib-2.0.0.dylib           	0x000000010284b90c g_main_context_dispatch + 364
+7   qemu-system-aarch64           	0x0000000101644728 glib_pollfds_poll + 88 (main-loop.c:233)
+8   qemu-system-aarch64           	0x0000000101644170 os_host_main_loop_wait + 128 (main-loop.c:256)
+9   qemu-system-aarch64           	0x000000010164403c main_loop_wait + 188 (main-loop.c:530)
+10  qemu-system-aarch64           	0x00000001012f3014 qemu_main_loop + 36 (runstate.c:721)
+11  qemu-system-aarch64           	0x0000000100c25e38 qemu_main + 40 (main.c:51)
+12  qemu-system-aarch64           	0x0000000100c7b1f4 call_qemu_main + 52 (cocoa.m:1746)
+13  qemu-system-aarch64           	0x000000010161a459 qemu_thread_start + 185 (qemu-thread-posix.c:521)
+14  libsystem_pthread.dylib       	0x00007fff6a6e2109 _pthread_start + 148
+15  libsystem_pthread.dylib       	0x00007fff6a6ddb8b thread_start + 15
+```
+
+So apparently, there is a dangling pointer of the QIOChannel in AIOContext.
+
+And indeed, that caused by the fact that when the fd read/write is blocked, it sets the fd handlers to the AIO context before yielding the coroutine (https://gitlab.com/qemu-project/qemu/-/blob/master/io/channel.c#L544).
+
+So after the fd is closed, the AIO still dispatches the fd readable event when the main loop dispatches again, using the dangling QIOChannel pointer (When the fd is reused I think).
+
+I suggest adding a `qio_channel_detach_aio_context()` call before the channel is shutdown in `remote-obj.c`, or before the fd is closed in `qio_channel_close()` in `io/channel.c`
+
+```c
+
+    if (o->ioc) {
+        qio_channel_detach_aio_context(o->ioc);
+        qio_channel_shutdown(o->ioc, QIO_CHANNEL_SHUTDOWN_BOTH, NULL);
+        qio_channel_close(o->ioc, NULL);
+    }
+
+    object_unref(OBJECT(o->ioc));
+```
+
+This bug might have slipped through the cracks because `mpqemu_remote_msg_loop_co` issues a shutdown request immediately after an I/O error occured on the QIOChannel.
+Additional information:
+

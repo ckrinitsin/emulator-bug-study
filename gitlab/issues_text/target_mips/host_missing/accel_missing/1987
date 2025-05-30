@@ -1,0 +1,48 @@
+snapshot: main thread hangs for a while after 'loadvm'
+Description of problem:
+When I was testing qemu snapshots, I found that after the `loadvm` command, the virtual machine would often get stuck for a while, and it can **resume execution after I enter some characters into the terminal**, this is weird because my guest system doesn't need to accept input.
+
+After some debugging, I found that the guest kernel is executing a `wait` instruction in `__r4k_wait()`.
+
+And I found that the main thread usually does not sleep at `qemu_poll_ns()` during normal execution, but after `loadvm`, the timeout is set to a large value (related to the interval time of snapshot operations), causes the main thread to get stuck on 'qemu_poll_ns()'.
+
+After some analysis, I think it is because save/load_snapshot() does not handle timers related to QEMU_CLOCK_VIRTUAL well, such as `mips_timer_cb()`, resulting in incorrect value when calculating timeout.
+Steps to reproduce:
+1. Start emulation and connect monitor
+2. `savevm` and wait for a moment
+3. `loadvm`
+Additional information:
+Stack backtrace of the guest kernel:
+```
+►  0 0x80104d40 __r4k_wait+32
+   1 0x80143cc4 cpu_startup_entry+284
+   2 0x80143cc4 cpu_startup_entry+284
+   3 0x80143cc4 cpu_startup_entry+284
+   4 0x80633fe0 kernel_init
+   5 0x80825cb8 start_kernel+1072
+```
+
+Stack backtrace of the main thread:
+```
+0 0x7ffff74f0a96 ppoll+166
+1 0x555555ea4786 qemu_poll_ns+221
+2 0x555555e9fea7 os_host_main_loop_wait+93
+3 0x555555e9ffd6 main_loop_wait+187
+4 0x555555a644fd qemu_main_loop+46
+5 0x5555557d2b6a qemu_default_main+17
+6 0x5555557d2ba9 main+45
+7 0x7ffff7402083 __libc_start_main+243
+```
+
+Stack backtrace of the vCPU thread:
+```
+#0  futex_wait_cancelable (private=<optimized out>, expected=0, futex_word=0x555556550848) at ../sysdeps/nptl/futex-internal.h:183
+#1  __pthread_cond_wait_common (abstime=0x0, clockid=0, mutex=0x5555564d0860 <qemu_global_mutex>, cond=0x555556550820) at pthread_cond_wait.c:508
+#2  __pthread_cond_wait (cond=0x555556550820, mutex=0x5555564d0860 <qemu_global_mutex>) at pthread_cond_wait.c:647
+#3  0x0000555555e85602 in qemu_cond_wait_impl (cond=0x555556550820, mutex=0x5555564d0860 <qemu_global_mutex>, file=0x5555560122ab "../system/cpus.c", line=431) at ../util/qemu-thread-posix.c:225
+#4  0x0000555555a5618f in qemu_wait_io_event (cpu=0x555556825200) at ../system/cpus.c:431
+#5  0x0000555555c8bcf1 in mttcg_cpu_thread_fn (arg=0x555556825200) at ../accel/tcg/tcg-accel-ops-mttcg.c:118
+#6  0x0000555555e85e50 in qemu_thread_start (args=0x555556550860) at ../util/qemu-thread-posix.c:541
+#7  0x00007ffff75d8609 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#8  0x00007ffff74fd133 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+```

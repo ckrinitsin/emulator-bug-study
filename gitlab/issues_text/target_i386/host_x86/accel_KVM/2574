@@ -1,0 +1,49 @@
+VM hang: 'error: kvm run failed Bad address' with some AMD GPUs since kernel 6.7
+Description of problem:
+The Debian ROCm Team runs GPU-utilizing test workloads in QEMU VMs into which we pass through AMD GPUs attached to PCIe x16 slots on the host. We do this to quickly test various Debian distributions/kernels/firmwares on a single physical host per GPU, and to isolate the host as much as possible from potentially hostile code.
+
+Starting with kernel 6.7 in the **guest**, with Navi 31 GPUs (eg: RX 7900 XT), as soon as anything triggers access to the GPU's memory, the VM hangs with `error: kvm run failed Bad address` and dumps its state.
+
+I gather that [this](https://gitlab.com/qemu-project/qemu/-/blob/ea9cdbcf3a0b8d5497cddf87990f1b39d8f3bb0a/accel/kvm/kvm-all.c#L3046-L3048) is where this message originates from. It would seem that the preceding [ioctl](https://gitlab.com/qemu-project/qemu/-/blob/ea9cdbcf3a0b8d5497cddf87990f1b39d8f3bb0a/accel/kvm/kvm-all.c#L3025) runs into `EFAULT` which eventually leads to a break out of the surrounding loop.
+
+Since we can reliably reproduce this starting with 6.7, our assumption is that this is caused by a change in the kernel and/or the `amdgpu` driver. However, as the error originates from kvm *on the host*, we could not rule out that this might also be a emulation issue. In particular, it was only 9.1 [c15e568](c15e568) where the handling of the `EFAULT` and `KVM_EXIT_MEMORY_FAULT` case was added, so perhaps we ran into something that is still incomplete.
+
+I'd appreciate any advice you could give us for further debugging. We will bisect 6.7 to see what could have triggered this on the guest side, but is there something that we can do on the host to further track this down, in particular which `-trace`s might be helpful?
+
+Other notes:
+- The VM boots and runs fine, GPU initializes fine according to `dmesg`. The issue is only triggered on GPU utilization
+- The problematic GPU in question worked fine with kernels 6.3 - 6.6
+- All other GPU architectures that we test this way (eg: Navi 2x) do not experience this issue, they work fine with all kernels we tested
+- We have checked with more than one GPU, to rule out a physical defect
+Steps to reproduce:
+Reproducing the issue requires
+1. A suitable image
+2. Access to a Navi 3x card. Remote access can be arranged, if necessary.
+
+Building a suitable image can be rather complicated and requires a Debian host. If needed, it would be easier for me to just share a pre-built image.
+Additional information:
+This is dumped just before the VM hangs:
+```
+ROCk module is loaded
+error: kvm run failed Bad address
+RAX=00000000000035c8 RBX=00000000000006ba RCX=0003000108b08073 RDX=00000000000006b9
+RSI=ffff9994b00035c8 RDI=ffff899403c80000 RBP=ffff899408b285e0 RSP=ffff9994816ab620
+R8 =0003000000000073 R9 =ffff9994b0000000 R10=ffff899403c8fb18 R11=ffff899408b065b8
+R12=ffff899403c80000 R13=0003000000000073 R14=ffff9994b0000000 R15=00000000000006ba
+RIP=ffffffffc11d8f93 RFL=00000282 [--S----] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 00000000 00000000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 00000000 00000000
+FS =0000 00007faa76aea780 00000000 00000000
+GS =0000 ffff899f0dd80000 00000000 00000000
+LDT=0000 0000000000000000 00000000 00000000
+TR =0040 fffffe41c66fc000 00004087 00008b00 DPL=0 TSS64-busy
+GDT=     fffffe41c66fa000 0000007f
+IDT=     fffffe0000000000 00000fff
+CR0=80050033 CR2=000055bd5a5d8598 CR3=000000010342c000 CR4=00750ef0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=ff ff 00 00 48 21 c1 8d 04 d5 00 00 00 00 4c 09 c1 48 01 c6 <48> 89 0e 31 c0 e9 6e b1 92 d2 0f 1f 00 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 66
+```
