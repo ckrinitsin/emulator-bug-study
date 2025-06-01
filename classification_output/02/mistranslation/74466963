@@ -1,0 +1,1879 @@
+mistranslation: 0.927
+instruction: 0.903
+boot: 0.894
+semantic: 0.891
+other: 0.877
+
+[Qemu-devel] [TCG only][Migration Bug? ] Occasionally, the content of VM's memory is inconsistent between Source and Destination of migration
+
+Hi all,
+
+Does anyboday remember the similar issue post by hailiang months ago
+http://patchwork.ozlabs.org/patch/454322/
+At least tow bugs about migration had been fixed since that.
+And now we found the same issue at the tcg vm(kvm is fine), after
+migration, the content VM's memory is inconsistent.
+we add a patch to check memory content, you can find it from affix
+
+steps to reporduce:
+1) apply the patch and re-build qemu
+2) prepare the ubuntu guest and run memtest in grub.
+soruce side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off
+destination side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+3) start migration
+with 1000M NIC, migration will finish within 3 min.
+
+at source:
+(qemu) migrate tcp:192.168.2.66:8881
+after saving ram complete
+e9e725df678d392b1a83b3a917f332bb
+qemu-system-x86_64: end ram md5
+(qemu)
+
+at destination:
+...skip...
+Completed load of VM with exit code 0 seq iteration 1264
+Completed load of VM with exit code 0 seq iteration 1265
+Completed load of VM with exit code 0 seq iteration 1266
+qemu-system-x86_64: after loading state section id 2(ram)
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+
+This occurs occasionally and only at tcg machine. It seems that
+some pages dirtied in source side don't transferred to destination.
+This problem can be reproduced even if we disable virtio.
+Is it OK for some pages that not transferred to destination when do
+migration ? Or is it a bug?
+Any idea...
+
+=================md5 check patch=============================
+
+diff --git a/Makefile.target b/Makefile.target
+index 962d004..e2cb8e9 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+ obj-y += memory_mapping.o
+ obj-y += dump.o
+ obj-y += migration/ram.o migration/savevm.o
+-LIBS := $(libs_softmmu) $(LIBS)
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+
+ # xen support
+ obj-$(CONFIG_XEN) += xen-common.o
+diff --git a/migration/ram.c b/migration/ram.c
+index 1eb155a..3b7a09d 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+version_id)
+}
+
+     rcu_read_unlock();
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
++    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+             "%" PRIu64 "\n", ret, seq_iter);
+     return ret;
+ }
+diff --git a/migration/savevm.c b/migration/savevm.c
+index 0ad1b93..3feaa61 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+
+ }
+
++#include "exec/ram_addr.h"
++#include "qemu/rcu_queue.h"
++#include <clplumbing/md5.h>
++#ifndef MD5_DIGEST_LENGTH
++#define MD5_DIGEST_LENGTH 16
++#endif
++
++static void check_host_md5(void)
++{
++    int i;
++    unsigned char md[MD5_DIGEST_LENGTH];
++    rcu_read_lock();
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+'pc.ram' block */
++    rcu_read_unlock();
++
++    MD5(block->host, block->used_length, md);
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
++        fprintf(stderr, "%02x", md[i]);
++    }
++    fprintf(stderr, "\n");
++    error_report("end ram md5");
++}
++
+ void qemu_savevm_state_begin(QEMUFile *f,
+                              const MigrationParams *params)
+ {
+@@ -1056,6 +1079,10 @@ void qemu_savevm_state_complete_precopy(QEMUFile
+*f, bool iterable_only)
+save_section_header(f, se, QEMU_VM_SECTION_END);
+
+         ret = se->ops->save_live_complete_precopy(f, se->opaque);
++
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
++        check_host_md5();
++
+         trace_savevm_section_end(se->idstr, se->section_id, ret);
+         save_section_footer(f, se);
+         if (ret < 0) {
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+MigrationIncomingState *mis)
+section_id, le->se->idstr);
+                 return ret;
+             }
++            if (section_type == QEMU_VM_SECTION_END) {
++                error_report("after loading state section id %d(%s)",
++                             section_id, le->se->idstr);
++                check_host_md5();
++            }
+             if (!check_section_footer(f, le)) {
+                 return -EINVAL;
+             }
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+     }
+
+     cpu_synchronize_all_post_init();
++    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
++    check_host_md5();
+
+     return ret;
+ }
+
+* Li Zhijian (address@hidden) wrote:
+>
+Hi all,
+>
+>
+Does anyboday remember the similar issue post by hailiang months ago
+>
+http://patchwork.ozlabs.org/patch/454322/
+>
+At least tow bugs about migration had been fixed since that.
+Yes, I wondered what happened to that.
+
+>
+And now we found the same issue at the tcg vm(kvm is fine), after migration,
+>
+the content VM's memory is inconsistent.
+Hmm, TCG only - I don't know much about that; but I guess something must
+be accessing memory without using the proper macros/functions so
+it doesn't mark it as dirty.
+
+>
+we add a patch to check memory content, you can find it from affix
+>
+>
+steps to reporduce:
+>
+1) apply the patch and re-build qemu
+>
+2) prepare the ubuntu guest and run memtest in grub.
+>
+soruce side:
+>
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+pc-i440fx-2.3,accel=tcg,usb=off
+>
+>
+destination side:
+>
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+>
+>
+3) start migration
+>
+with 1000M NIC, migration will finish within 3 min.
+>
+>
+at source:
+>
+(qemu) migrate tcp:192.168.2.66:8881
+>
+after saving ram complete
+>
+e9e725df678d392b1a83b3a917f332bb
+>
+qemu-system-x86_64: end ram md5
+>
+(qemu)
+>
+>
+at destination:
+>
+...skip...
+>
+Completed load of VM with exit code 0 seq iteration 1264
+>
+Completed load of VM with exit code 0 seq iteration 1265
+>
+Completed load of VM with exit code 0 seq iteration 1266
+>
+qemu-system-x86_64: after loading state section id 2(ram)
+>
+49c2dac7bde0e5e22db7280dcb3824f9
+>
+qemu-system-x86_64: end ram md5
+>
+qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+>
+>
+49c2dac7bde0e5e22db7280dcb3824f9
+>
+qemu-system-x86_64: end ram md5
+>
+>
+This occurs occasionally and only at tcg machine. It seems that
+>
+some pages dirtied in source side don't transferred to destination.
+>
+This problem can be reproduced even if we disable virtio.
+>
+>
+Is it OK for some pages that not transferred to destination when do
+>
+migration ? Or is it a bug?
+I'm pretty sure that means it's a bug.  Hard to find though, I guess
+at least memtest is smaller than a big OS.  I think I'd dump the whole
+of memory on both sides, hexdump and diff them  - I'd guess it would
+just be one byte/word different, maybe that would offer some idea what
+wrote it.
+
+Dave
+
+>
+Any idea...
+>
+>
+=================md5 check patch=============================
+>
+>
+diff --git a/Makefile.target b/Makefile.target
+>
+index 962d004..e2cb8e9 100644
+>
+--- a/Makefile.target
+>
++++ b/Makefile.target
+>
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+>
+obj-y += memory_mapping.o
+>
+obj-y += dump.o
+>
+obj-y += migration/ram.o migration/savevm.o
+>
+-LIBS := $(libs_softmmu) $(LIBS)
+>
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+>
+>
+# xen support
+>
+obj-$(CONFIG_XEN) += xen-common.o
+>
+diff --git a/migration/ram.c b/migration/ram.c
+>
+index 1eb155a..3b7a09d 100644
+>
+--- a/migration/ram.c
+>
++++ b/migration/ram.c
+>
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+>
+version_id)
+>
+}
+>
+>
+rcu_read_unlock();
+>
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
+>
++    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+>
+"%" PRIu64 "\n", ret, seq_iter);
+>
+return ret;
+>
+}
+>
+diff --git a/migration/savevm.c b/migration/savevm.c
+>
+index 0ad1b93..3feaa61 100644
+>
+--- a/migration/savevm.c
+>
++++ b/migration/savevm.c
+>
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+>
+>
+}
+>
+>
++#include "exec/ram_addr.h"
+>
++#include "qemu/rcu_queue.h"
+>
++#include <clplumbing/md5.h>
+>
++#ifndef MD5_DIGEST_LENGTH
+>
++#define MD5_DIGEST_LENGTH 16
+>
++#endif
+>
++
+>
++static void check_host_md5(void)
+>
++{
+>
++    int i;
+>
++    unsigned char md[MD5_DIGEST_LENGTH];
+>
++    rcu_read_lock();
+>
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+>
+'pc.ram' block */
+>
++    rcu_read_unlock();
+>
++
+>
++    MD5(block->host, block->used_length, md);
+>
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
+>
++        fprintf(stderr, "%02x", md[i]);
+>
++    }
+>
++    fprintf(stderr, "\n");
+>
++    error_report("end ram md5");
+>
++}
+>
++
+>
+void qemu_savevm_state_begin(QEMUFile *f,
+>
+const MigrationParams *params)
+>
+{
+>
+@@ -1056,6 +1079,10 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f,
+>
+bool iterable_only)
+>
+save_section_header(f, se, QEMU_VM_SECTION_END);
+>
+>
+ret = se->ops->save_live_complete_precopy(f, se->opaque);
+>
++
+>
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
+>
++        check_host_md5();
+>
++
+>
+trace_savevm_section_end(se->idstr, se->section_id, ret);
+>
+save_section_footer(f, se);
+>
+if (ret < 0) {
+>
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+>
+MigrationIncomingState *mis)
+>
+section_id, le->se->idstr);
+>
+return ret;
+>
+}
+>
++            if (section_type == QEMU_VM_SECTION_END) {
+>
++                error_report("after loading state section id %d(%s)",
+>
++                             section_id, le->se->idstr);
+>
++                check_host_md5();
+>
++            }
+>
+if (!check_section_footer(f, le)) {
+>
+return -EINVAL;
+>
+}
+>
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+>
+}
+>
+>
+cpu_synchronize_all_post_init();
+>
++    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
+>
++    check_host_md5();
+>
+>
+return ret;
+>
+}
+>
+>
+>
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+On 2015/12/3 17:24, Dr. David Alan Gilbert wrote:
+* Li Zhijian (address@hidden) wrote:
+Hi all,
+
+Does anyboday remember the similar issue post by hailiang months ago
+http://patchwork.ozlabs.org/patch/454322/
+At least tow bugs about migration had been fixed since that.
+Yes, I wondered what happened to that.
+And now we found the same issue at the tcg vm(kvm is fine), after migration,
+the content VM's memory is inconsistent.
+Hmm, TCG only - I don't know much about that; but I guess something must
+be accessing memory without using the proper macros/functions so
+it doesn't mark it as dirty.
+we add a patch to check memory content, you can find it from affix
+
+steps to reporduce:
+1) apply the patch and re-build qemu
+2) prepare the ubuntu guest and run memtest in grub.
+soruce side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off
+
+destination side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+
+3) start migration
+with 1000M NIC, migration will finish within 3 min.
+
+at source:
+(qemu) migrate tcp:192.168.2.66:8881
+after saving ram complete
+e9e725df678d392b1a83b3a917f332bb
+qemu-system-x86_64: end ram md5
+(qemu)
+
+at destination:
+...skip...
+Completed load of VM with exit code 0 seq iteration 1264
+Completed load of VM with exit code 0 seq iteration 1265
+Completed load of VM with exit code 0 seq iteration 1266
+qemu-system-x86_64: after loading state section id 2(ram)
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+
+This occurs occasionally and only at tcg machine. It seems that
+some pages dirtied in source side don't transferred to destination.
+This problem can be reproduced even if we disable virtio.
+
+Is it OK for some pages that not transferred to destination when do
+migration ? Or is it a bug?
+I'm pretty sure that means it's a bug.  Hard to find though, I guess
+at least memtest is smaller than a big OS.  I think I'd dump the whole
+of memory on both sides, hexdump and diff them  - I'd guess it would
+just be one byte/word different, maybe that would offer some idea what
+wrote it.
+Maybe one better way to do that is with the help of userfaultfd's write-protect
+capability. It is still in the development by Andrea Arcangeli, but there
+is a RFC version available, please refer to
+http://www.spinics.net/lists/linux-mm/msg97422.html
+ï¼I'm developing live memory snapshot which based on it, maybe this is another 
+scene where we
+can use userfaultfd's WP ;) ).
+Dave
+Any idea...
+
+=================md5 check patch=============================
+
+diff --git a/Makefile.target b/Makefile.target
+index 962d004..e2cb8e9 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+  obj-y += memory_mapping.o
+  obj-y += dump.o
+  obj-y += migration/ram.o migration/savevm.o
+-LIBS := $(libs_softmmu) $(LIBS)
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+
+  # xen support
+  obj-$(CONFIG_XEN) += xen-common.o
+diff --git a/migration/ram.c b/migration/ram.c
+index 1eb155a..3b7a09d 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+version_id)
+      }
+
+      rcu_read_unlock();
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
++    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+              "%" PRIu64 "\n", ret, seq_iter);
+      return ret;
+  }
+diff --git a/migration/savevm.c b/migration/savevm.c
+index 0ad1b93..3feaa61 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+
+  }
+
++#include "exec/ram_addr.h"
++#include "qemu/rcu_queue.h"
++#include <clplumbing/md5.h>
++#ifndef MD5_DIGEST_LENGTH
++#define MD5_DIGEST_LENGTH 16
++#endif
++
++static void check_host_md5(void)
++{
++    int i;
++    unsigned char md[MD5_DIGEST_LENGTH];
++    rcu_read_lock();
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+'pc.ram' block */
++    rcu_read_unlock();
++
++    MD5(block->host, block->used_length, md);
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
++        fprintf(stderr, "%02x", md[i]);
++    }
++    fprintf(stderr, "\n");
++    error_report("end ram md5");
++}
++
+  void qemu_savevm_state_begin(QEMUFile *f,
+                               const MigrationParams *params)
+  {
+@@ -1056,6 +1079,10 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f,
+bool iterable_only)
+          save_section_header(f, se, QEMU_VM_SECTION_END);
+
+          ret = se->ops->save_live_complete_precopy(f, se->opaque);
++
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
++        check_host_md5();
++
+          trace_savevm_section_end(se->idstr, se->section_id, ret);
+          save_section_footer(f, se);
+          if (ret < 0) {
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+MigrationIncomingState *mis)
+                               section_id, le->se->idstr);
+                  return ret;
+              }
++            if (section_type == QEMU_VM_SECTION_END) {
++                error_report("after loading state section id %d(%s)",
++                             section_id, le->se->idstr);
++                check_host_md5();
++            }
+              if (!check_section_footer(f, le)) {
+                  return -EINVAL;
+              }
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+      }
+
+      cpu_synchronize_all_post_init();
++    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
++    check_host_md5();
+
+      return ret;
+  }
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+.
+
+On 12/03/2015 05:37 PM, Hailiang Zhang wrote:
+On 2015/12/3 17:24, Dr. David Alan Gilbert wrote:
+* Li Zhijian (address@hidden) wrote:
+Hi all,
+
+Does anyboday remember the similar issue post by hailiang months ago
+http://patchwork.ozlabs.org/patch/454322/
+At least tow bugs about migration had been fixed since that.
+Yes, I wondered what happened to that.
+And now we found the same issue at the tcg vm(kvm is fine), after
+migration,
+the content VM's memory is inconsistent.
+Hmm, TCG only - I don't know much about that; but I guess something must
+be accessing memory without using the proper macros/functions so
+it doesn't mark it as dirty.
+we add a patch to check memory content, you can find it from affix
+
+steps to reporduce:
+1) apply the patch and re-build qemu
+2) prepare the ubuntu guest and run memtest in grub.
+soruce side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off
+
+destination side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+
+3) start migration
+with 1000M NIC, migration will finish within 3 min.
+
+at source:
+(qemu) migrate tcp:192.168.2.66:8881
+after saving ram complete
+e9e725df678d392b1a83b3a917f332bb
+qemu-system-x86_64: end ram md5
+(qemu)
+
+at destination:
+...skip...
+Completed load of VM with exit code 0 seq iteration 1264
+Completed load of VM with exit code 0 seq iteration 1265
+Completed load of VM with exit code 0 seq iteration 1266
+qemu-system-x86_64: after loading state section id 2(ram)
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+qemu-system-x86_64: qemu_loadvm_state: after
+cpu_synchronize_all_post_init
+
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+
+This occurs occasionally and only at tcg machine. It seems that
+some pages dirtied in source side don't transferred to destination.
+This problem can be reproduced even if we disable virtio.
+
+Is it OK for some pages that not transferred to destination when do
+migration ? Or is it a bug?
+I'm pretty sure that means it's a bug.  Hard to find though, I guess
+at least memtest is smaller than a big OS.  I think I'd dump the whole
+of memory on both sides, hexdump and diff them  - I'd guess it would
+just be one byte/word different, maybe that would offer some idea what
+wrote it.
+Maybe one better way to do that is with the help of userfaultfd's
+write-protect
+capability. It is still in the development by Andrea Arcangeli, but there
+is a RFC version available, please refer to
+http://www.spinics.net/lists/linux-mm/msg97422.html
+ï¼I'm developing live memory snapshot which based on it, maybe this is
+another scene where we
+can use userfaultfd's WP ;) ).
+sounds good.
+
+thanks
+Li
+Dave
+Any idea...
+
+=================md5 check patch=============================
+
+diff --git a/Makefile.target b/Makefile.target
+index 962d004..e2cb8e9 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+  obj-y += memory_mapping.o
+  obj-y += dump.o
+  obj-y += migration/ram.o migration/savevm.o
+-LIBS := $(libs_softmmu) $(LIBS)
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+
+  # xen support
+  obj-$(CONFIG_XEN) += xen-common.o
+diff --git a/migration/ram.c b/migration/ram.c
+index 1eb155a..3b7a09d 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+version_id)
+      }
+
+      rcu_read_unlock();
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
++    fprintf(stderr, "Completed load of VM with exit code %d seq
+iteration "
+              "%" PRIu64 "\n", ret, seq_iter);
+      return ret;
+  }
+diff --git a/migration/savevm.c b/migration/savevm.c
+index 0ad1b93..3feaa61 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+
+  }
+
++#include "exec/ram_addr.h"
++#include "qemu/rcu_queue.h"
++#include <clplumbing/md5.h>
++#ifndef MD5_DIGEST_LENGTH
++#define MD5_DIGEST_LENGTH 16
++#endif
++
++static void check_host_md5(void)
++{
++    int i;
++    unsigned char md[MD5_DIGEST_LENGTH];
++    rcu_read_lock();
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+'pc.ram' block */
++    rcu_read_unlock();
++
++    MD5(block->host, block->used_length, md);
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
++        fprintf(stderr, "%02x", md[i]);
++    }
++    fprintf(stderr, "\n");
++    error_report("end ram md5");
++}
++
+  void qemu_savevm_state_begin(QEMUFile *f,
+                               const MigrationParams *params)
+  {
+@@ -1056,6 +1079,10 @@ void
+qemu_savevm_state_complete_precopy(QEMUFile *f,
+bool iterable_only)
+          save_section_header(f, se, QEMU_VM_SECTION_END);
+
+          ret = se->ops->save_live_complete_precopy(f, se->opaque);
++
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
++        check_host_md5();
++
+          trace_savevm_section_end(se->idstr, se->section_id, ret);
+          save_section_footer(f, se);
+          if (ret < 0) {
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+MigrationIncomingState *mis)
+                               section_id, le->se->idstr);
+                  return ret;
+              }
++            if (section_type == QEMU_VM_SECTION_END) {
++                error_report("after loading state section id %d(%s)",
++                             section_id, le->se->idstr);
++                check_host_md5();
++            }
+              if (!check_section_footer(f, le)) {
+                  return -EINVAL;
+              }
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+      }
+
+      cpu_synchronize_all_post_init();
++    error_report("%s: after cpu_synchronize_all_post_init\n",
+__func__);
++    check_host_md5();
+
+      return ret;
+  }
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+.
+.
+--
+Best regards.
+Li Zhijian (8555)
+
+On 12/03/2015 05:24 PM, Dr. David Alan Gilbert wrote:
+* Li Zhijian (address@hidden) wrote:
+Hi all,
+
+Does anyboday remember the similar issue post by hailiang months ago
+http://patchwork.ozlabs.org/patch/454322/
+At least tow bugs about migration had been fixed since that.
+Yes, I wondered what happened to that.
+And now we found the same issue at the tcg vm(kvm is fine), after migration,
+the content VM's memory is inconsistent.
+Hmm, TCG only - I don't know much about that; but I guess something must
+be accessing memory without using the proper macros/functions so
+it doesn't mark it as dirty.
+we add a patch to check memory content, you can find it from affix
+
+steps to reporduce:
+1) apply the patch and re-build qemu
+2) prepare the ubuntu guest and run memtest in grub.
+soruce side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off
+
+destination side:
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+
+3) start migration
+with 1000M NIC, migration will finish within 3 min.
+
+at source:
+(qemu) migrate tcp:192.168.2.66:8881
+after saving ram complete
+e9e725df678d392b1a83b3a917f332bb
+qemu-system-x86_64: end ram md5
+(qemu)
+
+at destination:
+...skip...
+Completed load of VM with exit code 0 seq iteration 1264
+Completed load of VM with exit code 0 seq iteration 1265
+Completed load of VM with exit code 0 seq iteration 1266
+qemu-system-x86_64: after loading state section id 2(ram)
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+
+49c2dac7bde0e5e22db7280dcb3824f9
+qemu-system-x86_64: end ram md5
+
+This occurs occasionally and only at tcg machine. It seems that
+some pages dirtied in source side don't transferred to destination.
+This problem can be reproduced even if we disable virtio.
+
+Is it OK for some pages that not transferred to destination when do
+migration ? Or is it a bug?
+I'm pretty sure that means it's a bug.  Hard to find though, I guess
+at least memtest is smaller than a big OS.  I think I'd dump the whole
+of memory on both sides, hexdump and diff them  - I'd guess it would
+just be one byte/word different, maybe that would offer some idea what
+wrote it.
+I try to dump and compare them, more than 10 pages are different.
+in source side, they are random value rather than always 'FF' 'FB' 'EF'
+'BF'... in destination.
+and not all of the different pages are continuous.
+
+thanks
+Li
+Dave
+Any idea...
+
+=================md5 check patch=============================
+
+diff --git a/Makefile.target b/Makefile.target
+index 962d004..e2cb8e9 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+  obj-y += memory_mapping.o
+  obj-y += dump.o
+  obj-y += migration/ram.o migration/savevm.o
+-LIBS := $(libs_softmmu) $(LIBS)
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+
+  # xen support
+  obj-$(CONFIG_XEN) += xen-common.o
+diff --git a/migration/ram.c b/migration/ram.c
+index 1eb155a..3b7a09d 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+version_id)
+      }
+
+      rcu_read_unlock();
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
++    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+              "%" PRIu64 "\n", ret, seq_iter);
+      return ret;
+  }
+diff --git a/migration/savevm.c b/migration/savevm.c
+index 0ad1b93..3feaa61 100644
+--- a/migration/savevm.c
++++ b/migration/savevm.c
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+
+  }
+
++#include "exec/ram_addr.h"
++#include "qemu/rcu_queue.h"
++#include <clplumbing/md5.h>
++#ifndef MD5_DIGEST_LENGTH
++#define MD5_DIGEST_LENGTH 16
++#endif
++
++static void check_host_md5(void)
++{
++    int i;
++    unsigned char md[MD5_DIGEST_LENGTH];
++    rcu_read_lock();
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+'pc.ram' block */
++    rcu_read_unlock();
++
++    MD5(block->host, block->used_length, md);
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
++        fprintf(stderr, "%02x", md[i]);
++    }
++    fprintf(stderr, "\n");
++    error_report("end ram md5");
++}
++
+  void qemu_savevm_state_begin(QEMUFile *f,
+                               const MigrationParams *params)
+  {
+@@ -1056,6 +1079,10 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f,
+bool iterable_only)
+          save_section_header(f, se, QEMU_VM_SECTION_END);
+
+          ret = se->ops->save_live_complete_precopy(f, se->opaque);
++
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
++        check_host_md5();
++
+          trace_savevm_section_end(se->idstr, se->section_id, ret);
+          save_section_footer(f, se);
+          if (ret < 0) {
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+MigrationIncomingState *mis)
+                               section_id, le->se->idstr);
+                  return ret;
+              }
++            if (section_type == QEMU_VM_SECTION_END) {
++                error_report("after loading state section id %d(%s)",
++                             section_id, le->se->idstr);
++                check_host_md5();
++            }
+              if (!check_section_footer(f, le)) {
+                  return -EINVAL;
+              }
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+      }
+
+      cpu_synchronize_all_post_init();
++    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
++    check_host_md5();
+
+      return ret;
+  }
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+
+.
+--
+Best regards.
+Li Zhijian (8555)
+
+* Li Zhijian (address@hidden) wrote:
+>
+>
+>
+On 12/03/2015 05:24 PM, Dr. David Alan Gilbert wrote:
+>
+>* Li Zhijian (address@hidden) wrote:
+>
+>>Hi all,
+>
+>>
+>
+>>Does anyboday remember the similar issue post by hailiang months ago
+>
+>>
+http://patchwork.ozlabs.org/patch/454322/
+>
+>>At least tow bugs about migration had been fixed since that.
+>
+>
+>
+>Yes, I wondered what happened to that.
+>
+>
+>
+>>And now we found the same issue at the tcg vm(kvm is fine), after migration,
+>
+>>the content VM's memory is inconsistent.
+>
+>
+>
+>Hmm, TCG only - I don't know much about that; but I guess something must
+>
+>be accessing memory without using the proper macros/functions so
+>
+>it doesn't mark it as dirty.
+>
+>
+>
+>>we add a patch to check memory content, you can find it from affix
+>
+>>
+>
+>>steps to reporduce:
+>
+>>1) apply the patch and re-build qemu
+>
+>>2) prepare the ubuntu guest and run memtest in grub.
+>
+>>soruce side:
+>
+>>x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+>>e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+>>if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+>>virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+>>-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+>>tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+>>pc-i440fx-2.3,accel=tcg,usb=off
+>
+>>
+>
+>>destination side:
+>
+>>x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+>>e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+>>if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+>>virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+>>-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+>>tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+>>pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+>
+>>
+>
+>>3) start migration
+>
+>>with 1000M NIC, migration will finish within 3 min.
+>
+>>
+>
+>>at source:
+>
+>>(qemu) migrate tcp:192.168.2.66:8881
+>
+>>after saving ram complete
+>
+>>e9e725df678d392b1a83b3a917f332bb
+>
+>>qemu-system-x86_64: end ram md5
+>
+>>(qemu)
+>
+>>
+>
+>>at destination:
+>
+>>...skip...
+>
+>>Completed load of VM with exit code 0 seq iteration 1264
+>
+>>Completed load of VM with exit code 0 seq iteration 1265
+>
+>>Completed load of VM with exit code 0 seq iteration 1266
+>
+>>qemu-system-x86_64: after loading state section id 2(ram)
+>
+>>49c2dac7bde0e5e22db7280dcb3824f9
+>
+>>qemu-system-x86_64: end ram md5
+>
+>>qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+>
+>>
+>
+>>49c2dac7bde0e5e22db7280dcb3824f9
+>
+>>qemu-system-x86_64: end ram md5
+>
+>>
+>
+>>This occurs occasionally and only at tcg machine. It seems that
+>
+>>some pages dirtied in source side don't transferred to destination.
+>
+>>This problem can be reproduced even if we disable virtio.
+>
+>>
+>
+>>Is it OK for some pages that not transferred to destination when do
+>
+>>migration ? Or is it a bug?
+>
+>
+>
+>I'm pretty sure that means it's a bug.  Hard to find though, I guess
+>
+>at least memtest is smaller than a big OS.  I think I'd dump the whole
+>
+>of memory on both sides, hexdump and diff them  - I'd guess it would
+>
+>just be one byte/word different, maybe that would offer some idea what
+>
+>wrote it.
+>
+>
+I try to dump and compare them, more than 10 pages are different.
+>
+in source side, they are random value rather than always 'FF' 'FB' 'EF'
+>
+'BF'... in destination.
+>
+>
+and not all of the different pages are continuous.
+I wonder if it happens on all of memtest's different test patterns,
+perhaps it might be possible to narrow it down if you tell memtest
+to only run one test at a time.
+
+Dave
+
+>
+>
+thanks
+>
+Li
+>
+>
+>
+>
+>
+>Dave
+>
+>
+>
+>>Any idea...
+>
+>>
+>
+>>=================md5 check patch=============================
+>
+>>
+>
+>>diff --git a/Makefile.target b/Makefile.target
+>
+>>index 962d004..e2cb8e9 100644
+>
+>>--- a/Makefile.target
+>
+>>+++ b/Makefile.target
+>
+>>@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+>
+>>  obj-y += memory_mapping.o
+>
+>>  obj-y += dump.o
+>
+>>  obj-y += migration/ram.o migration/savevm.o
+>
+>>-LIBS := $(libs_softmmu) $(LIBS)
+>
+>>+LIBS := $(libs_softmmu) $(LIBS) -lplumb
+>
+>>
+>
+>>  # xen support
+>
+>>  obj-$(CONFIG_XEN) += xen-common.o
+>
+>>diff --git a/migration/ram.c b/migration/ram.c
+>
+>>index 1eb155a..3b7a09d 100644
+>
+>>--- a/migration/ram.c
+>
+>>+++ b/migration/ram.c
+>
+>>@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque, int
+>
+>>version_id)
+>
+>>      }
+>
+>>
+>
+>>      rcu_read_unlock();
+>
+>>-    DPRINTF("Completed load of VM with exit code %d seq iteration "
+>
+>>+    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+>
+>>              "%" PRIu64 "\n", ret, seq_iter);
+>
+>>      return ret;
+>
+>>  }
+>
+>>diff --git a/migration/savevm.c b/migration/savevm.c
+>
+>>index 0ad1b93..3feaa61 100644
+>
+>>--- a/migration/savevm.c
+>
+>>+++ b/migration/savevm.c
+>
+>>@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+>
+>>
+>
+>>  }
+>
+>>
+>
+>>+#include "exec/ram_addr.h"
+>
+>>+#include "qemu/rcu_queue.h"
+>
+>>+#include <clplumbing/md5.h>
+>
+>>+#ifndef MD5_DIGEST_LENGTH
+>
+>>+#define MD5_DIGEST_LENGTH 16
+>
+>>+#endif
+>
+>>+
+>
+>>+static void check_host_md5(void)
+>
+>>+{
+>
+>>+    int i;
+>
+>>+    unsigned char md[MD5_DIGEST_LENGTH];
+>
+>>+    rcu_read_lock();
+>
+>>+    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+>
+>>'pc.ram' block */
+>
+>>+    rcu_read_unlock();
+>
+>>+
+>
+>>+    MD5(block->host, block->used_length, md);
+>
+>>+    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
+>
+>>+        fprintf(stderr, "%02x", md[i]);
+>
+>>+    }
+>
+>>+    fprintf(stderr, "\n");
+>
+>>+    error_report("end ram md5");
+>
+>>+}
+>
+>>+
+>
+>>  void qemu_savevm_state_begin(QEMUFile *f,
+>
+>>                               const MigrationParams *params)
+>
+>>  {
+>
+>>@@ -1056,6 +1079,10 @@ void qemu_savevm_state_complete_precopy(QEMUFile *f,
+>
+>>bool iterable_only)
+>
+>>          save_section_header(f, se, QEMU_VM_SECTION_END);
+>
+>>
+>
+>>          ret = se->ops->save_live_complete_precopy(f, se->opaque);
+>
+>>+
+>
+>>+        fprintf(stderr, "after saving %s complete\n", se->idstr);
+>
+>>+        check_host_md5();
+>
+>>+
+>
+>>          trace_savevm_section_end(se->idstr, se->section_id, ret);
+>
+>>          save_section_footer(f, se);
+>
+>>          if (ret < 0) {
+>
+>>@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+>
+>>MigrationIncomingState *mis)
+>
+>>                               section_id, le->se->idstr);
+>
+>>                  return ret;
+>
+>>              }
+>
+>>+            if (section_type == QEMU_VM_SECTION_END) {
+>
+>>+                error_report("after loading state section id %d(%s)",
+>
+>>+                             section_id, le->se->idstr);
+>
+>>+                check_host_md5();
+>
+>>+            }
+>
+>>              if (!check_section_footer(f, le)) {
+>
+>>                  return -EINVAL;
+>
+>>              }
+>
+>>@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+>
+>>      }
+>
+>>
+>
+>>      cpu_synchronize_all_post_init();
+>
+>>+    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
+>
+>>+    check_host_md5();
+>
+>>
+>
+>>      return ret;
+>
+>>  }
+>
+>>
+>
+>>
+>
+>>
+>
+>--
+>
+>Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>
+>
+>
+>
+>.
+>
+>
+>
+>
+--
+>
+Best regards.
+>
+Li Zhijian (8555)
+>
+>
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+Li Zhijian <address@hidden> wrote:
+>
+Hi all,
+>
+>
+Does anyboday remember the similar issue post by hailiang months ago
+>
+http://patchwork.ozlabs.org/patch/454322/
+>
+At least tow bugs about migration had been fixed since that.
+>
+>
+And now we found the same issue at the tcg vm(kvm is fine), after
+>
+migration, the content VM's memory is inconsistent.
+>
+>
+we add a patch to check memory content, you can find it from affix
+>
+>
+steps to reporduce:
+>
+1) apply the patch and re-build qemu
+>
+2) prepare the ubuntu guest and run memtest in grub.
+>
+soruce side:
+>
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+pc-i440fx-2.3,accel=tcg,usb=off
+>
+>
+destination side:
+>
+x86_64-softmmu/qemu-system-x86_64 -netdev tap,id=hn0 -device
+>
+e1000,id=net-pci0,netdev=hn0,mac=52:54:00:12:34:65 -boot c -drive
+>
+if=none,file=/home/lizj/ubuntu.raw,id=drive-virtio-disk0 -device
+>
+virtio-blk-pci,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0
+>
+-vnc :7 -m 128 -smp 1 -device piix3-usb-uhci -device usb-tablet -qmp
+>
+tcp::4444,server,nowait -monitor stdio -cpu qemu64 -machine
+>
+pc-i440fx-2.3,accel=tcg,usb=off -incoming tcp:0:8881
+>
+>
+3) start migration
+>
+with 1000M NIC, migration will finish within 3 min.
+>
+>
+at source:
+>
+(qemu) migrate tcp:192.168.2.66:8881
+>
+after saving ram complete
+>
+e9e725df678d392b1a83b3a917f332bb
+>
+qemu-system-x86_64: end ram md5
+>
+(qemu)
+>
+>
+at destination:
+>
+...skip...
+>
+Completed load of VM with exit code 0 seq iteration 1264
+>
+Completed load of VM with exit code 0 seq iteration 1265
+>
+Completed load of VM with exit code 0 seq iteration 1266
+>
+qemu-system-x86_64: after loading state section id 2(ram)
+>
+49c2dac7bde0e5e22db7280dcb3824f9
+>
+qemu-system-x86_64: end ram md5
+>
+qemu-system-x86_64: qemu_loadvm_state: after cpu_synchronize_all_post_init
+>
+>
+49c2dac7bde0e5e22db7280dcb3824f9
+>
+qemu-system-x86_64: end ram md5
+>
+>
+This occurs occasionally and only at tcg machine. It seems that
+>
+some pages dirtied in source side don't transferred to destination.
+>
+This problem can be reproduced even if we disable virtio.
+>
+>
+Is it OK for some pages that not transferred to destination when do
+>
+migration ? Or is it a bug?
+>
+>
+Any idea...
+Thanks for describing how to reproduce the bug.
+If some pages are not transferred to destination then it is a bug, so we
+need to know what the problem is, notice that the problem can be that
+TCG is not marking dirty some page, that Migration code "forgets" about
+that page, or anything eles altogether, that is what we need to find.
+
+There are more posibilities, I am not sure that memtest is on 32bit
+mode, and it is inside posibility that we are missing some state when we
+are on real mode.
+
+Will try to take a look at this.
+
+THanks, again.
+
+
+>
+>
+=================md5 check patch=============================
+>
+>
+diff --git a/Makefile.target b/Makefile.target
+>
+index 962d004..e2cb8e9 100644
+>
+--- a/Makefile.target
+>
++++ b/Makefile.target
+>
+@@ -139,7 +139,7 @@ obj-y += memory.o cputlb.o
+>
+obj-y += memory_mapping.o
+>
+obj-y += dump.o
+>
+obj-y += migration/ram.o migration/savevm.o
+>
+-LIBS := $(libs_softmmu) $(LIBS)
+>
++LIBS := $(libs_softmmu) $(LIBS) -lplumb
+>
+>
+# xen support
+>
+obj-$(CONFIG_XEN) += xen-common.o
+>
+diff --git a/migration/ram.c b/migration/ram.c
+>
+index 1eb155a..3b7a09d 100644
+>
+--- a/migration/ram.c
+>
++++ b/migration/ram.c
+>
+@@ -2513,7 +2513,7 @@ static int ram_load(QEMUFile *f, void *opaque,
+>
+int version_id)
+>
+}
+>
+>
+rcu_read_unlock();
+>
+-    DPRINTF("Completed load of VM with exit code %d seq iteration "
+>
++    fprintf(stderr, "Completed load of VM with exit code %d seq iteration "
+>
+"%" PRIu64 "\n", ret, seq_iter);
+>
+return ret;
+>
+}
+>
+diff --git a/migration/savevm.c b/migration/savevm.c
+>
+index 0ad1b93..3feaa61 100644
+>
+--- a/migration/savevm.c
+>
++++ b/migration/savevm.c
+>
+@@ -891,6 +891,29 @@ void qemu_savevm_state_header(QEMUFile *f)
+>
+>
+}
+>
+>
++#include "exec/ram_addr.h"
+>
++#include "qemu/rcu_queue.h"
+>
++#include <clplumbing/md5.h>
+>
++#ifndef MD5_DIGEST_LENGTH
+>
++#define MD5_DIGEST_LENGTH 16
+>
++#endif
+>
++
+>
++static void check_host_md5(void)
+>
++{
+>
++    int i;
+>
++    unsigned char md[MD5_DIGEST_LENGTH];
+>
++    rcu_read_lock();
+>
++    RAMBlock *block = QLIST_FIRST_RCU(&ram_list.blocks);/* Only check
+>
+'pc.ram' block */
+>
++    rcu_read_unlock();
+>
++
+>
++    MD5(block->host, block->used_length, md);
+>
++    for(i = 0; i < MD5_DIGEST_LENGTH; i++) {
+>
++        fprintf(stderr, "%02x", md[i]);
+>
++    }
+>
++    fprintf(stderr, "\n");
+>
++    error_report("end ram md5");
+>
++}
+>
++
+>
+void qemu_savevm_state_begin(QEMUFile *f,
+>
+const MigrationParams *params)
+>
+{
+>
+@@ -1056,6 +1079,10 @@ void
+>
+qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only)
+>
+save_section_header(f, se, QEMU_VM_SECTION_END);
+>
+>
+ret = se->ops->save_live_complete_precopy(f, se->opaque);
+>
++
+>
++        fprintf(stderr, "after saving %s complete\n", se->idstr);
+>
++        check_host_md5();
+>
++
+>
+trace_savevm_section_end(se->idstr, se->section_id, ret);
+>
+save_section_footer(f, se);
+>
+if (ret < 0) {
+>
+@@ -1791,6 +1818,11 @@ static int qemu_loadvm_state_main(QEMUFile *f,
+>
+MigrationIncomingState *mis)
+>
+section_id, le->se->idstr);
+>
+return ret;
+>
+}
+>
++            if (section_type == QEMU_VM_SECTION_END) {
+>
++                error_report("after loading state section id %d(%s)",
+>
++                             section_id, le->se->idstr);
+>
++                check_host_md5();
+>
++            }
+>
+if (!check_section_footer(f, le)) {
+>
+return -EINVAL;
+>
+}
+>
+@@ -1901,6 +1933,8 @@ int qemu_loadvm_state(QEMUFile *f)
+>
+}
+>
+>
+cpu_synchronize_all_post_init();
+>
++    error_report("%s: after cpu_synchronize_all_post_init\n", __func__);
+>
++    check_host_md5();
+>
+>
+return ret;
+>
+}
+
+>
+>
+Thanks for describing how to reproduce the bug.
+>
+If some pages are not transferred to destination then it is a bug, so we need
+>
+to know what the problem is, notice that the problem can be that TCG is not
+>
+marking dirty some page, that Migration code "forgets" about that page, or
+>
+anything eles altogether, that is what we need to find.
+>
+>
+There are more posibilities, I am not sure that memtest is on 32bit mode, and
+>
+it is inside posibility that we are missing some state when we are on real
+>
+mode.
+>
+>
+Will try to take a look at this.
+>
+>
+THanks, again.
+>
+Hi Juan & Amit
+
+ Do you think we should add a mechanism to check the data integrity during LM 
+like Zhijian's patch did?  it may be very helpful for developers. 
+ Actually, I did the similar thing before in order to make sure that I did the 
+right thing we I change the code related to LM.
+
+Liang
+
+On (Fri) 04 Dec 2015 [01:43:07], Li, Liang Z wrote:
+>
+>
+>
+> Thanks for describing how to reproduce the bug.
+>
+> If some pages are not transferred to destination then it is a bug, so we
+>
+> need
+>
+> to know what the problem is, notice that the problem can be that TCG is not
+>
+> marking dirty some page, that Migration code "forgets" about that page, or
+>
+> anything eles altogether, that is what we need to find.
+>
+>
+>
+> There are more posibilities, I am not sure that memtest is on 32bit mode,
+>
+> and
+>
+> it is inside posibility that we are missing some state when we are on real
+>
+> mode.
+>
+>
+>
+> Will try to take a look at this.
+>
+>
+>
+> THanks, again.
+>
+>
+>
+>
+Hi Juan & Amit
+>
+>
+Do you think we should add a mechanism to check the data integrity during LM
+>
+like Zhijian's patch did?  it may be very helpful for developers.
+>
+Actually, I did the similar thing before in order to make sure that I did
+>
+the right thing we I change the code related to LM.
+If you mean for debugging, something that's not always on, then I'm
+fine with it.
+
+A script that goes along that shows the result of comparison of the
+diff will be helpful too, something that shows how many pages are
+differnt, how many bytes in a page on average, and so on.
+
+                Amit
+

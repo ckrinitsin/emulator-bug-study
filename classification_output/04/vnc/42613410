@@ -1,0 +1,157 @@
+vnc: 0.400
+KVM: 0.381
+device: 0.342
+other: 0.332
+graphic: 0.330
+semantic: 0.327
+mistranslation: 0.314
+instruction: 0.307
+network: 0.284
+assembly: 0.283
+socket: 0.190
+boot: 0.187
+
+[Qemu-devel] [PATCH, Bug 1612908] scripts: Add TCP endpoints for qom-* scripts
+
+From: Carl Allendorph <address@hidden>
+
+I've created a patch for bug #1612908. The current docs for the scripts
+in the "scripts/qmp/" directory suggest that both unix sockets and
+tcp endpoints can be used. The TCP endpoints don't work for most of the
+scripts, with notable exception of 'qmp-shell'. This patch attempts to
+refactor the process of distinguishing between unix path endpoints and
+tcp endpoints to work for all of these scripts.
+
+Carl Allendorph (1):
+  scripts: Add ability for qom-* python scripts to target tcp endpoints
+
+ scripts/qmp/qmp-shell | 22 ++--------------------
+ scripts/qmp/qmp.py    | 23 ++++++++++++++++++++---
+ 2 files changed, 22 insertions(+), 23 deletions(-)
+
+--
+2.7.4
+
+From: Carl Allendorph <address@hidden>
+
+The current code for QEMUMonitorProtocol accepts both a unix socket
+endpoint as a string and a tcp endpoint as a tuple. Most of the scripts
+that use this class don't massage the command line argument to generate
+a tuple. This patch refactors qmp-shell slightly to reuse the existing
+parsing of the "host:port" string for all the qom-* scripts.
+
+Signed-off-by: Carl Allendorph <address@hidden>
+---
+ scripts/qmp/qmp-shell | 22 ++--------------------
+ scripts/qmp/qmp.py    | 23 ++++++++++++++++++++---
+ 2 files changed, 22 insertions(+), 23 deletions(-)
+
+diff --git a/scripts/qmp/qmp-shell b/scripts/qmp/qmp-shell
+index 0373b24..8a2a437 100755
+--- a/scripts/qmp/qmp-shell
++++ b/scripts/qmp/qmp-shell
+@@ -83,9 +83,6 @@ class QMPCompleter(list):
+ class QMPShellError(Exception):
+     pass
+ 
+-class QMPShellBadPort(QMPShellError):
+-    pass
+-
+ class FuzzyJSON(ast.NodeTransformer):
+     '''This extension of ast.NodeTransformer filters literal "true/false/null"
+     values in an AST and replaces them by proper "True/False/None" values that
+@@ -103,28 +100,13 @@ class FuzzyJSON(ast.NodeTransformer):
+ #       _execute_cmd()). Let's design a better one.
+ class QMPShell(qmp.QEMUMonitorProtocol):
+     def __init__(self, address, pretty=False):
+-        qmp.QEMUMonitorProtocol.__init__(self, self.__get_address(address))
++        qmp.QEMUMonitorProtocol.__init__(self, address)
+         self._greeting = None
+         self._completer = None
+         self._pretty = pretty
+         self._transmode = False
+         self._actions = list()
+ 
+-    def __get_address(self, arg):
+-        """
+-        Figure out if the argument is in the port:host form, if it's not it's
+-        probably a file path.
+-        """
+-        addr = arg.split(':')
+-        if len(addr) == 2:
+-            try:
+-                port = int(addr[1])
+-            except ValueError:
+-                raise QMPShellBadPort
+-            return ( addr[0], port )
+-        # socket path
+-        return arg
+-
+     def _fill_completion(self):
+         for cmd in self.cmd('query-commands')['return']:
+             self._completer.append(cmd['name'])
+@@ -400,7 +382,7 @@ def main():
+ 
+         if qemu is None:
+             fail_cmdline()
+-    except QMPShellBadPort:
++    except qmp.QMPShellBadPort:
+         die('bad port number in command-line')
+ 
+     try:
+diff --git a/scripts/qmp/qmp.py b/scripts/qmp/qmp.py
+index 62d3651..261ece8 100644
+--- a/scripts/qmp/qmp.py
++++ b/scripts/qmp/qmp.py
+@@ -25,21 +25,23 @@ class QMPCapabilitiesError(QMPError):
+ class QMPTimeoutError(QMPError):
+     pass
+ 
++class QMPShellBadPort(QMPError):
++    pass
++
+ class QEMUMonitorProtocol:
+     def __init__(self, address, server=False, debug=False):
+         """
+         Create a QEMUMonitorProtocol class.
+ 
+         @param address: QEMU address, can be either a unix socket path (string)
+-                        or a tuple in the form ( address, port ) for a TCP
+-                        connection
++                        or a TCP endpoint (string in the format "host:port")
+         @param server: server mode listens on the socket (bool)
+         @raise socket.error on socket connection errors
+         @note No connection is established, this is done by the connect() or
+               accept() methods
+         """
+         self.__events = []
+-        self.__address = address
++        self.__address = self.__get_address(address)
+         self._debug = debug
+         self.__sock = self.__get_sock()
+         if server:
+@@ -47,6 +49,21 @@ class QEMUMonitorProtocol:
+             self.__sock.bind(self.__address)
+             self.__sock.listen(1)
+ 
++    def __get_address(self, arg):
++        """
++        Figure out if the argument is in the port:host form, if it's not it's
++        probably a file path.
++        """
++        addr = arg.split(':')
++        if len(addr) == 2:
++            try:
++                port = int(addr[1])
++            except ValueError:
++                raise QMPShellBadPort
++            return ( addr[0], port )
++        # socket path
++        return arg
++
+     def __get_sock(self):
+         if isinstance(self.__address, tuple):
+             family = socket.AF_INET
+-- 
+2.7.4
+

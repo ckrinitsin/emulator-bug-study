@@ -1,0 +1,430 @@
+other: 0.940
+instruction: 0.920
+semantic: 0.917
+boot: 0.909
+mistranslation: 0.882
+
+[Bug Report] Possible Missing Endianness Conversion
+
+The virtio packed virtqueue support patch[1] suggests converting
+endianness by lines:
+
+virtio_tswap16s(vdev, &e->off_wrap);
+virtio_tswap16s(vdev, &e->flags);
+
+Though both of these conversion statements aren't present in the
+latest qemu code here[2]
+
+Is this intentional?
+
+[1]:
+https://mail.gnu.org/archive/html/qemu-block/2019-10/msg01492.html
+[2]:
+https://elixir.bootlin.com/qemu/latest/source/hw/virtio/virtio.c#L314
+
+CCing Jason.
+
+On Mon, Jun 24, 2024 at 4:30â¯PM Xoykie <xoykie@gmail.com> wrote:
+>
+>
+The virtio packed virtqueue support patch[1] suggests converting
+>
+endianness by lines:
+>
+>
+virtio_tswap16s(vdev, &e->off_wrap);
+>
+virtio_tswap16s(vdev, &e->flags);
+>
+>
+Though both of these conversion statements aren't present in the
+>
+latest qemu code here[2]
+>
+>
+Is this intentional?
+Good catch!
+
+It looks like it was removed (maybe by mistake) by commit
+d152cdd6f6 ("virtio: use virtio accessor to access packed event")
+
+Jason can you confirm that?
+
+Thanks,
+Stefano
+
+>
+>
+[1]:
+https://mail.gnu.org/archive/html/qemu-block/2019-10/msg01492.html
+>
+[2]:
+https://elixir.bootlin.com/qemu/latest/source/hw/virtio/virtio.c#L314
+>
+
+On Mon, 24 Jun 2024 at 16:11, Stefano Garzarella <sgarzare@redhat.com> wrote:
+>
+>
+CCing Jason.
+>
+>
+On Mon, Jun 24, 2024 at 4:30â¯PM Xoykie <xoykie@gmail.com> wrote:
+>
+>
+>
+> The virtio packed virtqueue support patch[1] suggests converting
+>
+> endianness by lines:
+>
+>
+>
+> virtio_tswap16s(vdev, &e->off_wrap);
+>
+> virtio_tswap16s(vdev, &e->flags);
+>
+>
+>
+> Though both of these conversion statements aren't present in the
+>
+> latest qemu code here[2]
+>
+>
+>
+> Is this intentional?
+>
+>
+Good catch!
+>
+>
+It looks like it was removed (maybe by mistake) by commit
+>
+d152cdd6f6 ("virtio: use virtio accessor to access packed event")
+That commit changes from:
+
+-    address_space_read_cached(cache, off_off, &e->off_wrap,
+-                              sizeof(e->off_wrap));
+-    virtio_tswap16s(vdev, &e->off_wrap);
+
+which does a byte read of 2 bytes and then swaps the bytes
+depending on the host endianness and the value of
+virtio_access_is_big_endian()
+
+to this:
+
++    e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+
+virtio_lduw_phys_cached() is a small function which calls
+either lduw_be_phys_cached() or lduw_le_phys_cached()
+depending on the value of virtio_access_is_big_endian().
+(And lduw_be_phys_cached() and lduw_le_phys_cached() do
+the right thing for the host-endianness to do a "load
+a specifically big or little endian 16-bit value".)
+
+Which is to say that because we use a load/store function that's
+explicit about the size of the data type it is accessing, the
+function itself can handle doing the load as big or little
+endian, rather than the calling code having to do a manual swap after
+it has done a load-as-bag-of-bytes. This is generally preferable
+as it's less error-prone.
+
+(Explicit swap-after-loading still has a place where the
+code is doing a load of a whole structure out of the
+guest and then swapping each struct field after the fact,
+because it means we can do a single load-from-guest-memory
+rather than a whole sequence of calls all the way down
+through the memory subsystem.)
+
+thanks
+-- PMM
+
+On Mon, Jun 24, 2024 at 04:19:52PM GMT, Peter Maydell wrote:
+On Mon, 24 Jun 2024 at 16:11, Stefano Garzarella <sgarzare@redhat.com> wrote:
+CCing Jason.
+
+On Mon, Jun 24, 2024 at 4:30â¯PM Xoykie <xoykie@gmail.com> wrote:
+>
+> The virtio packed virtqueue support patch[1] suggests converting
+> endianness by lines:
+>
+> virtio_tswap16s(vdev, &e->off_wrap);
+> virtio_tswap16s(vdev, &e->flags);
+>
+> Though both of these conversion statements aren't present in the
+> latest qemu code here[2]
+>
+> Is this intentional?
+
+Good catch!
+
+It looks like it was removed (maybe by mistake) by commit
+d152cdd6f6 ("virtio: use virtio accessor to access packed event")
+That commit changes from:
+
+-    address_space_read_cached(cache, off_off, &e->off_wrap,
+-                              sizeof(e->off_wrap));
+-    virtio_tswap16s(vdev, &e->off_wrap);
+
+which does a byte read of 2 bytes and then swaps the bytes
+depending on the host endianness and the value of
+virtio_access_is_big_endian()
+
+to this:
+
++    e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+
+virtio_lduw_phys_cached() is a small function which calls
+either lduw_be_phys_cached() or lduw_le_phys_cached()
+depending on the value of virtio_access_is_big_endian().
+(And lduw_be_phys_cached() and lduw_le_phys_cached() do
+the right thing for the host-endianness to do a "load
+a specifically big or little endian 16-bit value".)
+
+Which is to say that because we use a load/store function that's
+explicit about the size of the data type it is accessing, the
+function itself can handle doing the load as big or little
+endian, rather than the calling code having to do a manual swap after
+it has done a load-as-bag-of-bytes. This is generally preferable
+as it's less error-prone.
+Thanks for the details!
+
+So, should we also remove `virtio_tswap16s(vdev, &e->flags);` ?
+
+I mean:
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 893a072c9d..2e5e67bdb9 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -323,7 +323,6 @@ static void vring_packed_event_read(VirtIODevice *vdev,
+     /* Make sure flags is seen before off_wrap */
+     smp_rmb();
+     e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+-    virtio_tswap16s(vdev, &e->flags);
+ }
+
+ static void vring_packed_off_wrap_write(VirtIODevice *vdev,
+
+Thanks,
+Stefano
+(Explicit swap-after-loading still has a place where the
+code is doing a load of a whole structure out of the
+guest and then swapping each struct field after the fact,
+because it means we can do a single load-from-guest-memory
+rather than a whole sequence of calls all the way down
+through the memory subsystem.)
+
+thanks
+-- PMM
+
+On Tue, 25 Jun 2024 at 08:18, Stefano Garzarella <sgarzare@redhat.com> wrote:
+>
+>
+On Mon, Jun 24, 2024 at 04:19:52PM GMT, Peter Maydell wrote:
+>
+>On Mon, 24 Jun 2024 at 16:11, Stefano Garzarella <sgarzare@redhat.com> wrote:
+>
+>>
+>
+>> CCing Jason.
+>
+>>
+>
+>> On Mon, Jun 24, 2024 at 4:30â¯PM Xoykie <xoykie@gmail.com> wrote:
+>
+>> >
+>
+>> > The virtio packed virtqueue support patch[1] suggests converting
+>
+>> > endianness by lines:
+>
+>> >
+>
+>> > virtio_tswap16s(vdev, &e->off_wrap);
+>
+>> > virtio_tswap16s(vdev, &e->flags);
+>
+>> >
+>
+>> > Though both of these conversion statements aren't present in the
+>
+>> > latest qemu code here[2]
+>
+>> >
+>
+>> > Is this intentional?
+>
+>>
+>
+>> Good catch!
+>
+>>
+>
+>> It looks like it was removed (maybe by mistake) by commit
+>
+>> d152cdd6f6 ("virtio: use virtio accessor to access packed event")
+>
+>
+>
+>That commit changes from:
+>
+>
+>
+>-    address_space_read_cached(cache, off_off, &e->off_wrap,
+>
+>-                              sizeof(e->off_wrap));
+>
+>-    virtio_tswap16s(vdev, &e->off_wrap);
+>
+>
+>
+>which does a byte read of 2 bytes and then swaps the bytes
+>
+>depending on the host endianness and the value of
+>
+>virtio_access_is_big_endian()
+>
+>
+>
+>to this:
+>
+>
+>
+>+    e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+>
+>
+>
+>virtio_lduw_phys_cached() is a small function which calls
+>
+>either lduw_be_phys_cached() or lduw_le_phys_cached()
+>
+>depending on the value of virtio_access_is_big_endian().
+>
+>(And lduw_be_phys_cached() and lduw_le_phys_cached() do
+>
+>the right thing for the host-endianness to do a "load
+>
+>a specifically big or little endian 16-bit value".)
+>
+>
+>
+>Which is to say that because we use a load/store function that's
+>
+>explicit about the size of the data type it is accessing, the
+>
+>function itself can handle doing the load as big or little
+>
+>endian, rather than the calling code having to do a manual swap after
+>
+>it has done a load-as-bag-of-bytes. This is generally preferable
+>
+>as it's less error-prone.
+>
+>
+Thanks for the details!
+>
+>
+So, should we also remove `virtio_tswap16s(vdev, &e->flags);` ?
+>
+>
+I mean:
+>
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+>
+index 893a072c9d..2e5e67bdb9 100644
+>
+--- a/hw/virtio/virtio.c
+>
++++ b/hw/virtio/virtio.c
+>
+@@ -323,7 +323,6 @@ static void vring_packed_event_read(VirtIODevice *vdev,
+>
+/* Make sure flags is seen before off_wrap */
+>
+smp_rmb();
+>
+e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+>
+-    virtio_tswap16s(vdev, &e->flags);
+>
+}
+That definitely looks like it's probably not correct...
+
+-- PMM
+
+On Fri, Jun 28, 2024 at 03:53:09PM GMT, Peter Maydell wrote:
+On Tue, 25 Jun 2024 at 08:18, Stefano Garzarella <sgarzare@redhat.com> wrote:
+On Mon, Jun 24, 2024 at 04:19:52PM GMT, Peter Maydell wrote:
+>On Mon, 24 Jun 2024 at 16:11, Stefano Garzarella <sgarzare@redhat.com> wrote:
+>>
+>> CCing Jason.
+>>
+>> On Mon, Jun 24, 2024 at 4:30â¯PM Xoykie <xoykie@gmail.com> wrote:
+>> >
+>> > The virtio packed virtqueue support patch[1] suggests converting
+>> > endianness by lines:
+>> >
+>> > virtio_tswap16s(vdev, &e->off_wrap);
+>> > virtio_tswap16s(vdev, &e->flags);
+>> >
+>> > Though both of these conversion statements aren't present in the
+>> > latest qemu code here[2]
+>> >
+>> > Is this intentional?
+>>
+>> Good catch!
+>>
+>> It looks like it was removed (maybe by mistake) by commit
+>> d152cdd6f6 ("virtio: use virtio accessor to access packed event")
+>
+>That commit changes from:
+>
+>-    address_space_read_cached(cache, off_off, &e->off_wrap,
+>-                              sizeof(e->off_wrap));
+>-    virtio_tswap16s(vdev, &e->off_wrap);
+>
+>which does a byte read of 2 bytes and then swaps the bytes
+>depending on the host endianness and the value of
+>virtio_access_is_big_endian()
+>
+>to this:
+>
+>+    e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+>
+>virtio_lduw_phys_cached() is a small function which calls
+>either lduw_be_phys_cached() or lduw_le_phys_cached()
+>depending on the value of virtio_access_is_big_endian().
+>(And lduw_be_phys_cached() and lduw_le_phys_cached() do
+>the right thing for the host-endianness to do a "load
+>a specifically big or little endian 16-bit value".)
+>
+>Which is to say that because we use a load/store function that's
+>explicit about the size of the data type it is accessing, the
+>function itself can handle doing the load as big or little
+>endian, rather than the calling code having to do a manual swap after
+>it has done a load-as-bag-of-bytes. This is generally preferable
+>as it's less error-prone.
+
+Thanks for the details!
+
+So, should we also remove `virtio_tswap16s(vdev, &e->flags);` ?
+
+I mean:
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 893a072c9d..2e5e67bdb9 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -323,7 +323,6 @@ static void vring_packed_event_read(VirtIODevice *vdev,
+      /* Make sure flags is seen before off_wrap */
+      smp_rmb();
+      e->off_wrap = virtio_lduw_phys_cached(vdev, cache, off_off);
+-    virtio_tswap16s(vdev, &e->flags);
+  }
+That definitely looks like it's probably not correct...
+Yeah, I just sent that patch:
+20240701075208.19634-1-sgarzare@redhat.com
+">https://lore.kernel.org/qemu-devel/
+20240701075208.19634-1-sgarzare@redhat.com
+We can continue the discussion there.
+
+Thanks,
+Stefano
+

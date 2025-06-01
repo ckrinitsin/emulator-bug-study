@@ -1,0 +1,200 @@
+boot: 0.881
+other: 0.853
+semantic: 0.843
+instruction: 0.821
+mistranslation: 0.768
+
+[BUG, RFC] Base node is in RW after making external snapshot
+
+Hi everyone,
+
+When making an external snapshot, we end up in a situation when 2 block
+graph nodes related to the same image file (format and storage nodes)
+have different RO flags set on them.
+
+E.g.
+
+# ls -la /proc/PID/fd
+lrwx------ 1 root qemu 64 Apr 24 20:14 12 -> /path/to/harddisk.hdd
+
+# virsh qemu-monitor-command VM '{"execute": "query-named-block-nodes"}'
+--pretty | egrep '"node-name"|"ro"'
+      "ro": false,
+      "node-name": "libvirt-1-format",
+      "ro": false,
+      "node-name": "libvirt-1-storage",
+
+# virsh snapshot-create-as VM --name snap --disk-only
+Domain snapshot snap created
+
+# ls -la /proc/PID/fd
+lr-x------ 1 root qemu 64 Apr 24 20:14 134 -> /path/to/harddisk.hdd
+lrwx------ 1 root qemu 64 Apr 24 20:14 135 -> /path/to/harddisk.snap
+
+# virsh qemu-monitor-command VM '{"execute": "query-named-block-nodes"}'
+--pretty | egrep '"node-name"|"ro"'
+      "ro": false,
+      "node-name": "libvirt-2-format",
+      "ro": false,
+      "node-name": "libvirt-2-storage",
+      "ro": true,
+      "node-name": "libvirt-1-format",
+      "ro": false,                        <--------------
+      "node-name": "libvirt-1-storage",
+
+File descriptor has been reopened in RO, but "libvirt-1-storage" node
+still has RW permissions set.
+
+I'm wondering it this a bug or this is intended?  Looks like a bug to
+me, although I see that some iotests (e.g. 273) expect 2 nodes related
+to the same image file to have different RO flags.
+
+bdrv_reopen_set_read_only()
+  bdrv_reopen()
+    bdrv_reopen_queue()
+      bdrv_reopen_queue_child()
+    bdrv_reopen_multiple()
+      bdrv_list_refresh_perms()
+        bdrv_topological_dfs()
+        bdrv_do_refresh_perms()
+      bdrv_reopen_commit()
+
+In the stack above bdrv_reopen_set_read_only() is only being called for
+the parent (libvirt-1-format) node.  There're 2 lists: BDSs from
+refresh_list are used by bdrv_drv_set_perm and this leads to actual
+reopen with RO of the file descriptor.  And then there's reopen queue
+bs_queue -- BDSs from this queue get their parameters updated.  While
+refresh_list ends up having the whole subtree (including children, this
+is done in bdrv_topological_dfs()) bs_queue only has the parent.  And
+that is because storage (child) node's (bs->inherits_from == NULL), so
+bdrv_reopen_queue_child() never adds it to the queue.  Could it be the
+source of this bug?
+
+Anyway, would greatly appreciate a clarification.
+
+Andrey
+
+On 4/24/24 21:00, Andrey Drobyshev wrote:
+>
+Hi everyone,
+>
+>
+When making an external snapshot, we end up in a situation when 2 block
+>
+graph nodes related to the same image file (format and storage nodes)
+>
+have different RO flags set on them.
+>
+>
+E.g.
+>
+>
+# ls -la /proc/PID/fd
+>
+lrwx------ 1 root qemu 64 Apr 24 20:14 12 -> /path/to/harddisk.hdd
+>
+>
+# virsh qemu-monitor-command VM '{"execute": "query-named-block-nodes"}'
+>
+--pretty | egrep '"node-name"|"ro"'
+>
+"ro": false,
+>
+"node-name": "libvirt-1-format",
+>
+"ro": false,
+>
+"node-name": "libvirt-1-storage",
+>
+>
+# virsh snapshot-create-as VM --name snap --disk-only
+>
+Domain snapshot snap created
+>
+>
+# ls -la /proc/PID/fd
+>
+lr-x------ 1 root qemu 64 Apr 24 20:14 134 -> /path/to/harddisk.hdd
+>
+lrwx------ 1 root qemu 64 Apr 24 20:14 135 -> /path/to/harddisk.snap
+>
+>
+# virsh qemu-monitor-command VM '{"execute": "query-named-block-nodes"}'
+>
+--pretty | egrep '"node-name"|"ro"'
+>
+"ro": false,
+>
+"node-name": "libvirt-2-format",
+>
+"ro": false,
+>
+"node-name": "libvirt-2-storage",
+>
+"ro": true,
+>
+"node-name": "libvirt-1-format",
+>
+"ro": false,                        <--------------
+>
+"node-name": "libvirt-1-storage",
+>
+>
+File descriptor has been reopened in RO, but "libvirt-1-storage" node
+>
+still has RW permissions set.
+>
+>
+I'm wondering it this a bug or this is intended?  Looks like a bug to
+>
+me, although I see that some iotests (e.g. 273) expect 2 nodes related
+>
+to the same image file to have different RO flags.
+>
+>
+bdrv_reopen_set_read_only()
+>
+bdrv_reopen()
+>
+bdrv_reopen_queue()
+>
+bdrv_reopen_queue_child()
+>
+bdrv_reopen_multiple()
+>
+bdrv_list_refresh_perms()
+>
+bdrv_topological_dfs()
+>
+bdrv_do_refresh_perms()
+>
+bdrv_reopen_commit()
+>
+>
+In the stack above bdrv_reopen_set_read_only() is only being called for
+>
+the parent (libvirt-1-format) node.  There're 2 lists: BDSs from
+>
+refresh_list are used by bdrv_drv_set_perm and this leads to actual
+>
+reopen with RO of the file descriptor.  And then there's reopen queue
+>
+bs_queue -- BDSs from this queue get their parameters updated.  While
+>
+refresh_list ends up having the whole subtree (including children, this
+>
+is done in bdrv_topological_dfs()) bs_queue only has the parent.  And
+>
+that is because storage (child) node's (bs->inherits_from == NULL), so
+>
+bdrv_reopen_queue_child() never adds it to the queue.  Could it be the
+>
+source of this bug?
+>
+>
+Anyway, would greatly appreciate a clarification.
+>
+>
+Andrey
+Friendly ping.  Could somebody confirm that it is a bug indeed?
+

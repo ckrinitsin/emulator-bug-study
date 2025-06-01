@@ -1,0 +1,4589 @@
+mistranslation: 0.962
+device: 0.931
+graphic: 0.931
+instruction: 0.930
+other: 0.930
+assembly: 0.926
+semantic: 0.923
+KVM: 0.914
+socket: 0.907
+vnc: 0.905
+network: 0.904
+boot: 0.895
+
+[BUG, RFC] cpr-transfer: qxl guest driver crashes after migration
+
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+>
+EMULATOR=/path/to/emulator
+>
+ROOTFS=/path/to/image
+>
+QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>
+$EMULATOR -enable-kvm \
+>
+-machine q35 \
+>
+-cpu host -smp 2 -m 2G \
+>
+-object
+>
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+>
+-machine memory-backend=ram0 \
+>
+-machine aux-ram-share=on \
+>
+-drive file=$ROOTFS,media=disk,if=virtio \
+>
+-qmp unix:$QMPSOCK,server=on,wait=off \
+>
+-nographic \
+>
+-device qxl-vga
+Run migration target:
+>
+EMULATOR=/path/to/emulator
+>
+ROOTFS=/path/to/image
+>
+QMPSOCK=/var/run/alma8qmp-dst.sock
+>
+>
+>
+>
+$EMULATOR -enable-kvm \
+>
+-machine q35 \
+>
+-cpu host -smp 2 -m 2G \
+>
+-object
+>
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+>
+-machine memory-backend=ram0 \
+>
+-machine aux-ram-share=on \
+>
+-drive file=$ROOTFS,media=disk,if=virtio \
+>
+-qmp unix:$QMPSOCK,server=on,wait=off \
+>
+-nographic \
+>
+-device qxl-vga \
+>
+-incoming tcp:0:44444 \
+>
+-incoming '{"channel-type": "cpr", "addr": { "transport": "socket",
+>
+"type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+>
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+>
+QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>
+$QMPSHELL -p $QMPSOCK <<EOF
+>
+migrate-set-parameters mode=cpr-transfer
+>
+migrate
+>
+channels=[{"channel-type":"main","addr":{"transport":"socket","type":"inet","host":"0","port":"44444"}},{"channel-type":"cpr","addr":{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-dst.sock"}}]
+>
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+>
+[   73.962002] [TTM] Buffer eviction failed
+>
+[   73.962072] qxl 0000:00:02.0: object_init failed for (3149824, 0x00000001)
+>
+[   73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to allocate
+>
+VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which speeds up
+the crash in the guest):
+>
+#!/bin/bash
+>
+>
+chvt 3
+>
+>
+for j in $(seq 80); do
+>
+echo "$(date) starting round $j"
+>
+if [ "$(journalctl --boot | grep "failed to allocate VRAM BO")" != ""
+>
+]; then
+>
+echo "bug was reproduced after $j tries"
+>
+exit 1
+>
+fi
+>
+for i in $(seq 100); do
+>
+dmesg > /dev/tty3
+>
+done
+>
+done
+>
+>
+echo "bug could not be reproduced"
+>
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into this?  Any
+suggestions would be appreciated.  Thanks!
+
+Andrey
+
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+     -machine q35 \
+     -cpu host -smp 2 -m 2G \
+     -object 
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+     -machine memory-backend=ram0 \
+     -machine aux-ram-share=on \
+     -drive file=$ROOTFS,media=disk,if=virtio \
+     -qmp unix:$QMPSOCK,server=on,wait=off \
+     -nographic \
+     -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+-machine q35 \
+     -cpu host -smp 2 -m 2G \
+     -object 
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+     -machine memory-backend=ram0 \
+     -machine aux-ram-share=on \
+     -drive file=$ROOTFS,media=disk,if=virtio \
+     -qmp unix:$QMPSOCK,server=on,wait=off \
+     -nographic \
+     -device qxl-vga \
+     -incoming tcp:0:44444 \
+     -incoming '{"channel-type": "cpr", "addr": { "transport": "socket", "type": "unix", 
+"path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+     migrate-set-parameters mode=cpr-transfer
+     migrate 
+channels=[{"channel-type":"main","addr":{"transport":"socket","type":"inet","host":"0","port":"44444"}},{"channel-type":"cpr","addr":{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[   73.962002] [TTM] Buffer eviction failed
+[   73.962072] qxl 0000:00:02.0: object_init failed for (3149824, 0x00000001)
+[   73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to allocate 
+VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+         echo "$(date) starting round $j"
+         if [ "$(journalctl --boot | grep "failed to allocate VRAM BO")" != "" 
+]; then
+                 echo "bug was reproduced after $j tries"
+                 exit 1
+         fi
+         for i in $(seq 100); do
+                 dmesg > /dev/tty3
+         done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into this?  Any
+suggestions would be appreciated.  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+
+- Steve
+
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+Â Â Â Â  -machine q35 \
+Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â  -object 
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â  -nographic \
+Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+Â Â Â Â  -machine q35 \
+Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â  -object 
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/ram0,share=on\
+Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â  -nographic \
+Â Â Â Â  -device qxl-vga \
+Â Â Â Â  -incoming tcp:0:44444 \
+Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport": "socket", "type": "unix", 
+"path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+Â Â Â Â  migrate 
+channels=[{"channel-type":"main","addr":{"transport":"socket","type":"inet","host":"0","port":"44444"}},{"channel-type":"cpr","addr":{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824, 0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to allocate 
+VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM BO")" != "" 
+]; then
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+Â Â Â Â Â Â Â Â  fi
+Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.  A message is printed at migration start time.
+1740667681-257312-1-git-send-email-steven.sistare@oracle.com
+/">https://lore.kernel.org/qemu-devel/
+1740667681-257312-1-git-send-email-steven.sistare@oracle.com
+/
+- Steve
+
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+>
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+>
+> On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+>
+>> Hi all,
+>
+>>
+>
+>> We've been experimenting with cpr-transfer migration mode recently and
+>
+>> have discovered the following issue with the guest QXL driver:
+>
+>>
+>
+>> Run migration source:
+>
+>>> EMULATOR=/path/to/emulator
+>
+>>> ROOTFS=/path/to/image
+>
+>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>
+>
+>>> $EMULATOR -enable-kvm \
+>
+>>> Â Â Â Â  -machine q35 \
+>
+>>> Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>> Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>> ram0,share=on\
+>
+>>> Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>> Â Â Â Â  -machine aux-ram-share=on \
+>
+>>> Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>> Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>> Â Â Â Â  -nographic \
+>
+>>> Â Â Â Â  -device qxl-vga
+>
+>>
+>
+>> Run migration target:
+>
+>>> EMULATOR=/path/to/emulator
+>
+>>> ROOTFS=/path/to/image
+>
+>>> QMPSOCK=/var/run/alma8qmp-dst.sock
+>
+>>> $EMULATOR -enable-kvm \
+>
+>>> Â Â Â Â  -machine q35 \
+>
+>>> Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>> Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>> ram0,share=on\
+>
+>>> Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>> Â Â Â Â  -machine aux-ram-share=on \
+>
+>>> Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>> Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>> Â Â Â Â  -nographic \
+>
+>>> Â Â Â Â  -device qxl-vga \
+>
+>>> Â Â Â Â  -incoming tcp:0:44444 \
+>
+>>> Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+>
+>>> "socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+>
+>>
+>
+>>
+>
+>> Launch the migration:
+>
+>>> QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+>
+>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>
+>
+>>> $QMPSHELL -p $QMPSOCK <<EOF
+>
+>>> Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+>
+>>> Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+>
+>>> {"transport":"socket","type":"inet","host":"0","port":"44444"}},
+>
+>>> {"channel-type":"cpr","addr":
+>
+>>> {"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+>
+>>> dst.sock"}}]
+>
+>>> EOF
+>
+>>
+>
+>> Then, after a while, QXL guest driver on target crashes spewing the
+>
+>> following messages:
+>
+>>> [Â Â  73.962002] [TTM] Buffer eviction failed
+>
+>>> [Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+>
+>>> 0x00000001)
+>
+>>> [Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+>
+>>> allocate VRAM BO
+>
+>>
+>
+>> That seems to be a known kernel QXL driver bug:
+>
+>>
+>
+>>
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+>
+>>
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+>
+>>
+>
+>> (the latter discussion contains that reproduce script which speeds up
+>
+>> the crash in the guest):
+>
+>>> #!/bin/bash
+>
+>>>
+>
+>>> chvt 3
+>
+>>>
+>
+>>> for j in $(seq 80); do
+>
+>>> Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+>
+>>> Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM
+>
+>>> BO")" != "" ]; then
+>
+>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+>
+>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+>
+>>> Â Â Â Â Â Â Â Â  fi
+>
+>>> Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+>
+>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+>
+>>> Â Â Â Â Â Â Â Â  done
+>
+>>> done
+>
+>>>
+>
+>>> echo "bug could not be reproduced"
+>
+>>> exit 0
+>
+>>
+>
+>> The bug itself seems to remain unfixed, as I was able to reproduce that
+>
+>> with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+>
+>> cpr-transfer code also seems to be buggy as it triggers the crash -
+>
+>> without the cpr-transfer migration the above reproduce doesn't lead to
+>
+>> crash on the source VM.
+>
+>>
+>
+>> I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+>
+>> rather passes it through the memory backend object, our code might
+>
+>> somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+>
+>> corruption so far.
+>
+>>
+>
+>> Could somebody help the investigation and take a look into this?Â  Any
+>
+>> suggestions would be appreciated.Â  Thanks!
+>
+>
+>
+> Possibly some memory region created by qxl is not being preserved.
+>
+> Try adding these traces to see what is preserved:
+>
+>
+>
+> -trace enable='*cpr*'
+>
+> -trace enable='*ram_alloc*'
+>
+>
+Also try adding this patch to see if it flags any ram blocks as not
+>
+compatible with cpr.Â  A message is printed at migration start time.
+>
+Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-email-
+>
+steven.sistare@oracle.com/
+>
+>
+- Steve
+>
+With the traces enabled + the "migration: ram block cpr blockers" patch
+applied:
+
+Source:
+>
+cpr_find_fd pc.bios, id 0 returns -1
+>
+cpr_save_fd pc.bios, id 0, fd 22
+>
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+>
+0x7fec18e00000
+>
+cpr_find_fd pc.rom, id 0 returns -1
+>
+cpr_save_fd pc.rom, id 0, fd 23
+>
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+>
+0x7fec18c00000
+>
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+>
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+>
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd
+>
+24 host 0x7fec18a00000
+>
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+>
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+>
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864
+>
+fd 25 host 0x7feb77e00000
+>
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+>
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 27
+>
+host 0x7fec18800000
+>
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+>
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864
+>
+fd 28 host 0x7feb73c00000
+>
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+>
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 34
+>
+host 0x7fec18600000
+>
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+>
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+>
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd 35
+>
+host 0x7fec18200000
+>
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+>
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+>
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 36
+>
+host 0x7feb8b600000
+>
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+>
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+>
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 37 host
+>
+0x7feb8b400000
+>
+>
+cpr_state_save cpr-transfer mode
+>
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+>
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+>
+cpr_state_load cpr-transfer mode
+>
+cpr_find_fd pc.bios, id 0 returns 20
+>
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+>
+0x7fcdc9800000
+>
+cpr_find_fd pc.rom, id 0 returns 19
+>
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+>
+0x7fcdc9600000
+>
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+>
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd
+>
+18 host 0x7fcdc9400000
+>
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+>
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864
+>
+fd 17 host 0x7fcd27e00000
+>
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 16
+>
+host 0x7fcdc9200000
+>
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864
+>
+fd 15 host 0x7fcd23c00000
+>
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+>
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 14
+>
+host 0x7fcdc8800000
+>
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+>
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd 13
+>
+host 0x7fcdc8400000
+>
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+>
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 11
+>
+host 0x7fcdc8200000
+>
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+>
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 10 host
+>
+0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the same
+addresses), and no incompatible ram blocks are found during migration.
+
+Andrey
+
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+>
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+>
+> On 2/28/2025 1:13 PM, Steven Sistare wrote:
+>
+>> On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+>
+>>> Hi all,
+>
+>>>
+>
+>>> We've been experimenting with cpr-transfer migration mode recently and
+>
+>>> have discovered the following issue with the guest QXL driver:
+>
+>>>
+>
+>>> Run migration source:
+>
+>>>> EMULATOR=/path/to/emulator
+>
+>>>> ROOTFS=/path/to/image
+>
+>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>
+>
+>>>> $EMULATOR -enable-kvm \
+>
+>>>> Â Â Â Â  -machine q35 \
+>
+>>>> Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>> Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>>> ram0,share=on\
+>
+>>>> Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>> Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>> Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>> Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>> Â Â Â Â  -nographic \
+>
+>>>> Â Â Â Â  -device qxl-vga
+>
+>>>
+>
+>>> Run migration target:
+>
+>>>> EMULATOR=/path/to/emulator
+>
+>>>> ROOTFS=/path/to/image
+>
+>>>> QMPSOCK=/var/run/alma8qmp-dst.sock
+>
+>>>> $EMULATOR -enable-kvm \
+>
+>>>> Â Â Â Â  -machine q35 \
+>
+>>>> Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>> Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>>> ram0,share=on\
+>
+>>>> Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>> Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>> Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>> Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>> Â Â Â Â  -nographic \
+>
+>>>> Â Â Â Â  -device qxl-vga \
+>
+>>>> Â Â Â Â  -incoming tcp:0:44444 \
+>
+>>>> Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+>
+>>>> "socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+>
+>>>
+>
+>>>
+>
+>>> Launch the migration:
+>
+>>>> QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+>
+>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>
+>
+>>>> $QMPSHELL -p $QMPSOCK <<EOF
+>
+>>>> Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+>
+>>>> Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+>
+>>>> {"transport":"socket","type":"inet","host":"0","port":"44444"}},
+>
+>>>> {"channel-type":"cpr","addr":
+>
+>>>> {"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+>
+>>>> dst.sock"}}]
+>
+>>>> EOF
+>
+>>>
+>
+>>> Then, after a while, QXL guest driver on target crashes spewing the
+>
+>>> following messages:
+>
+>>>> [Â Â  73.962002] [TTM] Buffer eviction failed
+>
+>>>> [Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+>
+>>>> 0x00000001)
+>
+>>>> [Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+>
+>>>> allocate VRAM BO
+>
+>>>
+>
+>>> That seems to be a known kernel QXL driver bug:
+>
+>>>
+>
+>>>
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+>
+>>>
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+>
+>>>
+>
+>>> (the latter discussion contains that reproduce script which speeds up
+>
+>>> the crash in the guest):
+>
+>>>> #!/bin/bash
+>
+>>>>
+>
+>>>> chvt 3
+>
+>>>>
+>
+>>>> for j in $(seq 80); do
+>
+>>>> Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+>
+>>>> Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM
+>
+>>>> BO")" != "" ]; then
+>
+>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+>
+>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+>
+>>>> Â Â Â Â Â Â Â Â  fi
+>
+>>>> Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+>
+>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+>
+>>>> Â Â Â Â Â Â Â Â  done
+>
+>>>> done
+>
+>>>>
+>
+>>>> echo "bug could not be reproduced"
+>
+>>>> exit 0
+>
+>>>
+>
+>>> The bug itself seems to remain unfixed, as I was able to reproduce that
+>
+>>> with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+>
+>>> cpr-transfer code also seems to be buggy as it triggers the crash -
+>
+>>> without the cpr-transfer migration the above reproduce doesn't lead to
+>
+>>> crash on the source VM.
+>
+>>>
+>
+>>> I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+>
+>>> rather passes it through the memory backend object, our code might
+>
+>>> somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+>
+>>> corruption so far.
+>
+>>>
+>
+>>> Could somebody help the investigation and take a look into this?Â  Any
+>
+>>> suggestions would be appreciated.Â  Thanks!
+>
+>>
+>
+>> Possibly some memory region created by qxl is not being preserved.
+>
+>> Try adding these traces to see what is preserved:
+>
+>>
+>
+>> -trace enable='*cpr*'
+>
+>> -trace enable='*ram_alloc*'
+>
+>
+>
+> Also try adding this patch to see if it flags any ram blocks as not
+>
+> compatible with cpr.Â  A message is printed at migration start time.
+>
+> Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-email-
+>
+> steven.sistare@oracle.com/
+>
+>
+>
+> - Steve
+>
+>
+>
+>
+With the traces enabled + the "migration: ram block cpr blockers" patch
+>
+applied:
+>
+>
+Source:
+>
+> cpr_find_fd pc.bios, id 0 returns -1
+>
+> cpr_save_fd pc.bios, id 0, fd 22
+>
+> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+>
+> 0x7fec18e00000
+>
+> cpr_find_fd pc.rom, id 0 returns -1
+>
+> cpr_save_fd pc.rom, id 0, fd 23
+>
+> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+>
+> 0x7fec18c00000
+>
+> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+>
+> cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+>
+> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd
+>
+> 24 host 0x7fec18a00000
+>
+> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+>
+> cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+>
+> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864
+>
+> fd 25 host 0x7feb77e00000
+>
+> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+>
+> cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 27
+>
+> host 0x7fec18800000
+>
+> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+>
+> cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864
+>
+> fd 28 host 0x7feb73c00000
+>
+> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+>
+> cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 34
+>
+> host 0x7fec18600000
+>
+> cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+>
+> cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+>
+> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd
+>
+> 35 host 0x7fec18200000
+>
+> cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+>
+> cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+>
+> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 36
+>
+> host 0x7feb8b600000
+>
+> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+>
+> cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+>
+> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 37 host
+>
+> 0x7feb8b400000
+>
+>
+>
+> cpr_state_save cpr-transfer mode
+>
+> cpr_transfer_output /var/run/alma8cpr-dst.sock
+>
+>
+Target:
+>
+> cpr_transfer_input /var/run/alma8cpr-dst.sock
+>
+> cpr_state_load cpr-transfer mode
+>
+> cpr_find_fd pc.bios, id 0 returns 20
+>
+> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+>
+> 0x7fcdc9800000
+>
+> cpr_find_fd pc.rom, id 0 returns 19
+>
+> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+>
+> 0x7fcdc9600000
+>
+> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+>
+> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd
+>
+> 18 host 0x7fcdc9400000
+>
+> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+>
+> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864
+>
+> fd 17 host 0x7fcd27e00000
+>
+> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 16
+>
+> host 0x7fcdc9200000
+>
+> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864
+>
+> fd 15 host 0x7fcd23c00000
+>
+> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+>
+> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 14
+>
+> host 0x7fcdc8800000
+>
+> cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+>
+> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd
+>
+> 13 host 0x7fcdc8400000
+>
+> cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+>
+> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 11
+>
+> host 0x7fcdc8200000
+>
+> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+>
+> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 10 host
+>
+> 0x7fcd3be00000
+>
+>
+Looks like both vga.vram and qxl.vram are being preserved (with the same
+>
+addresses), and no incompatible ram blocks are found during migration.
+>
+Sorry, addressed are not the same, of course.  However corresponding ram
+blocks do seem to be preserved and initialized.
+
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+ Â Â Â Â  -machine q35 \
+ Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+ Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â  -nographic \
+ Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+ Â Â Â Â  -machine q35 \
+ Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+ Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â  -nographic \
+ Â Â Â Â  -device qxl-vga \
+ Â Â Â Â  -incoming tcp:0:44444 \
+ Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+ Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+ Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+ Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+ Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM
+BO")" != "" ]; then
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+ Â Â Â Â Â Â Â Â  fi
+ Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+ Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+ Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers" patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host 
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host 
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd 24 
+host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864 fd 
+25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 27 host 
+0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864 fd 
+28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 34 host 
+0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd 35 
+host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 36 host 
+0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 37 host 
+0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host 
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host 
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size 262144 fd 18 
+host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size 67108864 fd 
+17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192 fd 16 host 
+0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size 67108864 fd 
+15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536 fd 14 host 
+0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size 2097152 fd 13 
+host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536 fd 11 host 
+0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd 10 host 
+0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the same
+addresses), and no incompatible ram blocks are found during migration.
+Sorry, addressed are not the same, of course.  However corresponding ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+  qemu_ram_alloc_internal()
+    if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+        ram_flags |= RAM_READONLY;
+    new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+0001-hw-qxl-cpr-support-preliminary.patch
+Description:
+Text document
+
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+>
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+>
+> On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+>
+>> On 2/28/25 8:20 PM, Steven Sistare wrote:
+>
+>>> On 2/28/2025 1:13 PM, Steven Sistare wrote:
+>
+>>>> On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+>
+>>>>> Hi all,
+>
+>>>>>
+>
+>>>>> We've been experimenting with cpr-transfer migration mode recently
+>
+>>>>> and
+>
+>>>>> have discovered the following issue with the guest QXL driver:
+>
+>>>>>
+>
+>>>>> Run migration source:
+>
+>>>>>> EMULATOR=/path/to/emulator
+>
+>>>>>> ROOTFS=/path/to/image
+>
+>>>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>>>
+>
+>>>>>> $EMULATOR -enable-kvm \
+>
+>>>>>> Â Â Â Â Â  -machine q35 \
+>
+>>>>>> Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>>>> Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>>>>> ram0,share=on\
+>
+>>>>>> Â Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>>>> Â Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>>>> Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>>>> Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>>>> Â Â Â Â Â  -nographic \
+>
+>>>>>> Â Â Â Â Â  -device qxl-vga
+>
+>>>>>
+>
+>>>>> Run migration target:
+>
+>>>>>> EMULATOR=/path/to/emulator
+>
+>>>>>> ROOTFS=/path/to/image
+>
+>>>>>> QMPSOCK=/var/run/alma8qmp-dst.sock
+>
+>>>>>> $EMULATOR -enable-kvm \
+>
+>>>>>> Â Â Â Â Â  -machine q35 \
+>
+>>>>>> Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>>>> Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+>
+>>>>>> ram0,share=on\
+>
+>>>>>> Â Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>>>> Â Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>>>> Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>>>> Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>>>> Â Â Â Â Â  -nographic \
+>
+>>>>>> Â Â Â Â Â  -device qxl-vga \
+>
+>>>>>> Â Â Â Â Â  -incoming tcp:0:44444 \
+>
+>>>>>> Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+>
+>>>>>> "socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+>
+>>>>>
+>
+>>>>>
+>
+>>>>> Launch the migration:
+>
+>>>>>> QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+>
+>>>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>>>
+>
+>>>>>> $QMPSHELL -p $QMPSOCK <<EOF
+>
+>>>>>> Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+>
+>>>>>> Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+>
+>>>>>> {"transport":"socket","type":"inet","host":"0","port":"44444"}},
+>
+>>>>>> {"channel-type":"cpr","addr":
+>
+>>>>>> {"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+>
+>>>>>> dst.sock"}}]
+>
+>>>>>> EOF
+>
+>>>>>
+>
+>>>>> Then, after a while, QXL guest driver on target crashes spewing the
+>
+>>>>> following messages:
+>
+>>>>>> [Â Â  73.962002] [TTM] Buffer eviction failed
+>
+>>>>>> [Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+>
+>>>>>> 0x00000001)
+>
+>>>>>> [Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+>
+>>>>>> allocate VRAM BO
+>
+>>>>>
+>
+>>>>> That seems to be a known kernel QXL driver bug:
+>
+>>>>>
+>
+>>>>>
+https://lore.kernel.org/all/20220907094423.93581-1-
+>
+>>>>> min_halo@163.com/T/
+>
+>>>>>
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+>
+>>>>>
+>
+>>>>> (the latter discussion contains that reproduce script which speeds up
+>
+>>>>> the crash in the guest):
+>
+>>>>>> #!/bin/bash
+>
+>>>>>>
+>
+>>>>>> chvt 3
+>
+>>>>>>
+>
+>>>>>> for j in $(seq 80); do
+>
+>>>>>> Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+>
+>>>>>> Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM
+>
+>>>>>> BO")" != "" ]; then
+>
+>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+>
+>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+>
+>>>>>> Â Â Â Â Â Â Â Â Â  fi
+>
+>>>>>> Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+>
+>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+>
+>>>>>> Â Â Â Â Â Â Â Â Â  done
+>
+>>>>>> done
+>
+>>>>>>
+>
+>>>>>> echo "bug could not be reproduced"
+>
+>>>>>> exit 0
+>
+>>>>>
+>
+>>>>> The bug itself seems to remain unfixed, as I was able to reproduce
+>
+>>>>> that
+>
+>>>>> with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+>
+>>>>> cpr-transfer code also seems to be buggy as it triggers the crash -
+>
+>>>>> without the cpr-transfer migration the above reproduce doesn't
+>
+>>>>> lead to
+>
+>>>>> crash on the source VM.
+>
+>>>>>
+>
+>>>>> I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+>
+>>>>> rather passes it through the memory backend object, our code might
+>
+>>>>> somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+>
+>>>>> corruption so far.
+>
+>>>>>
+>
+>>>>> Could somebody help the investigation and take a look into this?Â  Any
+>
+>>>>> suggestions would be appreciated.Â  Thanks!
+>
+>>>>
+>
+>>>> Possibly some memory region created by qxl is not being preserved.
+>
+>>>> Try adding these traces to see what is preserved:
+>
+>>>>
+>
+>>>> -trace enable='*cpr*'
+>
+>>>> -trace enable='*ram_alloc*'
+>
+>>>
+>
+>>> Also try adding this patch to see if it flags any ram blocks as not
+>
+>>> compatible with cpr.Â  A message is printed at migration start time.
+>
+>>> Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+>
+>>> email-
+>
+>>> steven.sistare@oracle.com/
+>
+>>>
+>
+>>> - Steve
+>
+>>>
+>
+>>
+>
+>> With the traces enabled + the "migration: ram block cpr blockers" patch
+>
+>> applied:
+>
+>>
+>
+>> Source:
+>
+>>> cpr_find_fd pc.bios, id 0 returns -1
+>
+>>> cpr_save_fd pc.bios, id 0, fd 22
+>
+>>> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+>
+>>> 0x7fec18e00000
+>
+>>> cpr_find_fd pc.rom, id 0 returns -1
+>
+>>> cpr_save_fd pc.rom, id 0, fd 23
+>
+>>> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+>
+>>> 0x7fec18c00000
+>
+>>> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+>
+>>> cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+>
+>>> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+>
+>>> 262144 fd 24 host 0x7fec18a00000
+>
+>>> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+>
+>>> cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+>
+>>> 67108864 fd 25 host 0x7feb77e00000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+>
+>>> cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+>
+>>> fd 27 host 0x7fec18800000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+>
+>>> cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+>
+>>> 67108864 fd 28 host 0x7feb73c00000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+>
+>>> cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+>
+>>> fd 34 host 0x7fec18600000
+>
+>>> cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+>
+>>> cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+>
+>>> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+>
+>>> 2097152 fd 35 host 0x7fec18200000
+>
+>>> cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+>
+>>> cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+>
+>>> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+>
+>>> fd 36 host 0x7feb8b600000
+>
+>>> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+>
+>>> cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+>
+>>> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+>
+>>> 37 host 0x7feb8b400000
+>
+>>>
+>
+>>> cpr_state_save cpr-transfer mode
+>
+>>> cpr_transfer_output /var/run/alma8cpr-dst.sock
+>
+>>
+>
+>> Target:
+>
+>>> cpr_transfer_input /var/run/alma8cpr-dst.sock
+>
+>>> cpr_state_load cpr-transfer mode
+>
+>>> cpr_find_fd pc.bios, id 0 returns 20
+>
+>>> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+>
+>>> 0x7fcdc9800000
+>
+>>> cpr_find_fd pc.rom, id 0 returns 19
+>
+>>> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+>
+>>> 0x7fcdc9600000
+>
+>>> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+>
+>>> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+>
+>>> 262144 fd 18 host 0x7fcdc9400000
+>
+>>> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+>
+>>> 67108864 fd 17 host 0x7fcd27e00000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+>
+>>> fd 16 host 0x7fcdc9200000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+>
+>>> 67108864 fd 15 host 0x7fcd23c00000
+>
+>>> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+>
+>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+>
+>>> fd 14 host 0x7fcdc8800000
+>
+>>> cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+>
+>>> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+>
+>>> 2097152 fd 13 host 0x7fcdc8400000
+>
+>>> cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+>
+>>> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+>
+>>> fd 11 host 0x7fcdc8200000
+>
+>>> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+>
+>>> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+>
+>>> 10 host 0x7fcd3be00000
+>
+>>
+>
+>> Looks like both vga.vram and qxl.vram are being preserved (with the same
+>
+>> addresses), and no incompatible ram blocks are found during migration.
+>
+>
+>
+> Sorry, addressed are not the same, of course.Â  However corresponding ram
+>
+> blocks do seem to be preserved and initialized.
+>
+>
+So far, I have not reproduced the guest driver failure.
+>
+>
+However, I have isolated places where new QEMU improperly writes to
+>
+the qxl memory regions prior to starting the guest, by mmap'ing them
+>
+readonly after cpr:
+>
+>
+Â  qemu_ram_alloc_internal()
+>
+Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+>
+Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+>
+Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+>
+>
+I have attached a draft fix; try it and let me know.
+>
+My console window looks fine before and after cpr, using
+>
+-vnc $hostip:0 -vga qxl
+>
+>
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.  Could it
+happen on your stand as well?  Could you try launching VM with
+"-nographic -device qxl-vga"?  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+
+As for your patch, I can report that it doesn't resolve the issue as it
+is.  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+
+>
+Program terminated with signal SIGSEGV, Segmentation fault.
+>
+#0  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+>
+412         d->ram->magic       = cpu_to_le32(QXL_RAM_MAGIC);
+>
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+>
+(gdb) bt
+>
+#0  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+>
+#1  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+>
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+>
+#2  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+>
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+>
+#3  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+>
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+>
+#4  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+>
+value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+>
+#5  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+>
+v=0x5638996f3770, name=0x56389759b141 "realized", opaque=0x5638987893d0,
+>
+errp=0x7ffd3c2b84e0)
+>
+at ../qom/object.c:2374
+>
+#6  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+>
+name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+>
+at ../qom/object.c:1449
+>
+#7  0x00005638970f8586 in object_property_set_qobject (obj=0x5638996e0e70,
+>
+name=0x56389759b141 "realized", value=0x5638996df900, errp=0x7ffd3c2b84e0)
+>
+at ../qom/qom-qobject.c:28
+>
+#8  0x00005638970f3d8d in object_property_set_bool (obj=0x5638996e0e70,
+>
+name=0x56389759b141 "realized", value=true, errp=0x7ffd3c2b84e0)
+>
+at ../qom/object.c:1519
+>
+#9  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+>
+bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+>
+#10 0x0000563896dba675 in qdev_device_add_from_qdict (opts=0x5638996dfe50,
+>
+from_json=false, errp=0x7ffd3c2b84e0) at ../system/qdev-monitor.c:714
+>
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+>
+errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+>
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0, opts=0x563898786150,
+>
+errp=0x56389855dc40 <error_fatal>) at ../system/vl.c:1207
+>
+#13 0x000056389737a6cc in qemu_opts_foreach
+>
+(list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+>
+<device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+>
+at ../util/qemu-option.c:1135
+>
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/vl.c:2745
+>
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+>
+<error_fatal>) at ../system/vl.c:2806
+>
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948) at
+>
+../system/vl.c:3838
+>
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at
+>
+../system/main.c:72
+So the attached adjusted version of your patch does seem to help.  At
+least I can't reproduce the crash on my stand.
+
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+
+Andrey
+0001-hw-qxl-cpr-support-preliminary.patch
+Description:
+Text Data
+
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently
+and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+ Â Â Â Â Â  -machine q35 \
+ Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+ Â Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â Â  -nographic \
+ Â Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+ Â Â Â Â Â  -machine q35 \
+ Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+ Â Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â Â  -nographic \
+ Â Â Â Â Â  -device qxl-vga \
+ Â Â Â Â Â  -incoming tcp:0:44444 \
+ Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+ Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+ Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-
+min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+ Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+ Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate VRAM
+BO")" != "" ]; then
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+ Â Â Â Â Â Â Â Â Â  fi
+ Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+ Â Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce
+that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't
+lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+ Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers" patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 24 host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 27 host 0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 34 host 0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 35 host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 36 host 0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+37 host 0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 18 host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 16 host 0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 14 host 0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 13 host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 11 host 0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+10 host 0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the same
+addresses), and no incompatible ram blocks are found during migration.
+Sorry, addressed are not the same, of course.Â  However corresponding ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+ Â  qemu_ram_alloc_internal()
+ Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+ Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+ Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.  Could it
+happen on your stand as well?
+cpr does not preserve the vnc connection and session.  To test, I specify
+port 0 for the source VM and port 1 for the dest.  When the src vnc goes
+dormant the dest vnc becomes active.
+Could you try launching VM with
+"-nographic -device qxl-vga"?  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+I have been running like that, but have not reproduced the qxl driver crash,
+and I suspect my guest image+kernel is too old.  However, once I realized the
+issue was post-cpr modification of qxl memory, I switched my attention to the
+fix.
+As for your patch, I can report that it doesn't resolve the issue as it
+is.  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+412         d->ram->magic       = cpu_to_le32(QXL_RAM_MAGIC);
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+(gdb) bt
+#0  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+#1  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70, 
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+#2  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70, 
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+#3  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70, 
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+#4  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70, value=true, 
+errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+#5  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70, v=0x5638996f3770, 
+name=0x56389759b141 "realized", opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+     at ../qom/object.c:2374
+#6  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70, name=0x56389759b141 
+"realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+     at ../qom/object.c:1449
+#7  0x00005638970f8586 in object_property_set_qobject (obj=0x5638996e0e70, 
+name=0x56389759b141 "realized", value=0x5638996df900, errp=0x7ffd3c2b84e0)
+     at ../qom/qom-qobject.c:28
+#8  0x00005638970f3d8d in object_property_set_bool (obj=0x5638996e0e70, 
+name=0x56389759b141 "realized", value=true, errp=0x7ffd3c2b84e0)
+     at ../qom/object.c:1519
+#9  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70, bus=0x563898cf3c20, 
+errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+#10 0x0000563896dba675 in qdev_device_add_from_qdict (opts=0x5638996dfe50, 
+from_json=false, errp=0x7ffd3c2b84e0) at ../system/qdev-monitor.c:714
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150, errp=0x56389855dc40 
+<error_fatal>) at ../system/qdev-monitor.c:733
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0, opts=0x563898786150, 
+errp=0x56389855dc40 <error_fatal>) at ../system/vl.c:1207
+#13 0x000056389737a6cc in qemu_opts_foreach
+     (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca <device_init_func>, 
+opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+     at ../util/qemu-option.c:1135
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/vl.c:2745
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40 
+<error_fatal>) at ../system/vl.c:2806
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948) at 
+../system/vl.c:3838
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at 
+../system/main.c:72
+So the attached adjusted version of your patch does seem to help.  At
+least I can't reproduce the crash on my stand.
+Thanks for the stack trace; the calls to SPICE_RING_INIT in init_qxl_ram are
+definitely harmful.  Try V2 of the patch, attached, which skips the lines
+of init_qxl_ram that modify guest memory.
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+It's a useful debugging technique, but changing protection on a large memory 
+region
+can be too expensive for production due to TLB shootdowns.
+
+Also, there are cases where writes are performed but the value is guaranteed to
+be the same:
+  qxl_post_load()
+    qxl_set_mode()
+      d->rom->mode = cpu_to_le32(modenr);
+The value is the same because mode and shadow_rom.mode were passed in vmstate
+from old qemu.
+
+- Steve
+0001-hw-qxl-cpr-support-preliminary-V2.patch
+Description:
+Text document
+
+On 3/5/25 22:19, Steven Sistare wrote:
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently
+and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â  -object
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â  -object
+memory-backend-file,id=ram0,size=2G,mem-path=/dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â  -device qxl-vga \
+Â Â Â Â Â Â  -incoming tcp:0:44444 \
+Â Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+Â Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+Â Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing
+the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR*
+failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-
+min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which
+speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+Â Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+Â Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to
+allocate VRAM
+BO")" != "" ]; then
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+Â Â Â Â Â Â Â Â Â Â  fi
+Â Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+Â Â Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce
+that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the
+crash -
+without the cpr-transfer migration the above reproduce doesn't
+lead to
+crash on the source VM.
+I suspect that, as cpr-transfer doesn't migrate the guest
+memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+Could somebody help the investigation and take a look into
+this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers"
+patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 24 host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 27 host 0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 34 host 0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 35 host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 36 host 0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+37 host 0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 18 host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 16 host 0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 14 host 0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 13 host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 11 host 0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+10 host 0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with
+the same
+addresses), and no incompatible ram blocks are found during
+migration.
+Sorry, addressed are not the same, of course.Â  However
+corresponding ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+Â Â  qemu_ram_alloc_internal()
+Â Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+Â Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+Â Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.Â  Could it
+happen on your stand as well?
+cpr does not preserve the vnc connection and session.Â  To test, I specify
+port 0 for the source VM and port 1 for the dest.Â  When the src vnc goes
+dormant the dest vnc becomes active.
+Could you try launching VM with
+"-nographic -device qxl-vga"?Â  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+I have been running like that, but have not reproduced the qxl driver
+crash,
+and I suspect my guest image+kernel is too old.Â  However, once I
+realized the
+issue was post-cpr modification of qxl memory, I switched my attention
+to the
+fix.
+As for your patch, I can report that it doesn't resolve the issue as it
+is.Â  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+412Â Â Â Â Â Â Â Â  d->ram->magicÂ Â Â Â Â Â  = cpu_to_le32(QXL_RAM_MAGIC);
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+(gdb) bt
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+#1Â  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+#2Â  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+#3Â  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+#4Â  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+#5Â  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+v=0x5638996f3770, name=0x56389759b141 "realized",
+opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+Â Â Â Â  at ../qom/object.c:2374
+#6Â  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+Â Â Â Â  at ../qom/object.c:1449
+#7Â  0x00005638970f8586 in object_property_set_qobject
+(obj=0x5638996e0e70, name=0x56389759b141 "realized",
+value=0x5638996df900, errp=0x7ffd3c2b84e0)
+Â Â Â Â  at ../qom/qom-qobject.c:28
+#8Â  0x00005638970f3d8d in object_property_set_bool
+(obj=0x5638996e0e70, name=0x56389759b141 "realized", value=true,
+errp=0x7ffd3c2b84e0)
+Â Â Â Â  at ../qom/object.c:1519
+#9Â  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+#10 0x0000563896dba675 in qdev_device_add_from_qdict
+(opts=0x5638996dfe50, from_json=false, errp=0x7ffd3c2b84e0) at
+../system/qdev-monitor.c:714
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0,
+opts=0x563898786150, errp=0x56389855dc40 <error_fatal>) at
+../system/vl.c:1207
+#13 0x000056389737a6cc in qemu_opts_foreach
+Â Â Â Â  (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+<device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+Â Â Â Â  at ../util/qemu-option.c:1135
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at
+../system/vl.c:2745
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+<error_fatal>) at ../system/vl.c:2806
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948)
+at ../system/vl.c:3838
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at
+../system/main.c:72
+So the attached adjusted version of your patch does seem to help.Â  At
+least I can't reproduce the crash on my stand.
+Thanks for the stack trace; the calls to SPICE_RING_INIT in
+init_qxl_ram are
+definitely harmful.Â  Try V2 of the patch, attached, which skips the lines
+of init_qxl_ram that modify guest memory.
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?Â  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+It's a useful debugging technique, but changing protection on a large
+memory region
+can be too expensive for production due to TLB shootdowns.
+Good point. Though we could move this code under non-default option to
+avoid re-writing.
+
+Den
+
+On 3/5/25 11:19 PM, Steven Sistare wrote:
+>
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+>
+> On 3/4/25 9:05 PM, Steven Sistare wrote:
+>
+>> On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+>
+>>> On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+>
+>>>> On 2/28/25 8:20 PM, Steven Sistare wrote:
+>
+>>>>> On 2/28/2025 1:13 PM, Steven Sistare wrote:
+>
+>>>>>> On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+>
+>>>>>>> Hi all,
+>
+>>>>>>>
+>
+>>>>>>> We've been experimenting with cpr-transfer migration mode recently
+>
+>>>>>>> and
+>
+>>>>>>> have discovered the following issue with the guest QXL driver:
+>
+>>>>>>>
+>
+>>>>>>> Run migration source:
+>
+>>>>>>>> EMULATOR=/path/to/emulator
+>
+>>>>>>>> ROOTFS=/path/to/image
+>
+>>>>>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>>>>>
+>
+>>>>>>>> $EMULATOR -enable-kvm \
+>
+>>>>>>>> Â Â Â Â Â Â  -machine q35 \
+>
+>>>>>>>> Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>>>>>> Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+>
+>>>>>>>> dev/shm/
+>
+>>>>>>>> ram0,share=on\
+>
+>>>>>>>> Â Â Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>>>>>> Â Â Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>>>>>> Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>>>>>> Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>>>>>> Â Â Â Â Â Â  -nographic \
+>
+>>>>>>>> Â Â Â Â Â Â  -device qxl-vga
+>
+>>>>>>>
+>
+>>>>>>> Run migration target:
+>
+>>>>>>>> EMULATOR=/path/to/emulator
+>
+>>>>>>>> ROOTFS=/path/to/image
+>
+>>>>>>>> QMPSOCK=/var/run/alma8qmp-dst.sock
+>
+>>>>>>>> $EMULATOR -enable-kvm \
+>
+>>>>>>>> Â Â Â Â Â Â  -machine q35 \
+>
+>>>>>>>> Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+>
+>>>>>>>> Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+>
+>>>>>>>> dev/shm/
+>
+>>>>>>>> ram0,share=on\
+>
+>>>>>>>> Â Â Â Â Â Â  -machine memory-backend=ram0 \
+>
+>>>>>>>> Â Â Â Â Â Â  -machine aux-ram-share=on \
+>
+>>>>>>>> Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+>
+>>>>>>>> Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+>
+>>>>>>>> Â Â Â Â Â Â  -nographic \
+>
+>>>>>>>> Â Â Â Â Â Â  -device qxl-vga \
+>
+>>>>>>>> Â Â Â Â Â Â  -incoming tcp:0:44444 \
+>
+>>>>>>>> Â Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+>
+>>>>>>>> "socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+>
+>>>>>>>
+>
+>>>>>>>
+>
+>>>>>>> Launch the migration:
+>
+>>>>>>>> QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+>
+>>>>>>>> QMPSOCK=/var/run/alma8qmp-src.sock
+>
+>>>>>>>>
+>
+>>>>>>>> $QMPSHELL -p $QMPSOCK <<EOF
+>
+>>>>>>>> Â Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+>
+>>>>>>>> Â Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+>
+>>>>>>>> {"transport":"socket","type":"inet","host":"0","port":"44444"}},
+>
+>>>>>>>> {"channel-type":"cpr","addr":
+>
+>>>>>>>> {"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+>
+>>>>>>>> dst.sock"}}]
+>
+>>>>>>>> EOF
+>
+>>>>>>>
+>
+>>>>>>> Then, after a while, QXL guest driver on target crashes spewing the
+>
+>>>>>>> following messages:
+>
+>>>>>>>> [Â Â  73.962002] [TTM] Buffer eviction failed
+>
+>>>>>>>> [Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+>
+>>>>>>>> 0x00000001)
+>
+>>>>>>>> [Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+>
+>>>>>>>> allocate VRAM BO
+>
+>>>>>>>
+>
+>>>>>>> That seems to be a known kernel QXL driver bug:
+>
+>>>>>>>
+>
+>>>>>>>
+https://lore.kernel.org/all/20220907094423.93581-1-
+>
+>>>>>>> min_halo@163.com/T/
+>
+>>>>>>>
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+>
+>>>>>>>
+>
+>>>>>>> (the latter discussion contains that reproduce script which
+>
+>>>>>>> speeds up
+>
+>>>>>>> the crash in the guest):
+>
+>>>>>>>> #!/bin/bash
+>
+>>>>>>>>
+>
+>>>>>>>> chvt 3
+>
+>>>>>>>>
+>
+>>>>>>>> for j in $(seq 80); do
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate
+>
+>>>>>>>> VRAM
+>
+>>>>>>>> BO")" != "" ]; then
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â  fi
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+>
+>>>>>>>> Â Â Â Â Â Â Â Â Â Â  done
+>
+>>>>>>>> done
+>
+>>>>>>>>
+>
+>>>>>>>> echo "bug could not be reproduced"
+>
+>>>>>>>> exit 0
+>
+>>>>>>>
+>
+>>>>>>> The bug itself seems to remain unfixed, as I was able to reproduce
+>
+>>>>>>> that
+>
+>>>>>>> with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+>
+>>>>>>> cpr-transfer code also seems to be buggy as it triggers the crash -
+>
+>>>>>>> without the cpr-transfer migration the above reproduce doesn't
+>
+>>>>>>> lead to
+>
+>>>>>>> crash on the source VM.
+>
+>>>>>>>
+>
+>>>>>>> I suspect that, as cpr-transfer doesn't migrate the guest
+>
+>>>>>>> memory, but
+>
+>>>>>>> rather passes it through the memory backend object, our code might
+>
+>>>>>>> somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+>
+>>>>>>> corruption so far.
+>
+>>>>>>>
+>
+>>>>>>> Could somebody help the investigation and take a look into
+>
+>>>>>>> this?Â  Any
+>
+>>>>>>> suggestions would be appreciated.Â  Thanks!
+>
+>>>>>>
+>
+>>>>>> Possibly some memory region created by qxl is not being preserved.
+>
+>>>>>> Try adding these traces to see what is preserved:
+>
+>>>>>>
+>
+>>>>>> -trace enable='*cpr*'
+>
+>>>>>> -trace enable='*ram_alloc*'
+>
+>>>>>
+>
+>>>>> Also try adding this patch to see if it flags any ram blocks as not
+>
+>>>>> compatible with cpr.Â  A message is printed at migration start time.
+>
+>>>>> Â Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+>
+>>>>> email-
+>
+>>>>> steven.sistare@oracle.com/
+>
+>>>>>
+>
+>>>>> - Steve
+>
+>>>>>
+>
+>>>>
+>
+>>>> With the traces enabled + the "migration: ram block cpr blockers"
+>
+>>>> patch
+>
+>>>> applied:
+>
+>>>>
+>
+>>>> Source:
+>
+>>>>> cpr_find_fd pc.bios, id 0 returns -1
+>
+>>>>> cpr_save_fd pc.bios, id 0, fd 22
+>
+>>>>> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+>
+>>>>> 0x7fec18e00000
+>
+>>>>> cpr_find_fd pc.rom, id 0 returns -1
+>
+>>>>> cpr_save_fd pc.rom, id 0, fd 23
+>
+>>>>> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+>
+>>>>> 0x7fec18c00000
+>
+>>>>> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+>
+>>>>> cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+>
+>>>>> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+>
+>>>>> 262144 fd 24 host 0x7fec18a00000
+>
+>>>>> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+>
+>>>>> cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+>
+>>>>> 67108864 fd 25 host 0x7feb77e00000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+>
+>>>>> cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+>
+>>>>> fd 27 host 0x7fec18800000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+>
+>>>>> cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+>
+>>>>> 67108864 fd 28 host 0x7feb73c00000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+>
+>>>>> cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+>
+>>>>> fd 34 host 0x7fec18600000
+>
+>>>>> cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+>
+>>>>> cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+>
+>>>>> 2097152 fd 35 host 0x7fec18200000
+>
+>>>>> cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+>
+>>>>> cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+>
+>>>>> fd 36 host 0x7feb8b600000
+>
+>>>>> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+>
+>>>>> cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+>
+>>>>> 37 host 0x7feb8b400000
+>
+>>>>>
+>
+>>>>> cpr_state_save cpr-transfer mode
+>
+>>>>> cpr_transfer_output /var/run/alma8cpr-dst.sock
+>
+>>>>
+>
+>>>> Target:
+>
+>>>>> cpr_transfer_input /var/run/alma8cpr-dst.sock
+>
+>>>>> cpr_state_load cpr-transfer mode
+>
+>>>>> cpr_find_fd pc.bios, id 0 returns 20
+>
+>>>>> qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+>
+>>>>> 0x7fcdc9800000
+>
+>>>>> cpr_find_fd pc.rom, id 0 returns 19
+>
+>>>>> qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+>
+>>>>> 0x7fcdc9600000
+>
+>>>>> cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+>
+>>>>> qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+>
+>>>>> 262144 fd 18 host 0x7fcdc9400000
+>
+>>>>> cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+>
+>>>>> 67108864 fd 17 host 0x7fcd27e00000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+>
+>>>>> fd 16 host 0x7fcdc9200000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+>
+>>>>> 67108864 fd 15 host 0x7fcd23c00000
+>
+>>>>> cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+>
+>>>>> qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+>
+>>>>> fd 14 host 0x7fcdc8800000
+>
+>>>>> cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+>
+>>>>> 2097152 fd 13 host 0x7fcdc8400000
+>
+>>>>> cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+>
+>>>>> fd 11 host 0x7fcdc8200000
+>
+>>>>> cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+>
+>>>>> qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+>
+>>>>> 10 host 0x7fcd3be00000
+>
+>>>>
+>
+>>>> Looks like both vga.vram and qxl.vram are being preserved (with the
+>
+>>>> same
+>
+>>>> addresses), and no incompatible ram blocks are found during migration.
+>
+>>>
+>
+>>> Sorry, addressed are not the same, of course.Â  However corresponding
+>
+>>> ram
+>
+>>> blocks do seem to be preserved and initialized.
+>
+>>
+>
+>> So far, I have not reproduced the guest driver failure.
+>
+>>
+>
+>> However, I have isolated places where new QEMU improperly writes to
+>
+>> the qxl memory regions prior to starting the guest, by mmap'ing them
+>
+>> readonly after cpr:
+>
+>>
+>
+>> Â Â  qemu_ram_alloc_internal()
+>
+>> Â Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+>
+>> Â Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+>
+>> Â Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+>
+>>
+>
+>> I have attached a draft fix; try it and let me know.
+>
+>> My console window looks fine before and after cpr, using
+>
+>> -vnc $hostip:0 -vga qxl
+>
+>>
+>
+>> - Steve
+>
+>
+>
+> Regarding the reproduce: when I launch the buggy version with the same
+>
+> options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+>
+> my VNC client silently hangs on the target after a while.Â  Could it
+>
+> happen on your stand as well?Â
+>
+>
+cpr does not preserve the vnc connection and session.Â  To test, I specify
+>
+port 0 for the source VM and port 1 for the dest.Â  When the src vnc goes
+>
+dormant the dest vnc becomes active.
+>
+Sure, I meant that VNC on the dest (on the port 1) works for a while
+after the migration and then hangs, apparently after the guest QXL crash.
+
+>
+> Could you try launching VM with
+>
+> "-nographic -device qxl-vga"?Â  That way VM's serial console is given you
+>
+> directly in the shell, so when qxl driver crashes you're still able to
+>
+> inspect the kernel messages.
+>
+>
+I have been running like that, but have not reproduced the qxl driver
+>
+crash,
+>
+and I suspect my guest image+kernel is too old.
+Yes, that's probably the case.  But the crash occurs on my Fedora 41
+guest with the 6.11.5-300.fc41.x86_64 kernel, so newer kernels seem to
+be buggy.
+
+
+>
+However, once I realized the
+>
+issue was post-cpr modification of qxl memory, I switched my attention
+>
+to the
+>
+fix.
+>
+>
+> As for your patch, I can report that it doesn't resolve the issue as it
+>
+> is.Â  But I was able to track down another possible memory corruption
+>
+> using your approach with readonly mmap'ing:
+>
+>
+>
+>> Program terminated with signal SIGSEGV, Segmentation fault.
+>
+>> #0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+>
+>> 412Â Â Â Â Â Â Â Â  d->ram->magicÂ Â Â Â Â Â  = cpu_to_le32(QXL_RAM_MAGIC);
+>
+>> [Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+>
+>> (gdb) bt
+>
+>> #0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+>
+>> #1Â  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+>
+>> errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+>
+>> #2Â  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+>
+>> errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+>
+>> #3Â  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+>
+>> errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+>
+>> #4Â  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+>
+>> value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+>
+>> #5Â  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+>
+>> v=0x5638996f3770, name=0x56389759b141 "realized",
+>
+>> opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+>
+>> Â Â Â Â  at ../qom/object.c:2374
+>
+>> #6Â  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+>
+>> name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+>
+>> Â Â Â Â  at ../qom/object.c:1449
+>
+>> #7Â  0x00005638970f8586 in object_property_set_qobject
+>
+>> (obj=0x5638996e0e70, name=0x56389759b141 "realized",
+>
+>> value=0x5638996df900, errp=0x7ffd3c2b84e0)
+>
+>> Â Â Â Â  at ../qom/qom-qobject.c:28
+>
+>> #8Â  0x00005638970f3d8d in object_property_set_bool
+>
+>> (obj=0x5638996e0e70, name=0x56389759b141 "realized", value=true,
+>
+>> errp=0x7ffd3c2b84e0)
+>
+>> Â Â Â Â  at ../qom/object.c:1519
+>
+>> #9Â  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+>
+>> bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+>
+>> #10 0x0000563896dba675 in qdev_device_add_from_qdict
+>
+>> (opts=0x5638996dfe50, from_json=false, errp=0x7ffd3c2b84e0) at ../
+>
+>> system/qdev-monitor.c:714
+>
+>> #11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+>
+>> errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+>
+>> #12 0x0000563896dc48f1 in device_init_func (opaque=0x0,
+>
+>> opts=0x563898786150, errp=0x56389855dc40 <error_fatal>) at ../system/
+>
+>> vl.c:1207
+>
+>> #13 0x000056389737a6cc in qemu_opts_foreach
+>
+>> Â Â Â Â  (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+>
+>> <device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+>
+>> Â Â Â Â  at ../util/qemu-option.c:1135
+>
+>> #14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/
+>
+>> vl.c:2745
+>
+>> #15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+>
+>> <error_fatal>) at ../system/vl.c:2806
+>
+>> #16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948)
+>
+>> at ../system/vl.c:3838
+>
+>> #17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at ../
+>
+>> system/main.c:72
+>
+>
+>
+> So the attached adjusted version of your patch does seem to help.Â  At
+>
+> least I can't reproduce the crash on my stand.
+>
+>
+Thanks for the stack trace; the calls to SPICE_RING_INIT in init_qxl_ram
+>
+are
+>
+definitely harmful.Â  Try V2 of the patch, attached, which skips the lines
+>
+of init_qxl_ram that modify guest memory.
+>
+Thanks, your v2 patch does seem to prevent the crash.  Would you re-send
+it to the list as a proper fix?
+
+>
+> I'm wondering, could it be useful to explicitly mark all the reused
+>
+> memory regions readonly upon cpr-transfer, and then make them writable
+>
+> back again after the migration is done?Â  That way we will be segfaulting
+>
+> early on instead of debugging tricky memory corruptions.
+>
+>
+It's a useful debugging technique, but changing protection on a large
+>
+memory region
+>
+can be too expensive for production due to TLB shootdowns.
+>
+>
+Also, there are cases where writes are performed but the value is
+>
+guaranteed to
+>
+be the same:
+>
+Â  qxl_post_load()
+>
+Â Â Â  qxl_set_mode()
+>
+Â Â Â Â Â  d->rom->mode = cpu_to_le32(modenr);
+>
+The value is the same because mode and shadow_rom.mode were passed in
+>
+vmstate
+>
+from old qemu.
+>
+There're also cases where devices' ROM might be re-initialized.  E.g.
+this segfault occures upon further exploration of RO mapped RAM blocks:
+
+>
+Program terminated with signal SIGSEGV, Segmentation fault.
+>
+#0  __memmove_avx_unaligned_erms () at
+>
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+>
+664             rep     movsb
+>
+[Current thread is 1 (Thread 0x7f6e7d08b480 (LWP 310379))]
+>
+(gdb) bt
+>
+#0  __memmove_avx_unaligned_erms () at
+>
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+>
+#1  0x000055aa1d030ecd in rom_set_mr (rom=0x55aa200ba380,
+>
+owner=0x55aa2019ac10, name=0x7fffb8272bc0 "/rom@etc/acpi/tables", ro=true)
+>
+at ../hw/core/loader.c:1032
+>
+#2  0x000055aa1d031577 in rom_add_blob
+>
+(name=0x55aa1da51f13 "etc/acpi/tables", blob=0x55aa208a1070, len=131072,
+>
+max_len=2097152, addr=18446744073709551615, fw_file_name=0x55aa1da51f13
+>
+"etc/acpi/tables", fw_callback=0x55aa1d441f59 <acpi_build_update>,
+>
+callback_opaque=0x55aa20ff0010, as=0x0, read_only=true) at
+>
+../hw/core/loader.c:1147
+>
+#3  0x000055aa1cfd788d in acpi_add_rom_blob
+>
+(update=0x55aa1d441f59 <acpi_build_update>, opaque=0x55aa20ff0010,
+>
+blob=0x55aa1fc9aa00, name=0x55aa1da51f13 "etc/acpi/tables") at
+>
+../hw/acpi/utils.c:46
+>
+#4  0x000055aa1d44213f in acpi_setup () at ../hw/i386/acpi-build.c:2720
+>
+#5  0x000055aa1d434199 in pc_machine_done (notifier=0x55aa1ff15050, data=0x0)
+>
+at ../hw/i386/pc.c:638
+>
+#6  0x000055aa1d876845 in notifier_list_notify (list=0x55aa1ea25c10
+>
+<machine_init_done_notifiers>, data=0x0) at ../util/notify.c:39
+>
+#7  0x000055aa1d039ee5 in qdev_machine_creation_done () at
+>
+../hw/core/machine.c:1749
+>
+#8  0x000055aa1d2c7b3e in qemu_machine_creation_done (errp=0x55aa1ea5cc40
+>
+<error_fatal>) at ../system/vl.c:2779
+>
+#9  0x000055aa1d2c7c7d in qmp_x_exit_preconfig (errp=0x55aa1ea5cc40
+>
+<error_fatal>) at ../system/vl.c:2807
+>
+#10 0x000055aa1d2ca64f in qemu_init (argc=35, argv=0x7fffb82730e8) at
+>
+../system/vl.c:3838
+>
+#11 0x000055aa1d79638c in main (argc=35, argv=0x7fffb82730e8) at
+>
+../system/main.c:72
+I'm not sure whether ACPI tables ROM in particular is rewritten with the
+same content, but there might be cases where ROM can be read from file
+system upon initialization.  That is undesirable as guest kernel
+certainly won't be too happy about sudden change of the device's ROM
+content.
+
+So the issue we're dealing with here is any unwanted memory related
+device initialization upon cpr.
+
+For now the only thing that comes to my mind is to make a test where we
+put as many devices as we can into a VM, make ram blocks RO upon cpr
+(and remap them as RW later after migration is done, if needed), and
+catch any unwanted memory violations.  As Den suggested, we might
+consider adding that behaviour as a separate non-default option (or
+"migrate" command flag specific to cpr-transfer), which would only be
+used in the testing.
+
+Andrey
+
+On 3/6/25 16:16, Andrey Drobyshev wrote:
+On 3/5/25 11:19 PM, Steven Sistare wrote:
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently
+and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+ Â Â Â Â Â Â  -machine q35 \
+ Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+ Â Â Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â Â Â  -nographic \
+ Â Â Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+ Â Â Â Â Â Â  -machine q35 \
+ Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+ Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+ Â Â Â Â Â Â  -machine memory-backend=ram0 \
+ Â Â Â Â Â Â  -machine aux-ram-share=on \
+ Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+ Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+ Â Â Â Â Â Â  -nographic \
+ Â Â Â Â Â Â  -device qxl-vga \
+ Â Â Â Â Â Â  -incoming tcp:0:44444 \
+ Â Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+ Â Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+ Â Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-
+min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which
+speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+ Â Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+ Â Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate
+VRAM
+BO")" != "" ]; then
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+ Â Â Â Â Â Â Â Â Â Â  fi
+ Â Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+ Â Â Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce
+that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't
+lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest
+memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into
+this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+ Â Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers"
+patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 24 host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 27 host 0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 34 host 0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 35 host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 36 host 0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+37 host 0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 18 host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 16 host 0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 14 host 0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 13 host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 11 host 0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+10 host 0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the
+same
+addresses), and no incompatible ram blocks are found during migration.
+Sorry, addressed are not the same, of course.Â  However corresponding
+ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+ Â Â  qemu_ram_alloc_internal()
+ Â Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+ Â Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+ Â Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.Â  Could it
+happen on your stand as well?
+cpr does not preserve the vnc connection and session.Â  To test, I specify
+port 0 for the source VM and port 1 for the dest.Â  When the src vnc goes
+dormant the dest vnc becomes active.
+Sure, I meant that VNC on the dest (on the port 1) works for a while
+after the migration and then hangs, apparently after the guest QXL crash.
+Could you try launching VM with
+"-nographic -device qxl-vga"?Â  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+I have been running like that, but have not reproduced the qxl driver
+crash,
+and I suspect my guest image+kernel is too old.
+Yes, that's probably the case.  But the crash occurs on my Fedora 41
+guest with the 6.11.5-300.fc41.x86_64 kernel, so newer kernels seem to
+be buggy.
+However, once I realized the
+issue was post-cpr modification of qxl memory, I switched my attention
+to the
+fix.
+As for your patch, I can report that it doesn't resolve the issue as it
+is.Â  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+412Â Â Â Â Â Â Â Â  d->ram->magicÂ Â Â Â Â Â  = cpu_to_le32(QXL_RAM_MAGIC);
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+(gdb) bt
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+#1Â  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+#2Â  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+#3Â  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+#4Â  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+#5Â  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+v=0x5638996f3770, name=0x56389759b141 "realized",
+opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+ Â Â Â Â  at ../qom/object.c:2374
+#6Â  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+ Â Â Â Â  at ../qom/object.c:1449
+#7Â  0x00005638970f8586 in object_property_set_qobject
+(obj=0x5638996e0e70, name=0x56389759b141 "realized",
+value=0x5638996df900, errp=0x7ffd3c2b84e0)
+ Â Â Â Â  at ../qom/qom-qobject.c:28
+#8Â  0x00005638970f3d8d in object_property_set_bool
+(obj=0x5638996e0e70, name=0x56389759b141 "realized", value=true,
+errp=0x7ffd3c2b84e0)
+ Â Â Â Â  at ../qom/object.c:1519
+#9Â  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+#10 0x0000563896dba675 in qdev_device_add_from_qdict
+(opts=0x5638996dfe50, from_json=false, errp=0x7ffd3c2b84e0) at ../
+system/qdev-monitor.c:714
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0,
+opts=0x563898786150, errp=0x56389855dc40 <error_fatal>) at ../system/
+vl.c:1207
+#13 0x000056389737a6cc in qemu_opts_foreach
+ Â Â Â Â  (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+<device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+ Â Â Â Â  at ../util/qemu-option.c:1135
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/
+vl.c:2745
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+<error_fatal>) at ../system/vl.c:2806
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948)
+at ../system/vl.c:3838
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at ../
+system/main.c:72
+So the attached adjusted version of your patch does seem to help.Â  At
+least I can't reproduce the crash on my stand.
+Thanks for the stack trace; the calls to SPICE_RING_INIT in init_qxl_ram
+are
+definitely harmful.Â  Try V2 of the patch, attached, which skips the lines
+of init_qxl_ram that modify guest memory.
+Thanks, your v2 patch does seem to prevent the crash.  Would you re-send
+it to the list as a proper fix?
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?Â  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+It's a useful debugging technique, but changing protection on a large
+memory region
+can be too expensive for production due to TLB shootdowns.
+
+Also, there are cases where writes are performed but the value is
+guaranteed to
+be the same:
+ Â  qxl_post_load()
+ Â Â Â  qxl_set_mode()
+ Â Â Â Â Â  d->rom->mode = cpu_to_le32(modenr);
+The value is the same because mode and shadow_rom.mode were passed in
+vmstate
+from old qemu.
+There're also cases where devices' ROM might be re-initialized.  E.g.
+this segfault occures upon further exploration of RO mapped RAM blocks:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+664             rep     movsb
+[Current thread is 1 (Thread 0x7f6e7d08b480 (LWP 310379))]
+(gdb) bt
+#0  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+#1  0x000055aa1d030ecd in rom_set_mr (rom=0x55aa200ba380, owner=0x55aa2019ac10, 
+name=0x7fffb8272bc0 "/rom@etc/acpi/tables", ro=true)
+     at ../hw/core/loader.c:1032
+#2  0x000055aa1d031577 in rom_add_blob
+     (name=0x55aa1da51f13 "etc/acpi/tables", blob=0x55aa208a1070, len=131072, max_len=2097152, 
+addr=18446744073709551615, fw_file_name=0x55aa1da51f13 "etc/acpi/tables", 
+fw_callback=0x55aa1d441f59 <acpi_build_update>, callback_opaque=0x55aa20ff0010, as=0x0, 
+read_only=true) at ../hw/core/loader.c:1147
+#3  0x000055aa1cfd788d in acpi_add_rom_blob
+     (update=0x55aa1d441f59 <acpi_build_update>, opaque=0x55aa20ff0010, 
+blob=0x55aa1fc9aa00, name=0x55aa1da51f13 "etc/acpi/tables") at ../hw/acpi/utils.c:46
+#4  0x000055aa1d44213f in acpi_setup () at ../hw/i386/acpi-build.c:2720
+#5  0x000055aa1d434199 in pc_machine_done (notifier=0x55aa1ff15050, data=0x0) 
+at ../hw/i386/pc.c:638
+#6  0x000055aa1d876845 in notifier_list_notify (list=0x55aa1ea25c10 
+<machine_init_done_notifiers>, data=0x0) at ../util/notify.c:39
+#7  0x000055aa1d039ee5 in qdev_machine_creation_done () at 
+../hw/core/machine.c:1749
+#8  0x000055aa1d2c7b3e in qemu_machine_creation_done (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2779
+#9  0x000055aa1d2c7c7d in qmp_x_exit_preconfig (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2807
+#10 0x000055aa1d2ca64f in qemu_init (argc=35, argv=0x7fffb82730e8) at 
+../system/vl.c:3838
+#11 0x000055aa1d79638c in main (argc=35, argv=0x7fffb82730e8) at 
+../system/main.c:72
+I'm not sure whether ACPI tables ROM in particular is rewritten with the
+same content, but there might be cases where ROM can be read from file
+system upon initialization.  That is undesirable as guest kernel
+certainly won't be too happy about sudden change of the device's ROM
+content.
+
+So the issue we're dealing with here is any unwanted memory related
+device initialization upon cpr.
+
+For now the only thing that comes to my mind is to make a test where we
+put as many devices as we can into a VM, make ram blocks RO upon cpr
+(and remap them as RW later after migration is done, if needed), and
+catch any unwanted memory violations.  As Den suggested, we might
+consider adding that behaviour as a separate non-default option (or
+"migrate" command flag specific to cpr-transfer), which would only be
+used in the testing.
+
+Andrey
+No way. ACPI with the source must be used in the same way as BIOSes
+and optional ROMs.
+
+Den
+
+On 3/6/2025 10:52 AM, Denis V. Lunev wrote:
+On 3/6/25 16:16, Andrey Drobyshev wrote:
+On 3/5/25 11:19 PM, Steven Sistare wrote:
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently
+and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â Â  -device qxl-vga \
+Â Â Â Â Â Â Â  -incoming tcp:0:44444 \
+Â Â Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+Â Â Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+Â Â Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-
+min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which
+speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+Â Â Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+Â Â Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate
+VRAM
+BO")" != "" ]; then
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+Â Â Â Â Â Â Â Â Â Â Â  fi
+Â Â Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+Â Â Â Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce
+that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't
+lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest
+memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into
+this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+Â Â Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers"
+patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 24 host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 27 host 0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 34 host 0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 35 host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 36 host 0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+37 host 0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 18 host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 16 host 0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 14 host 0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 13 host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 11 host 0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+10 host 0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the
+same
+addresses), and no incompatible ram blocks are found during migration.
+Sorry, addressed are not the same, of course.Â  However corresponding
+ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+Â Â Â  qemu_ram_alloc_internal()
+Â Â Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+Â Â Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+Â Â Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.Â  Could it
+happen on your stand as well?
+cpr does not preserve the vnc connection and session.Â  To test, I specify
+port 0 for the source VM and port 1 for the dest.Â  When the src vnc goes
+dormant the dest vnc becomes active.
+Sure, I meant that VNC on the dest (on the port 1) works for a while
+after the migration and then hangs, apparently after the guest QXL crash.
+Could you try launching VM with
+"-nographic -device qxl-vga"?Â  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+I have been running like that, but have not reproduced the qxl driver
+crash,
+and I suspect my guest image+kernel is too old.
+Yes, that's probably the case.Â  But the crash occurs on my Fedora 41
+guest with the 6.11.5-300.fc41.x86_64 kernel, so newer kernels seem to
+be buggy.
+However, once I realized the
+issue was post-cpr modification of qxl memory, I switched my attention
+to the
+fix.
+As for your patch, I can report that it doesn't resolve the issue as it
+is.Â  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+412Â Â Â Â Â Â Â Â  d->ram->magicÂ Â Â Â Â Â  = cpu_to_le32(QXL_RAM_MAGIC);
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+(gdb) bt
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+#1Â  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+#2Â  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+#3Â  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+#4Â  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+#5Â  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+v=0x5638996f3770, name=0x56389759b141 "realized",
+opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:2374
+#6Â  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:1449
+#7Â  0x00005638970f8586 in object_property_set_qobject
+(obj=0x5638996e0e70, name=0x56389759b141 "realized",
+value=0x5638996df900, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/qom-qobject.c:28
+#8Â  0x00005638970f3d8d in object_property_set_bool
+(obj=0x5638996e0e70, name=0x56389759b141 "realized", value=true,
+errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:1519
+#9Â  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+#10 0x0000563896dba675 in qdev_device_add_from_qdict
+(opts=0x5638996dfe50, from_json=false, errp=0x7ffd3c2b84e0) at ../
+system/qdev-monitor.c:714
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0,
+opts=0x563898786150, errp=0x56389855dc40 <error_fatal>) at ../system/
+vl.c:1207
+#13 0x000056389737a6cc in qemu_opts_foreach
+Â Â Â Â Â  (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+<device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+Â Â Â Â Â  at ../util/qemu-option.c:1135
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/
+vl.c:2745
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+<error_fatal>) at ../system/vl.c:2806
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948)
+at ../system/vl.c:3838
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at ../
+system/main.c:72
+So the attached adjusted version of your patch does seem to help.Â  At
+least I can't reproduce the crash on my stand.
+Thanks for the stack trace; the calls to SPICE_RING_INIT in init_qxl_ram
+are
+definitely harmful.Â  Try V2 of the patch, attached, which skips the lines
+of init_qxl_ram that modify guest memory.
+Thanks, your v2 patch does seem to prevent the crash.Â  Would you re-send
+it to the list as a proper fix?
+Yes.  Was waiting for your confirmation.
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?Â  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+It's a useful debugging technique, but changing protection on a large
+memory region
+can be too expensive for production due to TLB shootdowns.
+
+Also, there are cases where writes are performed but the value is
+guaranteed to
+be the same:
+Â Â  qxl_post_load()
+Â Â Â Â  qxl_set_mode()
+Â Â Â Â Â Â  d->rom->mode = cpu_to_le32(modenr);
+The value is the same because mode and shadow_rom.mode were passed in
+vmstate
+from old qemu.
+There're also cases where devices' ROM might be re-initialized.Â  E.g.
+this segfault occures upon further exploration of RO mapped RAM blocks:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+664Â Â Â Â Â Â Â Â Â Â Â Â  repÂ Â Â Â  movsb
+[Current thread is 1 (Thread 0x7f6e7d08b480 (LWP 310379))]
+(gdb) bt
+#0Â  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+#1Â  0x000055aa1d030ecd in rom_set_mr (rom=0x55aa200ba380, owner=0x55aa2019ac10, 
+name=0x7fffb8272bc0 "/rom@etc/acpi/tables", ro=true)
+Â Â Â Â  at ../hw/core/loader.c:1032
+#2Â  0x000055aa1d031577 in rom_add_blob
+Â Â Â Â  (name=0x55aa1da51f13 "etc/acpi/tables", blob=0x55aa208a1070, len=131072, max_len=2097152, 
+addr=18446744073709551615, fw_file_name=0x55aa1da51f13 "etc/acpi/tables", 
+fw_callback=0x55aa1d441f59 <acpi_build_update>, callback_opaque=0x55aa20ff0010, as=0x0, 
+read_only=true) at ../hw/core/loader.c:1147
+#3Â  0x000055aa1cfd788d in acpi_add_rom_blob
+Â Â Â Â  (update=0x55aa1d441f59 <acpi_build_update>, opaque=0x55aa20ff0010, 
+blob=0x55aa1fc9aa00, name=0x55aa1da51f13 "etc/acpi/tables") at ../hw/acpi/utils.c:46
+#4Â  0x000055aa1d44213f in acpi_setup () at ../hw/i386/acpi-build.c:2720
+#5Â  0x000055aa1d434199 in pc_machine_done (notifier=0x55aa1ff15050, data=0x0) 
+at ../hw/i386/pc.c:638
+#6Â  0x000055aa1d876845 in notifier_list_notify (list=0x55aa1ea25c10 
+<machine_init_done_notifiers>, data=0x0) at ../util/notify.c:39
+#7Â  0x000055aa1d039ee5 in qdev_machine_creation_done () at 
+../hw/core/machine.c:1749
+#8Â  0x000055aa1d2c7b3e in qemu_machine_creation_done (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2779
+#9Â  0x000055aa1d2c7c7d in qmp_x_exit_preconfig (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2807
+#10 0x000055aa1d2ca64f in qemu_init (argc=35, argv=0x7fffb82730e8) at 
+../system/vl.c:3838
+#11 0x000055aa1d79638c in main (argc=35, argv=0x7fffb82730e8) at 
+../system/main.c:72
+I'm not sure whether ACPI tables ROM in particular is rewritten with the
+same content, but there might be cases where ROM can be read from file
+system upon initialization.Â  That is undesirable as guest kernel
+certainly won't be too happy about sudden change of the device's ROM
+content.
+
+So the issue we're dealing with here is any unwanted memory related
+device initialization upon cpr.
+
+For now the only thing that comes to my mind is to make a test where we
+put as many devices as we can into a VM, make ram blocks RO upon cpr
+(and remap them as RW later after migration is done, if needed), and
+catch any unwanted memory violations.Â  As Den suggested, we might
+consider adding that behaviour as a separate non-default option (or
+"migrate" command flag specific to cpr-transfer), which would only be
+used in the testing.
+I'll look into adding an option, but there may be too many false positives,
+such as the qxl_set_mode case above.  And the maintainers may object to me
+eliminating the false positives by adding more CPR_IN tests, due to gratuitous
+(from their POV) ugliness.
+
+But I will use the technique to look for more write violations.
+Andrey
+No way. ACPI with the source must be used in the same way as BIOSes
+and optional ROMs.
+Yup, its a bug.  Will fix.
+
+- Steve
+
+see
+1741380954-341079-1-git-send-email-steven.sistare@oracle.com
+/">https://lore.kernel.org/qemu-devel/
+1741380954-341079-1-git-send-email-steven.sistare@oracle.com
+/
+- Steve
+
+On 3/6/2025 11:13 AM, Steven Sistare wrote:
+On 3/6/2025 10:52 AM, Denis V. Lunev wrote:
+On 3/6/25 16:16, Andrey Drobyshev wrote:
+On 3/5/25 11:19 PM, Steven Sistare wrote:
+On 3/5/2025 11:50 AM, Andrey Drobyshev wrote:
+On 3/4/25 9:05 PM, Steven Sistare wrote:
+On 2/28/2025 1:37 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:35 PM, Andrey Drobyshev wrote:
+On 2/28/25 8:20 PM, Steven Sistare wrote:
+On 2/28/2025 1:13 PM, Steven Sistare wrote:
+On 2/28/2025 12:39 PM, Andrey Drobyshev wrote:
+Hi all,
+
+We've been experimenting with cpr-transfer migration mode recently
+and
+have discovered the following issue with the guest QXL driver:
+
+Run migration source:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â Â  -device qxl-vga
+Run migration target:
+EMULATOR=/path/to/emulator
+ROOTFS=/path/to/image
+QMPSOCK=/var/run/alma8qmp-dst.sock
+$EMULATOR -enable-kvm \
+Â Â Â Â Â Â Â  -machine q35 \
+Â Â Â Â Â Â Â  -cpu host -smp 2 -m 2G \
+Â Â Â Â Â Â Â  -object memory-backend-file,id=ram0,size=2G,mem-path=/
+dev/shm/
+ram0,share=on\
+Â Â Â Â Â Â Â  -machine memory-backend=ram0 \
+Â Â Â Â Â Â Â  -machine aux-ram-share=on \
+Â Â Â Â Â Â Â  -drive file=$ROOTFS,media=disk,if=virtio \
+Â Â Â Â Â Â Â  -qmp unix:$QMPSOCK,server=on,wait=off \
+Â Â Â Â Â Â Â  -nographic \
+Â Â Â Â Â Â Â  -device qxl-vga \
+Â Â Â Â Â Â Â  -incoming tcp:0:44444 \
+Â Â Â Â Â Â Â  -incoming '{"channel-type": "cpr", "addr": { "transport":
+"socket", "type": "unix", "path": "/var/run/alma8cpr-dst.sock"}}'
+Launch the migration:
+QMPSHELL=/root/src/qemu/master/scripts/qmp/qmp-shell
+QMPSOCK=/var/run/alma8qmp-src.sock
+
+$QMPSHELL -p $QMPSOCK <<EOF
+Â Â Â Â Â Â Â  migrate-set-parameters mode=cpr-transfer
+Â Â Â Â Â Â Â  migrate channels=[{"channel-type":"main","addr":
+{"transport":"socket","type":"inet","host":"0","port":"44444"}},
+{"channel-type":"cpr","addr":
+{"transport":"socket","type":"unix","path":"/var/run/alma8cpr-
+dst.sock"}}]
+EOF
+Then, after a while, QXL guest driver on target crashes spewing the
+following messages:
+[Â Â  73.962002] [TTM] Buffer eviction failed
+[Â Â  73.962072] qxl 0000:00:02.0: object_init failed for (3149824,
+0x00000001)
+[Â Â  73.962081] [drm:qxl_alloc_bo_reserved [qxl]] *ERROR* failed to
+allocate VRAM BO
+That seems to be a known kernel QXL driver bug:
+https://lore.kernel.org/all/20220907094423.93581-1-
+min_halo@163.com/T/
+https://lore.kernel.org/lkml/ZTgydqRlK6WX_b29@eldamar.lan/
+(the latter discussion contains that reproduce script which
+speeds up
+the crash in the guest):
+#!/bin/bash
+
+chvt 3
+
+for j in $(seq 80); do
+Â Â Â Â Â Â Â Â Â Â Â  echo "$(date) starting round $j"
+Â Â Â Â Â Â Â Â Â Â Â  if [ "$(journalctl --boot | grep "failed to allocate
+VRAM
+BO")" != "" ]; then
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  echo "bug was reproduced after $j tries"
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  exit 1
+Â Â Â Â Â Â Â Â Â Â Â  fi
+Â Â Â Â Â Â Â Â Â Â Â  for i in $(seq 100); do
+Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  dmesg > /dev/tty3
+Â Â Â Â Â Â Â Â Â Â Â  done
+done
+
+echo "bug could not be reproduced"
+exit 0
+The bug itself seems to remain unfixed, as I was able to reproduce
+that
+with Fedora 41 guest, as well as AlmaLinux 8 guest. However our
+cpr-transfer code also seems to be buggy as it triggers the crash -
+without the cpr-transfer migration the above reproduce doesn't
+lead to
+crash on the source VM.
+
+I suspect that, as cpr-transfer doesn't migrate the guest
+memory, but
+rather passes it through the memory backend object, our code might
+somehow corrupt the VRAM.Â  However, I wasn't able to trace the
+corruption so far.
+
+Could somebody help the investigation and take a look into
+this?Â  Any
+suggestions would be appreciated.Â  Thanks!
+Possibly some memory region created by qxl is not being preserved.
+Try adding these traces to see what is preserved:
+
+-trace enable='*cpr*'
+-trace enable='*ram_alloc*'
+Also try adding this patch to see if it flags any ram blocks as not
+compatible with cpr.Â  A message is printed at migration start time.
+Â Â Â Â
+https://lore.kernel.org/qemu-devel/1740667681-257312-1-git-send-
+email-
+steven.sistare@oracle.com/
+
+- Steve
+With the traces enabled + the "migration: ram block cpr blockers"
+patch
+applied:
+
+Source:
+cpr_find_fd pc.bios, id 0 returns -1
+cpr_save_fd pc.bios, id 0, fd 22
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 22 host
+0x7fec18e00000
+cpr_find_fd pc.rom, id 0 returns -1
+cpr_save_fd pc.rom, id 0, fd 23
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 23 host
+0x7fec18c00000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns -1
+cpr_save_fd 0000:00:01.0/e1000e.rom, id 0, fd 24
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 24 host 0x7fec18a00000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/vga.vram, id 0, fd 25
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 25 host 0x7feb77e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vrom, id 0, fd 27
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 27 host 0x7fec18800000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.vram, id 0, fd 28
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 28 host 0x7feb73c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns -1
+cpr_save_fd 0000:00:02.0/qxl.rom, id 0, fd 34
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 34 host 0x7fec18600000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/tables, id 0, fd 35
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 35 host 0x7fec18200000
+cpr_find_fd /rom@etc/table-loader, id 0 returns -1
+cpr_save_fd /rom@etc/table-loader, id 0, fd 36
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 36 host 0x7feb8b600000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns -1
+cpr_save_fd /rom@etc/acpi/rsdp, id 0, fd 37
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+37 host 0x7feb8b400000
+
+cpr_state_save cpr-transfer mode
+cpr_transfer_output /var/run/alma8cpr-dst.sock
+Target:
+cpr_transfer_input /var/run/alma8cpr-dst.sock
+cpr_state_load cpr-transfer mode
+cpr_find_fd pc.bios, id 0 returns 20
+qemu_ram_alloc_shared pc.bios size 262144 max_size 262144 fd 20 host
+0x7fcdc9800000
+cpr_find_fd pc.rom, id 0 returns 19
+qemu_ram_alloc_shared pc.rom size 131072 max_size 131072 fd 19 host
+0x7fcdc9600000
+cpr_find_fd 0000:00:01.0/e1000e.rom, id 0 returns 18
+qemu_ram_alloc_shared 0000:00:01.0/e1000e.rom size 262144 max_size
+262144 fd 18 host 0x7fcdc9400000
+cpr_find_fd 0000:00:02.0/vga.vram, id 0 returns 17
+qemu_ram_alloc_shared 0000:00:02.0/vga.vram size 67108864 max_size
+67108864 fd 17 host 0x7fcd27e00000
+cpr_find_fd 0000:00:02.0/qxl.vrom, id 0 returns 16
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vrom size 8192 max_size 8192
+fd 16 host 0x7fcdc9200000
+cpr_find_fd 0000:00:02.0/qxl.vram, id 0 returns 15
+qemu_ram_alloc_shared 0000:00:02.0/qxl.vram size 67108864 max_size
+67108864 fd 15 host 0x7fcd23c00000
+cpr_find_fd 0000:00:02.0/qxl.rom, id 0 returns 14
+qemu_ram_alloc_shared 0000:00:02.0/qxl.rom size 65536 max_size 65536
+fd 14 host 0x7fcdc8800000
+cpr_find_fd /rom@etc/acpi/tables, id 0 returns 13
+qemu_ram_alloc_shared /rom@etc/acpi/tables size 131072 max_size
+2097152 fd 13 host 0x7fcdc8400000
+cpr_find_fd /rom@etc/table-loader, id 0 returns 11
+qemu_ram_alloc_shared /rom@etc/table-loader size 4096 max_size 65536
+fd 11 host 0x7fcdc8200000
+cpr_find_fd /rom@etc/acpi/rsdp, id 0 returns 10
+qemu_ram_alloc_shared /rom@etc/acpi/rsdp size 4096 max_size 4096 fd
+10 host 0x7fcd3be00000
+Looks like both vga.vram and qxl.vram are being preserved (with the
+same
+addresses), and no incompatible ram blocks are found during migration.
+Sorry, addressed are not the same, of course.Â  However corresponding
+ram
+blocks do seem to be preserved and initialized.
+So far, I have not reproduced the guest driver failure.
+
+However, I have isolated places where new QEMU improperly writes to
+the qxl memory regions prior to starting the guest, by mmap'ing them
+readonly after cpr:
+
+Â Â Â  qemu_ram_alloc_internal()
+Â Â Â Â Â  if (reused && (strstr(name, "qxl") || strstr("name", "vga")))
+Â Â Â Â Â Â Â Â Â  ram_flags |= RAM_READONLY;
+Â Â Â Â Â  new_block = qemu_ram_alloc_from_fd(...)
+
+I have attached a draft fix; try it and let me know.
+My console window looks fine before and after cpr, using
+-vnc $hostip:0 -vga qxl
+
+- Steve
+Regarding the reproduce: when I launch the buggy version with the same
+options as you, i.e. "-vnc 0.0.0.0:$port -vga qxl", and do cpr-transfer,
+my VNC client silently hangs on the target after a while.Â  Could it
+happen on your stand as well?
+cpr does not preserve the vnc connection and session.Â  To test, I specify
+port 0 for the source VM and port 1 for the dest.Â  When the src vnc goes
+dormant the dest vnc becomes active.
+Sure, I meant that VNC on the dest (on the port 1) works for a while
+after the migration and then hangs, apparently after the guest QXL crash.
+Could you try launching VM with
+"-nographic -device qxl-vga"?Â  That way VM's serial console is given you
+directly in the shell, so when qxl driver crashes you're still able to
+inspect the kernel messages.
+I have been running like that, but have not reproduced the qxl driver
+crash,
+and I suspect my guest image+kernel is too old.
+Yes, that's probably the case.Â  But the crash occurs on my Fedora 41
+guest with the 6.11.5-300.fc41.x86_64 kernel, so newer kernels seem to
+be buggy.
+However, once I realized the
+issue was post-cpr modification of qxl memory, I switched my attention
+to the
+fix.
+As for your patch, I can report that it doesn't resolve the issue as it
+is.Â  But I was able to track down another possible memory corruption
+using your approach with readonly mmap'ing:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+412Â Â Â Â Â Â Â Â  d->ram->magicÂ Â Â Â Â Â  = cpu_to_le32(QXL_RAM_MAGIC);
+[Current thread is 1 (Thread 0x7f1a4f83b480 (LWP 229798))]
+(gdb) bt
+#0Â  init_qxl_ram (d=0x5638996e0e70) at ../hw/display/qxl.c:412
+#1Â  0x0000563896e7f467 in qxl_realize_common (qxl=0x5638996e0e70,
+errp=0x7ffd3c2b8170) at ../hw/display/qxl.c:2142
+#2Â  0x0000563896e7fda1 in qxl_realize_primary (dev=0x5638996e0e70,
+errp=0x7ffd3c2b81d0) at ../hw/display/qxl.c:2257
+#3Â  0x0000563896c7e8f2 in pci_qdev_realize (qdev=0x5638996e0e70,
+errp=0x7ffd3c2b8250) at ../hw/pci/pci.c:2174
+#4Â  0x00005638970eb54b in device_set_realized (obj=0x5638996e0e70,
+value=true, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:494
+#5Â  0x00005638970f5e14 in property_set_bool (obj=0x5638996e0e70,
+v=0x5638996f3770, name=0x56389759b141 "realized",
+opaque=0x5638987893d0, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:2374
+#6Â  0x00005638970f39f8 in object_property_set (obj=0x5638996e0e70,
+name=0x56389759b141 "realized", v=0x5638996f3770, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:1449
+#7Â  0x00005638970f8586 in object_property_set_qobject
+(obj=0x5638996e0e70, name=0x56389759b141 "realized",
+value=0x5638996df900, errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/qom-qobject.c:28
+#8Â  0x00005638970f3d8d in object_property_set_bool
+(obj=0x5638996e0e70, name=0x56389759b141 "realized", value=true,
+errp=0x7ffd3c2b84e0)
+Â Â Â Â Â  at ../qom/object.c:1519
+#9Â  0x00005638970eacb0 in qdev_realize (dev=0x5638996e0e70,
+bus=0x563898cf3c20, errp=0x7ffd3c2b84e0) at ../hw/core/qdev.c:276
+#10 0x0000563896dba675 in qdev_device_add_from_qdict
+(opts=0x5638996dfe50, from_json=false, errp=0x7ffd3c2b84e0) at ../
+system/qdev-monitor.c:714
+#11 0x0000563896dba721 in qdev_device_add (opts=0x563898786150,
+errp=0x56389855dc40 <error_fatal>) at ../system/qdev-monitor.c:733
+#12 0x0000563896dc48f1 in device_init_func (opaque=0x0,
+opts=0x563898786150, errp=0x56389855dc40 <error_fatal>) at ../system/
+vl.c:1207
+#13 0x000056389737a6cc in qemu_opts_foreach
+Â Â Â Â Â  (list=0x563898427b60 <qemu_device_opts>, func=0x563896dc48ca
+<device_init_func>, opaque=0x0, errp=0x56389855dc40 <error_fatal>)
+Â Â Â Â Â  at ../util/qemu-option.c:1135
+#14 0x0000563896dc89b5 in qemu_create_cli_devices () at ../system/
+vl.c:2745
+#15 0x0000563896dc8c00 in qmp_x_exit_preconfig (errp=0x56389855dc40
+<error_fatal>) at ../system/vl.c:2806
+#16 0x0000563896dcb5de in qemu_init (argc=33, argv=0x7ffd3c2b8948)
+at ../system/vl.c:3838
+#17 0x0000563897297323 in main (argc=33, argv=0x7ffd3c2b8948) at ../
+system/main.c:72
+So the attached adjusted version of your patch does seem to help.Â  At
+least I can't reproduce the crash on my stand.
+Thanks for the stack trace; the calls to SPICE_RING_INIT in init_qxl_ram
+are
+definitely harmful.Â  Try V2 of the patch, attached, which skips the lines
+of init_qxl_ram that modify guest memory.
+Thanks, your v2 patch does seem to prevent the crash.Â  Would you re-send
+it to the list as a proper fix?
+Yes.Â  Was waiting for your confirmation.
+I'm wondering, could it be useful to explicitly mark all the reused
+memory regions readonly upon cpr-transfer, and then make them writable
+back again after the migration is done?Â  That way we will be segfaulting
+early on instead of debugging tricky memory corruptions.
+It's a useful debugging technique, but changing protection on a large
+memory region
+can be too expensive for production due to TLB shootdowns.
+
+Also, there are cases where writes are performed but the value is
+guaranteed to
+be the same:
+Â Â  qxl_post_load()
+Â Â Â Â  qxl_set_mode()
+Â Â Â Â Â Â  d->rom->mode = cpu_to_le32(modenr);
+The value is the same because mode and shadow_rom.mode were passed in
+vmstate
+from old qemu.
+There're also cases where devices' ROM might be re-initialized.Â  E.g.
+this segfault occures upon further exploration of RO mapped RAM blocks:
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0Â  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+664Â Â Â Â Â Â Â Â Â Â Â Â  repÂ Â Â Â  movsb
+[Current thread is 1 (Thread 0x7f6e7d08b480 (LWP 310379))]
+(gdb) bt
+#0Â  __memmove_avx_unaligned_erms () at 
+../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:664
+#1Â  0x000055aa1d030ecd in rom_set_mr (rom=0x55aa200ba380, owner=0x55aa2019ac10, 
+name=0x7fffb8272bc0 "/rom@etc/acpi/tables", ro=true)
+Â Â Â Â  at ../hw/core/loader.c:1032
+#2Â  0x000055aa1d031577 in rom_add_blob
+Â Â Â Â  (name=0x55aa1da51f13 "etc/acpi/tables", blob=0x55aa208a1070, len=131072, max_len=2097152, 
+addr=18446744073709551615, fw_file_name=0x55aa1da51f13 "etc/acpi/tables", 
+fw_callback=0x55aa1d441f59 <acpi_build_update>, callback_opaque=0x55aa20ff0010, as=0x0, 
+read_only=true) at ../hw/core/loader.c:1147
+#3Â  0x000055aa1cfd788d in acpi_add_rom_blob
+Â Â Â Â  (update=0x55aa1d441f59 <acpi_build_update>, opaque=0x55aa20ff0010, 
+blob=0x55aa1fc9aa00, name=0x55aa1da51f13 "etc/acpi/tables") at ../hw/acpi/utils.c:46
+#4Â  0x000055aa1d44213f in acpi_setup () at ../hw/i386/acpi-build.c:2720
+#5Â  0x000055aa1d434199 in pc_machine_done (notifier=0x55aa1ff15050, data=0x0) 
+at ../hw/i386/pc.c:638
+#6Â  0x000055aa1d876845 in notifier_list_notify (list=0x55aa1ea25c10 
+<machine_init_done_notifiers>, data=0x0) at ../util/notify.c:39
+#7Â  0x000055aa1d039ee5 in qdev_machine_creation_done () at 
+../hw/core/machine.c:1749
+#8Â  0x000055aa1d2c7b3e in qemu_machine_creation_done (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2779
+#9Â  0x000055aa1d2c7c7d in qmp_x_exit_preconfig (errp=0x55aa1ea5cc40 
+<error_fatal>) at ../system/vl.c:2807
+#10 0x000055aa1d2ca64f in qemu_init (argc=35, argv=0x7fffb82730e8) at 
+../system/vl.c:3838
+#11 0x000055aa1d79638c in main (argc=35, argv=0x7fffb82730e8) at 
+../system/main.c:72
+I'm not sure whether ACPI tables ROM in particular is rewritten with the
+same content, but there might be cases where ROM can be read from file
+system upon initialization.Â  That is undesirable as guest kernel
+certainly won't be too happy about sudden change of the device's ROM
+content.
+
+So the issue we're dealing with here is any unwanted memory related
+device initialization upon cpr.
+
+For now the only thing that comes to my mind is to make a test where we
+put as many devices as we can into a VM, make ram blocks RO upon cpr
+(and remap them as RW later after migration is done, if needed), and
+catch any unwanted memory violations.Â  As Den suggested, we might
+consider adding that behaviour as a separate non-default option (or
+"migrate" command flag specific to cpr-transfer), which would only be
+used in the testing.
+I'll look into adding an option, but there may be too many false positives,
+such as the qxl_set_mode case above.Â  And the maintainers may object to me
+eliminating the false positives by adding more CPR_IN tests, due to gratuitous
+(from their POV) ugliness.
+
+But I will use the technique to look for more write violations.
+Andrey
+No way. ACPI with the source must be used in the same way as BIOSes
+and optional ROMs.
+Yup, its a bug.Â  Will fix.
+
+- Steve
+

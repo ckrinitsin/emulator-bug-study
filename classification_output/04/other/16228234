@@ -1,0 +1,1852 @@
+other: 0.535
+mistranslation: 0.518
+KVM: 0.445
+instruction: 0.442
+network: 0.440
+device: 0.439
+assembly: 0.435
+vnc: 0.420
+semantic: 0.411
+graphic: 0.408
+boot: 0.402
+socket: 0.401
+
+[Qemu-devel] [Bug?] BQL about live migration
+
+Hello Juan & Dave,
+
+We hit a bug in our test:
+Network error occurs when migrating a guest, libvirt then rollback the
+migration, causes qemu coredump
+qemu log:
+2017-03-01T12:54:33.904949+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+ {"timestamp": {"seconds": 1488344073, "microseconds": 904914}, "event": "STOP"}
+2017-03-01T12:54:37.522500+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+ qmp_cmd_name: migrate_cancel
+2017-03-01T12:54:37.522607+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+ {"timestamp": {"seconds": 1488344077, "microseconds": 522556}, "event": 
+"MIGRATION", "data": {"status": "cancelling"}}
+2017-03-01T12:54:37.524671+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+ qmp_cmd_name: cont
+2017-03-01T12:54:37.524733+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+ virtio-balloon device status is 7 that means DRIVER OK
+2017-03-01T12:54:37.525434+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+ virtio-net device status is 7 that means DRIVER OK
+2017-03-01T12:54:37.525484+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+ virtio-blk device status is 7 that means DRIVER OK
+2017-03-01T12:54:37.525562+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+ virtio-serial device status is 7 that means DRIVER OK
+2017-03-01T12:54:37.527653+08:00|info|qemu[17672]|[17672]|vm_start[981]|: 
+vm_state-notify:3ms
+2017-03-01T12:54:37.528523+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+ {"timestamp": {"seconds": 1488344077, "microseconds": 527699}, "event": 
+"RESUME"}
+2017-03-01T12:54:37.530680+08:00|info|qemu[17672]|[33614]|migration_bitmap_sync[720]|:
+ this iteration cycle takes 3s, new dirtied data:0MB
+2017-03-01T12:54:37.530909+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+ {"timestamp": {"seconds": 1488344077, "microseconds": 530733}, "event": 
+"MIGRATION_PASS", "data": {"pass": 3}}
+2017-03-01T04:54:37.530997Z qemu-kvm: socket_writev_buffer: Got err=32 for 
+(131583/18446744073709551615)
+qemu-kvm: /home/abuild/rpmbuild/BUILD/qemu-kvm-2.6.0/hw/net/virtio_net.c:1519: 
+virtio_net_save: Assertion `!n->vhost_started' failed.
+2017-03-01 12:54:43.028: shutting down
+
+>
+From qemu log, qemu received and processed migrate_cancel/cont qmp commands
+after guest been stopped and entered the last round of migration. Then
+migration thread try to save device state when guest is running(started by
+cont command), causes assert and coredump.
+This is because in last iter, we call cpu_synchronize_all_states() to
+synchronize vcpu states, this call will release qemu_global_mutex and wait
+for do_kvm_cpu_synchronize_state() to be executed on target vcpu:
+(gdb) bt
+#0  0x00007f763d1046d5 in pthread_cond_wait@@GLIBC_2.3.2 () from 
+/lib64/libpthread.so.0
+#1  0x00007f7643e51d7f in qemu_cond_wait (cond=0x7f764445eca0 <qemu_work_cond>, 
+mutex=0x7f764445eba0 <qemu_global_mutex>) at util/qemu-thread-posix.c:132
+#2  0x00007f7643a2e154 in run_on_cpu (cpu=0x7f7644e06d80, func=0x7f7643a46413 
+<do_kvm_cpu_synchronize_state>, data=0x7f7644e06d80) at 
+/mnt/public/yanghy/qemu-kvm/cpus.c:995
+#3  0x00007f7643a46487 in kvm_cpu_synchronize_state (cpu=0x7f7644e06d80) at 
+/mnt/public/yanghy/qemu-kvm/kvm-all.c:1805
+#4  0x00007f7643a2c700 in cpu_synchronize_state (cpu=0x7f7644e06d80) at 
+/mnt/public/yanghy/qemu-kvm/include/sysemu/kvm.h:457
+#5  0x00007f7643a2db0c in cpu_synchronize_all_states () at 
+/mnt/public/yanghy/qemu-kvm/cpus.c:766
+#6  0x00007f7643a67b5b in qemu_savevm_state_complete_precopy (f=0x7f76462f2d30, 
+iterable_only=false) at /mnt/public/yanghy/qemu-kvm/migration/savevm.c:1051
+#7  0x00007f7643d121e9 in migration_completion (s=0x7f76443e78c0 
+<current_migration.37571>, current_active_state=4, 
+old_vm_running=0x7f74343fda00, start_time=0x7f74343fda08) at 
+migration/migration.c:1753
+#8  0x00007f7643d126c5 in migration_thread (opaque=0x7f76443e78c0 
+<current_migration.37571>) at migration/migration.c:1922
+#9  0x00007f763d100dc5 in start_thread () from /lib64/libpthread.so.0
+#10 0x00007f763ce2e71d in clone () from /lib64/libc.so.6
+(gdb) p iothread_locked
+$1 = true
+
+and then, qemu main thread been executed, it won't block because migration
+thread released the qemu_global_mutex:
+(gdb) thr 1
+[Switching to thread 1 (Thread 0x7fe298e08bc0 (LWP 30767))]
+#0  os_host_main_loop_wait (timeout=931565) at main-loop.c:270
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout %d\n", 
+timeout);
+(gdb) p iothread_locked
+$2 = true
+(gdb) l 268
+263
+264         ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len, 
+timeout);
+265
+266
+267         if (timeout) {
+268             qemu_mutex_lock_iothread();
+269             if (runstate_check(RUN_STATE_FINISH_MIGRATE)) {
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout %d\n", 
+timeout);
+271             }
+272         }
+(gdb)
+
+So, although we've hold iothread_lock in stop&copy phase of migration, we
+can't guarantee the iothread been locked all through the stop & copy phase,
+any thoughts on how to solve this problem?
+
+
+Thanks,
+-Gonglei
+
+On Fri, 03/03 09:29, Gonglei (Arei) wrote:
+>
+Hello Juan & Dave,
+>
+>
+We hit a bug in our test:
+>
+Network error occurs when migrating a guest, libvirt then rollback the
+>
+migration, causes qemu coredump
+>
+qemu log:
+>
+2017-03-01T12:54:33.904949+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344073, "microseconds": 904914}, "event":
+>
+"STOP"}
+>
+2017-03-01T12:54:37.522500+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+qmp_cmd_name: migrate_cancel
+>
+2017-03-01T12:54:37.522607+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 522556}, "event":
+>
+"MIGRATION", "data": {"status": "cancelling"}}
+>
+2017-03-01T12:54:37.524671+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+qmp_cmd_name: cont
+>
+2017-03-01T12:54:37.524733+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-balloon device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525434+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-net device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525484+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-blk device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525562+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-serial device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.527653+08:00|info|qemu[17672]|[17672]|vm_start[981]|:
+>
+vm_state-notify:3ms
+>
+2017-03-01T12:54:37.528523+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 527699}, "event":
+>
+"RESUME"}
+>
+2017-03-01T12:54:37.530680+08:00|info|qemu[17672]|[33614]|migration_bitmap_sync[720]|:
+>
+this iteration cycle takes 3s, new dirtied data:0MB
+>
+2017-03-01T12:54:37.530909+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 530733}, "event":
+>
+"MIGRATION_PASS", "data": {"pass": 3}}
+>
+2017-03-01T04:54:37.530997Z qemu-kvm: socket_writev_buffer: Got err=32 for
+>
+(131583/18446744073709551615)
+>
+qemu-kvm:
+>
+/home/abuild/rpmbuild/BUILD/qemu-kvm-2.6.0/hw/net/virtio_net.c:1519:
+>
+virtio_net_save: Assertion `!n->vhost_started' failed.
+>
+2017-03-01 12:54:43.028: shutting down
+>
+>
+From qemu log, qemu received and processed migrate_cancel/cont qmp commands
+>
+after guest been stopped and entered the last round of migration. Then
+>
+migration thread try to save device state when guest is running(started by
+>
+cont command), causes assert and coredump.
+>
+This is because in last iter, we call cpu_synchronize_all_states() to
+>
+synchronize vcpu states, this call will release qemu_global_mutex and wait
+>
+for do_kvm_cpu_synchronize_state() to be executed on target vcpu:
+>
+(gdb) bt
+>
+#0  0x00007f763d1046d5 in pthread_cond_wait@@GLIBC_2.3.2 () from
+>
+/lib64/libpthread.so.0
+>
+#1  0x00007f7643e51d7f in qemu_cond_wait (cond=0x7f764445eca0
+>
+<qemu_work_cond>, mutex=0x7f764445eba0 <qemu_global_mutex>) at
+>
+util/qemu-thread-posix.c:132
+>
+#2  0x00007f7643a2e154 in run_on_cpu (cpu=0x7f7644e06d80, func=0x7f7643a46413
+>
+<do_kvm_cpu_synchronize_state>, data=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/cpus.c:995
+>
+#3  0x00007f7643a46487 in kvm_cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/kvm-all.c:1805
+>
+#4  0x00007f7643a2c700 in cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/include/sysemu/kvm.h:457
+>
+#5  0x00007f7643a2db0c in cpu_synchronize_all_states () at
+>
+/mnt/public/yanghy/qemu-kvm/cpus.c:766
+>
+#6  0x00007f7643a67b5b in qemu_savevm_state_complete_precopy
+>
+(f=0x7f76462f2d30, iterable_only=false) at
+>
+/mnt/public/yanghy/qemu-kvm/migration/savevm.c:1051
+>
+#7  0x00007f7643d121e9 in migration_completion (s=0x7f76443e78c0
+>
+<current_migration.37571>, current_active_state=4,
+>
+old_vm_running=0x7f74343fda00, start_time=0x7f74343fda08) at
+>
+migration/migration.c:1753
+>
+#8  0x00007f7643d126c5 in migration_thread (opaque=0x7f76443e78c0
+>
+<current_migration.37571>) at migration/migration.c:1922
+>
+#9  0x00007f763d100dc5 in start_thread () from /lib64/libpthread.so.0
+>
+#10 0x00007f763ce2e71d in clone () from /lib64/libc.so.6
+>
+(gdb) p iothread_locked
+>
+$1 = true
+>
+>
+and then, qemu main thread been executed, it won't block because migration
+>
+thread released the qemu_global_mutex:
+>
+(gdb) thr 1
+>
+[Switching to thread 1 (Thread 0x7fe298e08bc0 (LWP 30767))]
+>
+#0  os_host_main_loop_wait (timeout=931565) at main-loop.c:270
+>
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+%d\n", timeout);
+>
+(gdb) p iothread_locked
+>
+$2 = true
+>
+(gdb) l 268
+>
+263
+>
+264         ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len,
+>
+timeout);
+>
+265
+>
+266
+>
+267         if (timeout) {
+>
+268             qemu_mutex_lock_iothread();
+>
+269             if (runstate_check(RUN_STATE_FINISH_MIGRATE)) {
+>
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+%d\n", timeout);
+>
+271             }
+>
+272         }
+>
+(gdb)
+>
+>
+So, although we've hold iothread_lock in stop&copy phase of migration, we
+>
+can't guarantee the iothread been locked all through the stop & copy phase,
+>
+any thoughts on how to solve this problem?
+Could you post a backtrace of the assertion?
+
+Fam
+
+On 2017/3/3 18:42, Fam Zheng wrote:
+>
+On Fri, 03/03 09:29, Gonglei (Arei) wrote:
+>
+> Hello Juan & Dave,
+>
+>
+>
+> We hit a bug in our test:
+>
+> Network error occurs when migrating a guest, libvirt then rollback the
+>
+> migration, causes qemu coredump
+>
+> qemu log:
+>
+> 2017-03-01T12:54:33.904949+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+>  {"timestamp": {"seconds": 1488344073, "microseconds": 904914}, "event":
+>
+> "STOP"}
+>
+> 2017-03-01T12:54:37.522500+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+>  qmp_cmd_name: migrate_cancel
+>
+> 2017-03-01T12:54:37.522607+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+>  {"timestamp": {"seconds": 1488344077, "microseconds": 522556}, "event":
+>
+> "MIGRATION", "data": {"status": "cancelling"}}
+>
+> 2017-03-01T12:54:37.524671+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+>  qmp_cmd_name: cont
+>
+> 2017-03-01T12:54:37.524733+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+>  virtio-balloon device status is 7 that means DRIVER OK
+>
+> 2017-03-01T12:54:37.525434+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+>  virtio-net device status is 7 that means DRIVER OK
+>
+> 2017-03-01T12:54:37.525484+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+>  virtio-blk device status is 7 that means DRIVER OK
+>
+> 2017-03-01T12:54:37.525562+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+>  virtio-serial device status is 7 that means DRIVER OK
+>
+> 2017-03-01T12:54:37.527653+08:00|info|qemu[17672]|[17672]|vm_start[981]|:
+>
+> vm_state-notify:3ms
+>
+> 2017-03-01T12:54:37.528523+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+>  {"timestamp": {"seconds": 1488344077, "microseconds": 527699}, "event":
+>
+> "RESUME"}
+>
+> 2017-03-01T12:54:37.530680+08:00|info|qemu[17672]|[33614]|migration_bitmap_sync[720]|:
+>
+>  this iteration cycle takes 3s, new dirtied data:0MB
+>
+> 2017-03-01T12:54:37.530909+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+>  {"timestamp": {"seconds": 1488344077, "microseconds": 530733}, "event":
+>
+> "MIGRATION_PASS", "data": {"pass": 3}}
+>
+> 2017-03-01T04:54:37.530997Z qemu-kvm: socket_writev_buffer: Got err=32 for
+>
+> (131583/18446744073709551615)
+>
+> qemu-kvm:
+>
+> /home/abuild/rpmbuild/BUILD/qemu-kvm-2.6.0/hw/net/virtio_net.c:1519:
+>
+> virtio_net_save: Assertion `!n->vhost_started' failed.
+>
+> 2017-03-01 12:54:43.028: shutting down
+>
+>
+>
+> From qemu log, qemu received and processed migrate_cancel/cont qmp commands
+>
+> after guest been stopped and entered the last round of migration. Then
+>
+> migration thread try to save device state when guest is running(started by
+>
+> cont command), causes assert and coredump.
+>
+> This is because in last iter, we call cpu_synchronize_all_states() to
+>
+> synchronize vcpu states, this call will release qemu_global_mutex and wait
+>
+> for do_kvm_cpu_synchronize_state() to be executed on target vcpu:
+>
+> (gdb) bt
+>
+> #0  0x00007f763d1046d5 in pthread_cond_wait@@GLIBC_2.3.2 () from
+>
+> /lib64/libpthread.so.0
+>
+> #1  0x00007f7643e51d7f in qemu_cond_wait (cond=0x7f764445eca0
+>
+> <qemu_work_cond>, mutex=0x7f764445eba0 <qemu_global_mutex>) at
+>
+> util/qemu-thread-posix.c:132
+>
+> #2  0x00007f7643a2e154 in run_on_cpu (cpu=0x7f7644e06d80,
+>
+> func=0x7f7643a46413 <do_kvm_cpu_synchronize_state>, data=0x7f7644e06d80) at
+>
+> /mnt/public/yanghy/qemu-kvm/cpus.c:995
+>
+> #3  0x00007f7643a46487 in kvm_cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+> /mnt/public/yanghy/qemu-kvm/kvm-all.c:1805
+>
+> #4  0x00007f7643a2c700 in cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+> /mnt/public/yanghy/qemu-kvm/include/sysemu/kvm.h:457
+>
+> #5  0x00007f7643a2db0c in cpu_synchronize_all_states () at
+>
+> /mnt/public/yanghy/qemu-kvm/cpus.c:766
+>
+> #6  0x00007f7643a67b5b in qemu_savevm_state_complete_precopy
+>
+> (f=0x7f76462f2d30, iterable_only=false) at
+>
+> /mnt/public/yanghy/qemu-kvm/migration/savevm.c:1051
+>
+> #7  0x00007f7643d121e9 in migration_completion (s=0x7f76443e78c0
+>
+> <current_migration.37571>, current_active_state=4,
+>
+> old_vm_running=0x7f74343fda00, start_time=0x7f74343fda08) at
+>
+> migration/migration.c:1753
+>
+> #8  0x00007f7643d126c5 in migration_thread (opaque=0x7f76443e78c0
+>
+> <current_migration.37571>) at migration/migration.c:1922
+>
+> #9  0x00007f763d100dc5 in start_thread () from /lib64/libpthread.so.0
+>
+> #10 0x00007f763ce2e71d in clone () from /lib64/libc.so.6
+>
+> (gdb) p iothread_locked
+>
+> $1 = true
+>
+>
+>
+> and then, qemu main thread been executed, it won't block because migration
+>
+> thread released the qemu_global_mutex:
+>
+> (gdb) thr 1
+>
+> [Switching to thread 1 (Thread 0x7fe298e08bc0 (LWP 30767))]
+>
+> #0  os_host_main_loop_wait (timeout=931565) at main-loop.c:270
+>
+> 270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+> %d\n", timeout);
+>
+> (gdb) p iothread_locked
+>
+> $2 = true
+>
+> (gdb) l 268
+>
+> 263
+>
+> 264         ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len,
+>
+> timeout);
+>
+> 265
+>
+> 266
+>
+> 267         if (timeout) {
+>
+> 268             qemu_mutex_lock_iothread();
+>
+> 269             if (runstate_check(RUN_STATE_FINISH_MIGRATE)) {
+>
+> 270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+> %d\n", timeout);
+>
+> 271             }
+>
+> 272         }
+>
+> (gdb)
+>
+>
+>
+> So, although we've hold iothread_lock in stop&copy phase of migration, we
+>
+> can't guarantee the iothread been locked all through the stop & copy phase,
+>
+> any thoughts on how to solve this problem?
+>
+>
+Could you post a backtrace of the assertion?
+#0  0x00007f97b1fbe5d7 in raise () from /usr/lib64/libc.so.6
+#1  0x00007f97b1fbfcc8 in abort () from /usr/lib64/libc.so.6
+#2  0x00007f97b1fb7546 in __assert_fail_base () from /usr/lib64/libc.so.6
+#3  0x00007f97b1fb75f2 in __assert_fail () from /usr/lib64/libc.so.6
+#4  0x000000000049fd19 in virtio_net_save (f=0x7f97a8ca44d0, 
+opaque=0x7f97a86e9018) at /usr/src/debug/qemu-kvm-2.6.0/hw/
+#5  0x000000000047e380 in vmstate_save_old_style (address@hidden, 
+address@hidden, se=0x7f9
+#6  0x000000000047fb93 in vmstate_save (address@hidden, address@hidden, 
+address@hidden
+#7  0x0000000000481ad2 in qemu_savevm_state_complete_precopy (f=0x7f97a8ca44d0, 
+address@hidden)
+#8  0x00000000006c6b60 in migration_completion (address@hidden 
+<current_migration.38312>, current_active_state=curre
+    address@hidden) at migration/migration.c:1761
+#9  0x00000000006c71db in migration_thread (address@hidden 
+<current_migration.38312>) at migration/migrati
+
+>
+>
+Fam
+>
+--
+Thanks,
+Yang
+
+* Gonglei (Arei) (address@hidden) wrote:
+>
+Hello Juan & Dave,
+cc'ing in pbonzini since it's magic involving cpu_synrhonize_all_states()
+
+>
+We hit a bug in our test:
+>
+Network error occurs when migrating a guest, libvirt then rollback the
+>
+migration, causes qemu coredump
+>
+qemu log:
+>
+2017-03-01T12:54:33.904949+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344073, "microseconds": 904914}, "event":
+>
+"STOP"}
+>
+2017-03-01T12:54:37.522500+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+qmp_cmd_name: migrate_cancel
+>
+2017-03-01T12:54:37.522607+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 522556}, "event":
+>
+"MIGRATION", "data": {"status": "cancelling"}}
+>
+2017-03-01T12:54:37.524671+08:00|info|qemu[17672]|[17672]|handle_qmp_command[3930]|:
+>
+qmp_cmd_name: cont
+>
+2017-03-01T12:54:37.524733+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-balloon device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525434+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-net device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525484+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-blk device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.525562+08:00|info|qemu[17672]|[17672]|virtio_set_status[725]|:
+>
+virtio-serial device status is 7 that means DRIVER OK
+>
+2017-03-01T12:54:37.527653+08:00|info|qemu[17672]|[17672]|vm_start[981]|:
+>
+vm_state-notify:3ms
+>
+2017-03-01T12:54:37.528523+08:00|info|qemu[17672]|[17672]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 527699}, "event":
+>
+"RESUME"}
+>
+2017-03-01T12:54:37.530680+08:00|info|qemu[17672]|[33614]|migration_bitmap_sync[720]|:
+>
+this iteration cycle takes 3s, new dirtied data:0MB
+>
+2017-03-01T12:54:37.530909+08:00|info|qemu[17672]|[33614]|monitor_qapi_event_emit[479]|:
+>
+{"timestamp": {"seconds": 1488344077, "microseconds": 530733}, "event":
+>
+"MIGRATION_PASS", "data": {"pass": 3}}
+>
+2017-03-01T04:54:37.530997Z qemu-kvm: socket_writev_buffer: Got err=32 for
+>
+(131583/18446744073709551615)
+>
+qemu-kvm:
+>
+/home/abuild/rpmbuild/BUILD/qemu-kvm-2.6.0/hw/net/virtio_net.c:1519:
+>
+virtio_net_save: Assertion `!n->vhost_started' failed.
+>
+2017-03-01 12:54:43.028: shutting down
+>
+>
+From qemu log, qemu received and processed migrate_cancel/cont qmp commands
+>
+after guest been stopped and entered the last round of migration. Then
+>
+migration thread try to save device state when guest is running(started by
+>
+cont command), causes assert and coredump.
+>
+This is because in last iter, we call cpu_synchronize_all_states() to
+>
+synchronize vcpu states, this call will release qemu_global_mutex and wait
+>
+for do_kvm_cpu_synchronize_state() to be executed on target vcpu:
+>
+(gdb) bt
+>
+#0  0x00007f763d1046d5 in pthread_cond_wait@@GLIBC_2.3.2 () from
+>
+/lib64/libpthread.so.0
+>
+#1  0x00007f7643e51d7f in qemu_cond_wait (cond=0x7f764445eca0
+>
+<qemu_work_cond>, mutex=0x7f764445eba0 <qemu_global_mutex>) at
+>
+util/qemu-thread-posix.c:132
+>
+#2  0x00007f7643a2e154 in run_on_cpu (cpu=0x7f7644e06d80, func=0x7f7643a46413
+>
+<do_kvm_cpu_synchronize_state>, data=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/cpus.c:995
+>
+#3  0x00007f7643a46487 in kvm_cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/kvm-all.c:1805
+>
+#4  0x00007f7643a2c700 in cpu_synchronize_state (cpu=0x7f7644e06d80) at
+>
+/mnt/public/yanghy/qemu-kvm/include/sysemu/kvm.h:457
+>
+#5  0x00007f7643a2db0c in cpu_synchronize_all_states () at
+>
+/mnt/public/yanghy/qemu-kvm/cpus.c:766
+>
+#6  0x00007f7643a67b5b in qemu_savevm_state_complete_precopy
+>
+(f=0x7f76462f2d30, iterable_only=false) at
+>
+/mnt/public/yanghy/qemu-kvm/migration/savevm.c:1051
+>
+#7  0x00007f7643d121e9 in migration_completion (s=0x7f76443e78c0
+>
+<current_migration.37571>, current_active_state=4,
+>
+old_vm_running=0x7f74343fda00, start_time=0x7f74343fda08) at
+>
+migration/migration.c:1753
+>
+#8  0x00007f7643d126c5 in migration_thread (opaque=0x7f76443e78c0
+>
+<current_migration.37571>) at migration/migration.c:1922
+>
+#9  0x00007f763d100dc5 in start_thread () from /lib64/libpthread.so.0
+>
+#10 0x00007f763ce2e71d in clone () from /lib64/libc.so.6
+>
+(gdb) p iothread_locked
+>
+$1 = true
+>
+>
+and then, qemu main thread been executed, it won't block because migration
+>
+thread released the qemu_global_mutex:
+>
+(gdb) thr 1
+>
+[Switching to thread 1 (Thread 0x7fe298e08bc0 (LWP 30767))]
+>
+#0  os_host_main_loop_wait (timeout=931565) at main-loop.c:270
+>
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+%d\n", timeout);
+>
+(gdb) p iothread_locked
+>
+$2 = true
+>
+(gdb) l 268
+>
+263
+>
+264         ret = qemu_poll_ns((GPollFD *)gpollfds->data, gpollfds->len,
+>
+timeout);
+>
+265
+>
+266
+>
+267         if (timeout) {
+>
+268             qemu_mutex_lock_iothread();
+>
+269             if (runstate_check(RUN_STATE_FINISH_MIGRATE)) {
+>
+270                 QEMU_LOG(LOG_INFO,"***** after qemu_pool_ns: timeout
+>
+%d\n", timeout);
+>
+271             }
+>
+272         }
+>
+(gdb)
+>
+>
+So, although we've hold iothread_lock in stop&copy phase of migration, we
+>
+can't guarantee the iothread been locked all through the stop & copy phase,
+>
+any thoughts on how to solve this problem?
+Ouch that's pretty nasty; I remember Paolo explaining to me a while ago that
+their were times when run_on_cpu would have to drop the BQL and I worried about 
+it,
+but this is the 1st time I've seen an error due to it.
+
+Do you know what the migration state was at that point? Was it 
+MIGRATION_STATUS_CANCELLING?
+I'm thinking perhaps we should stop 'cont' from continuing while migration is in
+MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED - so 
+that
+perhaps libvirt could avoid sending the 'cont' until then?
+
+Dave
+
+
+>
+>
+Thanks,
+>
+-Gonglei
+>
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+Ouch that's pretty nasty; I remember Paolo explaining to me a while ago that
+>
+their were times when run_on_cpu would have to drop the BQL and I worried
+>
+about it,
+>
+but this is the 1st time I've seen an error due to it.
+>
+>
+Do you know what the migration state was at that point? Was it
+>
+MIGRATION_STATUS_CANCELLING?
+>
+I'm thinking perhaps we should stop 'cont' from continuing while migration is
+>
+in
+>
+MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED - so
+>
+that
+>
+perhaps libvirt could avoid sending the 'cont' until then?
+No, there's no event, though I thought libvirt would poll until
+"query-migrate" returns the cancelled state.  Of course that is a small
+consolation, because a segfault is unacceptable.
+
+One possibility is to suspend the monitor in qmp_migrate_cancel and
+resume it (with add_migration_state_change_notifier) when we hit the
+CANCELLED state.  I'm not sure what the latency would be between the end
+of migrate_fd_cancel and finally reaching CANCELLED.
+
+Paolo
+
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+> Ouch that's pretty nasty; I remember Paolo explaining to me a while ago that
+>
+> their were times when run_on_cpu would have to drop the BQL and I worried
+>
+> about it,
+>
+> but this is the 1st time I've seen an error due to it.
+>
+>
+>
+> Do you know what the migration state was at that point? Was it
+>
+> MIGRATION_STATUS_CANCELLING?
+>
+> I'm thinking perhaps we should stop 'cont' from continuing while migration
+>
+> is in
+>
+> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED -
+>
+> so that
+>
+> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>
+No, there's no event, though I thought libvirt would poll until
+>
+"query-migrate" returns the cancelled state.  Of course that is a small
+>
+consolation, because a segfault is unacceptable.
+I think you might get an event if you set the new migrate capability called
+'events' on!
+
+void migrate_set_state(int *state, int old_state, int new_state)
+{
+    if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+        trace_migrate_set_state(new_state);
+        migrate_generate_event(new_state);
+    }
+}
+
+static void migrate_generate_event(int new_state)
+{
+    if (migrate_use_events()) {
+        qapi_event_send_migration(new_state, &error_abort); 
+    }
+}
+
+That event feature went in sometime after 2.3.0.
+
+>
+One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+resume it (with add_migration_state_change_notifier) when we hit the
+>
+CANCELLED state.  I'm not sure what the latency would be between the end
+>
+of migrate_fd_cancel and finally reaching CANCELLED.
+I don't like suspending monitors; it can potentially take quite a significant
+time to do a cancel.
+How about making 'cont' fail if we're in CANCELLING?
+
+I'd really love to see the 'run_on_cpu' being more careful about the BQL;
+we really need all of the rest of the devices to stay quiesced at times.
+
+Dave
+
+>
+Paolo
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+>
+>
+> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+>> Ouch that's pretty nasty; I remember Paolo explaining to me a while ago that
+>
+>> their were times when run_on_cpu would have to drop the BQL and I worried
+>
+>> about it,
+>
+>> but this is the 1st time I've seen an error due to it.
+>
+>>
+>
+>> Do you know what the migration state was at that point? Was it
+>
+>> MIGRATION_STATUS_CANCELLING?
+>
+>> I'm thinking perhaps we should stop 'cont' from continuing while migration
+>
+>> is in
+>
+>> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED -
+>
+>> so that
+>
+>> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>
+>
+> No, there's no event, though I thought libvirt would poll until
+>
+> "query-migrate" returns the cancelled state.  Of course that is a small
+>
+> consolation, because a segfault is unacceptable.
+>
+>
+I think you might get an event if you set the new migrate capability called
+>
+'events' on!
+>
+>
+void migrate_set_state(int *state, int old_state, int new_state)
+>
+{
+>
+if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+>
+trace_migrate_set_state(new_state);
+>
+migrate_generate_event(new_state);
+>
+}
+>
+}
+>
+>
+static void migrate_generate_event(int new_state)
+>
+{
+>
+if (migrate_use_events()) {
+>
+qapi_event_send_migration(new_state, &error_abort);
+>
+}
+>
+}
+>
+>
+That event feature went in sometime after 2.3.0.
+>
+>
+> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+> resume it (with add_migration_state_change_notifier) when we hit the
+>
+> CANCELLED state.  I'm not sure what the latency would be between the end
+>
+> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+>
+I don't like suspending monitors; it can potentially take quite a significant
+>
+time to do a cancel.
+>
+How about making 'cont' fail if we're in CANCELLING?
+Actually I thought that would be the case already (in fact CANCELLING is
+internal only; the outside world sees it as "active" in query-migrate).
+
+Lei, what is the runstate?  (That is, why did cont succeed at all)?
+
+Paolo
+
+>
+I'd really love to see the 'run_on_cpu' being more careful about the BQL;
+>
+we really need all of the rest of the devices to stay quiesced at times.
+That's not really possible, because of how condition variables work. :(
+
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+> * Paolo Bonzini (address@hidden) wrote:
+>
+>>
+>
+>>
+>
+>> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+>>> Ouch that's pretty nasty; I remember Paolo explaining to me a while ago
+>
+>>> that
+>
+>>> their were times when run_on_cpu would have to drop the BQL and I worried
+>
+>>> about it,
+>
+>>> but this is the 1st time I've seen an error due to it.
+>
+>>>
+>
+>>> Do you know what the migration state was at that point? Was it
+>
+>>> MIGRATION_STATUS_CANCELLING?
+>
+>>> I'm thinking perhaps we should stop 'cont' from continuing while
+>
+>>> migration is in
+>
+>>> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED -
+>
+>>> so that
+>
+>>> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>>
+>
+>> No, there's no event, though I thought libvirt would poll until
+>
+>> "query-migrate" returns the cancelled state.  Of course that is a small
+>
+>> consolation, because a segfault is unacceptable.
+>
+>
+>
+> I think you might get an event if you set the new migrate capability called
+>
+> 'events' on!
+>
+>
+>
+> void migrate_set_state(int *state, int old_state, int new_state)
+>
+> {
+>
+>     if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+>
+>         trace_migrate_set_state(new_state);
+>
+>         migrate_generate_event(new_state);
+>
+>     }
+>
+> }
+>
+>
+>
+> static void migrate_generate_event(int new_state)
+>
+> {
+>
+>     if (migrate_use_events()) {
+>
+>         qapi_event_send_migration(new_state, &error_abort);
+>
+>     }
+>
+> }
+>
+>
+>
+> That event feature went in sometime after 2.3.0.
+>
+>
+>
+>> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+>> resume it (with add_migration_state_change_notifier) when we hit the
+>
+>> CANCELLED state.  I'm not sure what the latency would be between the end
+>
+>> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+>
+>
+> I don't like suspending monitors; it can potentially take quite a
+>
+> significant
+>
+> time to do a cancel.
+>
+> How about making 'cont' fail if we're in CANCELLING?
+>
+>
+Actually I thought that would be the case already (in fact CANCELLING is
+>
+internal only; the outside world sees it as "active" in query-migrate).
+>
+>
+Lei, what is the runstate?  (That is, why did cont succeed at all)?
+I suspect it's RUN_STATE_FINISH_MIGRATE - we set that before we do the device
+save, and that's what we get at the end of a migrate and it's legal to restart
+from there.
+
+>
+Paolo
+>
+>
+> I'd really love to see the 'run_on_cpu' being more careful about the BQL;
+>
+> we really need all of the rest of the devices to stay quiesced at times.
+>
+>
+That's not really possible, because of how condition variables work. :(
+*Really* we need to find a solution to that - there's probably lots of 
+other things that can spring up in that small window other than the
+'cont'.
+
+Dave
+
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+On 03/03/2017 14:26, Dr. David Alan Gilbert wrote:
+>
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+>
+>
+> On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+>> * Paolo Bonzini (address@hidden) wrote:
+>
+>>>
+>
+>>>
+>
+>>> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+>>>> Ouch that's pretty nasty; I remember Paolo explaining to me a while ago
+>
+>>>> that
+>
+>>>> their were times when run_on_cpu would have to drop the BQL and I worried
+>
+>>>> about it,
+>
+>>>> but this is the 1st time I've seen an error due to it.
+>
+>>>>
+>
+>>>> Do you know what the migration state was at that point? Was it
+>
+>>>> MIGRATION_STATUS_CANCELLING?
+>
+>>>> I'm thinking perhaps we should stop 'cont' from continuing while
+>
+>>>> migration is in
+>
+>>>> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED -
+>
+>>>> so that
+>
+>>>> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>>>
+>
+>>> No, there's no event, though I thought libvirt would poll until
+>
+>>> "query-migrate" returns the cancelled state.  Of course that is a small
+>
+>>> consolation, because a segfault is unacceptable.
+>
+>>
+>
+>> I think you might get an event if you set the new migrate capability called
+>
+>> 'events' on!
+>
+>>
+>
+>> void migrate_set_state(int *state, int old_state, int new_state)
+>
+>> {
+>
+>>     if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+>
+>>         trace_migrate_set_state(new_state);
+>
+>>         migrate_generate_event(new_state);
+>
+>>     }
+>
+>> }
+>
+>>
+>
+>> static void migrate_generate_event(int new_state)
+>
+>> {
+>
+>>     if (migrate_use_events()) {
+>
+>>         qapi_event_send_migration(new_state, &error_abort);
+>
+>>     }
+>
+>> }
+>
+>>
+>
+>> That event feature went in sometime after 2.3.0.
+>
+>>
+>
+>>> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+>>> resume it (with add_migration_state_change_notifier) when we hit the
+>
+>>> CANCELLED state.  I'm not sure what the latency would be between the end
+>
+>>> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+>>
+>
+>> I don't like suspending monitors; it can potentially take quite a
+>
+>> significant
+>
+>> time to do a cancel.
+>
+>> How about making 'cont' fail if we're in CANCELLING?
+>
+>
+>
+> Actually I thought that would be the case already (in fact CANCELLING is
+>
+> internal only; the outside world sees it as "active" in query-migrate).
+>
+>
+>
+> Lei, what is the runstate?  (That is, why did cont succeed at all)?
+>
+>
+I suspect it's RUN_STATE_FINISH_MIGRATE - we set that before we do the device
+>
+save, and that's what we get at the end of a migrate and it's legal to restart
+>
+from there.
+Yeah, but I think we get there at the end of a failed migrate only.  So
+perhaps we can introduce a new state RUN_STATE_FAILED_MIGRATE and forbid
+"cont" from finish-migrate (only allow it from failed-migrate)?
+
+Paolo
+
+>
+> Paolo
+>
+>
+>
+>> I'd really love to see the 'run_on_cpu' being more careful about the BQL;
+>
+>> we really need all of the rest of the devices to stay quiesced at times.
+>
+>
+>
+> That's not really possible, because of how condition variables work. :(
+>
+>
+*Really* we need to find a solution to that - there's probably lots of
+>
+other things that can spring up in that small window other than the
+>
+'cont'.
+>
+>
+Dave
+>
+>
+--
+>
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+
+Hi Paolo,
+
+On Fri, Mar 3, 2017 at 9:33 PM, Paolo Bonzini <address@hidden> wrote:
+
+>
+>
+>
+On 03/03/2017 14:26, Dr. David Alan Gilbert wrote:
+>
+> * Paolo Bonzini (address@hidden) wrote:
+>
+>>
+>
+>>
+>
+>> On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+>>> * Paolo Bonzini (address@hidden) wrote:
+>
+>>>>
+>
+>>>>
+>
+>>>> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+>>>>> Ouch that's pretty nasty; I remember Paolo explaining to me a while
+>
+ago that
+>
+>>>>> their were times when run_on_cpu would have to drop the BQL and I
+>
+worried about it,
+>
+>>>>> but this is the 1st time I've seen an error due to it.
+>
+>>>>>
+>
+>>>>> Do you know what the migration state was at that point? Was it
+>
+MIGRATION_STATUS_CANCELLING?
+>
+>>>>> I'm thinking perhaps we should stop 'cont' from continuing while
+>
+migration is in
+>
+>>>>> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit
+>
+CANCELLED - so that
+>
+>>>>> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>>>>
+>
+>>>> No, there's no event, though I thought libvirt would poll until
+>
+>>>> "query-migrate" returns the cancelled state.  Of course that is a
+>
+small
+>
+>>>> consolation, because a segfault is unacceptable.
+>
+>>>
+>
+>>> I think you might get an event if you set the new migrate capability
+>
+called
+>
+>>> 'events' on!
+>
+>>>
+>
+>>> void migrate_set_state(int *state, int old_state, int new_state)
+>
+>>> {
+>
+>>>     if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+>
+>>>         trace_migrate_set_state(new_state);
+>
+>>>         migrate_generate_event(new_state);
+>
+>>>     }
+>
+>>> }
+>
+>>>
+>
+>>> static void migrate_generate_event(int new_state)
+>
+>>> {
+>
+>>>     if (migrate_use_events()) {
+>
+>>>         qapi_event_send_migration(new_state, &error_abort);
+>
+>>>     }
+>
+>>> }
+>
+>>>
+>
+>>> That event feature went in sometime after 2.3.0.
+>
+>>>
+>
+>>>> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+>>>> resume it (with add_migration_state_change_notifier) when we hit the
+>
+>>>> CANCELLED state.  I'm not sure what the latency would be between the
+>
+end
+>
+>>>> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+>>>
+>
+>>> I don't like suspending monitors; it can potentially take quite a
+>
+significant
+>
+>>> time to do a cancel.
+>
+>>> How about making 'cont' fail if we're in CANCELLING?
+>
+>>
+>
+>> Actually I thought that would be the case already (in fact CANCELLING is
+>
+>> internal only; the outside world sees it as "active" in query-migrate).
+>
+>>
+>
+>> Lei, what is the runstate?  (That is, why did cont succeed at all)?
+>
+>
+>
+> I suspect it's RUN_STATE_FINISH_MIGRATE - we set that before we do the
+>
+device
+>
+> save, and that's what we get at the end of a migrate and it's legal to
+>
+restart
+>
+> from there.
+>
+>
+Yeah, but I think we get there at the end of a failed migrate only.  So
+>
+perhaps we can introduce a new state RUN_STATE_FAILED_MIGRATE
+I think we do not need to introduce a new state here. If we hit 'cont' and
+the run state is RUN_STATE_FINISH_MIGRATE, we could assume that
+migration failed because 'RUN_STATE_FINISH_MIGRATE' only exists on
+source side, means we are finishing migration, a 'cont' at the meantime
+indicates that we are rolling back, otherwise source side should be
+destroyed.
+
+
+>
+and forbid
+>
+"cont" from finish-migrate (only allow it from failed-migrate)?
+>
+The problem of forbid 'cont' here is that it will result in a failed
+migration and the source
+side will remain paused. We actually expect a usable guest when rollback.
+Is there a way to kill migration thread when we're under main thread, if
+there is, we
+could do the following to solve this problem:
+1. 'cont' received during runstate RUN_STATE_FINISH_MIGRATE
+2. kill migration thread
+3. vm_start()
+
+But this only solves 'cont' problem. As Dave said before, other things could
+happen during the small windows while we are finishing migration, that's
+what I was worried about...
+
+
+>
+Paolo
+>
+>
+>> Paolo
+>
+>>
+>
+>>> I'd really love to see the 'run_on_cpu' being more careful about the
+>
+BQL;
+>
+>>> we really need all of the rest of the devices to stay quiesced at
+>
+times.
+>
+>>
+>
+>> That's not really possible, because of how condition variables work. :(
+>
+>
+>
+> *Really* we need to find a solution to that - there's probably lots of
+>
+> other things that can spring up in that small window other than the
+>
+> 'cont'.
+>
+>
+>
+> Dave
+>
+>
+>
+> --
+>
+> Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>
+>
+>
+
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+On 03/03/2017 14:26, Dr. David Alan Gilbert wrote:
+>
+> * Paolo Bonzini (address@hidden) wrote:
+>
+>>
+>
+>>
+>
+>> On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+>>> * Paolo Bonzini (address@hidden) wrote:
+>
+>>>>
+>
+>>>>
+>
+>>>> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+>>>>> Ouch that's pretty nasty; I remember Paolo explaining to me a while ago
+>
+>>>>> that
+>
+>>>>> their were times when run_on_cpu would have to drop the BQL and I
+>
+>>>>> worried about it,
+>
+>>>>> but this is the 1st time I've seen an error due to it.
+>
+>>>>>
+>
+>>>>> Do you know what the migration state was at that point? Was it
+>
+>>>>> MIGRATION_STATUS_CANCELLING?
+>
+>>>>> I'm thinking perhaps we should stop 'cont' from continuing while
+>
+>>>>> migration is in
+>
+>>>>> MIGRATION_STATUS_CANCELLING.  Do we send an event when we hit CANCELLED
+>
+>>>>> - so that
+>
+>>>>> perhaps libvirt could avoid sending the 'cont' until then?
+>
+>>>>
+>
+>>>> No, there's no event, though I thought libvirt would poll until
+>
+>>>> "query-migrate" returns the cancelled state.  Of course that is a small
+>
+>>>> consolation, because a segfault is unacceptable.
+>
+>>>
+>
+>>> I think you might get an event if you set the new migrate capability
+>
+>>> called
+>
+>>> 'events' on!
+>
+>>>
+>
+>>> void migrate_set_state(int *state, int old_state, int new_state)
+>
+>>> {
+>
+>>>     if (atomic_cmpxchg(state, old_state, new_state) == old_state) {
+>
+>>>         trace_migrate_set_state(new_state);
+>
+>>>         migrate_generate_event(new_state);
+>
+>>>     }
+>
+>>> }
+>
+>>>
+>
+>>> static void migrate_generate_event(int new_state)
+>
+>>> {
+>
+>>>     if (migrate_use_events()) {
+>
+>>>         qapi_event_send_migration(new_state, &error_abort);
+>
+>>>     }
+>
+>>> }
+>
+>>>
+>
+>>> That event feature went in sometime after 2.3.0.
+>
+>>>
+>
+>>>> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+>>>> resume it (with add_migration_state_change_notifier) when we hit the
+>
+>>>> CANCELLED state.  I'm not sure what the latency would be between the end
+>
+>>>> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+>>>
+>
+>>> I don't like suspending monitors; it can potentially take quite a
+>
+>>> significant
+>
+>>> time to do a cancel.
+>
+>>> How about making 'cont' fail if we're in CANCELLING?
+>
+>>
+>
+>> Actually I thought that would be the case already (in fact CANCELLING is
+>
+>> internal only; the outside world sees it as "active" in query-migrate).
+>
+>>
+>
+>> Lei, what is the runstate?  (That is, why did cont succeed at all)?
+>
+>
+>
+> I suspect it's RUN_STATE_FINISH_MIGRATE - we set that before we do the
+>
+> device
+>
+> save, and that's what we get at the end of a migrate and it's legal to
+>
+> restart
+>
+> from there.
+>
+>
+Yeah, but I think we get there at the end of a failed migrate only.  So
+>
+perhaps we can introduce a new state RUN_STATE_FAILED_MIGRATE and forbid
+>
+"cont" from finish-migrate (only allow it from failed-migrate)?
+OK, I was wrong in my previous statement; we actually go 
+FINISH_MIGRATE->POSTMIGRATE
+so no new state is needed; you shouldn't be restarting the cpu in 
+FINISH_MIGRATE.
+
+My preference is to get libvirt to wait for the transition to POSTMIGRATE before
+it issues the 'cont'.  I'd rather not block the monitor with 'cont' but I'm
+not sure how we'd cleanly make cont fail without breaking existing libvirts
+that usually don't hit this race. (cc'ing in Jiri).
+
+Dave
+
+>
+Paolo
+>
+>
+>> Paolo
+>
+>>
+>
+>>> I'd really love to see the 'run_on_cpu' being more careful about the BQL;
+>
+>>> we really need all of the rest of the devices to stay quiesced at times.
+>
+>>
+>
+>> That's not really possible, because of how condition variables work. :(
+>
+>
+>
+> *Really* we need to find a solution to that - there's probably lots of
+>
+> other things that can spring up in that small window other than the
+>
+> 'cont'.
+>
+>
+>
+> Dave
+>
+>
+>
+> --
+>
+> Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+Hi Dave,
+
+On Fri, Mar 3, 2017 at 9:26 PM, Dr. David Alan Gilbert <address@hidden>
+wrote:
+
+>
+* Paolo Bonzini (address@hidden) wrote:
+>
+>
+>
+>
+>
+> On 03/03/2017 14:11, Dr. David Alan Gilbert wrote:
+>
+> > * Paolo Bonzini (address@hidden) wrote:
+>
+> >>
+>
+> >>
+>
+> >> On 03/03/2017 13:00, Dr. David Alan Gilbert wrote:
+>
+...
+>
+> > That event feature went in sometime after 2.3.0.
+>
+> >
+>
+> >> One possibility is to suspend the monitor in qmp_migrate_cancel and
+>
+> >> resume it (with add_migration_state_change_notifier) when we hit the
+>
+> >> CANCELLED state.  I'm not sure what the latency would be between the
+>
+end
+>
+> >> of migrate_fd_cancel and finally reaching CANCELLED.
+>
+> >
+>
+> > I don't like suspending monitors; it can potentially take quite a
+>
+significant
+>
+> > time to do a cancel.
+>
+> > How about making 'cont' fail if we're in CANCELLING?
+>
+>
+>
+> Actually I thought that would be the case already (in fact CANCELLING is
+>
+> internal only; the outside world sees it as "active" in query-migrate).
+>
+>
+>
+> Lei, what is the runstate?  (That is, why did cont succeed at all)?
+>
+>
+I suspect it's RUN_STATE_FINISH_MIGRATE - we set that before we do the
+>
+device
+>
+It is RUN_STATE_FINISH_MIGRATE.
+
+
+>
+save, and that's what we get at the end of a migrate and it's legal to
+>
+restart
+>
+from there.
+>
+>
+> Paolo
+>
+>
+>
+> > I'd really love to see the 'run_on_cpu' being more careful about the
+>
+BQL;
+>
+> > we really need all of the rest of the devices to stay quiesced at
+>
+times.
+>
+>
+>
+> That's not really possible, because of how condition variables work. :(
+>
+>
+*Really* we need to find a solution to that - there's probably lots of
+>
+other things that can spring up in that small window other than the
+>
+'cont'.
+>
+This is what I was worry about. Not only sync_cpu_state() will call
+run_on_cpu()
+but also vm_stop_force_state() will, both of them did hit the small windows
+in our
+test.
+
+
+>
+>
+Dave
+>
+>
+--
+>
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>
+

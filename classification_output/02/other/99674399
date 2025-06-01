@@ -1,0 +1,149 @@
+other: 0.883
+instruction: 0.860
+mistranslation: 0.843
+semantic: 0.822
+boot: 0.822
+
+[BUG] qemu crashes on assertion in cpu_asidx_from_attrs when cpu is in smm mode
+
+Hi all!
+
+First, I see this issue:
+https://gitlab.com/qemu-project/qemu/-/issues/1198
+. 
+where some kvm/hardware failure leads to guest crash, and finally to this 
+assertion:
+
+   cpu_asidx_from_attrs: Assertion `ret < cpu->num_ases && ret >= 0' failed.
+
+But in the ticket the talk is about the guest crash and fixing the kernel, not 
+about the final QEMU assertion (which definitely show that something should be 
+fixed in QEMU code too).
+
+
+We've faced same stack one time:
+
+(gdb) bt
+#0  raise () from /lib/x86_64-linux-gnu/libc.so.6
+#1  abort () from /lib/x86_64-linux-gnu/libc.so.6
+#2  ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  __assert_fail () from /lib/x86_64-linux-gnu/libc.so.6
+#4  cpu_asidx_from_attrs  at ../hw/core/cpu-sysemu.c:76
+#5  cpu_memory_rw_debug  at ../softmmu/physmem.c:3529
+#6  x86_cpu_dump_state  at ../target/i386/cpu-dump.c:560
+#7  kvm_cpu_exec  at ../accel/kvm/kvm-all.c:3000
+#8  kvm_vcpu_thread_fn  at ../accel/kvm/kvm-accel-ops.c:51
+#9  qemu_thread_start  at ../util/qemu-thread-posix.c:505
+#10 start_thread () from /lib/x86_64-linux-gnu/libpthread.so.0
+#11 clone () from /lib/x86_64-linux-gnu/libc.so.6
+
+
+And what I see:
+
+static inline int x86_asidx_from_attrs(CPUState *cs, MemTxAttrs attrs)
+{
+    return !!attrs.secure;
+}
+
+int cpu_asidx_from_attrs(CPUState *cpu, MemTxAttrs attrs)
+{
+    int ret = 0;
+
+    if (cpu->cc->sysemu_ops->asidx_from_attrs) {
+        ret = cpu->cc->sysemu_ops->asidx_from_attrs(cpu, attrs);
+        assert(ret < cpu->num_ases && ret >= 0);         <<<<<<<<<<<<<<<<<
+    }
+    return ret;
+}
+
+(gdb) p cpu->num_ases
+$3 = 1
+
+(gdb) fr 5
+#5  0x00005578c8814ba3 in cpu_memory_rw_debug (cpu=c...
+(gdb) p attrs
+$6 = {unspecified = 0, secure = 1, user = 0, memory = 0, requester_id = 0, 
+byte_swap = 0, target_tlb_bit0 = 0, target_tlb_bit1 = 0, target_tlb_bit2 = 0}
+
+so .secure is 1, therefore ret is 1, in the same time num_ases is 1 too and 
+assertion fails.
+
+
+
+Where is .secure from?
+
+static inline MemTxAttrs cpu_get_mem_attrs(CPUX86State *env)
+{
+    return ((MemTxAttrs) { .secure = (env->hflags & HF_SMM_MASK) != 0 });
+}
+
+Ok, it means we in SMM mode.
+
+
+
+On the other hand, it seems that num_ases seems to be always 1 for x86:
+
+vsementsov@vsementsov-lin:~/work/src/qemu/yc-7.2$ git grep 'num_ases = '
+cpu.c:    cpu->num_ases = 0;
+softmmu/cpus.c:        cpu->num_ases = 1;
+target/arm/cpu.c:        cs->num_ases = 3 + has_secure;
+target/arm/cpu.c:        cs->num_ases = 1 + has_secure;
+target/i386/tcg/sysemu/tcg-cpu.c:    cs->num_ases = 2;
+
+
+So, something is wrong around cpu->num_ases and x86_asidx_from_attrs() which 
+may return more in SMM mode.
+
+
+The stack starts in
+//7  0x00005578c882f539 in kvm_cpu_exec (cpu=cpu@entry=0x5578ca2eb340) at 
+../accel/kvm/kvm-all.c:3000
+    if (ret < 0) {
+        cpu_dump_state(cpu, stderr, CPU_DUMP_CODE);
+        vm_stop(RUN_STATE_INTERNAL_ERROR);
+    }
+
+So that was some kvm error, and we decided to call cpu_dump_state(). And it 
+crashes. cpu_dump_state() is also called from hmp_info_registers, so I can 
+reproduce the crash with a tiny patch to master (as only CPU_DUMP_CODE path 
+calls cpu_memory_rw_debug(), as it is in kvm_cpu_exec()):
+
+diff --git a/monitor/hmp-cmds-target.c b/monitor/hmp-cmds-target.c
+index ff01cf9d8d..dcf0189048 100644
+--- a/monitor/hmp-cmds-target.c
++++ b/monitor/hmp-cmds-target.c
+@@ -116,7 +116,7 @@ void hmp_info_registers(Monitor *mon, const QDict *qdict)
+         }
+
+         monitor_printf(mon, "\nCPU#%d\n", cs->cpu_index);
+-        cpu_dump_state(cs, NULL, CPU_DUMP_FPU);
++        cpu_dump_state(cs, NULL, CPU_DUMP_CODE);
+     }
+ }
+
+
+Than run
+
+yes "info registers" | ./build/qemu-system-x86_64 -accel kvm -monitor stdio \
+   -global driver=cfi.pflash01,property=secure,value=on \
+   -blockdev "{'driver': 'file', 'filename': 
+'/usr/share/OVMF/OVMF_CODE_4M.secboot.fd', 'node-name': 'ovmf-code', 'read-only': 
+true}" \
+   -blockdev "{'driver': 'file', 'filename': '/usr/share/OVMF/OVMF_VARS_4M.fd', 
+'node-name': 'ovmf-vars', 'read-only': true}" \
+   -machine q35,smm=on,pflash0=ovmf-code,pflash1=ovmf-vars -m 2G -nodefaults
+
+And after some time (less than 20 seconds for me) it leads to
+
+qemu-system-x86_64: ../hw/core/cpu-sysemu.c:76: cpu_asidx_from_attrs: Assertion `ret < 
+cpu->num_ases && ret >= 0' failed.
+Aborted (core dumped)
+
+
+I've no idea how to correctly fix this bug, but I hope that my reproducer and 
+investigation will help a bit.
+
+--
+Best regards,
+Vladimir
+

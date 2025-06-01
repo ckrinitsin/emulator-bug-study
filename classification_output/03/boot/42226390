@@ -1,0 +1,190 @@
+boot: 0.943
+instruction: 0.925
+semantic: 0.924
+KVM: 0.905
+network: 0.894
+other: 0.894
+mistranslation: 0.826
+
+[BUG] AArch64 boot hang with -icount and -smp >1 (iothread locking issue?)
+
+Hello,
+
+I am encountering one or more bugs when using -icount and -smp >1 that I am
+attempting to sort out. My current theory is that it is an iothread locking
+issue.
+
+I am using a command-line like the following where $kernel is a recent upstream
+AArch64 Linux kernel Image (I can provide a binary if that would be helpful -
+let me know how is best to post):
+
+        qemu-system-aarch64 \
+                -M virt -cpu cortex-a57 -m 1G \
+                -nographic \
+                -smp 2 \
+                -icount 0 \
+                -kernel $kernel
+
+For any/all of the symptoms described below, they seem to disappear when I
+either remove `-icount 0` or change smp to `-smp 1`. In other words, it is the
+combination of `-smp >1` and `-icount` which triggers what I'm seeing.
+
+I am seeing two different (but seemingly related) behaviors. The first (and
+what I originally started debugging) shows up as a boot hang. When booting
+using the above command after Peter's "icount: Take iothread lock when running
+QEMU timers" patch [1], The kernel boots for a while and then hangs after:
+
+>
+...snip...
+>
+[    0.010764] Serial: AMBA PL011 UART driver
+>
+[    0.016334] 9000000.pl011: ttyAMA0 at MMIO 0x9000000 (irq = 13, base_baud
+>
+= 0) is a PL011 rev1
+>
+[    0.016907] printk: console [ttyAMA0] enabled
+>
+[    0.017624] KASLR enabled
+>
+[    0.031986] HugeTLB: registered 16.0 GiB page size, pre-allocated 0 pages
+>
+[    0.031986] HugeTLB: 16320 KiB vmemmap can be freed for a 16.0 GiB page
+>
+[    0.031986] HugeTLB: registered 512 MiB page size, pre-allocated 0 pages
+>
+[    0.031986] HugeTLB: 448 KiB vmemmap can be freed for a 512 MiB page
+>
+[    0.031986] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+>
+[    0.031986] HugeTLB: 0 KiB vmemmap can be freed for a 2.00 MiB page
+When it hangs here, I drop into QEMU's console, attach to the gdbserver, and it
+always reports that it is at address 0xffff800008dc42e8 (as shown below from an
+objdump of the vmlinux). I note this is in the middle of messing with timer
+system registers - which makes me suspect we're attempting to take the iothread
+lock when its already held:
+
+>
+ffff800008dc42b8 <arch_timer_set_next_event_virt>:
+>
+ffff800008dc42b8:       d503201f        nop
+>
+ffff800008dc42bc:       d503201f        nop
+>
+ffff800008dc42c0:       d503233f        paciasp
+>
+ffff800008dc42c4:       d53be321        mrs     x1, cntv_ctl_el0
+>
+ffff800008dc42c8:       32000021        orr     w1, w1, #0x1
+>
+ffff800008dc42cc:       d5033fdf        isb
+>
+ffff800008dc42d0:       d53be042        mrs     x2, cntvct_el0
+>
+ffff800008dc42d4:       ca020043        eor     x3, x2, x2
+>
+ffff800008dc42d8:       8b2363e3        add     x3, sp, x3
+>
+ffff800008dc42dc:       f940007f        ldr     xzr, [x3]
+>
+ffff800008dc42e0:       8b020000        add     x0, x0, x2
+>
+ffff800008dc42e4:       d51be340        msr     cntv_cval_el0, x0
+>
+* ffff800008dc42e8:       927ef820        and     x0, x1, #0xfffffffffffffffd
+>
+ffff800008dc42ec:       d51be320        msr     cntv_ctl_el0, x0
+>
+ffff800008dc42f0:       d5033fdf        isb
+>
+ffff800008dc42f4:       52800000        mov     w0, #0x0
+>
+// #0
+>
+ffff800008dc42f8:       d50323bf        autiasp
+>
+ffff800008dc42fc:       d65f03c0        ret
+The second behavior is that prior to Peter's "icount: Take iothread lock when
+running QEMU timers" patch [1], I observe the following message (same command
+as above):
+
+>
+ERROR:../accel/tcg/tcg-accel-ops.c:79:tcg_handle_interrupt: assertion failed:
+>
+(qemu_mutex_iothread_locked())
+>
+Aborted (core dumped)
+This is the same behavior described in Gitlab issue 1130 [0] and addressed by
+[1]. I bisected the appearance of this assertion, and found it was introduced
+by Pavel's "replay: rewrite async event handling" commit [2]. Commits prior to
+that one boot successfully (neither assertions nor hangs) with `-icount 0 -smp
+2`.
+
+I've looked over these two commits ([1], [2]), but it is not obvious to me
+how/why they might be interacting to produce the boot hangs I'm seeing and
+I welcome any help investigating further.
+
+Thanks!
+
+-Aaron Lindsay
+
+[0] -
+https://gitlab.com/qemu-project/qemu/-/issues/1130
+[1] -
+https://gitlab.com/qemu-project/qemu/-/commit/c7f26ded6d5065e4116f630f6a490b55f6c5f58e
+[2] -
+https://gitlab.com/qemu-project/qemu/-/commit/60618e2d77691e44bb78e23b2b0cf07b5c405e56
+
+On Fri, 21 Oct 2022 at 16:48, Aaron Lindsay
+<aaron@os.amperecomputing.com> wrote:
+>
+>
+Hello,
+>
+>
+I am encountering one or more bugs when using -icount and -smp >1 that I am
+>
+attempting to sort out. My current theory is that it is an iothread locking
+>
+issue.
+Weird coincidence, that is a bug that's been in the tree for months
+but was only reported to me earlier this week. Try reverting
+commit a82fd5a4ec24d923ff1e -- that should fix it.
+CAFEAcA_i8x00hD-4XX18ySLNbCB6ds1-DSazVb4yDnF8skjd9A@mail.gmail.com
+/">https://lore.kernel.org/qemu-devel/
+CAFEAcA_i8x00hD-4XX18ySLNbCB6ds1-DSazVb4yDnF8skjd9A@mail.gmail.com
+/
+has the explanation.
+
+thanks
+-- PMM
+
+On Oct 21 17:00, Peter Maydell wrote:
+>
+On Fri, 21 Oct 2022 at 16:48, Aaron Lindsay
+>
+<aaron@os.amperecomputing.com> wrote:
+>
+>
+>
+> Hello,
+>
+>
+>
+> I am encountering one or more bugs when using -icount and -smp >1 that I am
+>
+> attempting to sort out. My current theory is that it is an iothread locking
+>
+> issue.
+>
+>
+Weird coincidence, that is a bug that's been in the tree for months
+>
+but was only reported to me earlier this week. Try reverting
+>
+commit a82fd5a4ec24d923ff1e -- that should fix it.
+I can confirm that reverting a82fd5a4ec24d923ff1e fixes it for me.
+Thanks for the help and fast response!
+
+-Aaron
+
