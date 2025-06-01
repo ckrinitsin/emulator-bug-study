@@ -1,0 +1,126 @@
+other: 0.927
+semantic: 0.916
+instruction: 0.910
+mistranslation: 0.870
+
+[Bug] x86 EFLAGS refresh is not happening correctly
+
+Hello,
+I'm posting this here instead of opening an issue as it is not clear to me if this is a bug or not.
+The issue is located in function "cpu_compute_eflags" in target/i386/cpu.h
+(
+https://gitlab.com/qemu-project/qemu/-/blob/master/target/i386/cpu.h#L2071
+)
+This function is exectued in an out of cpu loop context.
+It is used to synchronize TCG internal eflags registers (CC_OP, CC_SRC,Â  etc...) with the CPU eflags field upon loop exit.
+It does:
+Â  Â  eflags
+|=
+cpu_cc_compute_all
+(
+env
+,
+CC_OP
+)
+|
+(
+env
+->
+df
+&
+DF_MASK
+);
+Shouldn't it be:
+Â  Â  Â
+eflags
+=
+cpu_cc_compute_all
+(
+env
+,
+CC_OP
+)
+|
+(
+env
+->
+df
+&
+DF_MASK
+);
+as eflags is entirely reevaluated by "cpu_cc_compute_all" ?
+Thanks,
+Kind regards,
+Stevie
+
+On 05/08/21 11:51, Stevie Lavern wrote:
+Shouldn't it be:
+eflags = cpu_cc_compute_all(env, CC_OP) | (env->df & DF_MASK);
+as eflags is entirely reevaluated by "cpu_cc_compute_all" ?
+No, both are wrong.  env->eflags contains flags other than the
+arithmetic flags (OF/SF/ZF/AF/PF/CF) and those have to be preserved.
+The right code is in helper_read_eflags.  You can move it into
+cpu_compute_eflags, and make helper_read_eflags use it.
+Paolo
+
+On 05/08/21 13:24, Paolo Bonzini wrote:
+On 05/08/21 11:51, Stevie Lavern wrote:
+Shouldn't it be:
+eflags = cpu_cc_compute_all(env, CC_OP) | (env->df & DF_MASK);
+as eflags is entirely reevaluated by "cpu_cc_compute_all" ?
+No, both are wrong.Â  env->eflags contains flags other than the
+arithmetic flags (OF/SF/ZF/AF/PF/CF) and those have to be preserved.
+The right code is in helper_read_eflags.Â  You can move it into
+cpu_compute_eflags, and make helper_read_eflags use it.
+Ah, actually the two are really the same, the TF/VM bits do not apply to
+cpu_compute_eflags so it's correct.
+What seems wrong is migration of the EFLAGS register.  There should be
+code in cpu_pre_save and cpu_post_load to special-case it and setup
+CC_DST/CC_OP as done in cpu_load_eflags.
+Also, cpu_load_eflags should assert that update_mask does not include
+any of the arithmetic flags.
+Paolo
+
+Thank for your reply!
+It's still a bit cryptic for me.
+I think i need to precise that I'm using a x86_64 custom user-mode,base on linux user-mode, that i'm developing (unfortunately i cannot share the code) with modifications in the translation loop (I've added cpu loop exits on specific instructions which are not control flow instructions).
+If my understanding is correct, in the user-mode case 'cpu_compute_eflags' is called directly by 'x86_cpu_exec_exit' with the intention of synchronizing the CPU env->eflags field with its real value (represented by the CC_* fields).
+I'm not sure how 'cpu_pre_save' and 'cpu_post_load' are involved in this case.
+Â
+As you said in your first email, 'helper_read_eflags' seems to be the correct way to go.
+Here is some detail about my current experimentation/understanding of this "issue":
+With the current implementationÂ
+Â  Â  Â  Â  Â
+eflags |= cpu_cc_compute_all(env, CC_OP) | (env->df & DF_MASK);
+if I exit the loop with a CC_OP different from CC_OP_EFLAGS, I found that the resulting env->eflags may be invalid.
+In my test case, the loop was exiting with eflags = 0x44 and CC_OP = CC_OP_SUBL with CC_DST=1, CC_SRC=258, CC_SRC2=0.
+While 'cpu_cc_compute_all' computes the correct flags (ZF:0, PF:0), the result will still be 0x44 (ZF:1, PF:1) due to the 'or' operation, thus leading to an incorrect eflags value loaded into the CPU env.Â
+In my case, after loop reentry, it led to an invalid branch to be taken.
+Thanks for your time!
+Regards
+Stevie
+Â
+On Thu, Aug 5, 2021 at 1:33 PM Paolo Bonzini <
+pbonzini@redhat.com
+> wrote:
+On 05/08/21 13:24, Paolo Bonzini wrote:
+> On 05/08/21 11:51, Stevie Lavern wrote:
+>>
+>> Shouldn't it be:
+>> eflags = cpu_cc_compute_all(env, CC_OP) | (env->df & DF_MASK);
+>> as eflags is entirely reevaluated by "cpu_cc_compute_all" ?
+>
+> No, both are wrong.Â  env->eflags contains flags other than the
+> arithmetic flags (OF/SF/ZF/AF/PF/CF) and those have to be preserved.
+>
+> The right code is in helper_read_eflags.Â  You can move it into
+> cpu_compute_eflags, and make helper_read_eflags use it.
+Ah, actually the two are really the same, the TF/VM bits do not apply to
+cpu_compute_eflags so it's correct.
+What seems wrong is migration of the EFLAGS register.Â  There should be
+code in cpu_pre_save and cpu_post_load to special-case it and setup
+CC_DST/CC_OP as done in cpu_load_eflags.
+Also, cpu_load_eflags should assert that update_mask does not include
+any of the arithmetic flags.
+Paolo
+

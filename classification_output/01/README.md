@@ -1,0 +1,4 @@
+- instruction: 13
+- mistranslation: 14
+- semantic: 8
+- other: 48

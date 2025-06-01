@@ -1,0 +1,538 @@
+other: 0.781
+semantic: 0.764
+instruction: 0.754
+mistranslation: 0.665
+
+[Qemu-devel] [BUG/RFC] INIT IPI lost when VM starts
+
+Hi,
+We encountered a problem that when a domain starts, seabios failed to online a 
+vCPU.
+
+After investigation, we found that the reason is in kvm-kmod, KVM_APIC_INIT bit 
+in
+vcpu->arch.apic->pending_events was overwritten by qemu, and thus an INIT IPI 
+sent
+to AP was lost. Qemu does this since libvirtd sends a âquery-cpusâ qmp command 
+to qemu
+on VM start.
+
+In qemu, qmp_query_cpus-> cpu_synchronize_state-> kvm_cpu_synchronize_state->
+do_kvm_cpu_synchronize_state, qemu gets registers/vcpu_events from kvm-kmod and
+sets cpu->kvm_vcpu_dirty to true, and vcpu thread in qemu will call
+kvm_arch_put_registers if cpu->kvm_vcpu_dirty is true, thus pending_events is
+overwritten by qemu.
+
+I think there is no need for qemu to set cpu->kvm_vcpu_dirty to true after 
+âquery-cpusâ,
+and  kvm-kmod should not clear KVM_APIC_INIT unconditionally. And I am not sure 
+whether
+it is OK for qemu to set cpu->kvm_vcpu_dirty in do_kvm_cpu_synchronize_state in 
+each caller.
+
+Whatâs your opinion?
+
+Let me clarify it more clearly. Time sequence is that qemu handles âquery-cpusâ qmp 
+command, vcpu 1 (and vcpu 0) got registers from kvm-kmod (qmp_query_cpus-> 
+cpu_synchronize_state-> kvm_cpu_synchronize_state->
+> do_kvm_cpu_synchronize_state-> kvm_arch_get_registers), then vcpu 0 (BSP) 
+sends INIT-SIPI to vcpu 1(AP). In kvm-kmod, vcpu 1âs pending_eventsâs KVM_APIC_INIT 
+bit set.
+Then vcpu 1 continue running, vcpu1 thread in qemu calls 
+kvm_arch_put_registers-> kvm_put_vcpu_events, so KVM_APIC_INIT bit in vcpu 1âs 
+pending_events got cleared, i.e., lost.
+
+In kvm-kmod, except for pending_events, sipi_vector may also be overwritten., 
+so I am not sure if there are other fields/registers in danger, i.e., those may 
+be modified asynchronously with vcpu thread itself.
+
+BTW, using a sleep like following can reliably reproduce this problem, if VM 
+equipped with more than 2 vcpus and starting VM using libvirtd.
+
+diff --git a/target/i386/kvm.c b/target/i386/kvm.c
+index 55865db..5099290 100644
+--- a/target/i386/kvm.c
++++ b/target/i386/kvm.c
+@@ -2534,6 +2534,11 @@ static int kvm_put_vcpu_events(X86CPU *cpu, int level)
+             KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SIPI_VECTOR;
+     }
+
++    if (CPU(cpu)->cpu_index == 1) {
++        fprintf(stderr, "vcpu 1 sleep!!!!\n");
++        sleep(10);
++    }
++
+     return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_VCPU_EVENTS, &events);
+ }
+
+
+On 2017/3/20 22:21, Herongguang (Stephen) wrote:
+Hi,
+We encountered a problem that when a domain starts, seabios failed to online a 
+vCPU.
+
+After investigation, we found that the reason is in kvm-kmod, KVM_APIC_INIT bit 
+in
+vcpu->arch.apic->pending_events was overwritten by qemu, and thus an INIT IPI 
+sent
+to AP was lost. Qemu does this since libvirtd sends a âquery-cpusâ qmp command 
+to qemu
+on VM start.
+
+In qemu, qmp_query_cpus-> cpu_synchronize_state-> kvm_cpu_synchronize_state->
+do_kvm_cpu_synchronize_state, qemu gets registers/vcpu_events from kvm-kmod and
+sets cpu->kvm_vcpu_dirty to true, and vcpu thread in qemu will call
+kvm_arch_put_registers if cpu->kvm_vcpu_dirty is true, thus pending_events is
+overwritten by qemu.
+
+I think there is no need for qemu to set cpu->kvm_vcpu_dirty to true after 
+âquery-cpusâ,
+and  kvm-kmod should not clear KVM_APIC_INIT unconditionally. And I am not sure 
+whether
+it is OK for qemu to set cpu->kvm_vcpu_dirty in do_kvm_cpu_synchronize_state in 
+each caller.
+
+Whatâs your opinion?
+
+On 20/03/2017 15:21, Herongguang (Stephen) wrote:
+>
+>
+We encountered a problem that when a domain starts, seabios failed to
+>
+online a vCPU.
+>
+>
+After investigation, we found that the reason is in kvm-kmod,
+>
+KVM_APIC_INIT bit in
+>
+vcpu->arch.apic->pending_events was overwritten by qemu, and thus an
+>
+INIT IPI sent
+>
+to AP was lost. Qemu does this since libvirtd sends a âquery-cpusâ qmp
+>
+command to qemu
+>
+on VM start.
+>
+>
+In qemu, qmp_query_cpus-> cpu_synchronize_state->
+>
+kvm_cpu_synchronize_state->
+>
+do_kvm_cpu_synchronize_state, qemu gets registers/vcpu_events from
+>
+kvm-kmod and
+>
+sets cpu->kvm_vcpu_dirty to true, and vcpu thread in qemu will call
+>
+kvm_arch_put_registers if cpu->kvm_vcpu_dirty is true, thus
+>
+pending_events is
+>
+overwritten by qemu.
+>
+>
+I think there is no need for qemu to set cpu->kvm_vcpu_dirty to true
+>
+after âquery-cpusâ,
+>
+and  kvm-kmod should not clear KVM_APIC_INIT unconditionally. And I am
+>
+not sure whether
+>
+it is OK for qemu to set cpu->kvm_vcpu_dirty in
+>
+do_kvm_cpu_synchronize_state in each caller.
+>
+>
+Whatâs your opinion?
+Hi Rongguang,
+
+sorry for the late response.
+
+Where exactly is KVM_APIC_INIT dropped?  kvm_get_mp_state does clear the
+bit, but the result of the INIT is stored in mp_state.
+
+kvm_get_vcpu_events is called after kvm_get_mp_state; it retrieves
+KVM_APIC_INIT in events.smi.latched_init and kvm_set_vcpu_events passes
+it back.  Maybe it should ignore events.smi.latched_init if not in SMM,
+but I would like to understand the exact sequence of events.
+
+Thanks,
+
+paolo
+
+On 2017/4/6 0:16, Paolo Bonzini wrote:
+On 20/03/2017 15:21, Herongguang (Stephen) wrote:
+We encountered a problem that when a domain starts, seabios failed to
+online a vCPU.
+
+After investigation, we found that the reason is in kvm-kmod,
+KVM_APIC_INIT bit in
+vcpu->arch.apic->pending_events was overwritten by qemu, and thus an
+INIT IPI sent
+to AP was lost. Qemu does this since libvirtd sends a âquery-cpusâ qmp
+command to qemu
+on VM start.
+
+In qemu, qmp_query_cpus-> cpu_synchronize_state->
+kvm_cpu_synchronize_state->
+do_kvm_cpu_synchronize_state, qemu gets registers/vcpu_events from
+kvm-kmod and
+sets cpu->kvm_vcpu_dirty to true, and vcpu thread in qemu will call
+kvm_arch_put_registers if cpu->kvm_vcpu_dirty is true, thus
+pending_events is
+overwritten by qemu.
+
+I think there is no need for qemu to set cpu->kvm_vcpu_dirty to true
+after âquery-cpusâ,
+and  kvm-kmod should not clear KVM_APIC_INIT unconditionally. And I am
+not sure whether
+it is OK for qemu to set cpu->kvm_vcpu_dirty in
+do_kvm_cpu_synchronize_state in each caller.
+
+Whatâs your opinion?
+Hi Rongguang,
+
+sorry for the late response.
+
+Where exactly is KVM_APIC_INIT dropped?  kvm_get_mp_state does clear the
+bit, but the result of the INIT is stored in mp_state.
+It's dropped in KVM_SET_VCPU_EVENTS, see below.
+kvm_get_vcpu_events is called after kvm_get_mp_state; it retrieves
+KVM_APIC_INIT in events.smi.latched_init and kvm_set_vcpu_events passes
+it back.  Maybe it should ignore events.smi.latched_init if not in SMM,
+but I would like to understand the exact sequence of events.
+time0:
+vcpu1:
+qmp_query_cpus-> cpu_synchronize_state-> kvm_cpu_synchronize_state->
+> do_kvm_cpu_synchronize_state(and set vcpu1's cpu->kvm_vcpu_dirty to true)-> 
+kvm_arch_get_registers(KVM_APIC_INIT bit in vcpu->arch.apic->pending_events was not set)
+
+time1:
+vcpu0:
+send INIT-SIPI to all AP->(in vcpu 0's context)__apic_accept_irq(KVM_APIC_INIT bit 
+in vcpu1's arch.apic->pending_events is set)
+
+time2:
+vcpu1:
+kvm_cpu_exec->(if cpu->kvm_vcpu_dirty is 
+true)kvm_arch_put_registers->kvm_put_vcpu_events(overwritten KVM_APIC_INIT bit in 
+vcpu->arch.apic->pending_events!)
+
+So it's a race between vcpu1 get/put registers with kvm/other vcpus changing 
+vcpu1's status/structure fields in the mean time, I am in worry of if there are 
+other fields may be overwritten,
+sipi_vector is one.
+
+also see:
+https://www.mail-archive.com/address@hidden/msg438675.html
+Thanks,
+
+paolo
+
+.
+
+Hi Paolo,
+
+What's your opinion about this patch? We found it just before finishing patches 
+for the past two days.
+
+
+Thanks,
+-Gonglei
+
+
+>
+-----Original Message-----
+>
+From: address@hidden [
+mailto:address@hidden
+On
+>
+Behalf Of Herongguang (Stephen)
+>
+Sent: Thursday, April 06, 2017 9:47 AM
+>
+To: Paolo Bonzini; address@hidden; address@hidden;
+>
+address@hidden; address@hidden; address@hidden;
+>
+wangxin (U); Huangweidong (C)
+>
+Subject: Re: [BUG/RFC] INIT IPI lost when VM starts
+>
+>
+>
+>
+On 2017/4/6 0:16, Paolo Bonzini wrote:
+>
+>
+>
+> On 20/03/2017 15:21, Herongguang (Stephen) wrote:
+>
+>> We encountered a problem that when a domain starts, seabios failed to
+>
+>> online a vCPU.
+>
+>>
+>
+>> After investigation, we found that the reason is in kvm-kmod,
+>
+>> KVM_APIC_INIT bit in
+>
+>> vcpu->arch.apic->pending_events was overwritten by qemu, and thus an
+>
+>> INIT IPI sent
+>
+>> to AP was lost. Qemu does this since libvirtd sends a âquery-cpusâ qmp
+>
+>> command to qemu
+>
+>> on VM start.
+>
+>>
+>
+>> In qemu, qmp_query_cpus-> cpu_synchronize_state->
+>
+>> kvm_cpu_synchronize_state->
+>
+>> do_kvm_cpu_synchronize_state, qemu gets registers/vcpu_events from
+>
+>> kvm-kmod and
+>
+>> sets cpu->kvm_vcpu_dirty to true, and vcpu thread in qemu will call
+>
+>> kvm_arch_put_registers if cpu->kvm_vcpu_dirty is true, thus
+>
+>> pending_events is
+>
+>> overwritten by qemu.
+>
+>>
+>
+>> I think there is no need for qemu to set cpu->kvm_vcpu_dirty to true
+>
+>> after âquery-cpusâ,
+>
+>> and  kvm-kmod should not clear KVM_APIC_INIT unconditionally. And I am
+>
+>> not sure whether
+>
+>> it is OK for qemu to set cpu->kvm_vcpu_dirty in
+>
+>> do_kvm_cpu_synchronize_state in each caller.
+>
+>>
+>
+>> Whatâs your opinion?
+>
+> Hi Rongguang,
+>
+>
+>
+> sorry for the late response.
+>
+>
+>
+> Where exactly is KVM_APIC_INIT dropped?  kvm_get_mp_state does clear
+>
+the
+>
+> bit, but the result of the INIT is stored in mp_state.
+>
+>
+It's dropped in KVM_SET_VCPU_EVENTS, see below.
+>
+>
+>
+>
+> kvm_get_vcpu_events is called after kvm_get_mp_state; it retrieves
+>
+> KVM_APIC_INIT in events.smi.latched_init and kvm_set_vcpu_events passes
+>
+> it back.  Maybe it should ignore events.smi.latched_init if not in SMM,
+>
+> but I would like to understand the exact sequence of events.
+>
+>
+time0:
+>
+vcpu1:
+>
+qmp_query_cpus-> cpu_synchronize_state-> kvm_cpu_synchronize_state->
+>
+> do_kvm_cpu_synchronize_state(and set vcpu1's cpu->kvm_vcpu_dirty to
+>
+true)-> kvm_arch_get_registers(KVM_APIC_INIT bit in
+>
+vcpu->arch.apic->pending_events was not set)
+>
+>
+time1:
+>
+vcpu0:
+>
+send INIT-SIPI to all AP->(in vcpu 0's
+>
+context)__apic_accept_irq(KVM_APIC_INIT bit in vcpu1's
+>
+arch.apic->pending_events is set)
+>
+>
+time2:
+>
+vcpu1:
+>
+kvm_cpu_exec->(if cpu->kvm_vcpu_dirty is
+>
+true)kvm_arch_put_registers->kvm_put_vcpu_events(overwritten
+>
+KVM_APIC_INIT bit in vcpu->arch.apic->pending_events!)
+>
+>
+So it's a race between vcpu1 get/put registers with kvm/other vcpus changing
+>
+vcpu1's status/structure fields in the mean time, I am in worry of if there
+>
+are
+>
+other fields may be overwritten,
+>
+sipi_vector is one.
+>
+>
+also see:
+>
+https://www.mail-archive.com/address@hidden/msg438675.html
+>
+>
+> Thanks,
+>
+>
+>
+> paolo
+>
+>
+>
+> .
+>
+>
+>
+
+2017-11-20 06:57+0000, Gonglei (Arei):
+>
+Hi Paolo,
+>
+>
+What's your opinion about this patch? We found it just before finishing
+>
+patches
+>
+for the past two days.
+I think your case was fixed by f4ef19108608 ("KVM: X86: Fix loss of
+pending INIT due to race"), but that patch didn't fix it perfectly, so
+maybe you're hitting a similar case that happens in SMM ...
+
+>
+> -----Original Message-----
+>
+> From: address@hidden [
+mailto:address@hidden
+On
+>
+> Behalf Of Herongguang (Stephen)
+>
+> On 2017/4/6 0:16, Paolo Bonzini wrote:
+>
+> > Hi Rongguang,
+>
+> >
+>
+> > sorry for the late response.
+>
+> >
+>
+> > Where exactly is KVM_APIC_INIT dropped?  kvm_get_mp_state does clear
+>
+> the
+>
+> > bit, but the result of the INIT is stored in mp_state.
+>
+>
+>
+> It's dropped in KVM_SET_VCPU_EVENTS, see below.
+>
+>
+>
+> >
+>
+> > kvm_get_vcpu_events is called after kvm_get_mp_state; it retrieves
+>
+> > KVM_APIC_INIT in events.smi.latched_init and kvm_set_vcpu_events passes
+>
+> > it back.  Maybe it should ignore events.smi.latched_init if not in SMM,
+>
+> > but I would like to understand the exact sequence of events.
+>
+>
+>
+> time0:
+>
+> vcpu1:
+>
+> qmp_query_cpus-> cpu_synchronize_state-> kvm_cpu_synchronize_state->
+>
+>  > do_kvm_cpu_synchronize_state(and set vcpu1's cpu->kvm_vcpu_dirty to
+>
+> true)-> kvm_arch_get_registers(KVM_APIC_INIT bit in
+>
+> vcpu->arch.apic->pending_events was not set)
+>
+>
+>
+> time1:
+>
+> vcpu0:
+>
+> send INIT-SIPI to all AP->(in vcpu 0's
+>
+> context)__apic_accept_irq(KVM_APIC_INIT bit in vcpu1's
+>
+> arch.apic->pending_events is set)
+>
+>
+>
+> time2:
+>
+> vcpu1:
+>
+> kvm_cpu_exec->(if cpu->kvm_vcpu_dirty is
+>
+> true)kvm_arch_put_registers->kvm_put_vcpu_events(overwritten
+>
+> KVM_APIC_INIT bit in vcpu->arch.apic->pending_events!)
+>
+>
+>
+> So it's a race between vcpu1 get/put registers with kvm/other vcpus changing
+>
+> vcpu1's status/structure fields in the mean time, I am in worry of if there
+>
+> are
+>
+> other fields may be overwritten,
+>
+> sipi_vector is one.
+Fields that can be asynchronously written by other VCPUs (like SIPI,
+NMI) must not be SET if other VCPUs were not paused since the last GET.
+(Looking at the interface, we can currently lose pending SMI.)
+
+INIT is one of the restricted fields, but the API unconditionally
+couples SMM with latched INIT, which means that we can lose an INIT if
+the VCPU is in SMM mode -- do you see SMM in kvm_vcpu_events?
+
+Thanks.
+
