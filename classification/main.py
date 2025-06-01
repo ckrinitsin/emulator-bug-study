@@ -1,29 +1,33 @@
 from transformers import pipeline
-from argparse import ArgumentParser
 from os import path
-
-from test import test
-from files import list_files_recursive
-from output import output
-
-parser = ArgumentParser(prog='classifier')
-parser.add_argument('-d', '--deepseek', action='store_true')
-parser.add_argument('-t', '--test', action='store_true')
-args = parser.parse_args()
 
 positive_categories = ['semantic', 'mistranslation', 'instruction', 'assembly'] # to add: register
 negative_categories = ['other', 'boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket'] # to add: performance
 categories = positive_categories + negative_categories
 
-def main():
-    if args.deepseek:
-        print("deepseek currently not supported")
-        exit()
+def list_files_recursive(path):
+    result = []
+    for entry in os.listdir(path):
+        full_path = os.path.join(path, entry)
+        if os.path.isdir(full_path):
+            result = result + list_files_recursive(full_path)
+        else:
+            result.append(full_path)
+    return result
 
+def output(text : str, category : str, labels : list, scores : list, identifier : str):
+    file_path = f"output/{category}/{identifier}"
+    makedirs(path.dirname(file_path), exist_ok = True)
+
+    with open(file_path, "w") as file:
+        for label, score in zip(labels, scores):
+            file.write(f"{label}: {score:.3f}\n")
+
+        file.write("\n")
+        file.write(text)
+
+def main():
     classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-    if args.test:
-        test(classifier, categories)
-        exit()
 
     bugs = list_files_recursive("../mailinglist/output_mailinglist")
     bugs = bugs + list_files_recursive("./semantic_issues")
