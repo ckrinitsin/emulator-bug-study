@@ -1,7 +1,7 @@
 from os import path, makedirs
 
-def output(text : str, labels : list, scores : list, identifier : str):
-    file_path = f"output/{labels[0]}/{identifier}"
+def output(text : str, category : str, labels : list, scores : list, identifier : str):
+    file_path = f"output/{category}/{identifier}"
     makedirs(path.dirname(file_path), exist_ok = True)
 
     with open(file_path, "w") as file:
