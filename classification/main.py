@@ -1,15 +1,15 @@
 from transformers import pipeline
-from os import path
+from os import path, listdir, makedirs
 
 positive_categories = ['semantic', 'mistranslation', 'instruction', 'assembly'] # to add: register
 negative_categories = ['other', 'boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket'] # to add: performance
 categories = positive_categories + negative_categories
 
-def list_files_recursive(path):
+def list_files_recursive(directory):
     result = []
-    for entry in os.listdir(path):
-        full_path = os.path.join(path, entry)
-        if os.path.isdir(full_path):
+    for entry in listdir(directory):
+        full_path = path.join(directory, entry)
+        if path.isdir(full_path):
             result = result + list_files_recursive(full_path)
         else:
             result.append(full_path)
@@ -29,7 +29,7 @@ def output(text : str, category : str, labels : list, scores : list, identifier 
 def main():
     classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
-    bugs = list_files_recursive("../mailinglist/output_mailinglist")
+    bugs = list_files_recursive("../results/scraper/mailinglist")
     bugs = bugs + list_files_recursive("./semantic_issues")
     for bug in bugs:
         print(f"Processing {bug}")

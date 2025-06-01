@@ -3,7 +3,7 @@ from re import sub
 from os import listdir, path
 
 model : str = "deepseek-r1:70b"
-directory : str = "../mailinglist/output_mailinglist"
+directory : str = "../results/scraper/mailinglist"
 
 with open("preambel", "r") as file:
     preambel = file.read()
