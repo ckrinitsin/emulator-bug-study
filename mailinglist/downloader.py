@@ -63,13 +63,13 @@ def main():
             # existing thread
             re_match = match(r'(?i)^re:\s*(.*)', text) # matches 'Re:'
             if re_match:
-                title_hash = str(hash(re_match.group(1).strip()))[1:8]
+                title_hash = str(hash(re_match.group(1).strip()))[1:9]
                 if path.exists(f"output_mailinglist/{title_hash}"):
                     process_thread(urljoin(url, href), title_hash)
                 continue
 
             # new thread
-            title_hash = str(hash(text.strip()))[1:8]
+            title_hash = str(hash(text.strip()))[1:9]
             if path.exists(f"output_mailinglist/{title_hash}"):
                 print(f"ERROR: {title_hash} should not exist!")
                 continue
