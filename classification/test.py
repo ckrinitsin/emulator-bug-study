@@ -4,6 +4,9 @@ directory : str = "./test_input"
 
 def test(classifier):
     for name in listdir(directory):
+        if name == "README.md":
+            continue
+
         with open(path.join(directory, name), "r") as file:
             sequence_to_classify = file.read()
 
