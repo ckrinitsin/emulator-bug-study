@@ -1,0 +1,131 @@
+other: 0.930
+instruction: 0.911
+device: 0.908
+semantic: 0.880
+mistranslation: 0.837
+assembly: 0.804
+socket: 0.803
+network: 0.743
+boot: 0.720
+vnc: 0.719
+graphic: 0.718
+KVM: 0.711
+
+UNDEFINED case for instruction BLX
+
+Hi
+
+I refer to the instruction BLX imm (T2 encoding) in ARMv7 (Thumb mode). 
+
+11110 S	imm10H	11 J1 0 J2 imm10L H
+
+
+if H == '1' then UNDEFINED;
+I1 = NOT(J1 EOR S);  I2 = NOT(J2 EOR S);  imm32 = SignExtend(S:I1:I2:imm10H:imm10L:'00', 32);
+targetInstrSet = InstrSet_A32;
+if InITBlock() && !LastInITBlock() then UNPREDICTABLE;
+
+According to the manual, if H equals to 1, this instruction should be an UNDEFINED instruction. However, it seems QEMU does not check this constraint in function trans_BLX_i. Thanks
+
+Regards
+Muhui
+
+It's right there in trans_BLX_i:
+
+    if (s->thumb && (a->imm & 2)) {
+        return false;
+    }
+
+
+Hi
+
+I still feel QEMU's implementation is not right. Could you please check it again. 
+
+According to https://developer.arm.com/documentation/ddi0406/c/Application-Level-Architecture/Instruction-Details/Alphabetical-list-of-instructions/BL--BLX--immediate-?lang=en
+
+The encoding T2 for BLX is below:
+
+15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0 
+ 1  1  1  1  0  S |       imm10H     | 1  1 J1  0 J2 |       imm10L      |H
+
+In the ASL of ARM,  we have  H == '1' then UNDEFINED;
+
+Symbol *H* represents the last bit of this instruction. I am not sure whether a->imm includes the symbol *H*. I double checked the file `t32.decode` and it seems so (It would be great if you can tell me what a->imm indeed represents in BLX).
+
+However, UNDEFINED means unallocated encoding in ARM manual. The right behavior might be something like below: 
+
+    if (s->thumb && (a->imm & 2)) {
+        unallocated_encoding(s);
+        return true;
+    }
+
+Correct me if I am wrong. I can also provide test case if you need. Many Thanks
+
+Regards
+Muhui
+
+
+
+
+The complete imm32 is computed by 
+
+%imm24           26:s1 13:1 11:1 16:10 0:11 !function=t32_branch24
+
+so that H appears at bit 1 in a->imm in trans_BLX_i.
+
+Returning false from any trans_* function means that the trans
+function did not match.  In some cases, this means that the next
+possible matching pattern is tested.  But in most cases, such as
+this one, we return all the way to disas_thumb2_insn, where we
+do in fact call unallocated_encoding.
+
+If you have a test case that fails, please provide it.
+
+Hi
+
+Thanks for your reply. I don't think return false is the right behavior here. H is related to decoding rather than encoding phase. The value of symbol *H* should not be used to check whether the (encoding) pattern is matched or not. In other words, whatever value H is, if the bytecode meet the pattern of BLX in Thumb T2 encoding, it should be a BLX instruction. 
+
+During the decoding phase, QEMU should check whether H equals to 1. If so, a SIGILL signal should be raised.  Please see a concrete case below:
+
+Below is the sample code, and 0xf279cf25 has the encoding pattern of instruction BLX. H is 1 here.
+
+int main()
+{
+        __asm__(".inst.w 0xf279cf25");
+        printf("no signal\n");
+}
+
+
+I cross compiled it in thumb mode and generate the binary named test_BLX, which is attached. I set a breakpoint at 0x102f0. The value in 0x102f0 is 0xf279cf25, which should be an UNDEFINED instruction and a SIGILL signal should be raised when executing this instruction.
+
+Breakpoint 1, 0x000102f0 in ?? ()
+gef> x/4i $pc
+=> 0x102f0:                     ; <UNDEFINED> instruction: 0xf279cf25
+   0x102f4:     ldr     r3, [pc, #12]   ; (0x10304)
+   0x102f6:     movs    r0, r3
+   0x102f8:     bl      0x5fe28
+
+When I use si to execute the instruction at 0x102f0, it will jump to 0x102f6. No signal is raised. Finally, the program will be exit without any raised signal.
+
+gef> si
+0x000102f6 in ?? ()
+
+I don't think this should be the right behavior. The same binary is tested on a physical ARM device and SIGILL is triggered. Return false seems not work here.  Many Thanks
+
+Regards
+Muhui
+
+
+Thanks for the test case.
+
+The problem is that we have raised the UDEF exception,
+and then the qemu kernel emulation code has decided that
+we should emulate the instruction as an FPE11 instruction.
+
+Which seems clearly incorrect, given we're in thumb mode.
+
+Proposed patch:
+https://<email address hidden>/
+
+The patches from Richard have now been merged (see https://gitlab.com/qemu-project/qemu/-/commit/c1438d6c02eae03c and the following commits). Thus marking this as "Fix committed" now.
+

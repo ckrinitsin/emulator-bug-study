@@ -1,0 +1,388 @@
+other: 0.922
+mistranslation: 0.875
+graphic: 0.867
+semantic: 0.862
+device: 0.855
+instruction: 0.836
+assembly: 0.832
+vnc: 0.827
+KVM: 0.790
+socket: 0.743
+network: 0.696
+boot: 0.613
+
+libvirt/kvm problem with disk attach/detach/reattach on running virt
+
+Release:         Ubuntu 11.10 (Oneiric)
+libvirt-bin:      0.9.2-4ubuntu15.1
+qemu-kvm:   0.14.1+noroms-0ubuntu6
+
+Summary:    With a running KVM virt,   performing an 'attach-disk',  then a 'detach-disk', then another 'attach-disk' 
+in an attempt to reattach the volume at the same point on the virt, fails, with the qemu reporting back to
+libvirt a 'Duplicate ID' error.
+
+Expected behavior:   The 2nd invocation of 'attach-disk' should have succeeded
+Actual behavior:         Duplicate ID error reported
+
+
+I believe this is most likely a qemu-kvm issue, as the DOM  kvm spits back at libvirt after the 'detach-disk'
+does not show the just-detached disk.   There is some kind of registry/lookup for devices in qemu-kvm
+and for whatever reason, the entry for the disk does not get removed when it is detached from the
+virt.   Specifically, the error gets reported at the 2nd attach-disk attempt from:
+  
+  qemu-option.c:qemu_opts_create:697
+
+684 QemuOpts *qemu_opts_create(QemuOptsList *list, const char *id, int fail_if_exists)                                                  
+685 {                                                                                                                                   
+686     QemuOpts *opts = NULL;                                                                                                          
+687                                                                                                                                     
+688     if (id) {                                                                                                                       
+689         if (!id_wellformed(id)) {                                                                                                   
+690             qerror_report(QERR_INVALID_PARAMETER_VALUE, "id", "an identifier");                                                     
+691             error_printf_unless_qmp("Identifiers consist of letters, digits, '-', '.', '_', starting with a letter.\n");            
+692             return NULL;                                                                                                            
+693         }                                                                                                                           
+694         opts = qemu_opts_find(list, id);                                                                                            
+695         if (opts != NULL) {                                                                                                         
+696             if (fail_if_exists) {                                                                                                   
+697                 qerror_report(QERR_DUPLICATE_ID, id, list->name);           <<<< ====== HERE ===========                                                          
+698                 return NULL;                                                                                                        
+699             } else {                                                                                                                
+700                 return opts;                                                                                                        
+701             }                                                                                                                       
+702         }                                                                                                                           
+703     }                                                                                                                               
+704     opts = qemu_mallocz(sizeof(*opts));                                                                                             
+705     if (id) {                                                                                                                       
+706         opts->id = qemu_strdup(id);                                                                                                 
+707     }                                                                                                                               
+708     opts->list = list;                                                                                                              
+709     loc_save(&opts->loc);                                                                                                           
+710     QTAILQ_INIT(&opts->head);                                                                                                       
+711     QTAILQ_INSERT_TAIL(&list->head, opts, next);                                                                                    
+712     return opts;                                                                                                                    
+713 }                                                                                                                                   
+
+========================================
+Output of my  attach/detach/attach
+========================================
+virsh # attach-disk base1 /var/lib/libvirt/images/extrastorage.img vdb
+Disk attached successfully
+
+virsh # dumpxml base1
+<domain type='kvm' id='2'>
+  <name>base1</name>
+  <uuid>9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</uuid>
+  <memory>1048576</memory>
+  <currentMemory>1048576</currentMemory>
+  <vcpu>2</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-0.14'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <cpu match='exact'>
+    <model>Opteron_G3</model>
+    <vendor>AMD</vendor>
+    <feature policy='require' name='skinit'/>
+    <feature policy='require' name='vme'/>
+    <feature policy='require' name='mmxext'/>
+    <feature policy='require' name='fxsr_opt'/>
+    <feature policy='require' name='cr8legacy'/>
+    <feature policy='require' name='ht'/>
+    <feature policy='require' name='3dnowprefetch'/>
+    <feature policy='require' name='3dnowext'/>
+    <feature policy='require' name='wdt'/>
+    <feature policy='require' name='extapic'/>
+    <feature policy='require' name='pdpe1gb'/>
+    <feature policy='require' name='osvw'/>
+    <feature policy='require' name='cmp_legacy'/>
+    <feature policy='require' name='3dnow'/>
+  </cpu>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/dev/rbd1'/>
+      <target dev='vda' bus='virtio'/>
+      <alias name='virtio-disk0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </disk>
+    <disk type='block' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source dev='/var/lib/libvirt/images/extrastorage.img'/>
+      <target dev='vdb' bus='virtio'/>
+      <alias name='virtio-disk1'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x07' function='0x0'/>
+    </disk>
+    <controller type='ide' index='0'>
+      <alias name='ide0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x1'/>
+    </controller>
+    <interface type='bridge'>
+      <mac address='52:54:00:a2:c1:2d'/>
+      <source bridge='br0'/>
+      <target dev='vnet0'/>
+      <model type='virtio'/>
+      <alias name='net0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <serial type='pty'>
+      <source path='/dev/pts/1'/>
+      <target port='0'/>
+      <alias name='serial0'/>
+    </serial>
+    <console type='pty' tty='/dev/pts/1'>
+      <source path='/dev/pts/1'/>
+      <target type='serial' port='0'/>
+      <alias name='serial0'/>
+    </console>
+    <input type='mouse' bus='ps2'/>
+    <graphics type='vnc' port='5900' autoport='yes'/>
+    <sound model='ich6'>
+      <alias name='sound0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <video>
+      <model type='cirrus' vram='9216' heads='1'/>
+      <alias name='video0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <alias name='balloon0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+  <seclabel type='dynamic' model='apparmor'>
+    <label>libvirt-9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</label>
+    <imagelabel>libvirt-9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</imagelabel>
+  </seclabel>
+</domain>
+
+virsh # detach-disk base1 vdb
+Disk detached successfully
+
+virsh # dumpxml base1
+<domain type='kvm' id='2'>
+  <name>base1</name>
+  <uuid>9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</uuid>
+  <memory>1048576</memory>
+  <currentMemory>1048576</currentMemory>
+  <vcpu>2</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-0.14'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <cpu match='exact'>
+    <model>Opteron_G3</model>
+    <vendor>AMD</vendor>
+    <feature policy='require' name='skinit'/>
+    <feature policy='require' name='vme'/>
+    <feature policy='require' name='mmxext'/>
+    <feature policy='require' name='fxsr_opt'/>
+    <feature policy='require' name='cr8legacy'/>
+    <feature policy='require' name='ht'/>
+    <feature policy='require' name='3dnowprefetch'/>
+    <feature policy='require' name='3dnowext'/>
+    <feature policy='require' name='wdt'/>
+    <feature policy='require' name='extapic'/>
+    <feature policy='require' name='pdpe1gb'/>
+    <feature policy='require' name='osvw'/>
+    <feature policy='require' name='cmp_legacy'/>
+    <feature policy='require' name='3dnow'/>
+  </cpu>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/dev/rbd1'/>
+      <target dev='vda' bus='virtio'/>
+      <alias name='virtio-disk0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </disk>
+    <controller type='ide' index='0'>
+      <alias name='ide0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x1'/>
+    </controller>
+    <interface type='bridge'>
+      <mac address='52:54:00:a2:c1:2d'/>
+      <source bridge='br0'/>
+      <target dev='vnet0'/>
+      <model type='virtio'/>
+      <alias name='net0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <serial type='pty'>
+      <source path='/dev/pts/1'/>
+      <target port='0'/>
+      <alias name='serial0'/>
+    </serial>
+    <console type='pty' tty='/dev/pts/1'>
+      <source path='/dev/pts/1'/>
+      <target type='serial' port='0'/>
+      <alias name='serial0'/>
+    </console>
+    <input type='mouse' bus='ps2'/>
+    <graphics type='vnc' port='5900' autoport='yes'/>
+    <sound model='ich6'>
+      <alias name='sound0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <video>
+      <model type='cirrus' vram='9216' heads='1'/>
+      <alias name='video0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <alias name='balloon0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+  <seclabel type='dynamic' model='apparmor'>
+    <label>libvirt-9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</label>
+    <imagelabel>libvirt-9ebebe7f-7dfa-4735-a80c-c19ebe4e1459</imagelabel>
+  </seclabel>
+</domain>
+
+virsh # attach-disk base1 /var/lib/libvirt/images/extrastorage.img vdb
+error: Failed to attach disk
+error: operation failed: adding virtio-blk-pci,bus=pci.0,addr=0x8,drive=drive-virtio-disk1,id=virtio-disk1 device failed: Duplicate ID 'virtio-disk1' for device
+======================================================
+
+reproduced in precise as well.
+
+Actually this may be a libvirt bug.  Using 'qemu -monitor stdio -vnc :1 -hda qatest.img -snapshot', i can do:
+
+(qemu) drive_add 1 if=none,id=x,file=../x.img
+OK
+(qemu) drive_del x
+(qemu) drive_add 1 if=none,id=x,file=../x.img
+OK
+
+
+But, I think that the 'Duplicate ID' messages is generated from within qemu-kvm,  so perhaps an interaction between libvirt/qemu.
+
+(qemu) device_add driver=ne2k_pci,id=x
+(qemu) device_del x
+(qemu) device_add driver=ne2k_pci,id=x
+Duplicate ID 'x' for device
+
+It appears that drive_add/drive_del works fine, but device_del does not
+fully delete its members.
+
+This happens with today's git HEAD of qemu as well, in other words it affects upstream.
+
+
+I've been looking at libvirt and qemu for other work, I'm doing, and I've criceld back to take another look at this.
+
+Since I first looked at this, my testbed has updated to use the "oneiric-proposed"  
+   qemu-kvm package '0.14.1+noroms-0ubuntu6.1'
+while retaining the libvirt-bin package
+   0.9.2-4ubuntu15.1
+
+I tried to duplicate the problem again, but this time my  Linux virt had 'acpiphp.ko'
+(the PCI hotplug module) loaded, and I was *unable* to reproduce the 'Duplicate ID'
+error.  Instead, continued attach/detach cycles resulted in success every time after
+.gt. 30 iterations.
+
+==
+**As a side-note  and possibly to be addressed as a separate bug, the drive does not
+actually get attached as the specified device each time inside the virt.   So even though
+the 'attach-disk --target' specifies, say, vdb,  the virt kernel increments the devname
+inside itself, so that we get  vdc,  vdd, vde....  The attaches subsequent to the detatch
+of vdz results in vdaa,, vdab, vdac and so on.
+==
+
+Now here's the kicker.  If you do an 'rmmod' on the PCI hotplug module within the
+virt and try the attach/detach/attach, the 'Duplicate ID' problem re-occurs.   This
+implies to me that there is some sort of effective interaction between qemu-kvm
+and the virt that affects this.   That is, when the virt actually gets and handles a
+device eject, then qemu-kvm behaves differently than when  the virt does not
+get/handle it.
+--
+Dec 14 09:54:16 base1 kernel: [ 2226.835417] acpiphp_glue: handle_hotplug_event_func: Device eject notify on \_SB_.PCI0.S27_
+Dec 14 09:54:16 base1 kernel: [ 2226.877208] virtio-pci 0000:00:1b.0: PCI INT A disabled
+--
+
+So, this gives us a better characterization of the bug, and I will look into it some more with this
+in mind.
+
+Some incremental findings:
+
+In 'qemu-kvm'  the DeviceState for the peer device of the BlockDeviceState that gets created when a disk attached by 'virsh attach-disk' references the  'QemuOpts' options structure that lists the options and the device ID string (ex: as 'virtio-disk4') that will (on a re-attach for the same disk when the hotplug module is not loaded in the virt) be found by 'qemu_find_opts()' under the call to 'drive_add'.
+
+When the PCI hotplug module *is* loaded in the virt,  the DriveState structure and the associatsd QemuOpts get released from within a separate thread by a call to 'qdev_free()' asynchronously from the main thread's invocation of 'do_device_del()'.     When the PCI hotplug modules is *not* loaded in the virt, there is never an invocation of 'qdev_free' for the device , so the options structure hangs around to be located in the attempt to re-attach a disk for the same disk, and we get the Duplicate ID error.      In the even of the hotplug module being loaded in the virt, the trace of the thread which invokes 'qdev_free' looks something like:
+==
+#1  0x00007fbb4b3403d9 in qdev_free (dev=0x7fbb4cc8d820) at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/hw/qdev.c:382
+#2  0x00007fbb4b4aabd7 in pciej_write (opaque=0x7fbb4c95dc90, addr=44552, val=33554432)
+    at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/hw/acpi_piix4.c:615
+#3  0x00007fbb4b309839 in ioport_write (index=2, address=44552, data=33554432) at ioport.c:81
+#4  0x00007fbb4b30a2c7 in cpu_outl (addr=44552, val=33554432) at ioport.c:278
+#5  0x00007fbb4b2a7b82 in kvm_handle_io (port=44552, data=0x7fbb4b1fa000, direction=1, size=4, count=1)
+    at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/kvm-all.c:824
+#6  0x00007fbb4b2aa353 in kvm_run (env=0x7fbb4c734860) at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/qemu-kvm.c:617
+#7  0x00007fbb4b2abab8 in kvm_cpu_exec (env=0x7fbb4c734860) at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/qemu-kvm.c:1233
+#8  0x00007fbb4b2ac2dd in kvm_main_loop_cpu (env=0x7fbb4c734860) at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/qemu-kvm.c:1419
+#9  0x00007fbb4b2ac476 in ap_main_loop (_env=0x7fbb4c734860) at /home/justinlw/src/qemu/qemu-kvm-0.14.1+noroms/qemu-kvm.c:1466
+#10 0x00007fbb4a9bbefc in start_thread (arg=0x7fbb4397f700) at pthread_create.c:304
+#11 0x00007fbb481c589d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:112
+#12 0x0000000000000000 in ?? ()
+==
+
+In a nutshell, the code is designed such that there is a resource leak if the virt does not play ball with PCI hotplugging in a case like this.   I have yet to do complete line of code: I will have to have a much better understanding of the Qemu PCI handling mechanisms first, I think.    Still I believe there are potentially useful findings in further nailing this bug (design feature?).
+
+I find that you should modprobe 'acpiphp' & 'pci_hotplug' modules in the VM(ubuntu only has 'acpiphp', but it doesn't matter), then this problem will be resolved.
+http://www.linux-kvm.org/page/Hotadd_pci_devices
+
+pci_hotplog actually is available, at least on precise.  But it is not loaded (acpiphp is).
+
+After I modprobe pci_hotplug, the problem goes away.  Thanks wangpan.
+
+Hi Stefan,
+
+I'm assigning this bug to you to get your input about which package I need to target it to.  It's invalid (I believe) for qemu-kvm.  We need server cloud guests to have pci_hotplog auto-loaded at boot (to avoid this bug).  Should I assign to package linux for that?
+
+For the cloud-images specifically, this problem was solved once before in bug 450463.  our cloud-images have the following in their /etc/modules:
+# /etc/modules: kernel modules to load at boot time.
+#
+# This file contains the names of kernel modules that should be loaded
+# at boot time, one per line. Lines beginning with "#" are ignored.
+# LP: #450463
+acpiphp
+
+It has been "good enough" since karmic to have that there, we can probably add pci_hotplug there also.
+
+
+I am quite confused. Looking at my Precise system, pci-hotplug is built-in, and the configs for Oneiric and Quantal are the same. Could you tell me the exact kernel version for which you see this as a module?
+
+@Stefan,
+
+I'm confused too.  I don't have the VM I saw that on available right now, but think it was a quantal image built from the net install cd.
+
+On a precise server image, pci_hotplug is indeed built in.  acpiphp is NOT being auto-loaded.   (<<<<  smoser <<<<<)
+
+Serge, Scott, somehow I think we all left here in a confused state and I do not think we still have the problem (at least not Trusty). From my last comment it seems I did not even find something that I could change for Precise. For now I would unassign myself and maybe this report should be closed if Justin has no objections.
+
+Is here still a problem left with upstream QEMU?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+[Expired for qemu-kvm (Ubuntu) because there has been no activity for 60 days.]
+

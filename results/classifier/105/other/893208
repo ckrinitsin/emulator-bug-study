@@ -1,0 +1,554 @@
+other: 0.975
+semantic: 0.961
+instruction: 0.960
+vnc: 0.950
+mistranslation: 0.949
+device: 0.948
+boot: 0.946
+assembly: 0.942
+graphic: 0.940
+KVM: 0.929
+socket: 0.922
+network: 0.913
+
+qemu on ARM hosts can't boot i386 image
+
+If you apply some workarounds for bug 870990, bug 883133 and bug 883136 QEMU still cannot boot the i386 debian_squeeze_i386_standard.qcow2 image from http://people.debian.org/~aurel32/qemu/i386/ -- grub starts to boot but something causes the system to reset just before display of the blue-background grub menu, so we go round in a loop forever. This image boots OK on i386 hosted qemu so this indicates some kind of ARM-host specific bug.
+
+I think this is a timer related issue; once I've fixed 883133 it falls with a triple fault from a divide instruction not long after a load of rdtsc stuff.  If I use -m 486 I can boot an old Debian 5 netinstall cd into rescue mode (with a bogomips of 69!).
+
+Dave
+
+
+On the basis of this analysis by David and since we don't seem to have problems with ARM guests on ARM hosts, I think we can deprioritise this bug as not being a requirement for KVM work.
+
+
+I was about to file a bug with the exact symptoms. 
+
+I can't boot a (possibly the very one) debian wheezy standard qcow2 image on my Odroid C1 (works fine on x86-32 with the same command line) using qemu-system-i386 that I built yesterday from git source.
+
+Is there a workaround or has nobody needed this for the last 4 years? Please advise on how to provide more relevant details.
+
+Thanks
+
+Just for laughs I 've tested my qemu build with this guy's x86 kernel and it's working as expected:
+
+https://github.com/mopp/Axel
+
+the difference being it was using -cdrom switch to boot from an .iso image
+
+Hello boyos,
+
+I got myself an Rpi2 recently and have been reading up on qemu.
+
+Does this mean there's a problem booting x86 images on Arm or just the ones from that particular source?
+
+
+
+On 09/19/15 12:54, Marina Kovalevna wrote:
+> Hello boyos,
+> 
+> I got myself an Rpi2 recently and have been reading up on qemu.
+> 
+> Does this mean there's a problem booting x86 images on Arm or just the
+> ones from that particular source?
+> 
+
+The outlandishness of this use case (-> buy an underpowered toy, run x86
+programs on it via *emulation*) is so exceptional that it tickled my
+fancy and I looked into it.
+
+I'm CCing Peter and Dave; I can see in the LP comments from 2011 that
+they looked at this in 2011-2012. We're going to have a good chuckle
+here I promise.
+
+So, Dave was correct in comment #1
+<https://bugs.launchpad.net/qemu-linaro/+bug/893208/comments/1> where he
+wrote,
+
+"it falls with a triple fault from a divide instruction not long after a
+load of rdtsc stuff".
+
+I booted the same Debian i386 Squeeze (and Wheezy) "standard" images
+from Aurelien's website as everyone else, in TCG mode, both on an x86_64
+host, and -- "brace for impact" -- on an aarch64 host (APM Mustang). The
+command line was simple,
+
+$ qemu-system-i386 -hda debian_squeeze_i386_standard.qcow2
+
+The symptoms reproduced on the aarch64 host, and didn't on the x86_64 host.
+
+Then I added
+
+  -d in_asm,op,int,exec,cpu,mmu,cpu_reset,ioport,unimp,guest_errors
+
+to capture the TCG logs, up to the point where grub rebooted (vs. didn't
+reboot, on the x86_64 host), and then diffed the logs between each
+other. (This wasn't so fast, on the aarch64 host, approx. 530 MB of log
+was written before the reboot.)
+
+Looking at the logs, I can confirm Dave's analysis from 2011 -- there's
+a CPUID, then an RDTSC, then a division by zero.
+
+So if you look at GRUB's code, you find the calibrate_tsc() function in
+"grub-core/kern/i386/tsc.c". (We're old friends with that function.) It
+calls grub_get_tsc() -- same file --, which explains both CPUID and
+RDTSC. (CPUID is only used for serialization, ie. for preventing the CPU
+from executing RDTSC out-of-order. RDTSCP would be an alternative, which
+combines both, but that's not as widely available.)
+
+Where does the division by zero come from then? Well grub fetches and
+stashes the TSC, then programs the PIT to sleep for some time, then
+re-fetches the TSC, and uses the TSC difference as denominator when
+calculating the "TSC rate". (It has a solid idea of the real time
+passed, due to the PIT frequency being a given.)
+
+Let's see where the TSC values come from in QEMU / TCG:
+
+helper_rdtsc()             [target-i386/misc_helper.c]
+  cpu_get_tsc()            [hw/i386/pc.c]
+    cpu_get_ticks()        [cpus.c]
+      cpu_get_real_ticks() [include/qemu/timer.h]
+
+Now, the cpu_get_real_ticks() implementation is *host* specific. You can
+find it implemented for a bunch of host architectures in
+"include/qemu/timer.h".
+
+Neither ARM nor AARCH64 qualify though; for those, the following
+pearlescent fallback gets built:
+
+> /* The host CPU doesn't have an easily accessible cycle counter.
+>    Just return a monotonically increasing value.  This will be
+>    totally wrong, but hopefully better than nothing.  */
+> static inline int64_t cpu_get_real_ticks (void)
+> {
+>     static int64_t ticks = 0;
+>     return ticks++;
+> }
+
+Note that this code dates back to the following commit (year 2006):
+
+commit 46152182100e68f7f8aa4954af1bf91160bb3d15
+Author: pbrook <pbrook@c046a42c-6fe2-441c-8c8c-71466251a162>
+Date:   Sun Jul 30 19:16:29 2006 +0000
+
+    Rewrite Arm host support.
+
+So... the frequency of the PIT is 1193182 per second (see PIT_FREQ in
+QEMU, and GRUB_SPEAKER_PIT_FREQUENCY in GRUB). Grub sleeps for 65535
+such cycles in calibrate_tsc(), between the two TSC reads. That's
+approximately 55 milliseconds. And for that long period, grub finds that
+the TSC has incremented by ... one.
+
+(Side remark: you'll find that recent grub versions don't choke on this.
+See <http://git.savannah.gnu.org/cgit/grub.git/commit/?id=2e62352b>,
+from January 2015.)
+
+I applied the following extremely sophisticated patch (with the motto
+"it cannot get more wronger"):
+
+> diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+> index 9939246..def22de 100644
+> --- a/include/qemu/timer.h
+> +++ b/include/qemu/timer.h
+> @@ -1003,8 +1003,7 @@ static inline int64_t cpu_get_real_ticks(void)
+>     totally wrong, but hopefully better than nothing.  */
+>  static inline int64_t cpu_get_real_ticks (void)
+>  {
+> -    static int64_t ticks = 0;
+> -    return ticks++;
+> +    return get_clock();
+>  }
+>  #endif
+>
+
+get_clock() is CLOCK_MONOTONIC based, has (theoretical) nanosecond
+resolution, and a nice flat int64_t encoding that should suffice for
+approx. 329 years. This should provide grub with a larger denominator.
+
+This "fix" allowed me to boot the i386 Debian image on the AARCH64 host.
+
+For a real fix... I think on AARCH64 hosts at least, a "real" cycle
+counter should be available, and someone who knows AARCH64 could write a
+function that fetches it.
+
+For 32-bit ARM, I presume the Raspberry Pi 2 and the Odroid C1 are
+advanced enough for a similar cycle counter reading function.
+
+I wonder though if ARM platforms remain in existence for which the 2006
+patch captures the right hardware capability. For those (and perhaps as
+a general fallback) I think my "patch" above would be an improvement.
+
+Peter?
+
+Thanks
+Laszlo
+
+
+On 21 September 2015 at 08:12, Laszlo Ersek <email address hidden> wrote:
+> Where does the division by zero come from then? Well grub fetches and
+> stashes the TSC, then programs the PIT to sleep for some time, then
+> re-fetches the TSC, and uses the TSC difference as denominator when
+> calculating the "TSC rate". (It has a solid idea of the real time
+> passed, due to the PIT frequency being a given.)
+
+I was wondering rereading the bug report whether this was down
+to our lousy RDTSC implementation...thanks for digging in and
+confirming what's going on.
+
+> Now, the cpu_get_real_ticks() implementation is *host* specific. You can
+> find it implemented for a bunch of host architectures in
+> "include/qemu/timer.h".
+
+> I applied the following extremely sophisticated patch (with the motto
+> "it cannot get more wronger"):
+>
+>> diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+>> index 9939246..def22de 100644
+>> --- a/include/qemu/timer.h
+>> +++ b/include/qemu/timer.h
+>> @@ -1003,8 +1003,7 @@ static inline int64_t cpu_get_real_ticks(void)
+>>     totally wrong, but hopefully better than nothing.  */
+>>  static inline int64_t cpu_get_real_ticks (void)
+>>  {
+>> -    static int64_t ticks = 0;
+>> -    return ticks++;
+>> +    return get_clock();
+>>  }
+>>  #endif
+>>
+>
+> get_clock() is CLOCK_MONOTONIC based, has (theoretical) nanosecond
+> resolution, and a nice flat int64_t encoding that should suffice for
+> approx. 329 years. This should provide grub with a larger denominator.
+>
+> This "fix" allowed me to boot the i386 Debian image on the AARCH64 host.
+>
+> For a real fix... I think on AARCH64 hosts at least, a "real" cycle
+> counter should be available, and someone who knows AARCH64 could write a
+> function that fetches it.
+>
+> For 32-bit ARM, I presume the Raspberry Pi 2 and the Odroid C1 are
+> advanced enough for a similar cycle counter reading function.
+
+There isn't a user-space readable cycle counter on ARM.
+(There is a counter which might be accessible to userspace
+depending on kernel config, but the kernel doesn't guarantee
+its availability as an ABI thing.)
+
+Probably we should figure out a sane way to emulate guest
+cycle counters that isn't dependent on the host CPU architecture.
+I think having QEMU's behaviour as seen by the guest vary like
+this is a recipe for confusion.
+
+thanks
+-- PMM
+
+
+* Peter Maydell (<email address hidden>) wrote:
+> On 21 September 2015 at 08:12, Laszlo Ersek <email address hidden> wrote:
+> > Where does the division by zero come from then? Well grub fetches and
+> > stashes the TSC, then programs the PIT to sleep for some time, then
+> > re-fetches the TSC, and uses the TSC difference as denominator when
+> > calculating the "TSC rate". (It has a solid idea of the real time
+> > passed, due to the PIT frequency being a given.)
+> 
+> I was wondering rereading the bug report whether this was down
+> to our lousy RDTSC implementation...thanks for digging in and
+> confirming what's going on.
+> 
+> > Now, the cpu_get_real_ticks() implementation is *host* specific. You can
+> > find it implemented for a bunch of host architectures in
+> > "include/qemu/timer.h".
+> 
+> > I applied the following extremely sophisticated patch (with the motto
+> > "it cannot get more wronger"):
+> >
+> >> diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+> >> index 9939246..def22de 100644
+> >> --- a/include/qemu/timer.h
+> >> +++ b/include/qemu/timer.h
+> >> @@ -1003,8 +1003,7 @@ static inline int64_t cpu_get_real_ticks(void)
+> >>     totally wrong, but hopefully better than nothing.  */
+> >>  static inline int64_t cpu_get_real_ticks (void)
+> >>  {
+> >> -    static int64_t ticks = 0;
+> >> -    return ticks++;
+> >> +    return get_clock();
+> >>  }
+> >>  #endif
+> >>
+> >
+> > get_clock() is CLOCK_MONOTONIC based, has (theoretical) nanosecond
+> > resolution, and a nice flat int64_t encoding that should suffice for
+> > approx. 329 years. This should provide grub with a larger denominator.
+> >
+> > This "fix" allowed me to boot the i386 Debian image on the AARCH64 host.
+> >
+> > For a real fix... I think on AARCH64 hosts at least, a "real" cycle
+> > counter should be available, and someone who knows AARCH64 could write a
+> > function that fetches it.
+> >
+> > For 32-bit ARM, I presume the Raspberry Pi 2 and the Odroid C1 are
+> > advanced enough for a similar cycle counter reading function.
+> 
+> There isn't a user-space readable cycle counter on ARM.
+> (There is a counter which might be accessible to userspace
+> depending on kernel config, but the kernel doesn't guarantee
+> its availability as an ABI thing.)
+> 
+> Probably we should figure out a sane way to emulate guest
+> cycle counters that isn't dependent on the host CPU architecture.
+> I think having QEMU's behaviour as seen by the guest vary like
+> this is a recipe for confusion.
+
+Time is always hard though;  what are the requirements for that
+particular view of time:
+
+   1) It must be monotonic - which get_clock() is iff the host
+      supports it (which I guess most do?)
+   2) It's got to be within a few orders of magnitude of sane
+      with respect to wall clock, so that if someone measures
+      it over a second or a 1/100th of a second or whatever then
+      it's still seen to go up.
+
+get_clock() isn't that bad if it's monotonic; if not I'd suggest
+for TCG a multiple of the number of TBs executed (if that's
+already stored somewhere), or something similar.
+
+Dave
+
+> thanks
+> -- PMM
+--
+Dr. David Alan Gilbert / <email address hidden> / Manchester, UK
+
+
+On 09/21/15 17:50, Dr. David Alan Gilbert wrote:
+> * Peter Maydell (<email address hidden>) wrote:
+>> On 21 September 2015 at 08:12, Laszlo Ersek <email address hidden> wrote:
+>>> Where does the division by zero come from then? Well grub fetches and
+>>> stashes the TSC, then programs the PIT to sleep for some time, then
+>>> re-fetches the TSC, and uses the TSC difference as denominator when
+>>> calculating the "TSC rate". (It has a solid idea of the real time
+>>> passed, due to the PIT frequency being a given.)
+>>
+>> I was wondering rereading the bug report whether this was down
+>> to our lousy RDTSC implementation...thanks for digging in and
+>> confirming what's going on.
+>>
+>>> Now, the cpu_get_real_ticks() implementation is *host* specific. You can
+>>> find it implemented for a bunch of host architectures in
+>>> "include/qemu/timer.h".
+>>
+>>> I applied the following extremely sophisticated patch (with the motto
+>>> "it cannot get more wronger"):
+>>>
+>>>> diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+>>>> index 9939246..def22de 100644
+>>>> --- a/include/qemu/timer.h
+>>>> +++ b/include/qemu/timer.h
+>>>> @@ -1003,8 +1003,7 @@ static inline int64_t cpu_get_real_ticks(void)
+>>>>     totally wrong, but hopefully better than nothing.  */
+>>>>  static inline int64_t cpu_get_real_ticks (void)
+>>>>  {
+>>>> -    static int64_t ticks = 0;
+>>>> -    return ticks++;
+>>>> +    return get_clock();
+>>>>  }
+>>>>  #endif
+>>>>
+>>>
+>>> get_clock() is CLOCK_MONOTONIC based, has (theoretical) nanosecond
+>>> resolution, and a nice flat int64_t encoding that should suffice for
+>>> approx. 329 years. This should provide grub with a larger denominator.
+>>>
+>>> This "fix" allowed me to boot the i386 Debian image on the AARCH64 host.
+>>>
+>>> For a real fix... I think on AARCH64 hosts at least, a "real" cycle
+>>> counter should be available, and someone who knows AARCH64 could write a
+>>> function that fetches it.
+>>>
+>>> For 32-bit ARM, I presume the Raspberry Pi 2 and the Odroid C1 are
+>>> advanced enough for a similar cycle counter reading function.
+>>
+>> There isn't a user-space readable cycle counter on ARM.
+>> (There is a counter which might be accessible to userspace
+>> depending on kernel config, but the kernel doesn't guarantee
+>> its availability as an ABI thing.)
+>>
+>> Probably we should figure out a sane way to emulate guest
+>> cycle counters that isn't dependent on the host CPU architecture.
+>> I think having QEMU's behaviour as seen by the guest vary like
+>> this is a recipe for confusion.
+> 
+> Time is always hard though;  what are the requirements for that
+> particular view of time:
+> 
+>    1) It must be monotonic - which get_clock() is iff the host
+>       supports it (which I guess most do?)
+>    2) It's got to be within a few orders of magnitude of sane
+>       with respect to wall clock, so that if someone measures
+>       it over a second or a 1/100th of a second or whatever then
+>       it's still seen to go up.
+> 
+> get_clock() isn't that bad if it's monotonic; if not I'd suggest
+> for TCG a multiple of the number of TBs executed (if that's
+> already stored somewhere), or something similar.
+
+I think that's quite what -icount does; I had even tested -icount before
+posting my email, and it works too. (See -icount in qemu-options.hx.) I
+hadn't known about -icount, but I saw the connection in the
+cpu_get_ticks() function (mentioned earlier in the call tree):
+
+/* return the host CPU cycle counter and handle stop/restart */
+/* Caller must hold the BQL */
+int64_t cpu_get_ticks(void)
+{
+    int64_t ticks;
+
+    if (use_icount) {
+        return cpu_get_icount();
+    }
+
+...
+
+I didn't recommend it because the documentation in "qemu-options.hx"
+confused me, and I thought the emulation should work without obscure
+switches.
+
+Thanks
+Laszlo
+
+
+> 
+> Dave
+> 
+>> thanks
+>> -- PMM
+> --
+> Dr. David Alan Gilbert / <email address hidden> / Manchester, UK
+> 
+
+
+
+What a funny coincidence, just before getting all of that bug email (telepathy?), I decided to also try a debian hurd image, but it immediately aborts:
+
+
+qemu-system-i386: qemu-coroutine-lock.c:91: qemu_co_queue_restart_all: Assertion `qemu_in_coroutine()' failed.
+Aborted
+
+Is this known and/or deserving a separate issue?
+
+PeteVine: That sounds like a separate bug ; probably best to get a separate report for it with a backtrace.
+
+Thanks for looking into it, Laszlo. I've already tried dosbox and had
+no idea qemu was impractical.
+
+
+get_clock() sounds like a good idea. Anybody post the patch? :)
+
+BTW, it seems the more expensive (but vastly less popular) odroids like the xu4 are built around kvm enabled processors which is why this bug doesn't affect them. 
+
+The most popular C1/C1+'s processor doesn't support kvm though so any update would be appreciated. 
+
+I tried installing openbsd yesterday from an official image to another raw image disk - no problem and the installed system works flawlessly. Hurd also boots fine (via grub) along with a few toy x86 kernels.
+
+It almost begins to look as if the raw images are ok whereas the qcow2 format is the problem somehow.  Had I tried those other images first I'd be convinced running x86 on arm hosts poses no problem at all - how is it even possible?
+
+
+Thanks for all the tips guys, I finally got it to work on my Rpi2.
+
+Still present in 2.5.  
+
+It doesn't work on my XU4 either. The supported virtualization would probably work for ARM images but it's not something many people need.
+
+What's the holdup, dear devs?  
+
+The "holdup" is simply that nobody who is interested in this issue has written a patch like that Paolo proposed in comment #13. (Mostly people either want to run ARM or other guest images in emulation on x86, or they're running ARM images with hardware virtualization on ARM hardware. Trying to run x86 images in emulation on ARM hosts is much less common.)
+
+Would the presence of RTC make any difference?
+
+No, this doesn't have anything to do with the RTC. It's just about our fallback implementation of cpu_get_host_ticks() being very poor.
+
+
+Another OS that works:
+
+https://static.redox-os.org/redox-installer.iso
+
+The previous increment-on-read fallback didn't increment fast
+enough for some versions of grub.
+
+https://bugs.launchpad.net/qemu-linaro/+bug/893208
+
+Signed-off-by: Christopher Covington <email address hidden>
+---
+I unfortunately don't have the opportunity to fully test this right
+now, but I'm sending it out nevertheless on the off chance that
+someone else might.
+---
+ include/qemu/timer.h | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/include/qemu/timer.h b/include/qemu/timer.h
+index d0946cb..60c6dd6 100644
+--- a/include/qemu/timer.h
++++ b/include/qemu/timer.h
+@@ -998,13 +998,12 @@ static inline int64_t cpu_get_host_ticks(void)
+ }
+ 
+ #else
+-/* The host CPU doesn't have an easily accessible cycle counter.
+-   Just return a monotonically increasing value.  This will be
+-   totally wrong, but hopefully better than nothing.  */
++/* The host CPU doesn't have an easily accessible cycle counter, so just return
++   the instruction count. This may make the CPU look like it has an IPC of
++   exactly 1, but that shouldn't cause any functional problems. */
+ static inline int64_t cpu_get_host_ticks (void)
+ {
+-    static int64_t ticks = 0;
+-    return ticks++;
++    return cpu_get_icount();
+ }
+ #endif
+ 
+-- 
+Qualcomm Innovation Center, Inc.
+Qualcomm Innovation Center, Inc. is a member of Code Aurora Forum,
+a Linux Foundation Collaborative Project
+
+
+
+Unfortunately that doesn't seem to work.  Qemu immediately goes into infinite loop and has to be killed -9. 
+
+Building anything besides qemu-system-i386 leads to link errors:
+
+ LINK  x86_64-linux-user/qemu-x86_64
+/usr/bin/ld.gold.real: error: ../libqemustub.a(cpu-get-icount.o): multiple definition of 'use_icount'
+/usr/bin/ld.gold.real: exec.o: previous definition here
+
+
+FWIW:
+
+Program received signal SIGINT, Interrupt.
+0xb644f73c in seqlock_read_retry (sl=0xb6b2acc8 <timers_state+16>, start=0)
+    at /tmp/qemu/include/qemu/seqlock.h:69
+69          return unlikely(atomic_read(&sl->sequence) != start);
+(gdb) bt
+#0  0xb644f73c in seqlock_read_retry (sl=0xb6b2acc8 <timers_state+16>, start=0)
+    at /tmp/qemu/include/qemu/seqlock.h:69
+#1  0xb644fa3c in cpu_get_icount () at /tmp/qemu/cpus.c:182
+#2  0xb644f518 in cpu_get_host_ticks () at /tmp/qemu/include/qemu/timer.h:1006
+#3  0xb644fcc4 in cpu_enable_ticks () at /tmp/qemu/cpus.c:252
+#4  0xb658a9ec in vm_start () at vl.c:764
+#5  0xb6597200 in main (argc=5, argv=0xbecfa6b4, envp=0xbecfa6cc) at vl.c:4651
+
+Looks like a patch for this issue has now been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=d1bb099f6308d594061
+
+Indeed, I had no problem booting the images this time around:
+
+https://asciinema.org/a/d2m42g5c0n3z2pnbskhirdv5j
+
+The qemu-linaro project seems to have been discontinued; the wiki and git repo links at <https://launchpad.net/qemu-linaro> don't work, and the latest release seems to be "qemu-linaro-1.7.0-2014.01.tar.gz". Marking this ticket as "invalid" for the qemu-linaro project.
+

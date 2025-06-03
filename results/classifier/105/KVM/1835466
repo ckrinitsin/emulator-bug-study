@@ -1,0 +1,263 @@
+KVM: 0.872
+vnc: 0.850
+other: 0.824
+mistranslation: 0.773
+graphic: 0.737
+device: 0.732
+semantic: 0.702
+instruction: 0.700
+assembly: 0.688
+socket: 0.687
+network: 0.676
+boot: 0.633
+
+qemu 4.0.0 abort()s in audio_get_pdo_in (poisoned drv->driver?)
+
+After upgrading qemu from 3.0.0 to 4.0.0 (compiled from release tarball), I'm seeing a (reproducible) crash related to audio subsystem.
+
+I recompiled qemu with debugging options and got it to crash under gdb:
+
+Thread 6 "qemu-system-x86" received signal SIGABRT, Aborted.
+0x00007ffff52e420b in raise () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007ffff52e420b in raise () at /lib64/libc.so.6
+#1  0x00007ffff52c6524 in abort () at /lib64/libc.so.6
+#2  0x000000000041ec33 in audio_get_pdo_in (dev=<optimized out>) at audio/audio_template.h:328
+#3  0x00000000005d0123 in AUD_open_in
+    (card=0x7ffdde98dbc8, sw=0x7ffff17444e0, name=0x999d80 "adc", callback_opaque=callback_opaque@entry=0x7ffdde98fd58, callback_fn=0x610940 <hda_audio_input_cb>, as=as@entry=0x7ffdde98fd84) at audio/audio_template.h:434
+#4  0x000000000060fe2e in hda_audio_setup (st=0x7ffdde98fd58) at hw/audio/hda-codec.c:490
+#5  0x000000000061051b in hda_audio_command (hda=0x7ffdde98db40, nid=4, data=<optimized out>) at hw/audio/hda-codec.c:590
+#6  0x000000000060ea20 in intel_hda_send_command (d=d@entry=0x7ffff0a2fc00, verb=verb@entry=4341777) at hw/audio/intel-hda.c:301
+#7  0x000000000060ebbe in intel_hda_corb_run (d=<optimized out>) at hw/audio/intel-hda.c:336
+#8  0x000000000060ebbe in intel_hda_corb_run (d=0x7ffff0a2fc00) at hw/audio/intel-hda.c:305
+#9  0x0000000000495b99 in memory_region_write_accessor
+    (mr=mr@entry=0x7ffff0a307a0, addr=72, value=value@entry=0x7fffeddfe568, size=size@entry=2, shift=<optimized out>, mask=mask@entry=65535, attrs=...)
+    at memory.c:502
+#10 0x000000000049448e in access_with_adjusted_size
+    (addr=addr@entry=72, value=value@entry=0x7fffeddfe568, size=size@entry=2, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=access_fn@entry=0x495b10 <memory_region_write_accessor>, mr=0x7ffff0a307a0, attrs=...) at memory.c:568
+#11 0x00000000004974f3 in memory_region_dispatch_write (mr=mr@entry=0x7ffff0a307a0, addr=72, data=<optimized out>, size=2, attrs=attrs@entry=...)
+    at memory.c:1496
+#12 0x000000000042afbc in flatview_write_continue
+    (fv=fv@entry=0x7ffdd36ef5c0, addr=addr@entry=4228186184, attrs=..., buf=buf@entry=0x7ffff66c7028 <incomplete sequence \311>, len=len@entry=2, addr1=<optimized out>, l=<optimized out>, mr=0x7ffff0a307a0) at exec.c:3279
+#13 0x000000000042b1d6 in flatview_write
+    (fv=0x7ffdd36ef5c0, addr=addr@entry=4228186184, attrs=attrs@entry=..., buf=buf@entry=0x7ffff66c7028 <incomplete sequence \311>, len=len@entry=2)
+    at exec.c:3318
+#14 0x000000000042e2a6 in address_space_write
+    (as=0xfc5080 <address_space_memory>, addr=4228186184, attrs=..., buf=buf@entry=0x7ffff66c7028 <incomplete sequence \311>, len=2)
+    at exec.c:3408
+#15 0x000000000042e33a in address_space_rw (as=<optimized out>, addr=<optimized out>, attrs=..., 
+    attrs@entry=..., buf=buf@entry=0x7ffff66c7028 <incomplete sequence \311>, len=<optimized out>, is_write=<optimized out>) at exec.c:3419
+#16 0x00000000004ac3c6 in kvm_cpu_exec (cpu=cpu@entry=0x7ffff0a81140) at accel/kvm/kvm-all.c:2034
+#17 0x00000000004812ae in qemu_kvm_cpu_thread_fn (arg=0x7ffff0a81140) at cpus.c:1281
+#18 0x00000000004812ae in qemu_kvm_cpu_thread_fn (arg=arg@entry=0x7ffff0a81140) at cpus.c:1254
+#19 0x000000000089d0eb in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:502
+#20 0x00007ffff549319c in start_thread () at /lib64/libpthread.so.0
+#21 0x00007ffff53ba4af in clone () at /lib64/libc.so.6
+
+
+After some poking around, I think there's something overwriting dev->driver so this switch(dev->driver) statement falls through to abort(): https://git.qemu.org/?p=qemu.git;a=blob;f=audio/audio_template.h;h=1232bb54db0e7073e60e3ccb72c1ed72cf5e3831;hb=131b9a05705636086699df15d4a6d328bb2585e8#l304
+
+
+Here's why I think so:
+
+$ export QEMU_AUDIO_DRV=pa
+$ gdb /usr/bin/qemu-system-x86_64
+(gdb) b qpa_audio_init
+Breakpoint 1 at 0x79bcb0: file audio/paaudio.c, line 831.
+(gdb) b audio_get_pdo_in
+Breakpoint 2 at 0x5ce320: file audio/audio_template.h, line 304.
+(gdb) run -enable-kvm -cpu Nehalem -machine q35 -device intel-iommu -name Workstation -smp 4 -m 8G -soundhw hda -rtc base=localtime -drive file=workstation-disk0.qcow2,if=virtio,format=qcow2 -drive file=workstation-disk1.qcow2,if=virtio,format=qcow2 -net nic,model=virtio,macaddr=aa:bb:cc:dd:ee:ff -net tap,ifname=tap42 -monitor telnet:127.0.0.1:7043,server,nowait -pidfile workstation.pid -vga qxl -global qxl-vga.vgamem_mb=64 -device usb-ehci,id=ehci -device usb-host,vendorid=0x1390,productid=0x5454,bus=ehci.0 -device usb-host,vendorid=0x054c,bus=ehci.0 -device usb-tablet -device nec-usb-xhci,id=xhci -device usb-host,vendorid=0x10c4,productid=0x888e,bus=xhci.0
+
+Thread 1 "qemu-system-x86" hit Breakpoint 1, qpa_audio_init (dev=0x7ffff161b6a0) at audio/paaudio.c:831
+(gdb) p (*dev)->driver
+$1 = AUDIODEV_DRIVER_PA
+(gdb) p/d AUDIODEV_DRIVER_PA
+$2 = 5
+(gdb) cont
+Continuing.
+[Thread 0x7ffff09ff700 (LWP 4078) exited]
+audio: warning: Using timer based audio emulation
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0) at audio/audio_template.h:304
+(gdb) p (*dev)->driver
+$3 = AUDIODEV_DRIVER_PA
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0) at audio/audio_template.h:304
+(gdb) p (*dev)->driver
+$4 = AUDIODEV_DRIVER_PA
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0) at audio/audio_template.h:304
+(gdb) p (*dev)->driver
+$5 = AUDIODEV_DRIVER_PA
+(gdb) cont
+Continuing.
+[New Thread 0x7ffff09ff700 (LWP 4483)]
+[New Thread 0x7ffddcdff700 (LWP 4489)]
+[New Thread 0x7ffddbdff700 (LWP 4490)]
+[New Thread 0x7ffddb1ff700 (LWP 4491)]
+[New Thread 0x7ffdd2dff700 (LWP 4494)]
+[New Thread 0x7ffdd25fe700 (LWP 4495)]
+[New Thread 0x7ffdd1dfd700 (LWP 4497)]
+[New Thread 0x7ffdda5ff700 (LWP 4500)]
+[New Thread 0x7ffdcedff700 (LWP 4501)]
+qemu-system-x86_64: warning: guest updated active QH
+[Switching to Thread 0x7fffef7ff700 (LWP 4097)]
+
+Thread 4 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0) at audio/audio_template.h:304
+(gdb) p (*dev)->driver
+$6 = 176
+
+
+For what it's worth, guest is Fedora 29, host is a Slackware system with qemu compiled (manually) with these options:
+
+CFLAGS="-O2 -fPIC" \
+CXXFLAGS="-O2 -fPIC" \
+./configure \
+  --prefix=/usr --libdir=/usr/lib64 --sysconfdir=/etc --localstatedir=/var \
+  --enable-gtk \
+  --enable-system \
+  --enable-kvm \
+  --enable-virtfs \
+  --enable-sdl \
+  --enable-gnutls \
+  --enable-curses \
+  --enable-virtfs \
+  --enable-curl \
+  --enable-linux-aio \
+  --enable-vhost-net \
+  --enable-spice \
+  --enable-libusb \
+  --enable-usb-redir \
+  --enable-lzo \
+  --enable-bzip2 \
+  --enable-libssh2 \
+  --enable-numa \
+  --enable-jemalloc \
+  --enable-opengl \
+  --audio-drv-list=alsa,oss,sdl,pa \
+  --enable-vnc --enable-vnc-sasl --enable-vnc-png --enable-vnc-jpeg \
+  --target-list=i386-softmmu,x86_64-softmmu,i386-linux-user,x86_64-linux-user,arm-softmmu,arm-linux-user,armeb-linux-user,sparc64-softmmu,sparc-softmmu,sparc32plus-linux-user,sparc64-linux-user \
+  --enable-debug --extra-cflags="-g3" --extra-ldflags="-g3" --disable-strip --disable-pie  # For debugging only
+
+Can you set a watchpoint for (*dev)->driver and see where it fires?
+
+My gdb-fu isn't great - does the following help?
+
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=dev@entry=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	audio/audio_template.h: No such file or directory.
+(gdb) print (*dev)->driver
+$1 = AUDIODEV_DRIVER_PA
+(gdb) watch *0x7ffff161b6a0
+Hardware watchpoint 4: *0x7ffff161b6a0
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=dev@entry=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	in audio/audio_template.h
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=dev@entry=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	in audio/audio_template.h
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 1, qpa_audio_init (dev=0x7ffff161b6a0) at audio/paaudio.c:831
+831	audio/paaudio.c: No such file or directory.
+(gdb) cont
+Continuing.
+audio: warning: Using timer based audio emulation
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	audio/audio_template.h: No such file or directory.
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	in audio/audio_template.h
+(gdb) cont
+Continuing.
+
+Thread 1 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	in audio/audio_template.h
+(gdb) p (*dev)->driver
+$2 = AUDIODEV_DRIVER_PA
+(gdb) cont
+Continuing.
+[New Thread 0x7ffff09ff700 (LWP 6438)]
+[New Thread 0x7ffddcdff700 (LWP 6439)]
+
+Thread 1 "qemu-system-x86" hit Hardware watchpoint 4: *0x7ffff161b6a0
+
+Old value = -486628296
+New value = 0
+0x00007ffff5422cf0 in __memset_avx2_unaligned_erms () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007ffff5422cf0 in __memset_avx2_unaligned_erms () at /lib64/libc.so.6
+#1  0x00007ffff580cee3 in calloc () at /usr/lib64/libjemalloc.so.2
+#2  0x00007ffff7ac9db1 in g_malloc0 () at /usr/lib64/libglib-2.0.so.0
+#3  0x00007ffff7bc7cc9 in  () at /usr/lib64/libgobject-2.0.so.0
+#4  0x00007ffff7bca8b8 in g_type_register_static () at /usr/lib64/libgobject-2.0.so.0
+#5  0x00007ffff7bca94d in g_type_register_static_simple () at /usr/lib64/libgobject-2.0.so.0
+#6  0x00007ffff7040e3a in  () at /usr/lib64/libgtk-3.so.0
+#7  0x00007ffff7043865 in gtk_icon_theme_get_type () at /usr/lib64/libgtk-3.so.0
+#8  0x00007ffff7043889 in gtk_icon_theme_new () at /usr/lib64/libgtk-3.so.0
+#9  0x00007ffff7043aa5 in gtk_icon_theme_get_for_screen () at /usr/lib64/libgtk-3.so.0
+#10 0x00000000007a0df3 in gtk_display_init (ds=<optimized out>, opts=0xfe7ae0 <dpy>) at ui/gtk.c:2200
+#11 0x0000000000423dd8 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4532
+(gdb) 
+(gdb) cont
+Continuing.
+[Thread 0x7ffddcdff700 (LWP 6439) exited]
+
+Thread 1 "qemu-system-x86" hit Hardware watchpoint 4: *0x7ffff161b6a0
+
+Old value = 0
+New value = -245161264
+0x00007ffff7bc7de1 in ?? () from /usr/lib64/libgobject-2.0.so.0
+(gdb) cont
+Continuing.
+[New Thread 0x7ffddcdff700 (LWP 6507)]
+[New Thread 0x7ffddbbff700 (LWP 6508)]
+[New Thread 0x7ffdd85ff700 (LWP 6509)]
+[New Thread 0x7ffdd25ff700 (LWP 6510)]
+[New Thread 0x7ffdd1dfe700 (LWP 6511)]
+[New Thread 0x7ffdd15fd700 (LWP 6512)]
+[New Thread 0x7ffddaafa700 (LWP 6513)]
+[New Thread 0x7ffdce7ff700 (LWP 6514)]
+[New Thread 0x7ffdcdbff700 (LWP 6515)]
+qemu-system-x86_64: warning: guest updated active QH
+[Switching to Thread 0x7fffee9ff700 (LWP 6340)]
+
+Thread 5 "qemu-system-x86" hit Breakpoint 2, audio_get_pdo_in (dev=0x7ffff161b6a0)
+    at audio/audio_template.h:304
+304	in audio/audio_template.h
+(gdb) print (*dev)->driver
+$3 = 176
+
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

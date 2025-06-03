@@ -1,0 +1,95 @@
+semantic: 0.943
+device: 0.934
+instruction: 0.931
+boot: 0.928
+other: 0.927
+assembly: 0.926
+mistranslation: 0.910
+vnc: 0.893
+socket: 0.888
+graphic: 0.857
+network: 0.855
+KVM: 0.764
+
+Baremetal kernel built from assembly runs multiple times
+
+QEMU version: 4.1.0.
+
+Full command used to launch: qemu-system-arm -machine raspi2 -kernel main
+
+(Technically, the first term of the command is actually "~/Applications/QEMU/qemu-4.1.0/build/arm-softmmu/qemu-system-arm", but I shortened it for readability.)
+
+Host information: Running debian 9.9 on a 64-bit x86 processor (Intel i5-2520M).
+
+Guest information: No operating system. I'm providing my own kernel, which I assembled from a 60-line ARM assembly program using arm-none-eabi-as and then linked with arm-none-eabi-ld, both version 2.28-5+9+b3.
+
+Additional details: To view the screen output of the program, I am using vncviewer version 6.19.1115 (r42122). All of the above software packages were installed as debian packages using apt, except for QEMU, which I built from source after downloading from the official website.
+
+.
+
+The issue here is that I have written a program in assembly and it isn't doing what I expect it to when I emulate it. Here's a summary of the code:
+
+1) Read a number from zero-initialized memory.
+
+2) Add one to the number and write it back.
+
+3) Use the number to determine a screen location to write to.
+
+4) Use the number to determine what color to write.
+
+5) Write 4000 half-words to the screen starting at that offset and using that color. This should result in a stripe across the whole screen that's about 6 pixels tall.
+
+The expected behavior is that *one* stripe should appear on the screen in a single color. However, the actual behavior is that up to *four* stripes appear, each in a different color. Furthermore, if I comment out the line that writes the incremented counter back to memory, then only one stripe will appear.
+
+I will also note that the Raspberry Pi 2, which is the system I'm emulating, has four cores. What I suspect is going on here is that my code is being loaded onto all four cores of the emulated machine. I couldn't find anything about this anywhere in the documentation, and it strikes me as bug.
+
+I have attached the assmebly code that I'm using, as well as a short makefile. Since I can only add one attachment to this report, I've combined the two into a single text file and labeled each. After separating the two into two files, you will need to change the first line of the makefile to point to your installation of qemu-system-arm v4.1.0. After that, type "make run" to run the program.
+
+Thanks in advance,
+Evan Rysdam
+
+
+
+I just noticed that on lines 53 and 55 of the attached file, I forgot to replace the register "r0" with its alias "address". Fixing these lines doesn't change the behavior of the program.
+
+Hi Evan,
+
+Your suspicion is correct, the QEMU model starts with the four cores powered on, so your code is likely running on each core in simultaneous.
+
+The hardware booting process is described [1]: your code is loaded as the firmware loads kernel.img (the last step).
+
+The ARM maintainer suggested [2] a way to bypass this: "[your binary] could be wrapped in a small guest binary that deals with handling all the secondary cores". This is not hard to do, but nobody volunteered to do it yet :)
+
+[1] https://raspberrypi.stackexchange.com/questions/10442/what-is-the-boot-sequence
+[2] https://<email address hidden>/msg655415.html
+
+Aha! So this is not a bug after all, but an intentional feature.
+
+Does "deal with handling all the secondary cores" basically mean "detecting what core I'm currently running on, and continuing only if it's the primary core"? If so, it's not clear to me how I could do this. I tried a few obvious ideas, like inspecting the value of r0 as soon as the program boots up, but I wasn't able to find a way to distinguish between the cores. Could you point me to any resources that would have the answer?
+
+Thanks for your quick response!
+Evan Rysdam
+
+You can look at hw/arm/raspi.c::write_smpboot():
+
+While the first core start booting the kernel, the other cores keep spinning until the 1st core configured the mailboxes:
+
+static const uint32_t smpboot[] = {
+    0xe1a0e00f, /*    mov     lr, pc */
+    0xe3a0fe00 + (BOARDSETUP_ADDR >> 4), /* mov pc, BOARDSETUP_ADDR */
+    0xee100fb0, /*    mrc     p15, 0, r0, c0, c0, 5;get core ID */
+    0xe7e10050, /*    ubfx    r0, r0, #0, #2       ;extract LSB */
+    0xe59f5014, /*    ldr     r5, =0x400000CC      ;load mbox base */
+    0xe320f001, /* 1: yield */
+    0xe7953200, /*    ldr     r3, [r5, r0, lsl #4] ;read mbox for our core*/
+    0xe3530000, /*    cmp     r3, #0               ;spin while zero */
+    0x0afffffb, /*    beq     1b */
+    0xe7853200, /*    str     r3, [r5, r0, lsl #4] ;clear mbox */
+    0xe12fff13, /*    bx      r3                   ;jump to target */
+    0x400000cc, /* (constant: mailbox 3 read/clear base) */
+};
+
+When the mailboxes are configured, all the cores can communicate between each others (and with the VC GPU).
+
+Ah, I've been missing out on a whole host of ARM instructions. I haven't tried it yet, but I should be able to get it working from here. Thanks so much for your help!
+

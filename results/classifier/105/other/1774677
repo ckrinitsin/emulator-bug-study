@@ -1,0 +1,178 @@
+semantic: 0.955
+mistranslation: 0.954
+other: 0.952
+vnc: 0.947
+boot: 0.936
+device: 0.936
+assembly: 0.935
+socket: 0.935
+graphic: 0.931
+instruction: 0.914
+KVM: 0.914
+network: 0.910
+
+-icount increases boot time by >10x
+
+When I specify the -icount option, some guest operations such as booting a Linux kernel take more than 10 times longer than otherwise.  For example, the following will boot Aboriginal Linux to the login prompt about 6 seconds on my system (using TCG, not KVM):
+
+wget http://landley.net/aboriginal/downloads/old/binaries/1.4.5/system-image-i686.tar.gz
+gunzip <system-image-i686.tar.gz | tar xfv -
+cd system-image-i686
+sh run-emulator.sh
+
+If I replace the last line with
+
+QEMU_EXTRA="-icount shift=auto" sh run-emulator.sh
+
+booting to the login prompt takes about 1 minute 20 seconds.
+
+I have tried different values for "shift" other than the "auto" used above, but have not been able to find one that gives reasonable performance.  Specifying "sleep=off" also did not help.
+
+During the slow boots, qemu appears to spend most of its time sleeping, not using the host CPU.
+
+I see this with multiple versions of qemu, including current git sources (c181ddaa176856b3cd2dfd12bbcf25fa9c884a97), and on multiple host OSes, including Debian 9 on x86_64.
+
+Yes, I can reproduce this. Also, interestingly, with the -icount version when I typed 'exit' to quit the guest I got this abort:
+
+qemu: fatal: cpu_io_recompile: could not find TB for pc=0x7fcd0aae636e
+EAX=c88053a4 EBX=00000069 ECX=c00211a4 EDX=00000000
+ESI=c7812180 EDI=c78126f0 EBP=0000000f ESP=c7a0de44
+EIP=c11ada30 EFL=00000287 [--S--PC] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =007b 00000000 ffffffff 00cff300 DPL=3 DS   [-WA]
+CS =0060 00000000 ffffffff 00cf9a00 DPL=0 CS32 [-R-]
+SS =0068 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =007b 00000000 ffffffff 00cff300 DPL=3 DS   [-WA]
+FS =0000 00000000 00000000 00000000
+GS =0033 080a130c ffffffff 00dff300 DPL=3 DS   [-WA]
+LDT=0000 00000000 00000000 00008200 DPL=0 LDT
+TR =0080 c12fbe60 0000206b 00008900 DPL=0 TSS32-avl
+GDT=     c12f6000 000000ff
+IDT=     ffffc000 000007ff
+CR0=8005003b CR2=09d40ffc CR3=07a08000 CR4=00000690
+DR0=00000000 DR1=00000000 DR2=00000000 DR3=00000000 
+DR6=ffff0ff0 DR7=00000400
+CCS=c8800000 CCD=c8805200 CCO=SUBL    
+EFER=0000000000000000
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001f80
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=ec00000000000000 4006
+XMM00=00000000000000000000000000000000 XMM01=00000000000000000000000000000000
+XMM02=00000000000000000000000000000000 XMM03=00000000000000000000000000000000
+XMM04=00000000000000000000000000000000 XMM05=00000000000000000000000000000000
+XMM06=00000000000000000000000000000000 XMM07=00000000000000000000000000000000
+Aborted (core dumped)
+
+
+...ah, that's the bug fixed by this patch: https://patchwork.ozlabs.org/patch/940058/
+
+
+The stalls in the test kernel seem to happen at and after the guest prints
+
+tsc: Refined TSC clocksource calibration: 1000.022 MHz
+clocksource: tsc: mask: 0xffffffffffffffff max_cycles: 0xe6a2bd9634, max_idle_ns: 440795211s
+hdc: QEMU DVD-ROM, ATAPI CD/DVD-ROM drive
+clocksource: Switched to clocksource tsc
+
+so I suspect a bad interaction between what icount is doing and in particular our emulation of the x86 timestamp counter and what Linux does with it.
+
+
+A couple of comments...  First, the problem is not limited to Linux guests.  In fact, I originally ran across it with a NetBSD guest, but then reproduced it with a Linux guest for the bug report, because in my experience, qemu bug reports involving non-Linux guests tend to be ignored.
+
+Second, the qemu man page says that "With sleep=on|off, the virtual time will jump to the next timer deadline instantly whenever the virtual cpu goes to sleep mode".  Although the text is confusing (see bug 1774412), to me it suggests that when the mode in case is selected, qemu should execute the guest as fast as possible and only provide it with an illusion of the passage of time, and there should be no reason for qemu itself to ever sleep.  Yet, regardless of whether I specify "sleep=on" or "sleep=off", qemu sleeps.
+
+
+I bisected this using the following test case (after the setup shown in the original bug report, and replacing "e1000" by "ne2k_pci" in the run-emulator.sh script to avoid a panic in the e1000 driver with some qemu versions):
+
+QEMU_EXTRA="-icount shift=3,sleep=off" sh run-emulator.sh
+
+The bisection identified the following commit:
+
+281b2201e4e18d5b9a26e1e8d81b62b5581a13be is the first bad commit
+commit 281b2201e4e18d5b9a26e1e8d81b62b5581a13be
+Author: Pavel Dovgalyuk <email address hidden>
+Date:   Thu Mar 10 14:56:03 2016 +0300
+
+    icount: remove obsolete warp call
+
+    qemu_clock_warp call in qemu_tcg_wait_io_event function is not needed
+    anymore, because it is called in every iteration of main_loop_wait.
+
+    Reviewed-by: Paolo Bonzini <email address hidden>
+
+    Signed-off-by: Pavel Dovgalyuk <email address hidden>
+    Message-Id: <20160310115603.4812.67559.stgit@PASHA-ISP>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+With revision 281b2201e4e18d5b9a26e1e8d81b62b5581a13be, the test case takes 141 seconds to boot.  With the previous revision, 33577b47c64435fcc2a1bc01c7e82534256f1fc3, it takes 1.7 seconds.
+
+
+I can reproduce it. But there is one interesting thing.
+When I replace "-nographic" with "-serial stdio" everything is ok,
+icount works normally.
+
+But "-nographic" runs are very slow in icount mode.
+It seems that GUI produces some events that force main loop to iterate.
+
+Does reverting the commit fix it? It was just a cleanup I think.
+
+Yes, I tried to revert (with some updates to the current code base) and the bug was fixed:
+
+diff --git a/cpus.c b/cpus.c
+index 181ce33..e2fc972 100644
+--- a/cpus.c
++++ b/cpus.c
+@@ -1172,6 +1172,13 @@ static void qemu_tcg_rr_wait_io_event(CPUState *cpu)
+ {
+     while (all_cpu_threads_idle()) {
+         stop_tcg_kick_timer();
++
++        qemu_mutex_unlock_iothread();
++        replay_mutex_lock();
++        qemu_mutex_lock_iothread();
++        qemu_start_warp_timer();
++        replay_mutex_unlock();
++
+         qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
+     }
+ 
+
+
+I tested Pavel's patch, applying it to master (c447afd5783b9237fa51b7a85777007d8d568bfc), but I'm afraid it only made things worse - qemu has now been booting the test kernel for 30 minutes but the boot has still not completed.  The last console messages printed were:
+
+piix 0000:00:01.1: not 100% native mode: will probe irqs later
+    ide0: BM-DMA at 0xc100-0xc107
+    ide1: BM-DMA at 0xc108-0xc10f
+
+Running strace -p on the qemu process shows it calling ppoll once per second:
+
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+ppoll([{fd=0, events=POLLIN}, {fd=7, events=POLLIN}, {fd=8, events=POLLIN}, {fd=10, events=POLLIN}, {fd=11, events=POLLIN}], 5, {tv_sec=1, tv_nsec=0}, NULL, 8) = 0 (Timeout)
+
+
+
+We figured out that there are races or something.
+I run QEMU under Ubuntu in VirtualBox (which has 1 CPU) and it works normally.
+On the real machine with multiple cores QEMU stalls with this patch.
+
+Looks like the bug was fixed by this commit:
+
+commit 013aabdc665e4256b38d8875a1a7b5e030ba98f1
+Author: Clement Deschamps <email address hidden>
+Date:   Sun Oct 21 16:21:03 2018 +0200
+
+    icount: fix deadlock when all cpus are sleeping
+
+    When all cpus are sleeping (e.g in WFI), to avoid a deadlock
+    in the main_loop, wake it up in order to start the warp timer.
+
+    Signed-off-by: Clement Deschamps <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+

@@ -1,0 +1,113 @@
+other: 0.736
+graphic: 0.622
+network: 0.599
+device: 0.565
+KVM: 0.552
+instruction: 0.541
+vnc: 0.536
+semantic: 0.518
+assembly: 0.496
+mistranslation: 0.494
+boot: 0.486
+socket: 0.475
+
+Coding bug in the function serial_ioport_write in serial.c
+
+Branch hash: b50ea0d  (pulled from github).
+
+I was reviewing the code and noticed the following in the function serial_ioport_write:
+
+    assert(size == 1 && addr < 8);
+        .
+        .
+        .
+    switch(addr) {
+    default:
+    case 0:
+        if (s->lcf & UART_LCR_DLAB) {
+            if (size == 1) {
+                s->divider = (s->divider & 0xff00) | val;
+            } else {
+                s->divider = val;
+            }
+        }
+
+The assert will trigger if the size is > 1, so the else of the if (size == 1) will never be executed and an attempt to specify a size > 1 will trigger an assert.
+
+The documentation for the UART indicates that the 16-bit divisor is broken up amongst 2 8-bit registers (DLL and DLM).  There already is code to handle the DLL and DLM portions of the divider register (as coded).
+
+This is not exactly going to cause a bug, as there is no code that calls this function with a value for size other than 1.  It is just unnecessary code.
+
+Since commit 5ec3a23e6c8 ("serial: convert PIO to new memory
+api read/write") we don't need to worry about accesses bigger
+than 8-bit. Use the extract()/deposit() functions to access
+the correct part of the 16-bit 'divider' register.
+
+Reported-by: Jonathan D. Belanger <email address hidden>
+Buglink: https://bugs.launchpad.net/qemu/+bug/1904331
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Cc: Bug 1904331 <email address hidden>
+---
+ hw/char/serial.c | 13 +++++--------
+ 1 file changed, 5 insertions(+), 8 deletions(-)
+
+diff --git a/hw/char/serial.c b/hw/char/serial.c
+index 97f71879ff2..62c627f486f 100644
+--- a/hw/char/serial.c
++++ b/hw/char/serial.c
+@@ -24,6 +24,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "qemu/bitops.h"
+ #include "hw/char/serial.h"
+ #include "hw/irq.h"
+ #include "migration/vmstate.h"
+@@ -338,11 +339,7 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+     default:
+     case 0:
+         if (s->lcr & UART_LCR_DLAB) {
+-            if (size == 1) {
+-                s->divider = (s->divider & 0xff00) | val;
+-            } else {
+-                s->divider = val;
+-            }
++            s->divider = deposit32(s->divider, 8 * addr, 8, val);
+             serial_update_parameters(s);
+         } else {
+             s->thr = (uint8_t) val;
+@@ -364,7 +361,7 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+         break;
+     case 1:
+         if (s->lcr & UART_LCR_DLAB) {
+-            s->divider = (s->divider & 0x00ff) | (val << 8);
++            s->divider = deposit32(s->divider, 8 * addr, 8, val);
+             serial_update_parameters(s);
+         } else {
+             uint8_t changed = (s->ier ^ val) & 0x0f;
+@@ -478,7 +475,7 @@ static uint64_t serial_ioport_read(void *opaque, hwaddr addr, unsigned size)
+     default:
+     case 0:
+         if (s->lcr & UART_LCR_DLAB) {
+-            ret = s->divider & 0xff;
++            ret = extract16(s->divider, 8 * addr, 8);
+         } else {
+             if(s->fcr & UART_FCR_FE) {
+                 ret = fifo8_is_empty(&s->recv_fifo) ?
+@@ -502,7 +499,7 @@ static uint64_t serial_ioport_read(void *opaque, hwaddr addr, unsigned size)
+         break;
+     case 1:
+         if (s->lcr & UART_LCR_DLAB) {
+-            ret = (s->divider >> 8) & 0xff;
++            ret = extract16(s->divider, 8 * addr, 8);
+         } else {
+             ret = s->ier;
+         }
+-- 
+2.26.2
+
+
+
+https://gitlab.com/qemu-project/qemu/-/commit/29daa894b6c31eae074d
+

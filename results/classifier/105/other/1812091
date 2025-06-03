@@ -1,0 +1,76 @@
+other: 0.891
+semantic: 0.884
+graphic: 0.879
+device: 0.845
+network: 0.824
+instruction: 0.819
+vnc: 0.811
+boot: 0.809
+assembly: 0.808
+KVM: 0.771
+socket: 0.739
+mistranslation: 0.642
+
+gdbstub memory accesses performed with wrong attributes
+
+Qemu-commit: b2f7c27f56bf1116ebb7848c75914aa7c5d6a040
+
+
+The ARMv8-M architecture (with security extensions) contains a SAU, the Security Attribution Unit. After booting the mps2-an505 and immediately halting (`-S`), I attempt to read the SAU_TYPE register, located at 0xE000EDD4, using gdb (x 0xE000EDD4). The returned value is 0, while the expected value is 8 (number of regions).
+
+On further investigation, it seems that `attrs.secure` is set to false (armv7m_nvic.c - nvic_readl, line 1167). Commenting out the check will return the correct value.
+
+As the CPU should be in 'secure' mode after reset, I think this behavior is wrong.
+
+Steps to reproduce:
+Example code that loads an endless loop into the beginning of secure memory: https://github.com/ajblane/armv8m-hello
+
+Commandline: qemu-system-arm -machine mps2-an505 -cpu cortex-m33 \
+	                    -m 4096 \
+			    -nographic -serial mon:stdio \
+	                    -kernel $(IMAGE) -s -S
+
+Attach with arm-none-eabi-gdb, and run x 0xE000EDD4.
+
+This is not an issue with the CPU emulation, it is a bug in the gdb memory read/write path, which currently effectively always does its accesses as nonsecure. The CPU itself is correctly coming out of reset in secure mode and will be able to read the correct value of the register.
+
+I suspect that the following change will fix this:
+diff --git a/exec.c b/exec.c
+index 6e875f0640a..2f0f40b0be6 100644
+--- a/exec.c
++++ b/exec.c
+@@ -3881,12 +3881,10 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
+         phys_addr += (addr & ~TARGET_PAGE_MASK);
+         if (is_write) {
+             address_space_write_rom(cpu->cpu_ases[asidx].as, phys_addr,
+-                                    MEMTXATTRS_UNSPECIFIED,
+-                                    buf, l);
++                                    attrs, buf, l);
+         } else {
+             address_space_rw(cpu->cpu_ases[asidx].as, phys_addr,
+-                             MEMTXATTRS_UNSPECIFIED,
+-                             buf, l, 0);
++                             attrs, buf, l, 0);
+         }
+         len -= l;
+         buf += l;
+
+
+I'll test it later today and send it as a proper patch if it works.
+
+
+Hello Peter and thanks a lot for your quick response.
+
+I have tested the patch and it seems to work! Looks like my testing code was buggy, apologies for the inaccurate bug description.
+
+Thanks,
+Thomas
+
+Patch sent to list:
+
+https://patchwork.ozlabs.org/patch/1026664/
+
+
+This fix is now in git master and will be in the upcoming 4.0 QEMU release.
+
+

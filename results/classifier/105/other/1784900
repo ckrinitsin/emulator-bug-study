@@ -1,0 +1,178 @@
+other: 0.956
+instruction: 0.947
+device: 0.943
+graphic: 0.936
+boot: 0.936
+semantic: 0.935
+socket: 0.934
+assembly: 0.931
+mistranslation: 0.905
+KVM: 0.904
+network: 0.890
+vnc: 0.869
+
+QEMU (frontend) crashes upon warm reboot with virtio-gpu device and vga=775 on Linux cmdline
+
+With vga=775 on the Linux command line a first boot of the VM running Linux works fine. After a warm reboot it crashes during Linux boot. The VM was used remotely via virt-manager and VNC.
+
+Bisecting the code lead to the following patch that introduced the bug:
+
+commit 1fccd7c5a9a722a9cbf1bc91693f4618034f01ac (HEAD, refs/bisect/bad)
+Author: Gerd Hoffmann <email address hidden>
+Date:   Mon Jul 2 18:24:43 2018 +0200
+
+    virtio-gpu: disable scanout when backing resource is destroyed
+
+    Signed-off-by: Gerd Hoffmann <email address hidden>
+    Reviewed-by: Marc-André Lureau <email address hidden>
+    Message-id: <email address hidden>
+
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 336dc59007..08cd567218 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -430,6 +430,16 @@ static void virtio_gpu_disable_scanout(VirtIOGPU *g, int scanout_id)
+ static void virtio_gpu_resource_destroy(VirtIOGPU *g,
+                                         struct virtio_gpu_simple_resource *res)
+ {
++    int i;
++
++    if (res->scanout_bitmask) {
++        for (i = 0; i < g->conf.max_outputs; i++) {
++            if (res->scanout_bitmask & (1 << i)) {
++                virtio_gpu_disable_scanout(g, i);
++            }
++        }
++    }
++
+     pixman_image_unref(res->image);
+     virtio_gpu_cleanup_mapping(res);
+     QTAILQ_REMOVE(&g->reslist, res, next);
+
+
+Reported backtraces can be found here:  https://paste.fedoraproject.org/paste/OUDEfCk1IY7xiy0I0PDlkw
+
+I also hit this with gtk frontend rather than vnc althought he backtrace looks very different.
+
+The reason for this bug is memory corruption in glibc's memory chunk header that is in front of some bitmap pixman is allocating and maintaining as image->bits.free_me. I set a memory watchpoint to this memory location and this code here triggered it and corrupted what seems to be a memory chunk size indicator, which upon free() causes print of 'invalid pointer' by glibc:
+
+Thread 1 "qemu-system-x86" hit Hardware watchpoint 2: *0x7f6160361d88
+
+Old value = 3145749
+New value = 0
+vga_draw_line8 (vga=vga@entry=0x556d68549b30, d=0x7f6160361d80 "", d@entry=0x7f61603615e0 "", addr=983528, width=<optimized out>)
+    at /home/stefanb/tmp/qemu-tip/hw/display/vga-helpers.h:297
+297	        ((uint32_t *)d)[3] = palette[vga_read_byte(vga, addr + 3)];
+
+
+(gdb) bt
+#0  vga_draw_line8 (vga=vga@entry=0x556d68549b30, d=0x7f6160361d80 "", d@entry=0x7f61603615e0 "", addr=983528, width=<optimized out>)
+    at /home/stefanb/tmp/qemu-tip/hw/display/vga-helpers.h:297
+#1  0x0000556d659918ee in vga_draw_graphic (full_update=0, s=0x556d68549b30) at /home/stefanb/tmp/qemu-tip/hw/display/vga.c:1695
+#2  vga_update_display (opaque=0x556d68549b30) at /home/stefanb/tmp/qemu-tip/hw/display/vga.c:1782
+#3  0x0000556d65c0cd92 in vnc_refresh (dcl=0x556d683055a8) at ui/vnc.c:3046
+#4  0x0000556d65bff702 in dpy_refresh (s=0x556d686be540) at ui/console.c:1658
+#5  gui_update (opaque=0x556d686be540) at ui/console.c:205
+#6  0x0000556d65d0deac in timerlist_run_timers (timer_list=0x556d66de0e00) at util/qemu-timer.c:536
+#7  0x0000556d65d0e0f7 in qemu_clock_run_timers (type=QEMU_CLOCK_REALTIME) at util/qemu-timer.c:547
+#8  qemu_clock_run_all_timers () at util/qemu-timer.c:674
+#9  0x0000556d65d0e5d1 in main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:503
+#10 0x0000556d65a5f2ee in main_loop () at vl.c:1865
+#11 0x0000556d658ff166 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4643
+
+
+This patch here fixes the issue, but is likely introducing inefficiency. There are two if statements above the patch that should set full_update = 1 due to 'some change', but none of them triggers it. So I think the surface is wrong and needs to be recreated.
+
+diff --git a/hw/display/vga.c b/hw/display/vga.c
+index ed476e4e80..71b5684994 100644
+--- a/hw/display/vga.c
++++ b/hw/display/vga.c
+@@ -1571,6 +1571,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
+          * must be updated with the new base address */
+         full_update = 1;
+     }
++    full_update = 1;
+
+     if (full_update) {
+         if (share_surface) {
+
+
+A better solution may be this one here:
+
+diff --git a/hw/display/vga.c b/hw/display/vga.c
+index ed476e4e80..4f365b6d43 100644
+--- a/hw/display/vga.c
++++ b/hw/display/vga.c
+@@ -1566,7 +1566,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
+         full_update = 1;
+     }
+     if (surface_data(surface) != s->vram_ptr + (s->start_addr * 4)
+-        && is_buffer_shared(surface)) {
++        /*&& is_buffer_shared(surface)*/) {
+         /* base address changed (page flip) -> shared display surfaces
+          * must be updated with the new base address */
+         full_update = 1;
+
+
+Another patch that seems to work tries to remember the old surface:
+
+diff --git a/hw/display/vga.c b/hw/display/vga.c
+index ed476e4e80..1aae6a6d3b 100644
+--- a/hw/display/vga.c
++++ b/hw/display/vga.c
+@@ -1554,7 +1554,8 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
+         height != s->last_height ||
+         s->last_depth != depth ||
+         s->last_byteswap != byteswap ||
+-        share_surface != is_buffer_shared(surface)) {
++        share_surface != is_buffer_shared(surface) ||
++        s->last_surface != surface) {
+         /* display parameters changed -> need new display surface */
+         s->last_scr_width = disp_width;
+         s->last_scr_height = height;
+@@ -1563,8 +1564,10 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
+         s->last_line_offset = s->line_offset;
+         s->last_depth = depth;
+         s->last_byteswap = byteswap;
++        s->last_surface = surface;
+         full_update = 1;
+     }
++    fprintf(stderr, "%p vs %p   share_surface: %d   surface: %p\n", surface_data(surface), s->vram_ptr + (s->start_addr * 4), share_surface, surface);
+     if (surface_data(surface) != s->vram_ptr + (s->start_addr * 4)
+         && is_buffer_shared(surface)) {
+         /* base address changed (page flip) -> shared display surfaces
+diff --git a/hw/display/vga_int.h b/hw/display/vga_int.h
+index f8fcf62a56..91afc52b0e 100644
+--- a/hw/display/vga_int.h
++++ b/hw/display/vga_int.h
+@@ -122,6 +122,7 @@ typedef struct VGACommonState {
+     uint32_t last_width, last_height; /* in chars or pixels */
+     uint32_t last_scr_width, last_scr_height; /* in pixels */
+     uint32_t last_depth; /* in bits */
++    void *last_surface;
+     bool last_byteswap;
+     bool force_shadow;
+     uint8_t cursor_start, cursor_end;
+
+
+On my system vga_draw_graphic is called with a surface_width(surface) = 1280, the next time surface_width(surface) = 1024, and then the next time again with surface_width(surface) = 1280. So it's a quick resolution change. Each time the surface pointer changes as well as surface_width(surface) and surface_data(surface). Do NOT try to access the s->last_surface with surface_data(s->last_surface) -- it likely has been freed already.
+
+So my guess is we could add (a subset of) checks like this one here:
+
+if (s->last_surface != surface ||
+    s->last_surface_width != surface_width(surface) ||
+    s->last_surface_height != surface_height(surface) ||
+    s->last_surface_data != surface_data(surface)) {
+
+    s->last_surface = surface;
+    s->last_surface_width = surface_width(surface);
+    ...
+    full_update = 1;
+}
+
+
+see also "[PATCH] virtio-gpu: fix crashes upon warm reboot with vga mode" for a potential fix
+
+Fix has been added here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=93f874fe9dbe0b997b5a94
+

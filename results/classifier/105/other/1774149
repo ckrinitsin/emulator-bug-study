@@ -1,0 +1,118 @@
+other: 0.980
+semantic: 0.978
+assembly: 0.977
+graphic: 0.974
+mistranslation: 0.972
+device: 0.971
+instruction: 0.969
+socket: 0.969
+boot: 0.964
+network: 0.945
+vnc: 0.943
+KVM: 0.918
+
+qemu-user x86_64 x86 gdb call function from gdb doesn't work
+
+While running qemu user x86_64 x86 with gdb server, calling functions are not working.
+
+Here is how to reproduce it:
+
+run in a terminal:
+$ qemu-x86_64 -g 12345 -L / /bin/ls
+
+In another terminal run gdb:
+(gdb) file /bin/ls
+(gdb) target remote :12345
+(gdb) b _init
+(gdb) c
+(gdb) call malloc(1)
+Could not fetch register "fs_base"; remote failure reply 'E14'
+
+In other cases we also got the error:
+Could not fetch register "orig_rax"; remote failure reply 'E14'
+
+Here is how I patched it (it is only a workaround):
+
+diff --git a/gdbstub.c b/gdbstub.c
+index 2a94030..5749efe 100644
+--- a/gdbstub.c
++++ b/gdbstub.c
+@@ -668,6 +668,11 @@ static int gdb_read_register(CPUState *cpu, uint8_t *mem_buf, int reg)
+             return r->get_reg(env, mem_buf, reg - r->base_reg);
+         }
+     }
++#ifdef TARGET_X86_64
++    return 8;
++#elif TARGET_I386
++    return 4;
++#endif
+     return 0;
+ }
+
+(Our guess for this issue was, gdb is requesting for 'fake' registers to know register size)
+
+Once we patched that, we got another problem while calling functions from gdb: We could call functions, but only once.
+
+Here is how to reproduce it:
+run in a terminal:
+$ qemu-x86_64 -g 12345 -L / /bin/ls
+
+In another terminal run gdb:
+(gdb) file /bin/ls
+(gdb) target remote :12345
+(gdb) b _init
+(gdb) c
+(gdb) call malloc(1)
+$1 = (void *) 0x620010
+(gdb) call malloc(1)
+Cannot access memory at address 0x40007ffb8f
+
+Here is how we patched it to make it work:
+
+diff --git a/exec.c b/exec.c
+index 03238a3..d303922 100644
+--- a/exec.c
++++ b/exec.c
+@@ -2833,7 +2833,7 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
+         if (!(flags & PAGE_VALID))
+             return -1;
+         if (is_write) {
+-            if (!(flags & PAGE_WRITE))
++            if (!(flags & (PAGE_WRITE | PAGE_WRITE_ORG)))
+                 return -1;
+             /* XXX: this code should not depend on lock_user */
+             if (!(p = lock_user(VERIFY_WRITE, addr, l, 0)))
+
+From what we saw, there is a page which is passed to read-only after first execution, and gdb need to write on that page to put a breakpoint. (on the stack)
+
+We suspect this is linked to this:
+https://qemu.weilnetz.de/w64/2012/2012-06-28/qemu-tech.html#Self_002dmodifying-code-and-translated-code-invalidation
+
+I have verified the second issue: the second call of function gives error "Cannot access memory at address".
+I have tried it for various architectures. It is same for mips. But it works for aarch64.
+
+It seems the issue is related to gdb code: set_gdbarch_call_dummy_location (gdbarch, ON_STACK);
+
+What is going on?
+The breakpoint is stored on stack and for the first time the address has a flag PAGE_WRITE.
+After a call, the address does not have anymore the flag PAGE_WRITE. It is changed in method tb_page_add() (file: accel/tcg/translate-all.c).
+
+I am thinking more about gdbstub.c.
+If there is handled packet M for writing data to memory, it should always write data to given address.
+Reason: you are debugging and you want to verify various scenarios, so changing different values on different places may be needed.
+
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

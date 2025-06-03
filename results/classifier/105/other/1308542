@@ -1,0 +1,189 @@
+other: 0.978
+graphic: 0.971
+assembly: 0.969
+semantic: 0.968
+instruction: 0.964
+boot: 0.964
+socket: 0.955
+network: 0.954
+device: 0.954
+mistranslation: 0.944
+vnc: 0.937
+KVM: 0.925
+
+hang in qemu_gluster_init
+
+In qemu_gluster_init, if the call to either glfs_set_volfile_server or glfs_set_logging fails into the "out" case, glfs_fini is called without having first calling glfs_init.  This causes glfs_lock to spin forever on this bit:
+
+	while (!fs->init)
+		pthread_cond_wait (&fs->cond, &fs->mutex);
+
+And here's the bottom part of the backtrace when hung:
+
+#0  pthread_cond_wait@@GLIBC_2.3.2 () at ../nptl/sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:183
+#1  0x00007feceebf58c3 in glfs_lock (fs=0x7fecf15660b0) at glfs-internal.h:156
+#2  glfs_active_subvol (fs=0x7fecf15660b0) at glfs-resolve.c:799
+#3  0x00007feceebeb5b4 in glfs_fini (fs=0x7fecf15660b0) at glfs.c:652
+#4  0x00007fecf0043c73 in qemu_gluster_init (gconf=<value optimized out>, filename=<value optimized out>) at /usr/src/debug/qemu-kvm-0.12.1.2/block/gluster.c:229
+
+I believe this can be fixed by simply moving the call to glfs_init after the call to glfs_new but before the calls to glfs_set_volfile_server or glfs_set_logging.
+
+Am 16.04.2014 um 15:25 hat John Eckersberg geschrieben:
+> Public bug reported:
+> 
+> In qemu_gluster_init, if the call to either glfs_set_volfile_server or
+> glfs_set_logging fails into the "out" case, glfs_fini is called without
+> having first calling glfs_init.  This causes glfs_lock to spin forever
+> on this bit:
+> 
+> 	while (!fs->init)
+> 		pthread_cond_wait (&fs->cond, &fs->mutex);
+> 
+> And here's the bottom part of the backtrace when hung:
+> 
+> #0  pthread_cond_wait@@GLIBC_2.3.2 () at ../nptl/sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:183
+> #1  0x00007feceebf58c3 in glfs_lock (fs=0x7fecf15660b0) at glfs-internal.h:156
+> #2  glfs_active_subvol (fs=0x7fecf15660b0) at glfs-resolve.c:799
+> #3  0x00007feceebeb5b4 in glfs_fini (fs=0x7fecf15660b0) at glfs.c:652
+> #4  0x00007fecf0043c73 in qemu_gluster_init (gconf=<value optimized out>, filename=<value optimized out>) at /usr/src/debug/qemu-kvm-0.12.1.2/block/gluster.c:229
+> 
+> I believe this can be fixed by simply moving the call to glfs_init after
+> the call to glfs_new but before the calls to glfs_set_volfile_server or
+> glfs_set_logging.
+
+Bharata, can you check whether this is the correct solution, and if so,
+send out a patch?
+
+Kevin
+
+
+On Thu, Apr 17, 2014 at 11:27:52AM +0200, Kevin Wolf wrote:
+> Am 16.04.2014 um 15:25 hat John Eckersberg geschrieben:
+> > Public bug reported:
+> > 
+> > In qemu_gluster_init, if the call to either glfs_set_volfile_server or
+> > glfs_set_logging fails into the "out" case, glfs_fini is called without
+> > having first calling glfs_init.  This causes glfs_lock to spin forever
+> > on this bit:
+> > 
+> > 	while (!fs->init)
+> > 		pthread_cond_wait (&fs->cond, &fs->mutex);
+> > 
+> > And here's the bottom part of the backtrace when hung:
+> > 
+> > #0  pthread_cond_wait@@GLIBC_2.3.2 () at ../nptl/sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:183
+> > #1  0x00007feceebf58c3 in glfs_lock (fs=0x7fecf15660b0) at glfs-internal.h:156
+> > #2  glfs_active_subvol (fs=0x7fecf15660b0) at glfs-resolve.c:799
+> > #3  0x00007feceebeb5b4 in glfs_fini (fs=0x7fecf15660b0) at glfs.c:652
+> > #4  0x00007fecf0043c73 in qemu_gluster_init (gconf=<value optimized out>, filename=<value optimized out>) at /usr/src/debug/qemu-kvm-0.12.1.2/block/gluster.c:229
+> > 
+> > I believe this can be fixed by simply moving the call to glfs_init after
+> > the call to glfs_new but before the calls to glfs_set_volfile_server or
+> > glfs_set_logging.
+> 
+> Bharata, can you check whether this is the correct solution, and if so,
+> send out a patch?
+
+I think glfs_set_volfile_server should have been called before glfs_init.
+Anyway will check gluster folks and send out an appropriate patch for this.
+
+BTW we haven't hit this problem till now because glfs_fini was nop when
+we wrote this driver but has been functionally implemented now.
+
+Regards,
+Bharata.
+
+
+
+" glfs_init" cannot be called before since it checks for cmds_args->volfile_server which is allocated only in "glfs_set_volfile_server".   We should either modify "glfs_fini" or define a new function to do the cleanup based on if init is done or not.
+
+On Fri, Apr 18, 2014 at 02:38:57PM -0000, Soumya Koduri wrote:
+> " glfs_init" cannot be called before since it checks for
+> cmds_args->volfile_server which is allocated only in
+> "glfs_set_volfile_server".   We should either modify "glfs_fini" or
+
+Soumya - Thanks for offering to fix this in gluster.
+(Ref: http://lists.gnu.org/archive/html/gluster-devel/2014-04/msg00192.html)
+
+Kevin - I will wait for this fix to be available in libgfapi before
+changing QEMU.
+
+Regards,
+Bharata.
+
+
+
+Also I should add a note to this related bug I filed against gluster - https://bugzilla.redhat.com/show_bug.cgi?id=1088589
+
+This bug is what causes the glfs_set_logging call to fail, and fall into the hang case.
+
+A complete fix has been included in the glusterfs master-branch. It has not (yet) been requested or marked for backporting to a stable (3.5.x) branch.
+
+* https://bugzilla.redhat.com/1091335 with http://review.gluster.org/7857
+
+The issue with glfs_set_logging is fixed in the almost released glusterfs-3.5.1 (https://bugzilla.redhat.com/1103413).
+
+Verified that this fixes the hang and no change is required in gluster
+driver of QEMU after this fix in glusterfs code.
+
+
+On Mon, Jun 23, 2014 at 11:59 PM, nixpanic <email address hidden> wrote:
+
+> A complete fix has been included in the glusterfs master-branch. It has
+> not (yet) been requested or marked for backporting to a stable (3.5.x)
+> branch.
+>
+> * https://bugzilla.redhat.com/1091335 with
+> http://review.gluster.org/7857
+>
+> The issue with glfs_set_logging is fixed in the almost released
+> glusterfs-3.5.1 (https://bugzilla.redhat.com/1103413).
+>
+> --
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1308542
+>
+> Title:
+>   hang in qemu_gluster_init
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   In qemu_gluster_init, if the call to either glfs_set_volfile_server or
+>   glfs_set_logging fails into the "out" case, glfs_fini is called
+>   without having first calling glfs_init.  This causes glfs_lock to spin
+>   forever on this bit:
+>
+>         while (!fs->init)
+>                 pthread_cond_wait (&fs->cond, &fs->mutex);
+>
+>   And here's the bottom part of the backtrace when hung:
+>
+>   #0  pthread_cond_wait@@GLIBC_2.3.2 () at
+> ../nptl/sysdeps/unix/sysv/linux/x86_64/pthread_cond_wait.S:183
+>   #1  0x00007feceebf58c3 in glfs_lock (fs=0x7fecf15660b0) at
+> glfs-internal.h:156
+>   #2  glfs_active_subvol (fs=0x7fecf15660b0) at glfs-resolve.c:799
+>   #3  0x00007feceebeb5b4 in glfs_fini (fs=0x7fecf15660b0) at glfs.c:652
+>   #4  0x00007fecf0043c73 in qemu_gluster_init (gconf=<value optimized
+> out>, filename=<value optimized out>) at
+> /usr/src/debug/qemu-kvm-0.12.1.2/block/gluster.c:229
+>
+>   I believe this can be fixed by simply moving the call to glfs_init
+>   after the call to glfs_new but before the calls to
+>   glfs_set_volfile_server or glfs_set_logging.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1308542/+subscriptions
+>
+>
+
+
+-- 
+http://raobharata.wordpress.com/
+
+
+Closing according to comment #7.
+

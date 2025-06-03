@@ -1,0 +1,143 @@
+other: 0.788
+graphic: 0.783
+mistranslation: 0.730
+semantic: 0.729
+instruction: 0.726
+assembly: 0.723
+network: 0.722
+socket: 0.706
+vnc: 0.675
+device: 0.666
+boot: 0.661
+KVM: 0.649
+
+windows 10 display scale will cause an exception
+Description of problem:
+windows dispaly sacle 150% or higher,  windows system will exception
+Steps to reproduce:
+1.  windows dispaly sacle 150%
+Additional information:
+- code in: qemu/hw/display/qxl-render.c
+
+static void qxl_unpack_chunks(void *dest, size_t size, PCIQXLDevice *qxl,
+                              QXLDataChunk *chunk, uint32_t group_id)
+{
+    uint32_t max_chunks = 32;
+    size_t offset = 0;
+    size_t bytes;
+    for (;;) {
+        bytes = MIN(size - offset, chunk->data_size);
+        memcpy(dest + offset, chunk->data, bytes);
+        offset += bytes;
+        if (offset == size) {
+            return;
+        }
+        chunk = qxl_phys2virt(qxl, chunk->next_chunk, group_id,
+                              sizeof(QXLDataChunk) + chunk->data_size);
+         **// get next chunk, but the chunk size use current chunk's data size, not next chunk's data size!!!!**
+         **// if next chunk alloc size < current chunk's data size, there will be exception **
+         
+        if (!chunk) {
+            return;
+        }
+        max_chunks--;
+        if (max_chunks == 0) {
+            return;
+        }
+    }
+}
+
+
+
+- code in: qxl_wddm_dod/QXLDod.cpp exist next chunk alloc size < current chunk's data size 
+
+NTSTATUS  QxlDevice::SetPointerShape(_In_ CONST DXGKARG_SETPOINTERSHAPE* pSetPointerShape)
+{
+.....
+    res = (Resource *)AllocMem(MSPACE_TYPE_VRAM, CURSOR_ALLOC_SIZE, TRUE);  // here we all the first QXLDataChunk , and alloc_size = (CURSOR_ALLOC_SIZE - sizeof(Resource) - sizeof(InternalCursor)) = 8118
+
+.....
+     for (; src != src_end; src += pSetPointerShape->Pitch) {
+        if (!PutBytesAlign(&chunk, &now, &end, src, line_size, PAGE_SIZE - PAGE_SIZE % line_size, NULL)) { // in this function ,we will alloc next QXLDataChunk 
+            ..........
+            break;
+        }
+    }
+}
+
+BOOLEAN QxlDevice::PutBytesAlign(QXLDataChunk **chunk_ptr, UINT8 **now_ptr,
+                            UINT8 **end_ptr, UINT8 *src, int size,
+                            size_t alloc_size, PLIST_ENTRY pDelayed)
+{
+    .....
+    size_t maxAllocSize = BITS_BUF_MAX - BITS_BUF_MAX % size;
+    alloc_size = MIN(alloc_size, maxAllocSize);
+    void *ptr = AllocMem(MSPACE_TYPE_VRAM, alloc_size + sizeof(QXLDataChunk), bForced);  *** //here will  alloc  next  QXLDataChunk  and  alloc_size  = (PAGE_SIZE - PAGE_SIZE % line_size) = 3876 ****
+}
+
+
+eg:
+dispaly sacle 150% ，mouse size will bu change to  57* 55  ，rgba data size = 12540,   we  need three QXLDataChunk  
+
+QXLDataChunk* first;
+first->data_size = 8118;
+first->prev_chunk = 0;
+first->next_chunk=second;
+first->data = [alloc_size(8118), data_size(8118)]
+
+QXLDataChunk* second;
+second->data_size = 3876;
+second->prev_chunk = first;
+second->next_chunk=third;
+second->data = [alloc_size(3876), data_size(3876)]
+
+QXLDataChunk* third;
+third->data_size = 546;
+third->prev_chunk =second;
+third->next_chunk=0;
+third->data = [alloc_size(3876), data_size(546)]
+
+
+chunk = first;
+qxl_phys2virt(qxl, second, group_id, sizeof(QXLDataChunk) + 8118)
+
+
+this size [sizeof(QXLDataChunk) + 8118]  > second  QXLDataChunk's  alloc  size  , will  cause  qxl_get_check_slot_offset check fail
+
+
+for second QXLDataChunk, we actual alloc size  is (sizeof(QXLDataChunk) + 3876),  but we assign (8118 + sizeof(QXLDataChunk))  will cause an exception
+
+
+suggest code :
+
+static void qxl_unpack_chunks(void *dest, size_t size, PCIQXLDevice *qxl,
+                              QXLDataChunk *chunk, uint32_t group_id)
+{
+    uint32_t max_chunks = 32;
+    size_t offset = 0;
+    size_t bytes;
+    QXLPHYSICAL next_chunk_phys = 0; 
+    for (;;) {
+        bytes = MIN(size - offset, chunk->data_size);
+        memcpy(dest + offset, chunk->data, bytes);
+        offset += bytes;
+        if (offset == size) {
+            return;
+        }
+        next_chunk_phys = chunk->next_chunk;
+        chunk = qxl_phys2virt(qxl, next_chunk_phys, group_id,
+                              sizeof(QXLDataChunk));  // fist time, only get the next chunk's data size;
+        if (!chunk) {
+            return;
+        }
+        chunk = qxl_phys2virt(qxl, next_chunk_phys, group_id,
+                              sizeof(QXLDataChunk) + chunk->data_size); // second time, check data size and get data;
+        if (!chunk) {
+            return;
+        }
+        max_chunks--;
+        if (max_chunks == 0) {
+            return;
+        }
+    }
+}

@@ -1,0 +1,75 @@
+boot: 0.829
+device: 0.678
+socket: 0.657
+network: 0.595
+instruction: 0.589
+vnc: 0.551
+semantic: 0.529
+graphic: 0.529
+KVM: 0.380
+mistranslation: 0.363
+other: 0.315
+assembly: 0.168
+
+Signal handlers in x86_64 userspace have wrongly aligned stack
+Description of problem:
+Various applications crash in signal handlers due to `movaps` getting a misaligned stack address. For some reason this is reported as a NULL deref, but `gdb` clearly shows the true cause.
+
+```plaintext
+> qemu-x86_64 /usr/bin/ruby -e '`true`'
+-e:1: [BUG] Segmentation fault at 0x0000000000000000
+ruby 3.2.2 (2023-03-30 revision e51014f9c0) [x86_64-linux-gnu]
+
+-- Control frame information -----------------------------------------------
+c:0003 p:---- s:0011 e:000010 CFUNC  :`
+c:0002 p:0005 s:0006 e:000005 EVAL   -e:1 [FINISH]
+c:0001 p:0000 s:0003 E:0015b0 DUMMY  [FINISH]
+
+-- Ruby level backtrace information ----------------------------------------
+-e:1:in `<main>'
+-e:1:in ``'
+
+-- Machine register context ------------------------------------------------
+ RIP: 0x00002aaaab50f98a RBP: 0x00002aaaabb136b8 RSP: 0x00002aaaab2a9c98
+ RAX: 0x0000000000000000 RBX: 0x0000000000004946 RCX: 0x0000000000000000
+ RDX: 0x00002aaaab2a9c98 RDI: 0x000000000caf0000 RSI: 0x0000000000000000
+  R8: 0x00002aaaab2aaa50  R9: 0x0000000000000050 R10: 0x0000000000000008
+ R11: 0x0000000000000000 R12: 0x0000000000000002 R13: 0x0000000000007310
+ R14: 0x0000000000005e10 R15: 0x00002aaab0537f20 EFL: 0x0000000000000246
+
+-- C level backtrace information -------------------------------------------
+```
+
+```plaintext
+(gdb) x/i $pc
+=> 0x2aaaab50f98a:      movaps %xmm0,(%rsp)
+(gdb) p/x $rsp
+$3 = 0x2aaaab2a9998
+```
+Steps to reproduce:
+1. ```qemu-x86_64 /usr/bin/ruby -e '`true`'```
+Additional information:
+The x86_64 psABI says:
+
+> the value (%rsp − 8) is always a multiple of 16 when control is transferred to the function entry point.
+
+However, when QEMU jumps to the signal handler, $rsp is aligned to 16B, i.e. ends in `0x..0`.
+
+The relevant kernel code:
+
+https://elixir.bootlin.com/linux/v6.5.5/source/arch/x86/kernel/signal.c#L123
+
+```plaintext
+	sp -= frame_size;
+
+	if (ia32_frame)
+		/*
+		 * Align the stack pointer according to the i386 ABI,
+		 * i.e. so that on function entry ((sp + 4) & 15) == 0.
+		 */
+		sp = ((sp + 4) & -FRAME_ALIGNMENT) - 4;
+	else
+		sp = round_down(sp, FRAME_ALIGNMENT) - 8;
+```
+
+CC @lvivier @bonzini @rth7680

@@ -1,0 +1,1006 @@
+mistranslation: 0.514
+device: 0.512
+network: 0.502
+instruction: 0.496
+boot: 0.495
+semantic: 0.486
+assembly: 0.473
+KVM: 0.431
+other: 0.411
+graphic: 0.380
+socket: 0.344
+vnc: 0.344
+
+Avoid migration issues with aligned 2MB THB
+
+------- Comment From <email address hidden> 2018-08-20 17:12 EDT-------
+Hi, in some environments it was observed that this qemu patch to enable THP made it more likely to hit guest migration issues, however the following kernel patch resolves those migration issues:
+
+https://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git/commit/?h=kvm-ppc-next&id=c066fafc595eef5ae3c83ae3a8305956b8c3ef15
+KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+
+Once merged upstream, it would be good to include that change as well to avoid potential migration problems. Should I open a new bug for that or is it better to track here?
+
+Note Paelzer: I have not seen related migration issues myself, but it seems reasonable and confirmed by IBM.
+
+Oh, I just realized while initially reported against qemu in bug 1781526 that this is a kernel, and not a qemu patch.
+
+That spreads the timeline a bit:
+- this should be in Cosmic before Release to avoid issues due to the fix of 1781526.
+  - since that is kind of short I'll bump priority there.
+- This has to be in Bionic before a fix for bug 1781526 (I'll wait with a qemu change until this one is complete)
+
+I'm marking the qemu task invalid (no action there other than to track the Bionic release of this which will finally unblock the SRU of bug 1781526 to Bionic).
+
+I'm adding a kernel task to reflect that this is a kernel change that is needed.
+Finally I'm adding a Cosmic and Bionic Task.
+
+This bug is missing log files that will aid in diagnosing the problem. While running an Ubuntu kernel (not a mainline or third-party kernel) please enter the following command in a terminal window:
+
+apport-collect 1788098
+
+and then change the status of the bug to 'Confirmed'.
+
+If, due to the nature of the issue you have encountered, you are unable to run this command, please add a comment stating that fact and change the bug status to 'Confirmed'.
+
+This change has been made by an automated script, maintained by the Ubuntu Kernel Team.
+
+For this particular case the log files are not needed and/or applicable.
+After discussing in #stable-kernel I set it to confirmed.
+
+FYI: this is essentially an IBM request, reverse mirroring will happen at some point, but I wanted to make you aware right now
+
+I built a test kernel with the following patch:
+KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+
+The test kernel can be downloaded from:
+http://kernel.ubuntu.com/~jsalisbury/lp1788098
+
+Can you test this kernel and see if it resolves this bug?
+
+Note about installing test kernels:
+• If the test kernel is prior to 4.15(Bionic) you need to install the linux-image and linux-image-extra .deb packages.
+• If the test kernel is 4.15(Bionic) or newer, you need to install the linux-modules, linux-modules-extra and linux-image-unsigned .deb packages.
+
+Thanks in advance!
+
+------- Comment From <email address hidden> 2018-08-30 10:29 EDT-------
+Thanks, I've asked for some testing assistance from our KVM team but will note here some of the details from the original report of this problem..
+
+repro steps are just a simple local host migration.
+
+..they later noted that increasing the speed was a workaround:
+(qemu) migrate_set_speed 1G
+
+so you would want to test w/ default speed to confirm the issue is resolved
+
+(qemu) migrate -d tcp:localhost:4444
+
+using " cosmic qemu version 1:2.12+dfsg-3 " from Bug 169712 / LP 1781526 (which enables qemu to use 2MB THP backing for powerpc), plus the test kernel build from this bug.
+
+Note without the kernel fix discussed in this bug, a migration problem might still happen even without that qemu THP patch if you got lucky enough to have a 2MB alignment by chance.
+
+Marking as incomplete while awaiting the IBM testing assistance described in comment #6.
+
+Nothing yet happened here.
+I also declared the related qemu fix that is blocked by this as incomplete.
+@manoj/jfh - maybe time for triage-r here?
+
+After discussions with IBM, reducing the priority.
+
+------- Comment From <email address hidden> 2018-12-21 12:10 EDT-------
+Hello,
+
+I have been trying to reproduce this bug over this week, but I couldn't do so on Ubuntu.
+
+Could anyone verify what I have been doing wrong?
+
+#################
+
+## QEMU
+
+I have built version Qemu 3.1.0 and made sure the patch that enables THP was included:
+../configure --target-list=ppc-linux-user,ppc64-linux-user,ppc64le-linux-user,ppc-softmmu,ppc64-softmmu --enable-debug-info --enable-trace-backends=log --python=/usr/bin/python3 && make -j $(nproc)'
+
+./ppc-softmmu/qemu-system-ppc -version
+QEMU emulator version 3.1.0 (v3.1.0-dirty)
+
+## Kernel
+
+uname -a
+Linux NAME 4.15.0-20-generic #21-Ubuntu SMP Tue Apr 24 06:14:44 UTC 2018 ppc64le ppc64le ppc64le GNU/Linux
+
+cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+
+## CLI command
+
+Both commands were sent on the same host,  (1) is the "migrating from" instance and (2) is the "migrate to" instance.
+
+(1)
+MALLOC_PERTURB_=1 /home/leonardo/qemu/build/ppc64-softmmu/qemu-system-ppc64 \
+-nographic \
+-serial mon:stdio \
+-S  \
+-name 'avocado-vt-vm1'  \
+-machine pseries  \
+-nodefaults  \
+-vga std \
+-device pci-bridge,id=pci_bridge,bus=pci.0,addr=0x3,chassis_nr=1  \
+-device virtio-serial-pci,id=virtio_serial_pci0,bus=pci.0,addr=0x4 \
+-object rng-random,filename=/dev/random,id=passthrough-RHq4nIpF \
+-device virtio-rng-pci,id=virtio-rng-pci-aXCni2OX,rng=passthrough-RHq4nIpF,bus=pci.0,addr=0x5 \
+-device nec-usb-xhci,id=usb1,bus=pci.0,addr=0x6 \
+-device virtio-scsi-pci,id=virtio_scsi_pci0,bus=pci.0,addr=0x7 \
+-drive id=drive_image1,if=none,snapshot=off,aio=native,cache=none,format=qcow2,file=/home/leonardo/images/ubuntu-18.04-ppc64le.qcow2 \
+-device scsi-hd,id=image1,drive=drive_image1 \
+-m 8192  \
+-smp 4,maxcpus=4,cores=2,threads=1,sockets=2 \
+-device usb-tablet,id=usb-tablet1,bus=usb1.0,port=1  \
+-vnc :0  \
+-rtc base=utc,clock=host  \
+-boot order=cdn,once=c,menu=off,strict=off \
+-enable-kvm  \
+-watchdog i6300esb \
+-watchdog-action reset \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x9
+
+(2) Same as above. Changes only a few stuff:
+- -name 'avocado-vt-vm1'  \
++ -name 'avocado-vt-vm2'  \
+- -vnc :0  \
++ -vnc :1  \
++ -incoming tcp:0:5801 \
+
+## Testing and Results
+
+(1) On guest :
+# stress --io 5 --cpu 4
+stress: info: [812] dispatching hogs: 4 cpu, 5 io, 0 vm, 0 hdd
+
+(1) on Qemu Terminal:
+(qemu) migrate_set_speed 256
+(qemu) migrate -d tcp:0:5801
+(qemu) info migrate
+globals:
+store-global-state: on
+only-migratable: off
+send-configuration: on
+send-section-footer: on
+capabilities: xbzrle: off rdma-pin-all: off auto-converge: off zero-blocks: off compress: off events: off postcopy-ram: off x-colo: off release-ram: off block: off return-path: off pause-before-switchover: off x
+-multifd: off dirty-bitmaps: off
+Migration status: completed
+total time: 1776 milliseconds
+downtime: 61 milliseconds
+setup: 9 milliseconds
+transferred ram: 422571 kbytes
+throughput: 1964.89 mbps
+remaining ram: 0 kbytes
+total ram: 8405056 kbytes
+duplicate: 2006371 pages
+skipped: 0 pages
+normal: 101037 pages
+normal bytes: 404148 kbytes
+dirty sync count: 3
+page size: 4 kbytes
+(qemu) info status
+VM status: paused (postmigrate)
+
+It's all over on ~2 seconds, no issues. Stress stay running on the new machine. (after cont)
+
+###
+
+Other Qemu tested, with the same result:
+v2.12 git
+v3.0.0 git
+Debian 1:2.12+dfsg-3ubuntu8)
+
+Other Host Kernel tested, with the same result:
+4.18.0 - Vanilla, no patch
+4.15.0-42-generic
+4.15.0-42-generic + patch
+4.15.0-32-generic (provided by jsalisbury)
+4.15.0-20-generic
+4.15.0 - Vanilla, no patch
+
+------- Comment From <email address hidden> 2019-01-04 06:12 EDT-------
+I have tried the following test in order to reproduce the bug:
+
+##
+root@localhost:~# uname -a
+Linux localhost 4.15.0-20-generic #21-Ubuntu SMP Tue Apr 24 06:14:44 UTC 2018 ppc64le ppc64le ppc64le GNU/Linux
+root@localhost:~# cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+##
+
+dd if=/dev/urandom of=/dev/shm/img bs=2M  count=2000
+md5sum /dev/shm/img > test.md5
+
+After the migration, i did:
+md5sum -c test.md5
+And the result was OK. (memory not corrupted).
+
+I also modified the above test allocating chunks of 2M, this way:
+
+for i in {0001..2000} ; do dd if=/dev/urandom of=/dev/shm/img_${i} bs=2M count=1 ; done
+md5sum /dev/shm/* > test.md5
+
+After the migration, i did:
+md5sum -c test.md5
+And the result was OK for every file. (memory not corrupted).
+
+Conclusion:
+- I have found no difference between patched and unpatched kernel during the tests.
+- The memory after the migration seems fine, returning the same memory block (tested with md5sum)
+
+Is there any other suggestion about how to reproduce the bug?
+
+Thanks!
+
+------- Comment From <email address hidden> 2019-01-04 14:29 EDT-------
+Test: Verify all memory after migration
+
+###################
+Host:
+###################
+
+# uname -a
+Linux host 4.15.0-20-generic #21-Ubuntu SMP Tue Apr 24 06:14:44 UTC 2018 ppc64le ppc64le ppc64le GNU/Linux
+
+#cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+
+#cat /proc/cpuinfo
+[...]
+processor	: 159
+cpu		        : POWER9, altivec supported
+clock		: 2300.000000MHz
+revision	        : 2.2 (pvr 004e 1202)
+
+timebase	: 512000000
+platform	        : PowerNV
+model		: 8375-42A
+machine		: PowerNV 8375-42A
+firmware	        : OPAL
+MMU		: Radix
+
+As previously, I have built version Qemu 3.1.0 and made sure the patch that enables THP was included:
+#../configure --target-list=ppc-linux-user,ppc64-linux-user,ppc64le-linux-user,ppc-softmmu,ppc64-softmmu --enable-debug-info --enable-trace-backends=log --python=/usr/bin/python3 && make -j $(nproc)'
+
+#./ppc-softmmu/qemu-system-ppc -version
+QEMU emulator version 3.1.0 (v3.1.0-dirty)
+
+###################
+Guest:
+###################
+
+### CLI 1:  Migrating from:
+MALLOC_PERTURB_=1 /home/leonardo/qemu/build/ppc64-softmmu/qemu-system-ppc64 \
+-nographic \
+-serial mon:stdio \
+-name 'avocado-vt-vm1'  \
+-machine pseries  \
+-nodefaults  \
+-vga std \
+-device pci-bridge,id=pci_bridge,bus=pci.0,addr=0x3,chassis_nr=1  \
+-device virtio-serial-pci,id=virtio_serial_pci0,bus=pci.0,addr=0x4 \
+-object rng-random,filename=/dev/random,id=passthrough-RHq4nIpF \
+-device virtio-rng-pci,id=virtio-rng-pci-aXCni2OX,rng=passthrough-RHq4nIpF,bus=pci.0,addr=0x5 \
+-device nec-usb-xhci,id=usb1,bus=pci.0,addr=0x6 \
+-device virtio-scsi-pci,id=virtio_scsi_pci0,bus=pci.0,addr=0x7 \
+-drive id=drive_image1,if=none,snapshot=off,aio=native,cache=none,format=qcow2,file=/home/leonardo/images/ubuntu-18.04-ppc64le.qcow2 \
+-device scsi-hd,id=image1,drive=drive_image1 \
+-m 8192  \
+-smp 4,maxcpus=4,cores=2,threads=1,sockets=2 \
+-device usb-tablet,id=usb-tablet1,bus=usb1.0,port=1  \
+-vnc :0  \
+-rtc base=utc,clock=host  \
+-boot order=cdn,once=c,menu=off,strict=off \
+-enable-kvm  \
+-watchdog i6300esb \
+-watchdog-action reset \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x9 \
+-initrd /boot/initrd.img-4.15.0-20-generic \
+-kernel /boot/vmlinux-4.15.0-20-generic \
+-append "root=UUID=b4ef9412-06d6-4947-9969-f15c7cc2c986 ro quiet splash
+
+### CLI 2:  Migrating To
+Copy of CLI 1, changing:
+
+- -name 'avocado-vt-vm1'  \
++ -name 'avocado-vt-vm2'  \
++ -S
+- -vnc :0  \
++ -vnc :1  \
++ -incoming tcp:0:5801 \
+
+### Inside Guest:
+
+#uname -a
+Linux localhost 4.15.0-20-generic #21-Ubuntu SMP Tue Apr 24 06:14:44 UTC 2018 ppc64le ppc64le ppc64le GNU/Linux
+
+# cat /sys/kernel/mm/transparent_hugepage/enabled
+[always] madvise never
+
+#cat /proc/cpuinfo
+processor	: 3
+cpu		        : POWER9 (architected), altivec supported
+clock		: 2900.000000MHz
+revision	        : 2.2 (pvr 004e 1202)
+
+timebase	: 512000000
+platform	        : pSeries
+model		: IBM pSeries (emulated by qemu)
+machine		: CHRP IBM pSeries (emulated by qemu)
+MMU		: Radix
+
+###################
+Test Software:
+###################
+I created a simple C file to:
+- allocate 2MB blocks,
+- write urandom to them,
+- md5sum all the blocks together,
+- stops, allowing migration,
+- re-md5sum everything,
+- free the blocks.
+
+The attached source file is copied to guest, then compiled:
+#gcc -o memtest memtest.c -lcrypto
+
+###################
+Procedure
+###################
+
+Use CLI commands to bring up Guest "Migrate from" and "Migrate to".
+
+On "Migrate from":
+root@localhost:~# ./memtest
+Block 0
+Block 128
+[...]
+Block 3968
+Allocated 4075 blocks of 2097152 size.
+Md5 = 209a63b9c1f9acd13fa32236229daa9b <Will change each run>
+Press enter key to check memory integrity
+<ctrl + z>
+[1]+  Stopped                 ./memtest
+root@localhost:~# free -h
+total        used        free      shared  buff/cache   available
+Mem:           8.0G        7.7G        246M         64K         21M         37M
+Swap:          758M        758M          0B
+
+- Enter Qemu Monitor: <ctrl + a, c >
+QEMU 3.1.0 monitor - type 'help' for more information
+(qemu) migrate -d tcp:0:5801
+<Wait till completed>
+(qemu) info status
+VM status: paused (postmigrate)
+(qemu) info migrate
+globals:
+store-global-state: on
+only-migratable: off
+send-configuration: on
+send-section-footer: on
+decompress-error-check: on
+capabilities: xbzrle: off rdma-pin-all: off auto-converge: off zero-blocks: off compress: off events: off
+postcopy-ram: off x-colo: off release-ram: off block: off return-path: off pause-before-switchover: off
+x-multifd: off dirty-bitmaps: off postcopy-blocktime: off late-block-activate: off
+Migration status: completed
+total time: 248950 milliseconds
+downtime: 112 milliseconds
+setup: 18 milliseconds
+transferred ram: 9847781 kbytes
+throughput: 269.52 mbps
+remaining ram: 0 kbytes
+total ram: 8405056 kbytes
+duplicate: 143398 pages
+skipped: 0 pages
+normal: 2456826 pages
+normal bytes: 9827304 kbytes
+dirty sync count: 7
+page size: 4 kbytes
+multifd bytes: 0 kbytes
+
+On "Migrate to":
+- Enter Qemu Monitor: <ctrl + a, c >
+(qemu) info status
+VM status: paused
+(qemu) cont
+(qemu)
+- Exit Qemu Monitor: <ctrl + a, c >
+root@localhost:~# fg
+./teste
+<press enter>
+Block 0
+Block 128
+[...]
+Block 3968
+Freed 4075 blocks of 2097152 size.
+Md5 = 209a63b9c1f9acd13fa32236229daa9b
+MD5 match!
+
+###################
+Results
+###################
+- It allocates (almost) all memory, migrate, verify all memory.
+- All memory seems to be intact after migration.
+- I did this test at least 5 times, MD5 matches everytime.
+
+###################
+NEEDINFO
+###################
+I still could not reproduce the bug. Is there any suggestion on how to reproduce it?
+Am I missing something?
+
+
+------- Comment (attachment only) From <email address hidden> 2019-01-04 14:32 EDT-------
+
+
+Hi Leonardo,
+thanks for your efforts trying to verify that.
+Given that you couldn't trigger it I wonder what to do.
+Currently it is incomplete waiting for such a test, but as it seems to elude you I'd suggest we call the bug invalid until we would know otherwise.
+
+For the related bug 1781526 I would think it faces a similar destiny.
+There also the test/verification kind of left us with Jhopper.
+It was said that this bug here might occur more often if 1781526 would be applied.
+While we couldn't trigger the bug here, I'm reluctant to push a nice but minor performance fix while we know it might trigger more crashes.
+
+Therefore I'll set BOTH bugs to invalid and would ask the kernel Team to stop working on this one here until one can provide a working trigger&verification.
+
+------- Comment From <email address hidden> 2019-01-24 09:26 EDT-------
+By suggestion of Michael Ranweiler, I did some concurrent migration tests.
+In fact, I just repeated the procedure used before, but did it twice at roughly the same time (in parallel).
+
+The results are attached.
+Migration 1:  from1.txt to1.txt
+Migration 2:  from2.txt to2.txt
+
+
+------- Comment (attachment only) From <email address hidden> 2019-01-24 09:28 EDT-------
+
+
+------- Comment From <email address hidden> 2019-01-24 09:34 EDT-------
+By the test results, the problem doesn't seem to reproduce.
+
+Are there any other suggestions to reproduce it?
+
+
+------- Comment (attachment only) From <email address hidden> 2019-01-24 09:29 EDT-------
+
+
+
+------- Comment (attachment only) From <email address hidden> 2019-01-24 09:30 EDT-------
+
+
+
+------- Comment (attachment only) From <email address hidden> 2019-01-24 09:33 EDT-------
+
+
+Thanks for your continuous efforts on this Leonardo, I have no further suggestion.
+I think to stay on the safe side we will keep everything as-is for now.
+
+I'd say it is IBMs call to decide between this now:
+a) Speed: Call 1781526 unblocked by the evaluation here. We'd re-consider SRUing that bug then based on your call this won't cause issues on ppc64el.
+b) Safety: since it was only a minor performance improvement but has the potential hidden breakage associated we keep 1781526 in Won't Fix
+
+------- Comment From <email address hidden> 2019-02-08 14:05 EDT-------
+In a meeting with lagarcia, I was informed this patch is very important, and that it is already on kernel 4.18-15 onwards.
+
+In fact, including this one. there are two important patches on this subject:
+
+https://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git/commit/?h=kvm-ppc-next&id=c066fafc595eef5ae3c83ae3a8305956b8c3ef15
+https://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git/commit/?h=kvm-ppc-next&id=6579804c431712d56956a63b1a01509441cc6800
+
+As I said before, for 18.10 onwards (kernel >= 4.18), the patch is available from kernel upstream source, but for Ubuntu 18.04 they may not be so easily applied.
+
+So I will work on backporting them to v4.15.
+
+------- Comment From <email address hidden> 2019-02-19 20:52 EDT-------
+(In reply to comment #34)
+> In a meeting with lagarcia, I was informed this patch is very important, and
+> that it is already on kernel 4.18-15 onwards.
+>
+> In fact, including this one. there are two important patches on this subject:
+>
+> https://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git/commit/
+> ?h=kvm-ppc-next&id=c066fafc595eef5ae3c83ae3a8305956b8c3ef15
+> https://git.kernel.org/pub/scm/linux/kernel/git/paulus/powerpc.git/commit/
+> ?h=kvm-ppc-next&id=6579804c431712d56956a63b1a01509441cc6800
+
+To get those you will need to cherry-pick the following patches from upstream:
+
+39c983ea0f96 KVM: PPC: Remove unused kvm_unmap_hva callback
+c4c8a7643e74 KVM: PPC: Book3S HV: Radix page fault handler optimizations
+f7caf712d885 KVM: PPC: Book3S HV: Streamline setting of reference and change bits
+58c5c276b4c2 KVM: PPC: Book3S HV: Handle 1GB pages in radix page fault handler
+31c8b0d0694a KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot() in page fault handler
+e2560b108fb1 KVM: PPC: Book3S HV: Make radix use correct tlbie sequence in kvmppc_radix_tlbie_page
+7e3d9a1d0f2c KVM: PPC: Book3S HV: Make radix clear pte when unmapping
+df158189dbcc KVM: PPC: Book 3S HV: Do ptesync in radix guest exit path
+21828c99ee91 powerpc/kvm: Switch kvm pmd allocator to custom allocator
+99491e2d0e50 powerpc/mm/radix: Remove unused code
+0078778a86b1 powerpc/mm/radix: implement LPID based TLB flushes to be used by KVM (note that this one will generate some conflicts)
+a5fad1e95952 KVM: PPC: Book3S HV: Use a helper to unmap ptes in the radix fault path
+a5704e83aa3d KVM: PPC: Book3S HV: Recursively unmap all page table entries when unmapping
+d91cb39ffa7b KVM: PPC: Book3S HV: Make radix use the Linux translation flush functions for partition scope
+9a4506e11b97 KVM: PPC: Book3S HV: Make radix handle process scoped LPID flush in C, with relocation on
+bc64dd0e1c4e KVM: PPC: Book3S HV: radix: Refine IO region partition scope attributes
+878cf2bb2d8d KVM: PPC: Book3S HV: radix: Do not clear partition PTE when RC or write bits do not match
+c066fafc595e KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+71d29f43b633 KVM: PPC: Book3S HV: Don't use compound_order to determine host mapping size
+6579804c4317 KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page fault
+
+------- Comment From <email address hidden> 2019-02-25 18:35 EDT-------
+I cherry-picked all patches on top of ubuntu-bionic (Ubuntu-4.15.0-45.48).
+
+Then, the next step was trying to find a way to reproduce the bug.
+
+I have noted, after several tests, that the previous suggestion of Michael Ranweiler was valid, but it's reproduction rate is about 50%. As previously I have tested only a few times, I could not get it to reproduce.
+
+How it fails:
+During 'memtest' second part, on a 'migrated to' guest, one of the migrations (that occur in parallel) would exit with a "Segmentation Fault" and not conclude the normal flow of the test.
+(It never reaches the puts part)
+
+After applying the kernel patches, it seems to work just fine all the times (I have tested 10+ times by now).
+
+The kernel debs generated by the building process can be downloaded on the link bellow:
+
+ftp://testcase.software.ibm.com/fromibm/linux/patched_kernel.tar.gz
+- Please use user=anonymous, passwd=anonymous if asked
+- Make sure to download it soon, as the link will be available for 3 business days.
+
+Building info:
+command: fakeroot debian/rules binary-generic binary-perarch
+git repo (before patches) : git://kernel.ubuntu.com/ubuntu/ubuntu-bionic.git
+(tag: Ubuntu-4.15.0-45.48)
+
+Thanks for all your effort Leonardo,
+that seems to make the bug valid again, but I'll leave that to JFH/Manoj to resurrect it and make it a proper kernel bug as it seems there now is a way to test it (at least you can do so) and a set of patches. I can not speak for the ack/nack of those back-ports but that the kernel Team will do then.
+
+This bug is missing log files that will aid in diagnosing the problem. While running an Ubuntu kernel (not a mainline or third-party kernel) please enter the following command in a terminal window:
+
+apport-collect 1788098
+
+and then change the status of the bug to 'Confirmed'.
+
+If, due to the nature of the issue you have encountered, you are unable to run this command, please add a comment stating that fact and change the bug status to 'Confirmed'.
+
+This change has been made by an automated script, maintained by the Ubuntu Kernel Team.
+
+In comment #22, you mentioned working on a backport of these patches to the Ubuntu 4.15 kernel. Was this successful? Is it possible to attach the backported patchsets to this bug?
+
+...or perhaps I've misunderstood. Are the patches listed in comment #23 the complete set required to resolve the issue (with no complex backporting required)?
+
+ProblemType: Bug
+AlsaDevices:
+ total 0
+ crw-rw---- 1 root audio 116,  1 Feb 26 08:00 seq
+ crw-rw---- 1 root audio 116, 33 Feb 26 08:00 timer
+AplayDevices: Error: [Errno 2] No such file or directory: 'aplay': 'aplay'
+ApportVersion: 2.20.9-0ubuntu7.5
+Architecture: ppc64el
+ArecordDevices: Error: [Errno 2] No such file or directory: 'arecord': 'arecord'
+AudioDevicesInUse: Error: command ['fuser', '-v', '/dev/snd/seq', '/dev/snd/timer'] failed with exit code 1:
+DistroRelease: Ubuntu 18.04
+HibernationDevice: RESUME=/dev/mapper/rhel_zzfp368h-swap
+IwConfig: Error: [Errno 2] No such file or directory: 'iwconfig': 'iwconfig'
+Lsusb:
+ Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
+ Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
+Package: linux (not installed)
+PciMultimedia:
+ 
+ProcEnviron:
+ TERM=xterm
+ PATH=(custom, no user)
+ LANG=en_US.UTF-8
+ SHELL=/bin/bash
+ProcFB:
+ 
+ProcKernelCmdLine: root=/dev/mapper/rhel_zzfp368h-root ro quiet splash
+ProcLoadAvg: 10.92 2.60 0.86 1/1347 9348
+ProcLocks:
+ 1: POSIX  ADVISORY  WRITE 3540 00:17:577 0 EOF
+ 2: FLOCK  ADVISORY  WRITE 3320 00:17:555 0 EOF
+ 3: POSIX  ADVISORY  WRITE 3628 00:17:610 0 EOF
+ 4: POSIX  ADVISORY  WRITE 1743 00:17:351 0 EOF
+ 5: FLOCK  ADVISORY  WRITE 3621 00:17:605 0 EOF
+ProcSwaps:
+ Filename				Type		Size	Used	Priority
+ /dev/dm-1                               partition	16646080	0	-2
+ProcVersion: Linux version 4.15.0-45-generic (buildd@bos02-ppc64el-005) (gcc version 7.3.0 (Ubuntu 7.3.0-16ubuntu3)) #48-Ubuntu SMP Tue Jan 29 16:27:02 UTC 2019
+ProcVersionSignature: Ubuntu 4.15.0-45.48-generic 4.15.18
+RelatedPackageVersions:
+ linux-restricted-modules-4.15.0-45-generic N/A
+ linux-backports-modules-4.15.0-45-generic  N/A
+ linux-firmware                             1.173.3
+RfKill: Error: [Errno 2] No such file or directory: 'rfkill': 'rfkill'
+Tags:  bionic
+Uname: Linux 4.15.0-45-generic ppc64le
+UnreportableReason: This report is about a package that is not installed.
+UpgradeStatus: No upgrade log present (probably fresh install)
+UserGroups:
+ 
+VarLogDump_list:
+ total 36888
+ -r--r----- 1 root root 9520107 Feb 25 15:11 FSPDUMP.13C63FW.0A00000F.20190225210916
+ -r--r----- 1 root root 9556523 Feb 25 15:11 FSPDUMP.13C63FW.1A00000F.20190225211018
+ -r--r----- 1 root root 9642286 Feb 26 08:00 FSPDUMP.13C63FW.2A00000F.20190226135913
+ -r--r----- 1 root root 9041963 Feb 25 15:11 FSPDUMP.13C63FW.7A00000E.20190225203903
+_MarkForUpload: False
+cpu_cores: Number of cores present = 40
+cpu_coreson: Number of cores online = 40
+cpu_dscr: DSCR is 16
+cpu_freq:
+ min:	3.499 GHz (cpu 159)
+ max:	3.500 GHz (cpu 2)
+ avg:	3.499 GHz
+cpu_runmode:
+ Could not retrieve current diagnostics mode,
+ No kernel interface to firmware
+cpu_smt: SMT=4
+
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+apport information
+
+------- Comment From <email address hidden> 2019-02-26 12:36 EDT-------
+(In reply to comment #41)
+> ...or perhaps I've misunderstood. Are the patches listed in comment #23 the
+> complete set required to resolve the issue (with no complex backporting
+> required)?
+
+Yes, the patches listed by Paul are the only ones required to fix the issue.
+
+As noted by Paul, there is only one patch that causes some conflict.
+I have solved this conflict and I will soon attach the full patch series.
+
+------- Comment From <email address hidden> 2019-02-26 12:58 EDT-------
+Here are the patches:
+
+https://gitlab.com/LeoBras/bionic/compare/master...lp1788098
+
+Also, I attached a tgz with the patches.
+
+
+
+------- Comment From <email address hidden> 2019-03-12 14:52 EDT-------
+(In reply to comment #60)
+The patches were sent to Ubuntu kernel-team mailing list.
+
+------- Comment From <email address hidden> 2019-03-14 15:47 EDT-------
+Patchset SRU
+
+[Impact]
+* VMs have a high chance to hit guest migration issues if more than one guest migration happens at a time, while using THP on ppc64le.
+
+* Migrating VMs in parallel will cause at least one guest to crash about half the time.  Since VM migration is a upgrade/uptime strategy this has a fairly large customer impact.
+
+* The uploaded patches correct the behavior of THP on guests. They are available on v4.18.x onwards.
+
+[Test Case]
+
+* One can reproduce the bug by trying two guest migrations, at the same time, following this instructions on comment 12: https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1788098/comments/12
+
+[Regression Potential]
+
+* These patches are already on linux-stable since v4.18.15 (also on hwe), so there is low regression chance.
+
+8afc7da95a7e [Bionic] KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page fault
+82f7758a9c99 [Bionic] KVM: PPC: Book3S HV: Don't use compound_order to determine host mapping size
+b0f7664dc993 [Bionic] KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+1991612ab005 [Bionic] KVM: PPC: Book3S HV: radix: Do not clear partition PTE when RC or write bits do not match
+04fea11aa5fe [Bionic] KVM: PPC: Book3S HV: radix: Refine IO region partition scope attributes
+9037e89d8093 [Bionic] KVM: PPC: Book3S HV: Make radix handle process scoped LPID flush in C, with relocation on
+ed0a86a433c7 [Bionic] KVM: PPC: Book3S HV: Make radix use the Linux translation flush functions for partition scope
+0effe5dc3cf4 [Bionic] KVM: PPC: Book3S HV: Recursively unmap all page table entries when unmapping
+42cbaef5361b [Bionic] KVM: PPC: Book3S HV: Use a helper to unmap ptes in the radix fault path
+414207e08540 [Bionic] powerpc/mm/radix: implement LPID based TLB flushes to be used by KVM
+eb2a70df7099 [Bionic] powerpc/mm/radix: Remove unused code
+ad052e60a417 [Bionic] powerpc/kvm: Switch kvm pmd allocator to custom allocator
+bb2c03e387f4 [Bionic] KVM: PPC: Book 3S HV: Do ptesync in radix guest exit path
+699642e0a4f8 [Bionic] KVM: PPC: Book3S HV: Make radix clear pte when unmapping
+297755f60b17 [Bionic] KVM: PPC: Book3S HV: Make radix use correct tlbie sequence in kvmppc_radix_tlbie_page
+d5f5570b7df4 [Bionic] KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot() in page fault handler
+b0adb3223100 [Bionic] KVM: PPC: Book3S HV: Handle 1GB pages in radix page fault handler
+5be468e7408b [Bionic] KVM: PPC: Book3S HV: Streamline setting of reference and change bits
+860816ea1680 [Bionic] KVM: PPC: Book3S HV: Radix page fault handler optimizations
+7fe24f427a09 [Bionic] KVM: PPC: Remove unused kvm_unmap_hva callback
+
+------- Comment From <email address hidden> 2019-03-26 13:12 EDT-------
+Updating:
+
+The patchset was acked by Juerg Haefliger on Mar 13.
+
+Hi Leonardo,
+unfortunately there was an issue with the SRU request and Juerg NACK-ed it, please have a look here:
+https://lists.ubuntu.com/archives/kernel-team/2019-March/099128.html
+Please re-submit the SRU request with the requested corrections.
+
+------- Comment From <email address hidden> 2019-04-08 10:37 EDT-------
+This (In reply to comment #64)
+> Hi Leonardo,
+> unfortunately there was an issue with the SRU request and Juerg NACK-ed it,
+> please have a look here:
+> https://lists.ubuntu.com/archives/kernel-team/2019-March/099128.html
+> Please re-submit the SRU request with the requested corrections.
+
+The email you posted was from March 10, and is outdated. The changes required were made, and it was acked on March 13, as said on the previous comment.
+
+Please see https://lists.ubuntu.com/archives/kernel-team/2019-March/099221.html
+
+Stefan NACK'ed the series. For some unknown reason that email did make it into the archive so here is ist content:
+
+> Since commit fb1522e099f0 ("KVM: update to new mmu_notifier semantic
+> v2", 2017-08-31), the MMU notifier code in KVM no longer calls the
+> kvm_unmap_hva callback.  This removes the PPC implementations of
+> kvm_unmap_hva().  
+
+This is not really the way SRUs should be done. We cannot remove support for
+interfaces after release. Also the amount of change as a requisite should be
+kept as minimal as possible. This just feels like too many changes without a
+strong argument on why this must be done that way.
+
+-Stefan
+
+
+------- Comment From <email address hidden> 2019-04-10 04:10 EDT-------
+(In reply to comment #66)
+> Stefan NACK'ed the series. For some unknown reason that email did make it
+> into the archive so here is ist content:
+>
+> > Since commit fb1522e099f0 ("KVM: update to new mmu_notifier semantic
+> > v2", 2017-08-31), the MMU notifier code in KVM no longer calls the
+> > kvm_unmap_hva callback.  This removes the PPC implementations of
+> > kvm_unmap_hva().
+>
+> This is not really the way SRUs should be done. We cannot remove support for
+> interfaces after release. Also the amount of change as a requisite should be
+> kept as minimal as possible. This just feels like too many changes without a
+> strong argument on why this must be done that way.
+>
+> -Stefan
+
+Well it was just removing dead code, but whatever.
+
+The series should be fine without that patch.
+
+In comment #22 above, it states that "In a meeting with lagarcia, I was informed this patch is very important, and that it is already on kernel 4.18-15 onwards."
+
+So, I assume that the required patchset(s) are already applied to the 18.04 HWE kernel, and this bug requests a backport to the bionic 4.15 kernel.
+
+Next step is for the Canonical kernel team to analyse this backport request, dropping the commit fb1522e099f0 ("KVM: update to new mmu_notifier semantic v2", 2017-08-31), to assess whether it can be SRU'ed into the bionic 4.15 kernel.
+
+------- Comment From <email address hidden> 2019-04-10 12:08 EDT-------
+(In reply to comment #68)
+> In comment #22 above, it states that "In a meeting with lagarcia, I was
+> informed this patch is very important, and that it is already on kernel
+> 4.18-15 onwards."
+>
+> So, I assume that the required patchset(s) are already applied to the 18.04
+> HWE kernel, and this bug requests a backport to the bionic 4.15 kernel.
+>
+> Next step is for the Canonical kernel team to analyse this backport request,
+> dropping the commit fb1522e099f0 ("KVM: update to new mmu_notifier semantic
+> v2", 2017-08-31), to assess whether it can be SRU'ed into the bionic 4.15
+> kernel.
+
+I may be wrong, but the patch to be dropped is "KVM: PPC: Remove unused kvm_unmap_hva callback" (7fe24f427a09).
+
+On this commit, it says it's removing code that is dead since commit fb1522e099f0.
+
+Leonardo, since you seem to have a reliable reproducer now, could you give this test kernel [1] a try? It just contains commit c066fafc595e ("KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()") and is basically what Joe gave you (comment #5) but at that time you weren't able to reproduce the issue.
+
+[1] https://kernel.ubuntu.com/~juergh/lp1788098/
+
+------- Comment From <email address hidden> 2019-04-29 18:50 EDT-------
+(In reply to comment #70)
+> Leonardo, since you seem to have a reliable reproducer now, could you give
+> this test kernel [1] a try? It just contains commit c066fafc595e ("KVM: PPC:
+> Book3S HV: Use correct pagesize in kvm_unmap_radix()") and is basically what
+> Joe gave you (comment #5) but at that time you weren't able to reproduce the
+> issue.
+>
+> [1] https://kernel.ubuntu.com/~juergh/lp1788098/
+
+Hello Juerg,
+
+As you pointed, this kernel has only one of the 19 patches of the patch series.
+IMHO it would't be very productive to test this kernel as is. It can as well work just fine, but it doesn't have the complete solution to this problems.
+The kernel with the whole patch series is already tested, and solves many other possible issues.
+
+But If you think it's really important to test this one, I will try to schedule it for testing ASAP.
+
+Leonardo, we're evaluating the patch series for inclusion.
+
+Leonardo, can you elaborate on the 'other possible issues'? We're hesitant to pull 18 patches into a stable kernel under the assumption that they *might* fix some *potential* issues, without clear evidence. If you can test the single-patch kernel and report back that there are still issues then that's a much stronger case for the other patches.
+
+Commit 'KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page fault' that you're asking for requires all these additional backports to apply cleanly. Which makes me wonder if we're not actually introducing a problem with these backports just to fix it again later. Not saying that's the case, just wondering...
+
+Also, the following seem to be totally unrelated and unnecessary:
+  - KVM: PPC: Remove unused kvm_unmap_hva callback
+  - powerpc/mm/radix: Remove unused code
+
+While looking through the patches I also noticed that the following is the second patch of a series of 11 but it's the only one from the series that you're backporting.
+  - powerpc/kvm: Switch kvm pmd allocator to custom allocator
+Its commit message mentions subsequent patches of that series so I'm wondering why we need/want only this single patch??
+
+Remember that we have to support this kernel for years and years to come so we only want to backport the absolute necessary.
+
+Lastly and FYI, the following is the minimal subset of your patches that all cherry-pick cleanly:
+  - KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page fault
+  - KVM: PPC: Book3S HV: Don't use compound_order to determine host mapping size
+  - KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+  - KVM: PPC: Book3S HV: radix: Refine IO region partition scope attributes
+  - KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot() in page fault handler
+  - KVM: PPC: Book3S HV: Handle 1GB pages in radix page fault handler
+  - KVM: PPC: Book3S HV: Streamline setting of reference and change bits
+  - KVM: PPC: Book3S HV: Radix page fault handler optimizations
+
+Please provide some context why we need all the above (and potentially more).
+
+------- Comment From <email address hidden> 2019-05-10 19:54 EDT-------
+Hello Juerg,
+
+As this complete list was suggested by Paul, I think he may be the best person to show the context of the patch series.
+
+------- Comment From <email address hidden> 2019-05-13 17:04 EDT-------
+Adding Paul Mackerras - can you help with the context for the patches - beyond the potential performance impact?   We were picking up this series because it fixes the migration problem, which appeared after adding a patch for bug 169712 for performance.  Thanks!
+
+[Expired for linux (Ubuntu) because there has been no activity for 60 days.]
+
+[Expired for linux (Ubuntu Bionic) because there has been no activity for 60 days.]
+
+This bug has expired, marking it as invalid, please reopen if this is still a valid issue.
+
+These patches are still needed to solve the bug, so this bug need to be reopened.
+We are waiting for Paul's reply.
+
+------- Comment From <email address hidden> 2019-09-26 15:42 EDT-------
+Re-opening on our side to test in 19.10.  Everything should be there for that, but it would be good to confirm this in time to get any needed fixes to 20.04, too.  Just being clear at this point we don't need to target bionic - but validate on 19.10.
+
+------- Comment From <email address hidden> 2019-09-27 01:51 EDT-------
+(In reply to comment #73)
+> Leonardo, can you elaborate on the 'other possible issues'? We're hesitant
+> to pull 18 patches into a stable kernel under the assumption that they
+> *might* fix some *potential* issues, without clear evidence. If you can test
+> the single-patch kernel and report back that there are still issues then
+> that's a much stronger case for the other patches.
+>
+> Commit 'KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page
+> fault' that you're asking for requires all these additional backports to
+> apply cleanly. Which makes me wonder if we're not actually introducing a
+> problem with these backports just to fix it again later. Not saying that's
+> the case, just wondering...
+>
+> Also, the following seem to be totally unrelated and unnecessary:
+> - KVM: PPC: Remove unused kvm_unmap_hva callback
+> - powerpc/mm/radix: Remove unused code
+>
+> While looking through the patches I also noticed that the following is the
+> second patch of a series of 11 but it's the only one from the series that
+> you're backporting.
+> - powerpc/kvm: Switch kvm pmd allocator to custom allocator
+> Its commit message mentions subsequent patches of that series so I'm
+> wondering why we need/want only this single patch??
+>
+> Remember that we have to support this kernel for years and years to come so
+> we only want to backport the absolute necessary.
+>
+> Lastly and FYI, the following is the minimal subset of your patches that all
+> cherry-pick cleanly:
+> - KVM: PPC: Book3S HV: Avoid crash from THP collapse during radix page fault
+> - KVM: PPC: Book3S HV: Don't use compound_order to determine host mapping
+> size
+> - KVM: PPC: Book3S HV: Use correct pagesize in kvm_unmap_radix()
+> - KVM: PPC: Book3S HV: radix: Refine IO region partition scope attributes
+> - KVM: PPC: Book3S HV: Use __gfn_to_pfn_memslot() in page fault handler
+> - KVM: PPC: Book3S HV: Handle 1GB pages in radix page fault handler
+> - KVM: PPC: Book3S HV: Streamline setting of reference and change bits
+> - KVM: PPC: Book3S HV: Radix page fault handler optimizations
+>
+> Please provide some context why we need all the above (and potentially more).
+
+OK, so these are the ones *not* included in the above list (oldest to newest, with upstream commit IDs):
+
+39c983ea0f96 KVM: PPC: Remove unused kvm_unmap_hva callback
+
+This one is dead code removal, it can be dropped.
+
+e2560b108fb1 KVM: PPC: Book3S HV: Make radix use correct tlbie sequence in kvmppc_radix_tlbie_page
+
+This one adds barriers which are required according to the architecture specification. It is not strictly related to fixing this bug, but if not included here, another bug should be raised to include it. It is quite safe since it is just adding barrier instructions. Without it there is a possibility of occasional mis-translation of addresses (though perhaps a very small possibility). If another bug is raised for this patch, include df158189dbcc below as well in the same bug.
+
+7e3d9a1d0f2c KVM: PPC: Book3S HV: Make radix clear pte when unmapping
+
+This fixes a real bug, though it is not strictly related to the bug in this bugzilla. If it is not included here then another bug should be raised to include it. It is a small, simple and safe change. Without it there is a possibility of guests getting stuck doing continual hypervisor page faults.
+
+df158189dbcc KVM: PPC: Book 3S HV: Do ptesync in radix guest exit path
+
+This one, like e2560b108fb1 above, adds barriers which are required according to the architecture specification. It is not strictly related to fixing this bug, but if not included here, another bug should be raised to include it. It is quite safe since it is just adding barrier instructions.
+
+21828c99ee91 powerpc/kvm: Switch kvm pmd allocator to custom allocator
+
+This one is not needed and can be dropped.
+
+99491e2d0e50 powerpc/mm/radix: Remove unused code
+
+This is dead code removal and can be dropped.
+
+0078778a86b1 powerpc/mm/radix: implement LPID based TLB flushes to be used by KVM
+
+This is not strictly needed and can be dropped if d91cb39ffa7b and 9a4506e11b97 are being dropped.
+
+a5fad1e95952 KVM: PPC: Book3S HV: Use a helper to unmap ptes in the radix fault path
+
+This is not strictly needed (code refactoring) and can be dropped.
+
+a5704e83aa3d KVM: PPC: Book3S HV: Recursively unmap all page table entries when unmapping
+
+This one fixes a memory leak, so is not strictly related to this bug. The memory leak will probably not be apparent unless users are using 1GB huge pages to back guests.
+
+d91cb39ffa7b KVM: PPC: Book3S HV: Make radix use the Linux translation flush functions for partition scope
+
+This is code refactoring and can be dropped.
+
+9a4506e11b97 KVM: PPC: Book3S HV: Make radix handle process scoped LPID flush in C, with relocation on
+
+This is code refactoring and can be dropped.
+
+878cf2bb2d8d KVM: PPC: Book3S HV: radix: Do not clear partition PTE when RC or write bits do not match
+
+This one is a performance optimization and can be dropped.
+
+So in summary, three of these patches should be included, whether under this bug or under other bugs. The other 9 can be dropped.
+
+I just double-checked all the commits that are mentioned in comment #67.
+
+In between (or let's better say since quite some time) they are all in Eoan master and are also all in Disco master (and with that even in bionic's hwe kernel, despite comment #66: 'no need to target bionic').
+Hence if one uses the default disco and eoan kernel today, it includes the above list of patches (#67).
+With that I change at least the Eoan entry to Fix Released.
+
+Frank, based on your previous comment I'm also flagging disco as Fix Released. Please fix this if it makes no sense (just to be accurate). Thx!
+
+That was abs. correct, Rafael - thx (I just haven't had the permission to add D).
+
+I know it's an old bug, but I just want to confirm if my understanding is correct:
+
+- You have received all the suggested patchs, via mailing list
+- Some of them could not be accepted
+- Paul Mackerras have pointed which patches can be dropped, and which are needed to fix the issue
+- By above comments, bionic hwe, disco and eoan already contain the patches.
+- The patches won't be applied in bionic
+
+Is the above correct?
+
+Hi Leonardo, yes that's correct.
+Focus was changed in the way to make sure that everything is in 19.10, to be well prepared for 20.04 - and 18.04 (GA kernel 4.15) is not targeted (nevertheless 18.04 HWE kernel incl. the patches).
+(All according to LP comment #66.)
+

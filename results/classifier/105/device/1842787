@@ -1,0 +1,221 @@
+mistranslation: 0.948
+device: 0.944
+other: 0.939
+instruction: 0.936
+KVM: 0.929
+assembly: 0.928
+semantic: 0.926
+socket: 0.924
+graphic: 0.922
+vnc: 0.921
+boot: 0.919
+network: 0.915
+
+Writes permanently hang with very heavy I/O on virtio-scsi - worse on virtio-blk
+
+Up to date Arch Linux on host and guest.  linux 5.2.11.  QEMU 4.1.0.  Full command line at bottom.
+
+Host gives QEMU two thin LVM volumes.  The first is the root filesystem, and the second is for heavy I/O, on a Samsung 970 Evo 1TB.
+
+When maxing out the I/O on the second virtual block device using virtio-blk, I often get a "lockup" in about an hour or two.  From the advise of iggy in IRC, I switched over to virtio-scsi.  It ran perfectly for a few days, but then "locked up" in the same way.
+
+By "lockup", I mean writes to the second virtual block device permanently hang.  I can read files from it, but even "touch foo" never times out, cannot be "kill -9"'ed, and is stuck in uninterruptible sleep.
+
+When this happens, writes to the first virtual block device with the root filesystem are fine, so the O/S itself remains responsive.
+
+The second virtual block device uses BTRFS.  But, I have also tried XFS and reproduced the issue.
+
+In guest, when this starts, it starts logging "task X blocked for more than Y seconds".  Below is an example of one of these.  At this point, anything that is or does in the future write to this block device gets stuck in uninterruptible sleep.
+
+-----
+
+INFO: task kcompactd:232 blocked for more than 860 seconds.
+      Not tained 5.2.11-1 #1
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this messae.
+kcompactd0      D    0   232      2 0x80004000
+Call Trace:
+ ? __schedule+0x27f/0x6d0
+ schedule+0x3d/0xc0
+ io_schedule+0x12/0x40
+ __lock_page+0x14a/0x250
+ ? add_to_page_cache_lru+0xe0/0xe0
+ migrate_pages+0x803/0xb70
+ ? isolate_migratepages_block+0x9f0/0x9f0
+ ? __reset_isolation_suitable+0x110/0x110
+ compact_zone+0x6a2/0xd30
+ kcompactd_do_work+0x134/0x260
+ ? kvm_clock_read+0x14/0x30
+ ? kvm_sched_clock_read+0x5/0x10
+ kcompactd+0xd3/0x220
+ ? wait_woken+0x80/0x80
+ kthread+0xfd/0x130
+ ? kcompactd_do_work+0x260/0x260
+ ? kthread_park+0x80/0x80
+ ret_from_fork+0x35/0x40
+
+-----
+
+In guest, there are no other dmesg/journalctl entries other than "task...blocked".
+
+On host, there are no dmesg/journalctl entries whatsoever.  Everything else in host continues to work fine, including other QEMU VM's on the same underlying SSD (but obviously different lvm volumes.)
+
+I understand there might not be enough to go on here, and I also understand it's possible this isn't a QEMU bug.  Happy to run given commands or patches to help diagnose what's going on here.
+
+I'm now running a custom compiled QEMU 4.1.0, with debug symbols, so I can get a meaningful backtrace from the host point of view.
+
+-----
+
+/usr/bin/qemu-system-x86_64
+   -name arch,process=qemu:arch
+   -no-user-config
+   -nodefaults
+   -nographic
+   -uuid 0528162b-2371-41d5-b8da-233fe61b6458
+   -pidfile /tmp/0528162b-2371-41d5-b8da-233fe61b6458.pid
+   -machine q35,accel=kvm,vmport=off,dump-guest-core=off
+   -cpu SandyBridge-IBRS
+   -smp cpus=24,cores=12,threads=1,sockets=2
+   -m 24G
+   -drive if=pflash,format=raw,readonly,file=/usr/share/ovmf/x64/OVMF_CODE.fd
+   -drive if=pflash,format=raw,readonly,file=/var/qemu/0528162b-2371-41d5-b8da-233fe61b6458.fd
+   -monitor telnet:localhost:8000,server,nowait,nodelay
+   -spice unix,addr=/tmp/0528162b-2371-41d5-b8da-233fe61b6458.sock,disable-ticketing
+   -device ioh3420,id=pcie.1,bus=pcie.0,slot=0
+   -device virtio-vga,bus=pcie.1,addr=0
+   -usbdevice tablet
+   -netdev bridge,id=network0,br=br0
+   -device virtio-net-pci,netdev=network0,mac=02:37:de:79:19:09,bus=pcie.0,addr=3
+   -device virtio-scsi-pci,id=scsi1
+   -drive driver=raw,node-name=hd0,file=/dev/lvm/arch_root,if=none,discard=unmap
+   -device scsi-hd,drive=hd0,bootindex=1
+   -drive driver=raw,node-name=hd1,file=/dev/lvm/arch_nvme,if=none,discard=unmap
+   -device scsi-hd,drive=hd1,bootindex=2
+
+-----
+
+On Thu, Sep 05, 2019 at 03:42:03AM -0000, James Harvey wrote:
+> ** Description changed:
+> 
+>   Up to date Arch Linux on host and guest.  linux 5.2.11.  QEMU 4.1.0.
+>   Full command line at bottom.
+>   
+>   Host gives QEMU two thin LVM volumes.  The first is the root filesystem,
+>   and the second is for heavy I/O, on a Samsung 970 Evo 1TB.
+>   
+>   When maxing out the I/O on the second virtual block device using virtio-
+>   blk, I often get a "lockup" in about an hour or two.  From the advise of
+>   iggy in IRC, I switched over to virtio-scsi.  It ran perfectly for a few
+>   days, but then "locked up" in the same way.
+>   
+>   By "lockup", I mean writes to the second virtual block device
+>   permanently hang.  I can read files from it, but even "touch foo" never
+>   times out, cannot be "kill -9"'ed, and is stuck in uninterruptible
+>   sleep.
+>   
+>   When this happens, writes to the first virtual block device with the
+>   root filesystem are fine, so the O/S itself remains responsive.
+>   
+>   The second virtual block device uses BTRFS.  But, I have also tried XFS
+>   and reproduced the issue.
+>   
+>   In guest, when this starts, it starts logging "task X blocked for more
+>   than Y seconds".  Below is an example of one of these.  At this point,
+>   anything that is or does in the future write to this block device gets
+>   stuck in uninterruptible sleep.
+>   
+>   -----
+>   
+>   INFO: task kcompactd:232 blocked for more than 860 seconds.
+>         Not tained 5.2.11-1 #1
+>   "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this messae.
+>   kcompactd0      D    0   232      2 0x80004000
+>   Call Trace:
+>    ? __schedule+0x27f/0x6d0
+>    schedule+0x3d/0xc0
+>    io_schedule+0x12/0x40
+>    __lock_page+0x14a/0x250
+>    ? add_to_page_cache_lru+0xe0/0xe0
+>    migrate_pages+0x803/0xb70
+>    ? isolate_migratepages_block+0x9f0/0x9f0
+>    ? __reset_isolation_suitable+0x110/0x110
+>    compact_zone+0x6a2/0xd30
+>    kcompactd_do_work+0x134/0x260
+>    ? kvm_clock_read+0x14/0x30
+>    ? kvm_sched_clock_read+0x5/0x10
+>    kcompactd+0xd3/0x220
+>    ? wait_woken+0x80/0x80
+>    kthread+0xfd/0x130
+>    ? kcompactd_do_work+0x260/0x260
+>    ? kthread_park+0x80/0x80
+>    ret_from_fork+0x35/0x40
+>   
+>   -----
+>   
+>   In guest, there are no other dmesg/journalctl entries other than
+>   "task...blocked".
+>   
+>   On host, there are no dmesg/journalctl entries whatsoever.  Everything
+>   else in host continues to work fine, including other QEMU VM's on the
+>   same underlying SSD (but obviously different lvm volumes.)
+>   
+>   I understand there might not be enough to go on here, and I also
+>   understand it's possible this isn't a QEMU bug.  Happy to run given
+>   commands or patches to help diagnose what's going on here.
+>   
+>   I'm now running a custom compiled QEMU 4.1.0, with debug symbols, so I
+>   can get a meaningful backtrace from the host point of view.
+>   
+>   I've only recently tried this level of I/O, so can't say if this is a
+>   new issue.
+>   
+> + When writes are hanging, on host, I can connect to the monitor.  Running
+> + "info block" shows nothing unusual.
+> + 
+>   -----
+>   
+>   /usr/bin/qemu-system-x86_64
+>      -name arch,process=qemu:arch
+>      -no-user-config
+>      -nodefaults
+>      -nographic
+>      -uuid 0528162b-2371-41d5-b8da-233fe61b6458
+>      -pidfile /tmp/0528162b-2371-41d5-b8da-233fe61b6458.pid
+>      -machine q35,accel=kvm,vmport=off,dump-guest-core=off
+>      -cpu SandyBridge-IBRS
+>      -smp cpus=24,cores=12,threads=1,sockets=2
+>      -m 24G
+>      -drive if=pflash,format=raw,readonly,file=/usr/share/ovmf/x64/OVMF_CODE.fd
+>      -drive if=pflash,format=raw,readonly,file=/var/qemu/0528162b-2371-41d5-b8da-233fe61b6458.fd
+>      -monitor telnet:localhost:8000,server,nowait,nodelay
+>      -spice unix,addr=/tmp/0528162b-2371-41d5-b8da-233fe61b6458.sock,disable-ticketing
+>      -device ioh3420,id=pcie.1,bus=pcie.0,slot=0
+>      -device virtio-vga,bus=pcie.1,addr=0
+>      -usbdevice tablet
+>      -netdev bridge,id=network0,br=br0
+>      -device virtio-net-pci,netdev=network0,mac=02:37:de:79:19:09,bus=pcie.0,addr=3
+>      -device virtio-scsi-pci,id=scsi1
+>      -drive driver=raw,node-name=hd0,file=/dev/lvm/arch_root,if=none,discard=unmap
+>      -device scsi-hd,drive=hd0,bootindex=1
+>      -drive driver=raw,node-name=hd1,file=/dev/lvm/arch_nvme,if=none,discard=unmap
+>      -device scsi-hd,drive=hd1,bootindex=2
+
+Please post backtrace of all QEMU threads when I/O is hung.  You can use
+"gdb -p $(pidog qemu-system-x86_64)" to connect GDB and "thread apply
+all bt" to produce a backtrace of all threads.
+
+Stefan
+
+
+Apologies, it looks like I ran into two separate bugs, one with XFS, and one with BTRFS, that had the same symptom, initially making me to think this must be a QEMU issue.
+
+Using blktrace, I was able to see within the VM, that the virtio block device wasn't getting the writes that were going into uninterruptible sleep.
+
+So, this should be able to be closed.  For some reason, virtio-blk seemed to trigger the bugs more rapidly, but at this point, I can't say there is anything at fault with it or virtio-scsi.
+
+
+BTRFS issue was discussed and linked to here https://lore.kernel.org<email address hidden>/ and has been released.  I've been able to run it for several days without a lockup, so it seems to have fixed the issue for me.
+
+I just emailed the XFS list about the separate problems with it.  No idea if it's an issue in more recent kernels than 5.1.15-5.1.16, which is what I was running at the time of the XFS errors.  (Like the original report said, I was on 5.2.11 at that point.)  See https://www.spinics.net/lists/linux-xfs/msg31927.html
+
+Thanks for updating us on this issue, which turned out not to be a QEMU bug.
+

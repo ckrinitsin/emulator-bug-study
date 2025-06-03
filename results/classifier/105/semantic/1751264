@@ -1,0 +1,83 @@
+semantic: 0.825
+other: 0.767
+instruction: 0.760
+graphic: 0.758
+device: 0.708
+assembly: 0.707
+network: 0.482
+boot: 0.478
+mistranslation: 0.468
+vnc: 0.433
+socket: 0.407
+KVM: 0.375
+
+qemu-img convert issue in a tmpfs partition
+
+qemu-img convert command is slow when the file to convert is located in a tmpfs formatted partition.
+
+v2.1.0 on debian/jessie x64, ext4: 10m14s
+v2.1.0 on debian/jessie x64, tmpfs: 10m15s
+
+v2.1.0 on debian/stretch x64, ext4: 11m9s
+v2.1.0 on debian/stretch x64, tmpfs: 10m21.362s
+
+v2.8.0 on debian/jessie x64, ext4: 10m21s
+v2.8.0 on debian/jessie x64, tmpfs: Too long
+
+v2.8.0 on debian/stretch x64, ext4: 10m42s
+v2.8.0 on debian/stretch x64, tmpfs: Too long
+
+It seems that the issue is caused by this commit : https://github.com/qemu/qemu/commit/690c7301600162421b928c7f26fd488fd8fa464e
+
+In order to reproduce this bug :
+
+1/ mount a tmpfs partition : mount -t tmpfs tmpfs /tmp
+2/ get a vmdk file (we used a 15GB image) and put it on /tmp
+3/ run the 'qemu-img convert -O qcow2 /tmp/file.vmdk /path/to/destination' command
+
+When we trace the process, we can see that there's a lseek loop which is very slow (compare to outside a tmpfs partition).
+
+Hi,
+
+This is a combination of (in our opinion) a bug in tmpfs (...and I think maybe btrfs as well?), the fact that the vmdk block driver is not very well optimized, and qemu-img convert assuming that the filesystem works as it thinks it does or that at least the block driver can work around this.
+
+So what happens is that qemu-img convert tries to find out which data it needs to copy.  For this, it queries which parts of the image are allocated.  This involves querying both the format level (vmdk in this case) and the protocol level (tmpfs in this case).
+
+Now the vmdk block driver is not very well optimized, so it only allows querying on cluster boundaries (64 kB by default, as far as I can tell).  qcow2 OTOH allows greater areas (I just created a 512 MB image and it can query the whole image at once).
+
+So the requests go down to the protocol level.  We expect that to respond very quickly to an allocation request (the lseek() you are seeing) -- but tmpfs (and I think btrfs, too) don't do that.  They take a rather long time.
+
+For an example, the attached program seeks through a file (in 64 kB steps) with SEEK_DATA/SEEK_HOLE.  This is what happens:
+$ cd /tmp
+$ gcc test.c -std=c11 -Wall -Wextra -pedantic -O3
+$ qemu-img create -f raw -o preallocation=falloc empty 512M
+$ qemu-img create -f raw -o preallocation=falloc ~/empty 512M
+$ time ./a.out empty
+./a.out empty  0,01s user 23,10s system 99% cpu 23,166 total
+$ time ./a.out ~/empty
+./a.out ~/empty  0,01s user 0,03s system 96% cpu 0,041 total
+
+So there's a huge difference and that is (in my opinion) a bug in tmpfs.
+
+(When converting from qcow2 you don't notice this, because qcow2 allows performing a single allocation request for the whole image, so it doesn't matter much whether that's slow.)
+
+
+There are three ways around this:
+(1) tmpfs (and probably btrfs? -- although I can't reproduce it myself right now) should be fixed.  If they can't tell allocated areas quickly, they should just report the whole file as allocated.
+
+(2) Our vmdk driver could be optimized.  Sure, but that wouldn't solve the real issue and someone would have to do it first (and we don't have a strong interest in this, because all format drivers but qcow2 and raw are there mainly just for reading other formats and converting them to qcow2).
+
+(3a) qemu-img convert could poll for allocation information less insistently.  One way would be to add a switch to disable this behavior completely and force it to just read everything.  We already have -S 0 which could do this; but just reading all data and then doing zero detection over it kind of defeats the purpose.  If read() + memcmp() is faster than lseek(SEEK_DATA), then the FS is just doing something wrong.
+
+(3b) Eric Blake has recently added support for a less insisting way to query allocation status that should only go to the format layer (e.g. vmdk) and ignore the protocol layer (e.g. tmpfs).  Maybe qemu-img convert should use that.
+
+
+But in any case, I claim the main issue is in tmpfs.
+
+Max
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

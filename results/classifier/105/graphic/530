@@ -1,0 +1,56 @@
+graphic: 0.905
+boot: 0.889
+semantic: 0.836
+socket: 0.807
+device: 0.790
+instruction: 0.782
+KVM: 0.773
+mistranslation: 0.751
+other: 0.713
+vnc: 0.699
+assembly: 0.697
+network: 0.467
+
+Invalid guest state when rebooting a nesting hypervisor
+Description of problem:
+On a standard Linux machine, I run a custom hypervisor stack based on [Hedron](https://github.com/cyberus-technology/hedron) in a qemu VM with nesting capabilities. The Hedron stack starts a nested Linux guest with complete pass-through of all resources not required for virtualizing the nested guest. In particular, ACPI and PCI including the reset functionality are directly accessible to the nested guest. As soon as the nested guest issues a machine reset, I get a hardware error with the following error message:
+
+<details><summary>KVM: entry failed, hardware error 0x80000021</summary>
+<pre>
+If you're running a guest on an Intel machine without unrestricted mode
+support, the failure can be most likely due to the guest entering an invalid
+state for Intel VT. For example, the guest maybe running in big real mode
+which is not supported on less recent Intel processors.
+
+EAX=00000000 EBX=00000000 ECX=00000000 EDX=00050657
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00000000
+EIP=0000fff0 EFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 00000000 0000ffff 00009300
+CS =f000 ffff0000 0000ffff 00009b00
+SS =0000 00000000 0000ffff 00009300
+DS =0000 00000000 0000ffff 00009300
+FS =0000 00000000 0000ffff 00009300
+GS =0000 00000000 0000ffff 00009300
+LDT=0000 00000000 0000ffff 00008200
+TR =0000 00000000 0000ffff 00008b00
+GDT=     00000000 0000ffff
+IDT=     00000000 0000ffff
+CR0=60000010 CR2=00000000 CR3=00000000 CR4=003726f8
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000000
+</pre>
+</details>
+
+If I'm not mistaken, the CR4 value of `0x003726f8` is the offending state here, because PCIDE (bit 17) is set, even though the arch state indicates real-mode and the Intel SDM states:
+
+> If the “IA-32e mode guest” VM-entry control is 0, bit 17 in the CR4 field (corresponding to CR4.PCIDE) must be 0.
+
+Furthermore, the issue is not present when not using PCID in the L1 hypervisor or when PCID/VPID are fused out using `qemu-kvm -cpu host,-pcid,-vmx-vpid,-vmx-invpcid-exit`.
+Steps to reproduce:
+1. Boot custom hypervisor stack (unfortunately not yet publicly available, I'm working on that)
+2. In nested Linux guest, type `reboot`, which eventually directly reboots the main VM (all main VM hardware is passed through to the single nested guest)
+Additional information:
+I have tracked down the [change](https://gitlab.com/qemu/qemu/-/commit/b16c0e20c74218f2d69710cedad11da7dd4d2190#063d8f78716c7a658841a1d51cc66bf30f697082_3920_3944) that likely introduced this issue. Moving the call to `kvm_put_sregs` back down (I suspect after `kvm_put_nested_state`, but I did not verify that yet) solves the reboot issue for me. The comment makes it clear that it is important to keep a certain order here, so I'm aware just reversing it is not an option.
+
+Maybe this already helps enough to figure out what exactly the issue and correct fix is, and I am happy to try any suggestions as long as I cannot provide a proper reproducer.

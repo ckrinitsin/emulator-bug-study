@@ -1,0 +1,118 @@
+semantic: 0.903
+other: 0.885
+assembly: 0.882
+network: 0.863
+graphic: 0.860
+device: 0.843
+instruction: 0.835
+vnc: 0.738
+KVM: 0.702
+mistranslation: 0.680
+boot: 0.644
+socket: 0.627
+
+Ethernet interrupt vectors for sabrelite machine are defined backwards
+
+The sabrelite machine model used by qemu-system-arm is based on the Freescale/NXP i.MX6Q processor. This SoC has an on-board ethernet controller which is supported in QEMU using the imx_fec.c module (actually called imx.enet for this model.)
+
+The include/hw/arm/fsm-imx6.h file defines the interrupt vectors for the imx.enet device like this:
+
+#define FSL_IMX6_ENET_MAC_1588_IRQ 118
+#define FSL_IMX6_ENET_MAC_IRQ 119
+
+However, this is backwards. The reference manual for the i.MX6D/Q devices can be found here:
+
+https://www.nxp.com/docs/en/reference-manual/IMX6DQRM.pdf
+
+On page 225, in Table 3-1. ARM Cortex A9 domain interrupt summary, it shows the following:
+
+150 ENET
+MAC 0 IRQ, Logical OR of:
+MAC 0 Periodic Timer Overflow
+MAC 0 Time Stamp Available
+MAC 0 Time Stamp Available
+MAC 0 Time Stamp Available
+MAC 0 Payload Receive Error
+MAC 0 Transmit FIFO Underrun
+MAC 0 Collision Retry Limit
+MAC 0 Late Collision
+MAC 0 Ethernet Bus Error
+MAC 0 MII Data Transfer Done
+MAC 0 Receive Buffer Done
+MAC 0 Receive Frame Done
+MAC 0 Transmit Buffer Done
+MAC 0 Transmit Frame Done
+MAC 0 Graceful Stop
+MAC 0 Babbling Transmit Error
+MAC 0 Babbling Receive Error
+MAC 0 Wakeup Request [synchronous]
+
+151 ENET
+MAC 0 1588 Timer interrupt [synchronous] request
+
+Note:
+150 - 32 == 118
+151 - 32 == 119
+
+In other words, the vector definitions in the fsl-imx6.h file are reversed. The correct definition is:
+
+#define FSL_IMX6_ENET_MAC_IRQ 118
+#define FSL_IMX6_ENET_MAC_1588_IRQ 119
+
+I tested the sabrelite simulation using VxWorks 7 (which supports the SabreLite board) and found that while I was able to send and receive packet data via the simulated ethernet interface, the VxWorks i.MX6 ethernet driver failed to receive any interrupts. When I corrected the interrupt vector definitions as shown above and recompiled QEMU, everything worked as expected. I was able to exchange ICMP packets with the simulated target and telnet to/from the VxWorks instance running in the virtual machine. I used the tap interface for this.
+
+As a workaround I was also able to make the ethernet work by modifying the VxWorks imx6q-sabrelite.dts file to change the ethernet interrupt property from 150 to 151.
+
+This problem was observed with the following environment:
+
+Host: FreeBSD/amd64 11.1-RELEASE
+QEMU version: 2.11.0 and 2.11.1 built from source code
+
+Swapping the interrupt pins fixes the problem on Linux v4.13 and later. Older kernels start failing as follows.
+
+ On v4.12 and earlier, the Ethernet interface fails to instantiate with
+    fec 2188000.ethernet (unnamed net_device) (uninitialized): MDIO read timeout
+    fec: probe of 2188000.ethernet failed with error -5
+  I have not found the reason yet. Unmodified qemu works fine.
+- v4.1 and earlier crash. The crash is due to a bad error path and fixed by commit
+  32cba57ba74be ("net: fec: introduce fec_ptp_stop and use in probe fail path").
+
+
+Followup on #1: The relevant upstream commit is 4c8777892e80b ("ARM: dts: imx6qdl-sabrelite: remove erratum ERR006687 workaround").
+
+Test results with various kernel versions:
+4.14+: Both versions of qemu (as-is and interrupts reverted) work fine
+4.9.y: Requires cherry-pick of 4c8777892e80b for both versions of qemu to work
+4.4.y: Requires backport of 4c8777892e80b for both versions of qemu to work
+4.1.y: Requires backport of 4c8777892e80b for both versions of qemu to work
+
+I didn't test older kernels.
+
+Now the big question is if this matches the experience with real hardware.
+
+
+"4.14+: Both versions of qemu (as-is and interrupts reverted) work fine"
+
+Hm. I really wonder how it can be possible that Linux works with the interrupt vectors reversed, though to be fair I have not looked at the Linux i.MX6 ENET driver code. I suppose it's possible that the driver is binding the same interrupt service routine to both interrupt vectors. If so, then it works by accident. :)
+
+I think U-Boot uses polling so it wouldn't care if the interrupt vectors are wrong.
+
+We have several SabreLite boards in house. We also have NXP Sabre SD reference boards which use the same i.MX6Q SoC and the exact same ethernet driver with the same interrupt configuration. I have always used VxWorks with them rather than Linux, and I can say for a fact that the VxWorks ENET driver only binds an ISR to vector 150 (118) (VxWorks doesn't currently support the IEEE 1588 feature with this interface so it never uses vector 151) and it works as expected -- network interrupt events are indeed received via vector 150.
+
+The same VxWorks image that works with real hardware does not work with QEMU unless I fix the vectors in fsl-imx6.h.
+
+In short, both the hardware and the manual seem to agree. QEMU is doing it wrong. :)
+
+Also, the errata sheet for the i.MX6 is here:
+
+https://www.nxp.com/docs/en/errata/IMX6DQCE.pdf
+
+Apparently erratum 6687 is related to power management and wakeup events. I'm not sure how that factors in to how Linux behaves.
+
+#3: Correct, Linux version 4.14 and older registers two interrupt lines, both the correct and the wrong one. With qemu version, the kernel receives interrupts on irq 151, with the other on 150. So, yes, I guess it works by accident. My question is what to do with older (pre-4.14) kernels. Presumably those worked (?) with real hardware, so I am a bit concerned about the impact of applying 4c8777892e80b to those kernels.
+
+
+Submitted https://patchwork.kernel.org/patch/10264615/
+
+This is now fixed in git master by commit 6461d7e2678fe4, which updates the defines and also has a workaround for older guest kernels (which we can remove if/when we model the IOMUX).
+

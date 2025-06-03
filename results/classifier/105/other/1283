@@ -1,0 +1,95 @@
+semantic: 0.934
+instruction: 0.926
+other: 0.926
+graphic: 0.923
+assembly: 0.922
+device: 0.899
+socket: 0.895
+KVM: 0.882
+vnc: 0.862
+boot: 0.860
+network: 0.853
+mistranslation: 0.828
+
+Live migration cause scsi_req_unref: Assertion `req->refcount > 0' failed
+Description of problem:
+During live migration, copy file from one folder to another. Migration can succeed. After a while, copy can't finish and in target host qemu crash:
+```
+qemu-system-x86_64: ../hw/scsi/scsi-bus.c:1366: scsi_req_unref: Assertion `req->refcount > 0' failed.
+2022-10-28 03:22:54.948+0000: shutting down, reason=crashed
+```
+libvirt configure related:
+```
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/images/gen-l-vrt-295-008/swx-jd01-001-new.img'/>
+      <target dev='sda' bus='scsi'/>
+      <alias name='ua-box-volume-0'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <controller type='scsi' index='0' model='lsilogic'>
+      <address type='pci' domain='0x0000' bus='0x03' slot='0x01' function='0x0'/>
+    </controller>
+```
+If change `bus='scsi'` to `bus='sata'`, same test steps can pass.
+Steps to reproduce:
+1. Inside VM
+```
+fallocate -l 10G /tmp/test.img
+cp /tmp/test.img /
+```
+2. Same time, migrate VM to another server
+```
+virsh migrate --verbose --live --persistent swx-jd01-001 qemu+ssh://gen-l-vrt-294/system  --unsafe --auto-converge  --auto-converge-initial 60 --auto-converge-increment 20
+
+```
+3. After a while, cp can't finish and qemu crash on destination server with assert fail.
+Additional information:
+stack traces:
+```
+#0  __pthread_kill_implementation (no_tid=0, signo=6, threadid=140544841483840) at ./nptl/pthread_kill.c:44
+#1  __pthread_kill_internal (signo=6, threadid=140544841483840) at ./nptl/pthread_kill.c:78
+#2  __GI___pthread_kill (threadid=140544841483840, signo=signo@entry=6) at ./nptl/pthread_kill.c:89
+#3  0x00007fd3284f9476 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#4  0x00007fd3284df7f3 in __GI_abort () at ./stdlib/abort.c:79
+#5  0x00007fd3284df71b in __assert_fail_base
+    (fmt=0x7fd328694150 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=0x55791c97acbb "req->refcount > 0", file=0x55791c97ac7f "../hw/scsi/scsi-bus.c", line=1366, function=<optimized out>)
+    at ./assert/assert.c:92
+#6  0x00007fd3284f0e96 in __GI___assert_fail
+    (assertion=assertion@entry=0x55791c97acbb "req->refcount > 0", file=file@entry=0x55791c97ac7f "../hw/scsi/scsi-bus.c", line=line@entry=1366, function=function@entry=0x55791c97b2a0 <__PRETTY_FUNCTION__.14> "scsi_req_unref") at ./assert/assert.c:101
+#7  0x000055791c499a2e in scsi_req_unref (req=<optimized out>) at ../hw/scsi/scsi-bus.c:1366
+#8  0x000055791c49b61f in scsi_device_purge_requests (sdev=sdev@entry=0x55791e6e0c00, sense=...) at ../hw/scsi/scsi-bus.c:1639
+#9  0x000055791c49d704 in scsi_disk_reset (dev=0x55791e6e0c00) at ../hw/scsi/scsi-disk.c:2336
+#10 0x000055791c72a6ed in qdev_reset_one (dev=<optimized out>, opaque=<optimized out>) at ../hw/core/qdev.c:254
+#11 0x000055791c726fa9 in qbus_walk_children
+    (bus=<optimized out>, pre_devfn=0x55791c728770 <qdev_prereset>, pre_busfn=0x55791c7286a0 <qbus_prereset>, post_devfn=0x55791c72a6e0 <qdev_reset_one>, post_busfn=0x55791c728ae0 <qbus_reset_one>, opaque=0x0) at ../hw/core/bus.c:54
+#12 0x000055791c72a790 in qdev_walk_children
+    (opaque=0x0, post_busfn=0x55791c728ae0 <qbus_reset_one>, post_devfn=0x55791c72a6e0 <qdev_reset_one>, pre_busfn=0x55791c7286a0 <qbus_prereset>, pre_devfn=0x55791c728770 <qdev_prereset>, dev=0x55791ed2a430) at ../hw/core/qdev.c:413
+#13 qdev_reset_all (dev=0x55791ed2a430) at ../hw/core/qdev.c:272
+#14 0x000055791c688134 in memory_region_write_accessor (mr=mr@entry=0x55791ed2ae60, addr=20, value=value@entry=0x7fd32559f618, size=size@entry=1, shift=<optimized out>, mask=mask@entry=255, attrs=...)
+    at ../softmmu/memory.c:492
+#15 0x000055791c6858c6 in access_with_adjusted_size
+     (addr=addr@entry=20, value=value@entry=0x7fd32559f618, size=size@entry=1, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=0x55791c6880b0 <memory_region_write_accessor>, mr=0x55791ed2ae60, attrs=...) at ../softmmu/memory.c:554
+#16 0x000055791c689bf2 in memory_region_dispatch_write (mr=mr@entry=0x55791ed2ae60, addr=20, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ../softmmu/memory.c:1521
+#17 0x000055791c690cf0 in flatview_write_continue (fv=fv@entry=0x55791e729ac0, addr=addr@entry=4257226772, attrs=...,
+    attrs@entry=..., ptr=ptr@entry=0x7fd328d36028, len=len@entry=1, addr1=<optimized out>, l=<optimized out>, mr=0x55791ed2ae60) at /opt/qemu/include/qemu/host-utils.h:166
+#18 0x000055791c690fb0 in flatview_write (fv=0x55791e729ac0, addr=addr@entry=4257226772, attrs=attrs@entry=..., buf=buf@entry=0x7fd328d36028, len=len@entry=1) at ../softmmu/physmem.c:2867
+#19 0x000055791c694799 in address_space_write (len=1, buf=0x7fd328d36028, attrs=..., addr=4257226772, as=0x55791d08a740 <address_space_memory>) at ../softmmu/physmem.c:2963
+#20 address_space_rw (as=0x55791d08a740 <address_space_memory>, addr=4257226772, attrs=attrs@entry=..., buf=buf@entry=0x7fd328d36028, len=1, is_write=<optimized out>) at ../softmmu/physmem.c:2973
+#21 0x000055791c71d19e in kvm_cpu_exec (cpu=cpu@entry=0x55791dc9d890) at ../accel/kvm/kvm-all.c:2954
+#22 0x000055791c71e6c5 in kvm_vcpu_thread_fn (arg=arg@entry=0x55791dc9d890) at ../accel/kvm/kvm-accel-ops.c:49
+#23 0x000055791c885be1 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:504
+#24 0x00007fd32854bb43 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#25 0x00007fd3285dcbb4 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:100
+```
+Guest disk partition
+```
+root@swx-jd01-001:~# lsblk
+NAME                          MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sda                             8:0    0   64G  0 disk 
+├─sda1                          8:1    0  512M  0 part /boot/efi
+├─sda2                          8:2    0    1K  0 part 
+└─sda5                          8:5    0 63.5G  0 part 
+  ├─vgwin--dbausdhrjgi-root   253:0    0 62.6G  0 lvm  /
+  └─vgwin--dbausdhrjgi-swap_1 253:1    0  980M  0 lvm  [SWAP]
+```

@@ -1,0 +1,141 @@
+semantic: 0.876
+assembly: 0.867
+other: 0.853
+instruction: 0.814
+device: 0.775
+graphic: 0.768
+network: 0.767
+boot: 0.754
+mistranslation: 0.663
+socket: 0.658
+vnc: 0.560
+KVM: 0.556
+
+Disks in mptsas1068 scsi controller not seen by linux
+
+When using the mptsas1068 scsi controller, linux detects the controller itself but not the drives attached to it. Freebsd works. Using a different controller with linux works. VMware with linux works. 
+
+qemu 2.6.50 (v2.6.0-1925-g6b92bbf)
+seabios rel-1.9.0-139-gae3f78f (master branch, required for mptsas1068 support)
+
+Test script, loosely based off what libvirt runs and the libvirt tests that Paolo Bonzini wrote [1]
+
+#####################
+iso=archlinux-2016.07.01-dual.iso
+#iso=FreeBSD-10.3-RELEASE-amd64-bootonly.iso
+device=mptsas1068
+#device=lsi
+
+img=empty.img
+qemu-img create -f qcow2 $img 1G
+
+/usr/bin/qemu-system-x86_64 \
+-enable-kvm \
+-m 1024 \
+-boot menu=on \
+-device $device,id=scsi0,bus=pci.0,addr=0x9 \
+-drive file=$img,format=qcow2,if=none,id=drive-scsi0-0-0-0 \
+-device scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0-0-0-0,id=scsi0-0-0-0,bootindex=2 \
+-drive file=$iso,format=raw,if=none,id=drive-ide0-0-1,readonly=on \
+-device ide-cd,bus=ide.0,unit=1,drive=drive-ide0-0-1,id=ide0-0-1,bootindex=1
+#####################
+
+The ISOs can be downloaded from [2] and [3].
+
+After booting linux, do "lsblk". /dev/sda should exist.
+
+After booting freebsd, do "geom disk list". A da0 / "QEMU QEMU HARDDISK" should be mentioned.
+
+With device=mptsas1068 this fails in linux.
+
+With device=lsi line it works in both.
+
+With VMWare and a linux VM (opensuse 10.1, kernel 2.6.18) which only loads modules for mptsas1068, this works.
+
+I also reproduced this with the debian 8.5 netinstall image, but it insists in making you pick a driver from a list of modules when it fails to mount it, instead of dropping to a shell.
+
+Arch linux dmesg output snippet (full output attached as arch-linux-dmesg.txt):
+
+#####################
+root@archiso ~ # dmesg | grep -i -e mpt -e scsi -e ioc0
+[    0.000000] Linux version 4.6.3-1-ARCH (builduser@tobias) (gcc version 6.1.1 20160602 (GCC) ) #1 SMP PREEMPT Fri Jun 24 21:19:13 CEST 2016
+[    0.000000]   Normal   empty
+[    0.000000] Preemptible hierarchical RCU implementation.
+[    1.879616] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 249)
+[    1.951581] SCSI subsystem initialized
+[    1.957113] Fusion MPT base driver 3.04.20
+[    1.957618] Fusion MPT SAS Host driver 3.04.20
+[    2.281773] scsi host0: ata_piix
+[    2.285372] scsi host1: ata_piix
+[    2.305803] mptbase: ioc0: Initiating bringup
+[    2.363555] ioc0: LSISAS1068 A0: Capabilities={Initiator}
+[    2.444390] scsi 0:0:1:0: CD-ROM            QEMU     QEMU DVD-ROM     2.5+ PQ: 0 ANSI: 5
+[    2.500572] scsi host2: ioc0: LSISAS1068 A0, FwRev=01329200h, Ports=8, MaxQ=128, IRQ=11
+[    2.507024] sr 0:0:1:0: [sr0] scsi3-mmc drive: 4x/4x cd/rw xa/form2 tray
+[    2.507274] sr 0:0:1:0: Attached scsi CD-ROM sr0
+#####################
+
+The controller itself is detected, the disk isn't.
+
+An early version of this patch [4] said that it was only tested with FreeBSD:
+
+>Tested with FreeBSD for now.  The previous version (before the
+>configuration page rewrite) worked with RHEL and Windows guests as well.
+>
+>TODO: write qtest for (at least) config pages, test Linux and Windows.
+
+[1]: https://libvirt.org/git/?p=libvirt.git;a=commitdiff;h=fc922eb2080a3fa7b24bc8a8b0aabfd394480143
+[2]: https://www.archlinux.org/download
+[3]: https://www.freebsd.org/where.html
+[4]: https://lists.nongnu.org/archive/html/qemu-devel/2015-10/msg06475.html
+
+
+
+
+
+Linux requires that you specify a WWN for the disk (through the wwn property of the scsi-disk device).
+
+Welp. Yeah now I see it, it was in the test case I linked. Thanks.
+
+Vmware doesn't seem to need this. Seems like it assigns a WWN of 0x5000c293944837df to my disk (not in the vm config files as far as i can see, seems to persist across reboots)
+
+[    2.305111] ioc0: LSISAS1068 B0: Capabilities={Initiator}
+[    2.445800] scsi host2: ioc0: LSISAS1068 B0, FwRev=01032920h, Ports=1, MaxQ=128, IRQ=18
+[    2.447672] mptsas: ioc0: attaching ssp device: fw_channel 0, fw_id 0, phy 0, sas_addr 0x5000c293944837df
+[    2.448806] scsi 2:0:0:0: Direct-Access     VMware,  VMware Virtual S 1.0  PQ: 0 ANSI: 2
+
+Qemu with the manually specified WWN, for reference:
+
+[    3.656894] ioc0: LSISAS1068 A0: Capabilities={Initiator}
+[    3.790680] scsi host0: ioc0: LSISAS1068 A0, FwRev=01329200h, Ports=8, MaxQ=128, IRQ=10
+[    3.792232] mptsas: ioc0: attaching ssp device: fw_channel 0, fw_id 0, phy 0, sas_addr 0x5000c50015ea71ac
+[    3.792476] scsi 0:0:0:0: Direct-Access     QEMU     QEMU HARDDISK    2.5+ PQ: 0 ANSI: 5
+
+Also vmware doesn't populate /dev/disk/by-id/wwn-*:
+
+# ls /dev/disk/by-id
+ata-VMware_Virtual_IDE_CDROM_Drive_00000000000000000001@  dm-name-arch_airootfs@
+
+Qemu:
+
+# ls /dev/disk/by-id
+ata-QEMU_DVD-ROM_QM00002@  scsi-35000c50015ea71ac@        scsi-35000c50015ea71ac-part2@  wwn-0x5000c50015ea71ac@        wwn-0x5000c50015ea71ac-part2@
+dm-name-arch_airootfs@     scsi-35000c50015ea71ac-part1@  scsi-35000c50015ea71ac-part3@  wwn-0x5000c50015ea71ac-part1@  wwn-0x5000c50015ea71ac-part3@
+
+
+Not directly related: after getting the arch iso cd to boot, I found that the VM that I actually wanted to get working uses mptspi instead of mptsas. So I didn't even need this controller...
+
+The non-working vmware config says `scsi0.virtualDev = "lsilogic"` (that's mptspi, LSI53C1030 or "LSI Logic Ultra 320"). For the mptsas tests above, I changed it to `scsi0.virtualDev = "lsisas1068"`.
+
+Is it correct to say that the LSI53C1030 parts of [1] were never applied?
+
+[1]: http://lists.gnu.org/archive/html/qemu-devel/2012-09/msg01608.html
+
+> The non-working vmware config says `scsi0.virtualDev = "lsilogic"`
+> (that's mptspi, LSI53C1030 or "LSI Logic Ultra 320"). For the mptsas
+> tests above, I changed it to `scsi0.virtualDev = "lsisas1068"`.
+>
+> Is it correct to say that the LSI53C1030 parts of [1] were never applied?
+
+Yes, that's correct.  The patch you linked was almost entirely rewritten.
+

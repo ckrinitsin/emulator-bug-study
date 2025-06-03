@@ -1,0 +1,72 @@
+instruction: 0.852
+other: 0.827
+device: 0.746
+mistranslation: 0.740
+graphic: 0.738
+semantic: 0.721
+vnc: 0.658
+socket: 0.636
+boot: 0.572
+assembly: 0.571
+KVM: 0.487
+network: 0.484
+
+x86: singlestepping through SYSCALL instruction causes exception in kernelspace
+
+Hi,
+
+The bug was originally reported [1] and [2] here. There is a problem inside QEMU with singlestepping from userspace until SYSCALL instruction is reached. The OS has in FMASK TF bit set, therefore there should be no singlestepping exception when transitioning to kernelmode. But, inside QEMU there is (TF is clear seems FMASK is applied). See below for further details.
+
+The reproducer is available at [2].
+
+Here is the original text with some minor clarifications:
+
+It seems that there is something wrong with QEMU with respect to handle the singlestepping and AMD64 syscall instruction.
+
+The AMD "syscall" instruction will clear defined flag in the FMASK MSR. Normally the TF flag is set there, so the first instruction when kernel is entered after syscall won't cause single step exception in the kernel.
+
+The observed scenario is a unhandled singlestep fault in the kernel or host reboot or QEMU crash.
+
+The possible way how to reproduce it is to single step through any function (in userspace) which does "syscall" instruction. After syscall is entered QEMU will trigger singlestepping exception in the kernel despite that the TF is set in FMASK MSR. Real HW behaves correctly and does not trigger this exception.
+
+
+What is interesting is that I was not able to trigger it if I just enabled TF and did the syscall instruction, perhaps for this bug is somewhat important to have TF set for previous few instruction.
+
+
+I have stumbled to this problem while working with our custom OS. However after some googling I found out that the NetBSD guys (CCed) are having very similar problem and I asked them to prepare a ISO image where the problem ends with QEMU SIGSEGV or host reboot. 
+
+Thanks
+Rudolf
+
+[1] https://lists.gnu.org/archive/html/qemu-devel/2015-10/msg02289.html
+[2] http://gnats.netbsd.org/49603
+
+I believe this is fixed in the qemu git mainline (but not yet in any release)
+by the following commits:
+
+ commit c52ab08aee6f7d4717fc6b517174043126bd302f
+ Author: Doug Evans <email address hidden>
+ Date:   Tue Dec 6 23:06:30 2016 +0000
+
+     target-i386: Fix eflags.TF/#DB handling of syscall/sysret insns
+
+     The syscall and sysret instructions behave a bit differently:
+     TF is checked after the instruction completes.
+     This allows the o/s to disable #DB at a syscall by adding TF to FMASK.
+     And then when the sysret is executed the #DB is taken "as if" the
+     syscall insn just completed.
+
+ commit 410e98146ffde201ab4c778823ac8beaa74c4c3f
+ Author: Doug Evans <email address hidden>
+ Date:   Sat Dec 24 20:29:33 2016 +0000
+
+     target/i386: Fix bad patch application to translate.c
+
+     In commit c52ab08aee6f7d4717fc6b517174043126bd302f,
+     the patch snippet for the "syscall" insn got applied to "iret".
+
+
+Hi Andreas, man thanks for your reply. I can confirm that applying the two patches fixes my problem in the older version of the QEMU.
+
+The two patches mentioned in comment #1 have been released with v2.9.0, so setting status to "Fix released" now.
+

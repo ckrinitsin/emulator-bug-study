@@ -1,0 +1,92 @@
+other: 0.916
+semantic: 0.910
+device: 0.898
+graphic: 0.889
+mistranslation: 0.885
+assembly: 0.876
+instruction: 0.868
+vnc: 0.850
+boot: 0.843
+KVM: 0.842
+socket: 0.841
+network: 0.837
+
+aarch64-softmmu "bad ram pointer" crash
+
+I am developing a piece of software called SimBench which is a benchmarking system for full system simulators. I am currently porting this to aarch64, using QEMU as a test platform. 
+
+I have encountered a 'bad ram pointer' crash. I've attempted to build a minimum test case, but I haven't managed to replicate the behaviour in isolation, so I've created a branch of my project which exhibits the crash: https://bitbucket.org/Awesomeclaw/simbench/get/qemu-bug.tar.gz
+
+The package can be compiled using:
+
+make
+
+and then run using:
+
+qemu-system-aarch64  -M virt -m 512 -cpu cortex-a57 -kernel out/armv8/virt/simbench -nographic
+
+I have replicated the issue in both qemu 2.8.1 and in 2.9.0-rc3, on Fedora 23. Please let me know if you need any more information or any logs/core dumps/etc.
+
+I've done some investigation and it appears that this bug is caused by the following:
+
+1. The flash memory of the virt platform is initialised as a cfi.pflash01. It has a memory region with romd_mode = true and rom_device = true
+
+2. Some code stored in the flash memory is executed. This causes the memory to be loaded into the TLB.
+
+3. The code is overwritten. This causes the romd_mode of the flash memory to be reset. It also causes the code to be evicted from the TLB.
+
+4. An attempt is made to execute the code again (cpu_exec(), cpu-exec.c:677)
+4a. Eventually, QEMU attempts to refill the TLB (softmmu_template.h:127)
+4b. We try to fill in the tlb entry (tlb_set_page_with_attrs, cputlb.c:602)
+4b. The flash memory no longer appears to be a ram or romd (cputlb.c:632)
+4c. QEMU decides that the flash memory is an IO device (cputlb.c:634)
+4d. QEMU aborts while trying to fill in the rest of the TLB entry (qemu_ram_addr_from_host_nofail)
+
+I have built a MWE (which I have attached) which produces this behaviour in git head. I'm not exactly sure what a fix for this should look like: AFAIK it's not technically valid to write into flash, but I'm not sure that QEMU crashing should be considered correct behaviour. 
+
+On 12 April 2017 at 16:02, Harry Wagstaff <email address hidden> wrote:
+> I've done some investigation and it appears that this bug is caused by
+> the following:
+>
+> 1. The flash memory of the virt platform is initialised as a
+> cfi.pflash01. It has a memory region with romd_mode = true and
+> rom_device = true
+>
+> 2. Some code stored in the flash memory is executed. This causes the
+> memory to be loaded into the TLB.
+>
+> 3. The code is overwritten. This causes the romd_mode of the flash
+> memory to be reset. It also causes the code to be evicted from the TLB.
+>
+> 4. An attempt is made to execute the code again (cpu_exec(), cpu-exec.c:677)
+> 4a. Eventually, QEMU attempts to refill the TLB (softmmu_template.h:127)
+> 4b. We try to fill in the tlb entry (tlb_set_page_with_attrs, cputlb.c:602)
+> 4b. The flash memory no longer appears to be a ram or romd (cputlb.c:632)
+> 4c. QEMU decides that the flash memory is an IO device (cputlb.c:634)
+> 4d. QEMU aborts while trying to fill in the rest of the TLB entry (qemu_ram_addr_from_host_nofail)
+
+Yeah, this is a known bug -- but fixing it would just mean that
+we would print the slightly more helpful message about the
+guest attempting to execute from something that isn't RAM
+or ROM before exiting.
+
+See for instance this thread from January.
+https://lists.nongnu.org/archive/html/qemu-devel/2017-01/msg00674.html
+
+> I have built a MWE (which I have attached) which produces this behaviour
+> in git head. I'm not exactly sure what a fix for this should look like:
+> AFAIK it's not technically valid to write into flash, but I'm not sure
+> that QEMU crashing should be considered correct behaviour.
+
+You should fix your guest so that it doesn't try to execute
+from flash without putting the flash back into the mode you
+can execute from...
+
+Writing to the flash device is permitted -- it's how
+you program it (you write command bytes to it, and
+read back responses and status and so on).
+
+thanks
+-- PMM
+
+

@@ -1,0 +1,143 @@
+graphic: 0.912
+other: 0.900
+KVM: 0.895
+mistranslation: 0.884
+assembly: 0.872
+vnc: 0.855
+device: 0.853
+semantic: 0.852
+instruction: 0.844
+socket: 0.827
+boot: 0.800
+network: 0.772
+
+Image corruption during snapshot creation/deletion
+
+Hello,
+
+The creation/deletion of snapshots sometimes crashes and corrupts the VM image and provoke a segmentation fault in "strcmp", called from "bdrv_snapshot_find".
+
+Here is a patch that temporarily fixes that (it fixes the segfault but not its reason) :
+
+--- qemu-kvm-0.12.2-old/savevm.c	2010-01-18 19:48:25.000000000 +0100
++++ qemu-kvm-0.12.2/savevm.c	2010-02-12 13:45:07.225644169 +0100
+@@ -1624,6 +1624,7 @@
+     int nb_sns, i, ret;
+ 
+     ret = -ENOENT;
++	if (!name) return ret;
+     nb_sns = bdrv_snapshot_list(bs, &sn_tab);
+     if (nb_sns < 0)
+         return ret;
+@@ -1649,6 +1650,8 @@
+     QEMUSnapshotInfo sn1, *snapshot = &sn1;
+     int ret;
+ 
++	if (!name) return 0;
++
+     QTAILQ_FOREACH(dinfo, &drives, next) {
+         bs = dinfo->bdrv;
+         if (bdrv_can_snapshot(bs) &&
+@@ -1777,6 +1780,11 @@
+     QTAILQ_FOREACH(dinfo, &drives, next) {
+         bs1 = dinfo->bdrv;
+         if (bdrv_has_snapshot(bs1)) {
++			if (!name) {
++				monitor_printf(mon, "Could not find snapshot 'NULL' on "
++								                   "device '%s'\n",
++								                   bdrv_get_device_name(bs1));
++			}
+             ret = bdrv_snapshot_goto(bs1, name);
+             if (ret < 0) {
+                 if (bs != bs1)
+@@ -1804,6 +1812,11 @@
+         }
+     }
+ 
++	if (!name) {
++		monitor_printf(mon, "VM state name is NULL\n");
++		return -EINVAL;
++	}
++
+     /* Don't even try to load empty VM states */
+     ret = bdrv_snapshot_find(bs, &sn, name);
+     if ((ret >= 0) && (sn.vm_state_size == 0))
+@@ -1840,6 +1853,11 @@
+     QTAILQ_FOREACH(dinfo, &drives, next) {
+         bs1 = dinfo->bdrv;
+         if (bdrv_has_snapshot(bs1)) {
++			if (!name) {
++				monitor_printf(mon, "Could not find snapshot 'NULL' on "
++								                   "device '%s'\n",
++								                   bdrv_get_device_name(bs1));
++			}
+             ret = bdrv_snapshot_delete(bs1, name);
+             if (ret < 0) {
+                 if (ret == -ENOTSUP)
+
+
+The patch is very simple. Some checks on the variable "name" were missing in "savevm.c".
+
+Regards,
+
+Nicolas Grandjean
+Conix Security
+
+Can you provide more information about what leads to corruption?  For instance, how are you launching the guest?
+
+# tar -zxf qemu-kvm-0.12.4.tar.gz
+# cd qemu-kvm-0.12.4/
+# ./configure --enable-debug && make && sudo make install
+# sudo gdb qemu-system-x86_64
+GNU gdb 6.8-debian
+Copyright (C) 2008 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu"...
+(gdb) r test.img
+Starting program: /usr/local/bin/qemu-system-x86_64 test.img
+[Thread debugging using libthread_db enabled]
+[New Thread 0x7f0730e906f0 (LWP 9790)]
+[New Thread 0x7f072ef12950 (LWP 9793)]
+[New Thread 0x7f072549b950 (LWP 9794)]
+VNC server running on `127.0.0.1:5900'
+
+(qemu) savevm    // works fine
+(qemu) savevm    // crash!!
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7f0730e906f0 (LWP 9790)]
+0x00007f072fa276d2 in strcmp () from /lib/libc.so.6
+(gdb) bt
+#0  0x00007f072fa276d2 in strcmp () from /lib/libc.so.6
+#1  0x00000000004ee0c6 in bdrv_snapshot_find (bs=0x18fd390, sn_info=0x7fffe87dd600, name=0x0) at savevm.c:1632
+#2  0x00000000004ee1b6 in del_existing_snapshots (mon=0x1985800, name=0x0) at savevm.c:1654
+#3  0x00000000004ee41b in do_savevm (mon=0x1985800, qdict=0x1951020) at savevm.c:1722
+#4  0x0000000000416b25 in handle_user_command (mon=0x1985800, cmdline=0x194d0b0 "savevm ")
+    at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/monitor.c:3672
+#5  0x0000000000417d80 in monitor_command_cb (mon=0x1985800, cmdline=0x194d0b0 "savevm ", opaque=0x0)
+    at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/monitor.c:4180
+#6  0x00000000004c3657 in readline_handle_byte (rs=0x194d0b0, ch=13) at readline.c:369
+#7  0x0000000000417cf9 in monitor_read (opaque=0x1985800, buf=0x7fffe87ddca0 "\r�}��\177", size=1)
+    at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/monitor.c:4166
+#8  0x00000000004e6a0d in qemu_chr_read (s=0x18f8110, buf=0x7fffe87ddca0 "\r�}��\177", len=1) at qemu-char.c:154
+#9  0x00000000004c5cd7 in kbd_send_chars (opaque=0x19856c0) at console.c:1130
+#10 0x00000000004c5f22 in kbd_put_keysym (keysym=65293) at console.c:1183
+#11 0x0000000000506799 in do_key_event (vs=0x1bd3420, down=1, keycode=28, sym=65293) at vnc.c:1630
+#12 0x00000000005067fb in key_event (vs=0x1bd3420, down=1, sym=65293) at vnc.c:1647
+#13 0x0000000000507738 in protocol_client_msg (vs=0x1bd3420, data=0x194fc10 "\004\001y", len=8) at vnc.c:1936
+#14 0x0000000000505c2f in vnc_client_read (opaque=0x1bd3420) at vnc.c:1303
+#15 0x000000000040c73b in main_loop_wait (timeout=1000) at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/vl.c:3999
+#16 0x000000000042dcf9 in kvm_main_loop () at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/qemu-kvm.c:2121
+#17 0x000000000040cde4 in main_loop () at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/vl.c:4209
+#18 0x00000000004108dc in main (argc=2, argv=0x7fffe87de598, envp=0x7fffe87de5b0)
+    at /home/ght1/Kvm/orig/qemu-kvm-0.12.2/vl.c:6235
+
+The file "test.img" is a Qemu Image, Format: Qcow , Version: 2 with a clean Debian 5.0 install. I have the same issue with Windows XP.
+
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

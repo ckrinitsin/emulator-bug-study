@@ -1,0 +1,657 @@
+KVM: 0.799
+mistranslation: 0.735
+vnc: 0.708
+network: 0.577
+boot: 0.557
+semantic: 0.552
+assembly: 0.539
+device: 0.523
+instruction: 0.504
+other: 0.504
+socket: 0.494
+graphic: 0.438
+
+virtio-serial loses writes when used over virtio-mmio
+
+virtio-serial appears to lose writes, but only when used on top of virtio-mmio.  The scenario is this:
+
+/home/rjones/d/qemu/arm-softmmu/qemu-system-arm \
+    -global virtio-blk-device.scsi=off \
+    -nodefconfig \
+    -nodefaults \
+    -nographic \
+    -M vexpress-a15 \
+    -machine accel=kvm:tcg \
+    -m 500 \
+    -no-reboot \
+    -kernel /home/rjones/d/libguestfs/tmp/.guestfs-1001/kernel.27944 \
+    -dtb /home/rjones/d/libguestfs/tmp/.guestfs-1001/dtb.27944 \
+    -initrd /home/rjones/d/libguestfs/tmp/.guestfs-1001/initrd.27944 \
+    -device virtio-scsi-device,id=scsi \
+    -drive file=/home/rjones/d/libguestfs/tmp/libguestfsLa9dE2/scratch.1,cache=unsafe,format=raw,id=hd0,if=none \
+    -device scsi-hd,drive=hd0 \
+    -drive file=/home/rjones/d/libguestfs/tmp/.guestfs-1001/root.27944,snapshot=on,id=appliance,cache=unsafe,if=none \
+    -device scsi-hd,drive=appliance \
+    -device virtio-serial-device \
+    -serial stdio \
+    -chardev socket,path=/home/rjones/d/libguestfs/tmp/libguestfsLa9dE2/guestfsd.sock,id=channel0 \
+    -device virtserialport,chardev=channel0,name=org.libguestfs.channel.0 \
+    -append 'panic=1 mem=500M console=ttyAMA0 udevtimeout=600 no_timer_check acpi=off printk.time=1 cgroup_disable=memory root=/dev/sdb selinux=0 guestfs_verbose=1 TERM=xterm-256color'
+
+After the guest starts up, a daemon writes 4 bytes to a virtio-serial socket.  The host side reads these 4 bytes correctly and writes a 64 byte message.  The guest never sees this message.
+
+I enabled virtio-mmio debugging, and this is what is printed (## = my comment):
+
+## guest opens the socket:
+trying to open virtio-serial channel '/dev/virtio-ports/org.libguestfs.channel.0'
+virtio_mmio: virtio_mmio_write offset 0x50 value 0x3
+opened the socket, sock = 3
+udevadm settle
+## guest writes 4 bytes to the socket:
+virtio_mmio: virtio_mmio_write offset 0x50 value 0x5
+virtio_mmio: virtio_mmio setting IRQ 1
+virtio_mmio: virtio_mmio_read offset 0x60
+virtio_mmio: virtio_mmio_write offset 0x64 value 0x1
+virtio_mmio: virtio_mmio setting IRQ 0
+sent magic GUESTFS_LAUNCH_FLAG
+## host reads 4 bytes successfully:
+main_loop libguestfs: recv_from_daemon: received GUESTFS_LAUNCH_FLAG
+libguestfs: [14605ms] appliance is up
+Guest launched OK.
+## host writes 64 bytes to socket:
+libguestfs: writing the data to the socket (size = 64)
+waiting for next request
+libguestfs: data written OK
+## hangs here forever with guest in read() call never receiving any data
+
+I am using qemu from git today (2d1fe1873a984).
+
+strace -f of qemu when it fails.
+
+Notes:
+
+ - fd = 6 is the Unix domain socket connected to virtio-serial
+ - only one 4 byte write occurs to this socket (expected guest -> host communication)
+ - the socket isn't read at all (even though the library on the other side has written)
+ - the socket is never added to any poll/ppoll syscall, so it's no wonder that qemu never sees any data on the socket
+
+
+Recall this bug only happens intermittently.  This is an strace -f of qemu when it happens to work.
+
+Notes:
+
+ - fd = 6 is the Unix domain socket
+ - there are an expected number of recvmsg & writes, all with the correct sizes
+ - this time qemu adds the socket to ppoll
+
+I can reproduce this bug on a second ARM machine which doesn't have KVM (ie. using TCG).  Note it's still linked to virtio-mmio.
+
+On 09/12/13 14:04, Richard Jones wrote:
+
+> +     -chardev socket,path=/home/rjones/d/libguestfs/tmp/libguestfsLa9dE2/guestfsd.sock,id=channel0 \
+
+Is this a socket that libguestfs pre-creates on the host-side?
+
+> the socket is never added to any poll/ppoll syscall, so it's no
+> wonder that qemu never sees any data on the socket
+
+
+This should be happening:
+
+qemu_chr_open_socket() [qemu-char.c]
+  unix_connect_opts() [util/qemu-sockets.c]
+    qemu_socket()
+    connect()
+  qemu_set_nonblock() [util/oslib-posix.c]
+  qemu_chr_open_socket_fd()
+    socket_set_nodelay() [util/osdep.c]
+    io_channel_from_socket()
+      g_io_channel_unix_new()
+    tcp_chr_connect()
+      io_add_watch_poll()
+        g_source_new()
+        g_source_attach()
+        g_source_unref()
+      qemu_chr_be_generic_open()
+
+io_add_watch_poll() should make sure the fd is polled starting with the
+next main loop iteration.
+
+Interestingly, even in the "successful" case, there's a slew of ppoll()
+calls between connect() returning 6, and the first ppoll() that actually
+covers fd=6.
+
+Laszlo
+
+
+> Is this a socket that libguestfs pre-creates on the host-side?
+
+Yes it is:
+https://github.com/libguestfs/libguestfs/blob/master/src/launch-direct.c#L208
+
+You mention a scenario that might cause this.  But that appears to be when the socket is opened.  Note that the guest did send 4 bytes successfully (received OK at the host).  The lost write occurs when the host next tries to send a message back to the guest.
+
+On 09/16/13 16:39, Richard Jones wrote:
+>> Is this a socket that libguestfs pre-creates on the host-side?
+> 
+> Yes it is:
+> https://github.com/libguestfs/libguestfs/blob/master/src/launch-direct.c#L208
+> 
+> You mention a scenario that might cause this.  But that appears to be
+> when the socket is opened.  Note that the guest did send 4 bytes
+> successfully (received OK at the host).  The lost write occurs when the
+> host next tries to send a message back to the guest.
+
+Which is the first time ever that a GLib event loop context messed up
+only for reading would be exposed.
+
+In other words, if the action
+
+  register fd 6 for reading in the GLib main loop context
+
+fails, that wouldn't prevent qemu from *writing* to the UNIX domain socket.
+
+In both traces, the IO-thread (thread-id 8488 in the successful case,
+and thread-id 7586 in the failing case) is the one opening / registering
+etc. fd 6. The IO-thread is also the one calling ppoll().
+
+However, all write(6, ...) syscalls are issued by one of the VCPU
+threads (thread-id 8490 in the successful case, and thread-id 7588 in
+the failing case).
+
+Hmmmm. Normally (as in, virtio-pci), when a VCPU thread (running KVM)
+executes guest code that sends data to the host via virtio, KVM kicks
+the "host notifier" eventfd.
+
+Once this "host notifier" eventfd is kicked, the IO thread should do:
+
+  virtio_queue_host_notifier_read()
+    virtio_queue_notify_vq()
+      vq->handle_output()
+        handle_output() [hw/char/virtio-serial-bus.c]
+          do_flush_queued_data()
+            vsc->have_data()
+              flush_buf() [hw/char/virtio-console.c]
+                qemu_chr_fe_write()
+                  ... goes to the unix domain socket ...
+
+When virtio-mmio is used though, the same seems to happen in VCPU thread:
+
+  virtio_mmio_write()
+    virtio_queue_notify()
+      virtio_queue_notify_vq()
+        ...same as above...
+
+
+
+A long shot:
+
+(a) With virtio-pci:
+
+(a1) guest writes to virtio-serial port,
+(a2) KVM sets the host notifier eventfd "pending",
+(a3) the IO thread sees that in the main loop / ppoll(), and copies the
+data to the UNIX domain socket (the backend),
+(a4) host-side libguestfs reads the data and responds,
+(a5) the IO-thread reads the data from the UNIX domain socket,
+(a6) the IO-thread pushes the data to the guest.
+
+(b) with virtio-mmio:
+
+(b1) guest writes to virtio-serial port,
+(b2) the VCPU thread in qemu reads the data (virtio-mmio) and copies it
+to the UNIX domain socket,
+(b3) host-side libguestfs reads the data and responds,
+(b4) the IO-thread is not (yet?) ready to read the data from the UNIX
+domain socket.
+
+I can't quite pin it down, but I think that in the virtio-pci case, the
+fact that everything runs through the IO-thread automatically serializes
+the connection to the UNIX domain socket (and its addition to the GLib
+main loop context) with the message from the guest. Due to the KVM
+eventfd (the "host notifier") everything goes through the same ppoll().
+Maybe it doesn't enforce any theoretical serialization, it might just
+add a sufficiently long delay that there's never a problem in practice.
+
+Whereas in the virtio-mmio case, the initial write to the UNIX domain
+socket, and the response from host-side libguestfs, runs unfettered. I
+imagine something like:
+
+- (IO thread)       connect to socket
+- (IO thread)       add fd to main loop context
+- (guest)           write to virtio-serial port
+- (VCPU thread)     copy data to UNIX domain socket
+- (host libguestfs) read req, write resp to UNIX domain socket
+- (IO thread)       "I should probably check readiness on that socket
+                    sometime"
+
+I don't know why the IO-thread doesn't get there *eventually*.
+
+What happens if you add a five second delay to libguestfs, before
+writing the response?
+
+Laszlo
+
+
+
+On 16 September 2013 17:13, Laszlo Ersek <email address hidden> wrote:
+> Hmmmm. Normally (as in, virtio-pci), when a VCPU thread (running KVM)
+> executes guest code that sends data to the host via virtio, KVM kicks
+> the "host notifier" eventfd.
+
+What happens in the virtio-pci without eventfd case?
+(eg virtio-pci on a non-x86 host)
+
+Also, IIRC Alex said they'd had an annoying "data gets lost"
+issue with the s390 virtio transports too...
+
+-- PMM
+
+
+> What happens if you add a five second delay to libguestfs,
+> before writing the response?
+
+No change.  Still hangs in the same place.
+
+On 09/17/13 10:09, Peter Maydell wrote:
+> On 16 September 2013 17:13, Laszlo Ersek <email address hidden> wrote:
+>> Hmmmm. Normally (as in, virtio-pci), when a VCPU thread (running KVM)
+>> executes guest code that sends data to the host via virtio, KVM kicks
+>> the "host notifier" eventfd.
+> 
+> What happens in the virtio-pci without eventfd case?
+> (eg virtio-pci on a non-x86 host)
+
+I'm confused. I think Anthony or Michael could answer better.
+
+There's at least three cases here I guess (KVM + eventfd, KVM without
+eventfd (enforceable eg. with the "ioeventfd" property for virtio
+devices), and TCG). We're probably talking about the third case.
+
+I think we end up in
+
+  virtio_pci_config_ops.write == virtio_pci_config_write
+    virtio_ioport_write()
+      virtio_queue_notify()
+        ... the "usual" stuff ...
+
+As far as I know TCG supports exactly one VCPU thread but that's still
+separate from the IO-thread. In that case the above could trigger the
+problem similarly to virtio-mmio I guess...
+
+I think we should debug into GLib, independently of virtio. What annoys
+me mostly is the huge number of ppoll()s in Rich's trace between
+connecting to the UNIX domain socket and actually checking it for
+read-readiness. The fd in question should show up in the first ppoll()
+after connect().
+
+My email might not make any sense. Sorry.
+Laszlo
+
+
+> There's at least three cases here I guess (KVM + eventfd, KVM without
+> eventfd (enforceable eg. with the "ioeventfd" property for virtio
+> devices), and TCG). We're probably talking about the third case.
+
+To clarify on this point: I have reproduced this bug on two different ARM
+machines, one using KVM and one using TCG.
+
+In both cases they are ./configure'd without any special ioeventfd-related
+options, which appears to mean CONFIG_EVENTFD=y (in both cases).
+
+In both cases I'm using a single vCPU.
+
+On 09/17/13 11:51, Richard Jones wrote:
+>> There's at least three cases here I guess (KVM + eventfd, KVM without
+>> eventfd (enforceable eg. with the "ioeventfd" property for virtio
+>> devices), and TCG). We're probably talking about the third case.
+> 
+> To clarify on this point: I have reproduced this bug on two different ARM
+> machines, one using KVM and one using TCG.
+> 
+> In both cases they are ./configure'd without any special ioeventfd-related
+> options, which appears to mean CONFIG_EVENTFD=y (in both cases).
+> 
+> In both cases I'm using a single vCPU.
+> 
+
+I think I have a theory now; it's quite convoluted.
+
+The problem is a deadlock in ppoll() that is *masked* by unrelated file
+descriptor traffic in all of the apparently working cases.
+
+I wrote some ad-hoc debug patches, and this is the log leading up to the
+hang:
+
+  io_watch_poll_prepare: chardev:channel0 was_active:0 now_active:0
+  qemu_poll_ns: timeout=4281013151888
+  poll entry #0 fd 3
+  poll entry #1 fd 5
+  poll entry #2 fd 0
+  poll entry #3 fd 11
+  poll entry #4 fd 4
+  trying to open virtio-serial channel '/dev/virtio-ports/org.libguestfs.channel.0'
+  opened the socket, sock = 3
+  udevadm settle
+  libguestfs: recv_from_daemon: received GUESTFS_LAUNCH_FLAG
+  libguestfs: [21734ms] appliance is up
+  Guest launched OK.
+  libguestfs: writing the data to the socket (size = 64)
+  sent magic GUESTFS_LAUNCH_FLAG
+  main_loop waiting for next request
+  libguestfs: data written OK
+  <HANG>
+
+Setup call tree for the backend (ie. the UNIX domain socket):
+
+   1  qemu_chr_open_socket() [qemu-char.c]
+   2    unix_connect_opts() [util/qemu-sockets.c]
+   3      qemu_socket()
+   4      connect()
+   5    qemu_chr_open_socket_fd() [qemu-char.c]
+   6      io_channel_from_socket()
+   7        g_io_channel_unix_new()
+   8      tcp_chr_connect()
+   9        io_add_watch_poll()
+  10          g_source_new()
+  11          g_source_attach()
+
+This part connects to libguestfs's UNIX domain socket (the new socket
+file descriptor, returned on line 3, is fd 6), and it registers a few
+callbacks. Notably, the above doesn't try to add fd 6 to the set of
+polled file descriptors.
+
+
+Then, the setup call tree for the frontend (the virtio-serial port) is
+as follows:
+
+  12  virtconsole_initfn() [hw/char/virtio-console.c]
+  13    qemu_chr_add_handlers() [qemu-char.c]
+
+This reaches into the chardev (ie. the backend referenced by the
+frontend, label "channel0"), and sets further callbacks.
+
+
+The following seems to lead up to the hang:
+
+  14 os_host_main_loop_wait() [main-loop.c]
+  15   glib_pollfds_fill()
+  16     g_main_context_prepare()
+  17       io_watch_poll_prepare() [qemu-char.c]
+  18         chr_can_read() [hw/char/virtio-console.c]
+  19           virtio_serial_guest_ready() [hw/char/virtio-serial-bus.c]
+  20
+  21             if (use_multiport(port->vser) && !port->guest_connected) {
+  22                 return 0;
+  23             }
+  24
+  25             virtqueue_get_avail_bytes()
+  26         g_io_create_watch() // conditionally
+  27   qemu_poll_ns() [qemu-timer.c]
+  28     ppoll()
+
+Line 15: glib_pollfds_fill() prepares the array of file descriptors for
+polling. As first step,
+
+Line 16: it calls g_main_context_prepare(). This GLib function runs the
+"prepare" callbacks for the GSource's in the main context.
+
+The GSource for fd 6 has been allocated on line 10 above, and its
+"prepare" callback has been set to io_watch_poll_prepare() there. It is
+called on line 17.
+
+Line 17: io_watch_poll_prepare() is a crucial function. It decides
+whether fd 6 (the backend fd) will be added to the set of pollfds or
+not.
+
+It checks whether the frontend has become writeable (ie. it must have
+been unwriteable up to now, but it must be writeable now). If so, a
+(persistent) watch is created (on line 26), which is the action that
+includes fd 6 in the set of pollfds after all. If there is no change in
+the status of the frontend, the watch is not changed.
+
+io_watch_poll_prepare() checks for the writeability of the frontend (ie.
+virtio serial port) by the "fd_can_read" callback. This has been set to
+chr_can_read() on line 13, inside virtconsole_initfn().
+
+So, the frontend-writeability check happens in chr_can_read(), which
+simply calls:
+
+Line 19: virtio_serial_guest_ready(). This function *normally* checks
+for the available room in the virtqueue (the guest receives serial port
+data from the host by submitting "receive requests" that must be filled
+in by the host); see line 25.
+
+However, virtio_serial_guest_ready() first verifies whether the guest
+has connected to the virtio-serial port at all. If not, then the
+function will report the frontend unwriteable (lines 21-23).
+
+
+Now, right before the hang, the guest hasn't yet connected to the
+virtio-serial port. Therefore line 22 fires (= virtio-serial port is
+unwriteable), which in turn results in *no* watch being created for the
+backend. Consequently, the UNIX domain socket (fd 6) is not added to the
+set of pollfds:
+
+  io_watch_poll_prepare: chardev:channel0 was_active:0 now_active:0
+  qemu_poll_ns: timeout=4281013151888
+  poll entry #0 fd 3
+  poll entry #1 fd 5
+  poll entry #2 fd 0
+  poll entry #3 fd 11
+  poll entry #4 fd 4
+
+At this point the IO thread is blocked in ppoll().
+
+Then, the guest connects to the serial port, and sends data.
+
+  trying to open virtio-serial channel '/dev/virtio-ports/org.libguestfs.channel.0'
+  opened the socket, sock = 3
+  udevadm settle
+
+As discussed before, this guest-to-host transfer is handled by the VCPU
+thread, and the data is written to fd 6 (the UNIX domain socket). The
+host-side libguestfs component reads it, and answers.
+
+  libguestfs: recv_from_daemon: received GUESTFS_LAUNCH_FLAG
+  libguestfs: [21734ms] appliance is up
+  Guest launched OK.
+  libguestfs: writing the data to the socket (size = 64)
+  sent magic GUESTFS_LAUNCH_FLAG
+  main_loop waiting for next request  # note, this is a libguestfs message!
+  libguestfs: data written OK
+  <HANG>
+
+Unfortunately, ppoll() is not watching out for fd 6 at all, hence this
+deadlocks.
+
+
+What about the successful cases though? A good proportion of the
+attempts succeed.
+
+This is explained by the fact that *other* file descriptors can break
+out the IO-thread from ppoll().
+
+- The most common example is KVM *with* eventfd support. The KVM eventfd
+  (the host notifier) is part of the pollfd set, and whenever the guest
+  sends some data, KVM kicks the eventfd, and ppoll() returns. This
+  masks the problem universally.
+
+- In the other two cases, we either have KVM *without* eventfd support,
+  or TCG. Rich reproduced the hang under both, and he's seen successful
+  (actually: masked deadlock) cases as well, on both.
+
+  In these setups the file descriptor traffic that masks the problem is
+  not from a KVM eventfd, hence the wakeup is quite random. There is
+  sometimes a perceivable pause between ppoll() going to sleep and
+  waking up. At other times there's no other fd traffic, and the
+  deadlock persists.
+
+In my testing on Rich's ARM box, the unrelated fd that breaks out the IO-thread
+from ppoll() is the eventfd that belongs to the AIO thread pool. It is fd 11,
+and it is allocated in:
+
+  0x00512d3c in event_notifier_init (e=0x1f4ad80, active=0) at util/event_notifier-posix.c:34
+  34          ret = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  (gdb) n
+  39          if (ret >= 0) {
+  (gdb) print ret
+  $2 = 11
+  (gdb) where
+  #0  event_notifier_init (e=0x1f4ad80, active=0) at util/event_notifier-posix.c:39
+  #1  0x00300b4c in thread_pool_init_one (pool=0x1f4ad80, ctx=0x1f39e18) at thread-pool.c:295
+  #2  0x00300c6c in thread_pool_new (ctx=0x1f39e18) at thread-pool.c:313
+  #3  0x0001686c in aio_get_thread_pool (ctx=0x1f39e18) at async.c:238
+  #4  0x0006f9d8 in paio_submit (bs=0x1f4a020, fd=10, sector_num=0, qiov=0xbe88c164, nb_sectors=4,
+      cb=0x389d8 <bdrv_co_io_em_complete>, opaque=0xb6505ec4, type=1) at block/raw-posix.c:799
+  #5  0x0006fb84 in raw_aio_submit (bs=0x1f4a020, sector_num=0, qiov=0xbe88c164, nb_sectors=4,
+      cb=0x389d8 <bdrv_co_io_em_complete>, opaque=0xb6505ec4, type=1) at block/raw-posix.c:828
+  #6  0x0006fc28 in raw_aio_readv (bs=0x1f4a020, sector_num=0, qiov=0xbe88c164, nb_sectors=4,
+      cb=0x389d8 <bdrv_co_io_em_complete>, opaque=0xb6505ec4) at block/raw-posix.c:836
+  #7  0x00038b2c in bdrv_co_io_em (bs=0x1f4a020, sector_num=0, nb_sectors=4, iov=0xbe88c164, is_write=false)
+      at block.c:3957
+  #8  0x00038bf0 in bdrv_co_readv_em (bs=0x1f4a020, sector_num=0, nb_sectors=4, iov=0xbe88c164) at block.c:3974
+  #9  0x000349d4 in bdrv_co_do_readv (bs=0x1f4a020, sector_num=0, nb_sectors=4, qiov=0xbe88c164, flags=(unknown: 0))
+      at block.c:2619
+  #10 0x00033804 in bdrv_rw_co_entry (opaque=0xbe88c0e8) at block.c:2236
+  #11 0x0009ba54 in coroutine_trampoline (i0=32811528, i1=0) at coroutine-ucontext.c:118
+  #12 0x492fd160 in setcontext () from /usr/lib/libc.so.6
+  #13 0x492fd160 in setcontext () from /usr/lib/libc.so.6
+  Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+
+And the transitory hang looks like:
+
+  io_watch_poll_prepare: chardev:channel0 was_active:0 now_active:0
+  qemu_poll_ns: timeout=4281193192443
+  poll entry #0 fd 3
+  poll entry #1 fd 5
+  poll entry #2 fd 0
+  poll entry #3 fd 11
+  poll entry #4 fd 4
+
+Again, at this point IO thread is blocked in ppoll(),
+
+  trying to open virtio-serial channel   '/dev/virtio-ports/org.libguestfs.channel.0'
+  opened the socket, sock = 3
+  udevadm settle
+
+the guest transferred out some data,
+
+  libguestfs: recv_from_daemon: received GUESTFS_LAUNCH_FLAG
+  libguestfs: [20921ms] appliance is up
+  Guest launched OK.
+  libguestfs: writing the data to the socket (size = 64)
+  sent magic GUESTFS_LAUNCH_FLAG
+  main_loop waiting for next request
+  libguestfs: data written OK
+
+and the host side libguestfs has responded. The IO-thread is  blocked in
+ppoll(), guaranteed, and it doesn't notice readiness of fd 6 for
+reading.
+
+However, the (completely unrelated) AIO thread-pool eventfd is kicked at
+that point, and poll returns:
+
+  ppoll(): 1, errno=Success
+  poll entry #0 fd 3 events 25 revents 0
+  poll entry #1 fd 5 events 1 revents 0
+  poll entry #2 fd 0 events 1 revents 0
+  poll entry #3 fd 11 events 1 revents 1
+  poll entry #4 fd 4 events 1 revents 0
+
+Which in turn allows the IO-thread to run os_host_main_loop_wait()
+again, and *now* we're seeing the activation of fd 6 (its frontend, the
+virtio-serial port has been connected by the guest in the meantime and
+is now writeable):
+
+  io_watch_poll_prepare: chardev:channel0 was_active:0 now_active:1
+  qemu_poll_ns: timeout=0
+  poll entry #0 fd 3
+  poll entry #1 fd 5
+  poll entry #2 fd 0
+  poll entry #3 fd 11
+  poll entry #4 fd 4
+  poll entry #5 fd 6
+
+And stuff works as expected from here on.
+
+
+The VCPU thread needs to interrupt the IO-thread's ppoll() call
+explicitly.
+
+Basically, when the chardev's attached frontend (in this case, the
+virtio serial port) experiences a change that would cause it to report
+writeability in io_watch_poll_prepare() -- lines 17-18 --, it must
+interrupt ppoll().
+
+The following call tree seems relevant, but I'm not sure if it would be
+appropriate. When the guest message
+
+  trying to open virtio-serial channel '/dev/virtio-ports/org.libguestfs.channel.0'
+
+is printed, the following call chain is executed in the VCPU thread:
+
+  #0  qemu_chr_fe_set_open (chr=0xf22190, fe_open=1) at qemu-char.c:3404
+  #1  0x001079dc in set_guest_connected (port=0x1134f00, guest_connected=1) at hw/char/virtio-console.c:83
+  #2  0x003cfd94 in handle_control_message (vser=0x1124360, buf=0xb50005f8, len=8)
+      at /home/rjones/d/qemu/hw/char/virtio-serial-bus.c:379
+  #3  0x003d0020 in control_out (vdev=0x1124360, vq=0x11246b0) at /home/rjones/d/qemu/hw/char/virtio-serial-bus.c:416
+  #4  0x0044afe4 in virtio_queue_notify_vq (vq=0x11246b0) at /home/rjones/d/qemu/hw/virtio/virtio.c:720
+  #5  0x0044b054 in virtio_queue_notify (vdev=0x1124360, n=3) at /home/rjones/d/qemu/hw/virtio/virtio.c:726
+  #6  0x00271f30 in virtio_mmio_write (opaque=0x11278c8, offset=80, value=3, size=4) at hw/virtio/virtio-mmio.c:264
+  #7  0x00456aac in memory_region_write_accessor (mr=0x1128ba8, addr=80, value=0xb5972b08, size=4, shift=0,
+      mask=4294967295) at /home/rjones/d/qemu/memory.c:440
+  #8  0x00456c90 in access_with_adjusted_size (addr=80, value=0xb5972b08, size=4, access_size_min=1,
+      access_size_max=4, access=0x4569d0 <memory_region_write_accessor>, mr=0x1128ba8)
+      at /home/rjones/d/qemu/memory.c:477
+  #9  0x0045955c in memory_region_dispatch_write (mr=0x1128ba8, addr=80, data=3, size=4)
+      at /home/rjones/d/qemu/memory.c:984
+  #10 0x0045cee0 in io_mem_write (mr=0x1128ba8, addr=80, val=3, size=4) at /home/rjones/d/qemu/memory.c:1748
+  #11 0x0035d8dc in address_space_rw (as=0xa982f8 <address_space_memory>, addr=471008336, buf=0xb6f3d028 "\003",
+      len=4, is_write=true) at /home/rjones/d/qemu/exec.c:1954
+  #12 0x0035ddf0 in cpu_physical_memory_rw (addr=471008336, buf=0xb6f3d028 "\003", len=4, is_write=1)
+      at /home/rjones/d/qemu/exec.c:2033
+  #13 0x00453000 in kvm_cpu_exec (cpu=0x1097020) at /home/rjones/d/qemu/kvm-all.c:1665
+  #14 0x0034ca94 in qemu_kvm_cpu_thread_fn (arg=0x1097020) at /home/rjones/d/qemu/cpus.c:802
+  #15 0x494c6bc0 in start_thread () from /usr/lib/libpthread.so.0
+
+Unfortunately, the leaf (ie. qemu_chr_fe_set_open()) doesn't do anything
+here; the only chardev that sets the "chr_set_fe_open" callback is the
+spicevmc backend.
+
+I think the "socket" chardev might want to implement "chr_set_fe_open",
+kicking a (new) global eventfd, sending some signal to the IO-thread, or
+interrupting ppoll() in some other way. A new global eventfd just for
+this purpose seems quite the kludge, but it shouldn't be hard to
+implement. It needs no handler at all.
+
+Thanks
+Laszlo
+
+
+
+FWIW I am able to reproduce this quite easily on aarch64 too.
+
+My test program is:
+https://github.com/libguestfs/libguestfs/blob/master/tests/qemu/qemu-speed-test.c
+
+and you use it like this:
+qemu-speed-test --virtio-serial-upload
+
+(You can also test virtio-serial downloads and a few other things, but those don't appear to deadlock)
+
+Slowing down the upload, even just by enabling debugging, is sufficient to make the problem go away most of the time.
+
+I am testing with qemu from git (f45c56e0166e86d3b309ae72f4cb8e3d0949c7ef).
+
+I don't know how to close bugs in launchpad, but this one can be closed
+for a couple of reasons:
+
+(1) I benchmarked virtio-mmio the other day using qemu-speed-test on aarch64
+and I did not encounter the bug.
+
+(2) aarch64 has supported virtio-pci for a while, for virtio-mmio is effectively
+obsolete.
+
+Fixed upstream, see previous comment.
+

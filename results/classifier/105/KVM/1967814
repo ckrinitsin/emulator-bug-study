@@ -1,0 +1,438 @@
+KVM: 0.889
+graphic: 0.863
+assembly: 0.859
+other: 0.857
+vnc: 0.853
+network: 0.840
+instruction: 0.839
+boot: 0.839
+socket: 0.835
+semantic: 0.823
+device: 0.822
+mistranslation: 0.746
+
+Ubuntu 20.04.3 - ilzlnx3g1 - virtio-scsi devs on KVM guest having miscompares on disktests when there is a failed path.
+
+== Comment: #63 - Halil Pasic <email address hidden> - 2022-03-28 17:33:34 ==
+I'm pretty confident I've figured out what is going on. 
+
+From the guest side, the decision whether the SCSI command was completed successfully or not comes down to looking at the sense data. Prior to commit
+a108557bbf ("scsi: inline sg_io_sense_from_errno() into the callers."), we don't
+build sense data as a response to seeing a host status presented by the host SCSI stack (e.g. kernel).
+
+Thus when the kernel tells us that  a given SCSI command did not get completed via
+SCSI_HOST_TRANSPORT_DISRUPTED or SCSI_HOST_NO_LUN, we end up  fooling the guest into believing that the command completed successfully.
+
+The guest kernel, and especially virtio and multipath are at no fault (AFAIU). Given these facts, it isn't all that surprising, that we end up with corruptions.
+
+All we have to do is do backports for QEMU (when necessary). I didn't investigate vhost-scsi -- my guess is, that it ain't affected.
+
+How do we want to handle the back-ports?
+
+== Comment: #66 - Halil Pasic <email address hidden> - 2022-04-04 05:36:33 ==
+This is a proposed backport containing 7 patches in mbox format. I tried to pick patches sanely, and all I had to do was basically resolving merge conflicts.
+
+I have to admit I have no extensive experience in doing such invasive backports, and my knowledge of the QEMU SCSI stack is very limited. I would be happy if the Ubuntu folks would have a good look at this, and if possible improve on it.
+
+Default Comment by Bridge
+
+Default Comment by Bridge
+
+Changing the affected package from "linux (Ubuntu)" (kernel) to "qemu (Ubuntu)" as affected package, since the attached patch set is for qemu.
+
+List of original commits and the version they were in:
+
+v5.2.0
+commit 3b12a7fd39307017c8968b8d05986a63b33752b5
+Author: Paolo Bonzini <email address hidden>
+Date:   Thu Nov 12 10:52:04 2020 +0100
+    scsi-disk: convert more errno values back to SCSI statuses
+
+v6.0.0
+commit f95f61c2c9618fae7d8ea4c1d63e7416884bad52
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Feb 24 13:14:07 2021 +0100
+    scsi-disk: move scsi_handle_rw_error earlier
+
+v6.0.0
+commit d7a84021db8eeddcd5d24ab591a1434763caff6c
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Feb 24 16:30:09 2021 +0100
+    scsi: introduce scsi_sense_from_errno()
+
+v6.0.0
+commit f63c68bc0f514694a958b2e84a204b7792d28b17
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Feb 24 18:59:36 2021 +0100
+    scsi-disk: pass SCSI status to scsi_handle_rw_error
+
+v6.0.0
+commit 41af878b96582fc8c83303ab8921e40468403702
+Author: Hannes Reinecke <email address hidden>
+Date:   Mon Nov 16 19:40:38 2020 +0100
+    scsi: Rename linux-specific SG_ERR codes to generic SCSI_HOST error codes
+
+v6.0.0
+commit db66a15cb80f09da24a5311a3f3b8f0c1835bf71
+Author: Hannes Reinecke <email address hidden>
+Date:   Mon Nov 16 19:40:39 2020 +0100
+    scsi: Add mapping for generic SCSI_HOST status to sense codes
+
+v6.0.0
+commit a108557bbff8a3f44233982f015f996426411be8
+Author: Hannes Reinecke <email address hidden>
+Date:   Mon Nov 16 19:40:40 2020 +0100
+    scsi: inline sg_io_sense_from_errno() into the callers.
+
+Thereby indeed this is only for Focal.
+Sorry, but analyzing the details will take more time...
+
+I can confirm that just on the patch-level only two need backporting, the rest applies as is and I have regenerated them to match the packaging requirements. The backport-adaptations themselves are minimal.
+
+From the content I guess it is complex enough that nobody can be fully sure.
+I'm still reading it ...
+
+Until then a few questions:
+- I wonder if we'd also want/need dc293f6 "scsi: fix sense code for EREMOTEIO" (to ensure this kind of ioerror gets to the guest as well) - what do you think?
+- I also wondered about 424740d "scsi-disk: do not complete requests early for rerror/werror=ignore" but we do not have 40dce4ee applied so that should be ok
+
+I'm done reading and while a complex subsystem and a bunch of changes they individually all seem sane to me (although a108557b could have side effects that are hard to spot).
+
+For SRU considerations I think this includes potential change of behavior of formerly silently ignored errors now becoming visible (or with more detail) to the guest. But IMHO silently hiding I/O errors is asking for problems and data corruption (just as you've found it=, while reporting them is correct.
+
+I'll later build a PPA for your testing  as you seem to have a testcase with Disktest on your side that can reproduce the issue that made you aware.
+
+Prepared
+PPA: https://launchpad.net/~paelzer/+archive/ubuntu/lp-1967814-scsi-error-handling/+packages
+MP: https://code.launchpad.net/~paelzer/ubuntu/+source/qemu/+git/qemu/+merge/418636
+
+Let us see if one builds and tests fine and the other gets positive review feedback.
+
+------- Comment From <email address hidden> 2022-04-06 09:24 EDT-------
+(In reply to comment #76)
+> I can confirm that just on the patch-level only two need backporting, the
+> rest applies as is and I have regenerated them to match the packaging
+> requirements. The backport-adaptations themselves are minimal.
+>
+> From the content I guess it is complex enough that nobody can be fully sure.
+> I'm still reading it ...
+>
+> Until then a few questions:
+> - I wonder if we'd also want/need dc293f6 "scsi: fix sense code for
+> EREMOTEIO" (to ensure this kind of ioerror gets to the guest as well) - what
+> do you think?
+> - I also wondered about 424740d "scsi-disk: do not complete requests early
+> for rerror/werror=ignore" but we do not have 40dce4ee applied so that should
+> be ok
+
+I have nothing against including those. I was under the impression that a minimal fix is desired, and my tests indicate that dose patches are not strictly necessary.
+
+Generally I think that those are good patches, and having them is better than not having them. But then I hope most of the patches are good patches, and obviously backporting all the good patches is not very practicable -- hence the principle of minimality.
+
+It is just my two cents. My understanding of SCSI is quite poor.
+
+You are right for a general stance of SRU minimality
+
+But this case felt like fixing 7/8 of a single whole.
+And while indeed your case didn't need this one more fix someone else would and we touch this code anyway. Vice versa all tests since this is upstream is done with it applied - so the coverage of the code with this added is better than without - so we also avoid unexpected side effects.
+OTOH We would not fix something totally else like something in virtio as part of this, no matter how reasonable that patch might look like.
+
+Let me know if you had time to push the PPA through your testing.
+
+------- Comment From <email address hidden> 2022-04-07 18:42 EDT-------
+(In reply to comment #80)
+> Let me know if you had time to push the PPA through your testing.
+
+Pulled the PPA
+
+root@ilzlnx3:~# apt info qemu
+Package: qemu
+Version: 1:4.2-3ubuntu6.22~focalppa1
+
+I triggered a path failure from the host and saw the faulty paths on the guest but no data miscompares (first time I've ever seen it not having miscompares at the first try).
+Recovered and tried again, this time I did got the miscompares, I captured the DBGINFO and sosreport, let me know if something else is needed.
+
+********** EXPECTED (Target: /fc/mapper/scsi_32G_d1_ilsd9840l/test, LBA: 1243520, Offset: 5) **********
+00000000  00 00 00 00  00 12 F9 80   00 00 00 00  00 00 00 01  ................
+00000010  00 00 00 00  62 4F 60 1C   00 00 00 00  00 00 06 EB  ....bO`.........
+00000020  69 6C 7A 6C  6E 78 33 67   31 00 00 00  00 00 00 00  ilzlnx3g1.......
+00000030  2F 66 63 2F  6D 61 70 70   65 72 2F 73  63 73 69 5F  /fc/mapper/scsi_
+00000040  33 32 47 5F  64 31 5F 69   6C 73 64 39  38 34 30 6C  32G_d1_ilsd9840l
+
+********** ACTUAL (Target: /fc/mapper/scsi_32G_d1_ilsd9840l/test, LBA: 1243520, Offset: 5) **********
+00000000  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00  ................
+00000010  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00  ................
+00000020  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00  ................
+00000030  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00  ................
+
+
+------- Comment (attachment only) From <email address hidden> 2022-04-07 18:43 EDT-------
+
+
+
+------- Comment (attachment only) From <email address hidden> 2022-04-07 18:44 EDT-------
+
+
+------- Comment From <email address hidden> 2022-04-08 05:13 EDT-------
+(In reply to comment #81)
+> (In reply to comment #80)
+> > Let me know if you had time to push the PPA through your testing.
+>
+> Pulled the PPA
+>
+> root@ilzlnx3:~# apt info qemu
+> Package: qemu
+> Version: 1:4.2-3ubuntu6.22~focalppa1
+>
+> I triggered a path failure from the host and saw the faulty paths on the
+> guest but no data miscompares (first time I've ever seen it not having
+> miscompares at the first try).
+> Recovered and tried again, this time I did got the miscompares, I captured
+> the DBGINFO and sosreport, let me know if something else is needed.
+>
+> ********** EXPECTED (Target: /fc/mapper/scsi_32G_d1_ilsd9840l/test, LBA:
+> 1243520, Offset: 5) **********
+> 00000000  00 00 00 00  00 12 F9 80   00 00 00 00  00 00 00 01
+> ................
+> 00000010  00 00 00 00  62 4F 60 1C   00 00 00 00  00 00 06 EB
+> ....bO`.........
+> 00000020  69 6C 7A 6C  6E 78 33 67   31 00 00 00  00 00 00 00
+> ilzlnx3g1.......
+> 00000030  2F 66 63 2F  6D 61 70 70   65 72 2F 73  63 73 69 5F
+> /fc/mapper/scsi_
+> 00000040  33 32 47 5F  64 31 5F 69   6C 73 64 39  38 34 30 6C
+> 32G_d1_ilsd9840l
+>
+> ********** ACTUAL (Target: /fc/mapper/scsi_32G_d1_ilsd9840l/test, LBA:
+> 1243520, Offset: 5) **********
+> 00000000  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00
+> ................
+> 00000010  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00
+> ................
+> 00000020  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00
+> ................
+> 00000030  00 00 00 00  00 00 00 00   00 00 00 00  00 00 00 00
+> ................
+
+That is very bad news! :(
+
+I was not able to trigger the problem with the patched qemu. I will try harder, but if I can't trigger the problem it becomes very difficult for me to work on it.
+
+------- Comment From <email address hidden> 2022-04-08 05:20 EDT-------
+(In reply to comment #81)
+> (In reply to comment #80)
+> > Let me know if you had time to push the PPA through your testing.
+>
+> Pulled the PPA
+>
+> root@ilzlnx3:~# apt info qemu
+> Package: qemu
+> Version: 1:4.2-3ubuntu6.22~focalppa1
+>
+> I triggered a path failure from the host and saw the faulty paths on the
+> guest but no data miscompares (first time I've ever seen it not having
+> miscompares at the first try).
+> Recovered and tried again, this time I did got the miscompares, I captured
+> the DBGINFO and sosreport, let me know if something else is needed.
+
+Maybe we are hitting a different case. Maybe not. In the past we used to observe multiple types of miscompares one of which is the all zero, and another one is wrong but still  disktest data.
+
+I'm curious if we see the wrong disktest data type of miscompare with the patched qemu.
+
+Also I would like to know if the miscompare is still observable after a reboot (i.e. if you destroy and re-start the guest, and then do a manual compare with disktest on the given block (without the write phase).
+
+Also can I help you install a self-built upstream qemu so we can test with that as well? Maybe we are just missing some more patches.
+
+Thanks Vanessa for the testing on the PPA!
+
+@Halil - I'd leave the debugging of the remaining issue to you as while you can't reproduce it yet it still is much closer to you than it is to me :-/ Thanks in advance, let us know what you find.
+
+In the meantime I have prepared the SRU content and got a PR review, so once we are convinced it is good - or found what we need to change - we should be ready to continue.
+
+------- Comment From <email address hidden> 2022-04-25 19:20 EDT-------
+(In reply to comment #94)
+> Thanks Vanessa for the testing on the PPA!
+>
+> @Halil - I'd leave the debugging of the remaining issue to you as while you
+> can't reproduce it yet it still is much closer to you than it is to me :-/
+> Thanks in advance, let us know what you find.
+>
+> In the meantime I have prepared the SRU content and got a PR review, so once
+> we are convinced it is good - or found what we need to change - we should be
+> ready to continue.
+
+I was not testing the PPA you provided properly, I pulled it again and made sure it was installed and running:
+
+root@ilzlnx3:~# /usr/bin/qemu-system-s390x --version
+QEMU emulator version 4.2.1 (Debian 1:4.2-3ubuntu6.22~focalppa1)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+I ran the error injects for a few hours and no miscompares were encountered.
+Thanks @Halil, for bringing the issue to my attention!
+
+------- Comment From <email address hidden> 2022-04-28 05:22 EDT-------
+(In reply to comment #97)
+> (In reply to comment #94)
+> > Thanks Vanessa for the testing on the PPA!
+> >
+> > @Halil - I'd leave the debugging of the remaining issue to you as while you
+> > can't reproduce it yet it still is much closer to you than it is to me :-/
+> > Thanks in advance, let us know what you find.
+> >
+> > In the meantime I have prepared the SRU content and got a PR review, so once
+> > we are convinced it is good - or found what we need to change - we should be
+> > ready to continue.
+>
+> I was not testing the PPA you provided properly, I pulled it again and made
+> sure it was installed and running:
+>
+> root@ilzlnx3:~# /usr/bin/qemu-system-s390x --version
+> QEMU emulator version 4.2.1 (Debian 1:4.2-3ubuntu6.22~focalppa1)
+> Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+>
+> I ran the error injects for a few hours and no miscompares were encountered.
+> Thanks @Halil, for bringing the issue to my attention!
+
+@Ubuntu: I think we can and should move forward with this. The problem with the
+previous test results is, that the qemu from the PPA wasn't installed at all, and thus we ended up just verifying that the old one is still broken.
+
+I read Vanessas comment like, she the issue is not observed any more with the PPA installed: i.e. the fix works at least for the test-case that used to trigger the problem reliably. @Vanessa: Please correct me if I'm wrong.
+
+------- Comment From <email address hidden> 2022-04-28 18:36 EDT-------
+(In reply to comment #98)
+>
+> @Ubuntu: I think we can and should move forward with this. The problem with
+> the
+> previous test results is, that the qemu from the PPA wasn't installed at
+> all, and thus we ended up just verifying that the old one is still broken.
+>
+> I read Vanessas comment like, she the issue is not observed any more with
+> the PPA installed: i.e. the fix works at least for the test-case that used
+> to trigger the problem reliably. @Vanessa: Please correct me if I'm wrong.
+
+That is correct, the fix works, no miscompares while doing the test-case I've been using to reproduce this issue (tested for a few hours, no more than 30 seconds in between error injects).
+
+root@ilzlnx3:~# /usr/bin/qemu-system-s390x --version
+QEMU emulator version 4.2.1 (Debian 1:4.2-3ubuntu6.22~focalppa1)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+Following up on some older bugs...
+Okay, that means the PPA version of qemu for focal could be successfully verified (no miss-compares).
+So I'll change the status back to In Progress ...
+
+Thanks for the pre-check.
+Everything is ready and now uploaded to Focal, there please verify it on the real build once accepted by the SRU team.
+
+Hello bugproxy, or anyone else affected,
+
+Accepted qemu into focal-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:4.2-3ubuntu6.22 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-focal to verification-done-focal. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-focal. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+I've accepted this, and I agree that this is a good candidate for testing in proposed for longer than 7 days; I'll do so after at least 14 days, so double the normal soak time.
+
+All autopkgtests for the newly accepted qemu (1:4.2-3ubuntu6.22) for focal have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+ubuntu-image/1.11+20.04ubuntu1 (amd64)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/focal/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+That was a flaky test, resolved by now.
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu6.23
+
+---------------
+qemu (1:4.2-3ubuntu6.23) focal-security; urgency=medium
+
+  * SECURITY UPDATE: heap overflow in floppy disk emulator
+    - debian/patches/CVE-2021-3507.patch: prevent end-of-track overrun in
+      hw/block/fdc.c.
+    - CVE-2021-3507
+  * SECURITY UPDATE: integer overflow in QXL display device emulation
+    - debian/patches/CVE-2021-4206.patch: check width and height in
+      hw/display/qxl-render.c, hw/display/vmware_vga.c, ui/cursor.c.
+    - CVE-2021-4206
+  * SECURITY UPDATE: heap overflow in QXL display device emulation
+    - debian/patches/CVE-2021-4207.patch: fix race condition in qxl_cursor
+      in hw/display/qxl-render.c.
+    - CVE-2021-4207
+  * SECURITY UPDATE: memory leakage in virtio-net device
+    - debian/patches/CVE-2022-26353.patch: fix map leaking on error during
+      receive in hw/net/virtio-net.c.
+    - CVE-2022-26353
+  * SECURITY UPDATE: memory leakage in vhost-vsock device
+    - debian/patches/CVE-2022-26354.patch: detach the virqueue element in
+      case of error in hw/virtio/vhost-vsock.c.
+    - CVE-2022-26354
+
+ -- Marc Deslauriers <email address hidden>  Thu, 09 Jun 2022 11:35:04 -0400
+
+------- Comment From <email address hidden> 2022-06-21 11:20 EDT-------
+(In reply to comment #105)
+> If this package fixes the bug for you, please add a comment to this bug,
+> mentioning the version of the package you tested, what testing has been
+> performed on the package and change the tag from verification-needed-focal
+> to verification-done-focal. If it does not fix the bug for you, please add a
+> comment stating that, and change the tag to verification-failed-focal. In
+> either case, without details of your testing we will not be able to proceed.
+>
+Tested this fix and it has solved the issue. Tested with the following version:
+
+root@ilzlnx3:~# /usr/bin/qemu-system-s390x --version
+QEMU emulator version 4.2.1 (Debian 1:4.2-3ubuntu6.22)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+Testing performed:
+HostSidePortBounce:
+1. Run I/O on mapped LUNs
+2. Disable one port on host side and wait for 10 minutes
+3. Enable the port and wait for 10 minutes
+4. Repeat step b and c with the other ports
+5. Check I/O tool logs
+
+Passed. No miscompares or error logs.
+
+Switch Reboot:
+1. Start IO on mapped LUNs
+2. Reload brocade/cisco switch and wait for 5 minutes after switch online for host recovery
+3. Check I/O tool logs
+
+Passed. No miscompares or error logs.
+
+SVC Node reset:
+1. Run I/O on mapped LUNs
+2. Execute anode reset warm start script against the cluster.
+3. Check both I/O logs and script logs
+
+Passed. No miscompares or error logs.
+
+zMpath failover failback
+1. Run I/O on mapped LUN
+2. Vary off one chpid of a lpar and wait for 60 seconds
+3. Vary on the chpid ofthe lpar and wait for 20 minutes
+4. Repeat step b and c with the other chpids of the lpar
+5. Check logs of I/O tool
+
+Passed. No miscompares or error logs.
+
+> Further information regarding the verification process can be found at
+> https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in
+> advance for helping!
+
+Thanks for the patience awaiting testing and for all the effort
+

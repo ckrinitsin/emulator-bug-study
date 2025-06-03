@@ -1,0 +1,161 @@
+graphic: 0.884
+instruction: 0.832
+other: 0.804
+semantic: 0.802
+mistranslation: 0.798
+socket: 0.786
+device: 0.781
+assembly: 0.778
+vnc: 0.751
+KVM: 0.712
+network: 0.709
+boot: 0.669
+
+LDTR not properly emulated when MTE tag checks enabled at EL0
+
+I am trying to boot Android (just the non-GUI parts for now) under QEMU with MTE enabled. This can be done by following the instructions here to build the fvp-eng target with MTE support:
+
+https://cs.android.com/android/platform/superproject/+/master:device/generic/goldfish/fvpbase/
+
+and launching QEMU with the following command:
+
+qemu-system-aarch64 -kernel $ANDROID_PRODUCT_OUT/kernel -initrd $ANDROID_PRODUCT_OUT/combined-ramdisk.img -machine virt,mte=on -cpu max -drive driver=raw,file=$ANDROID_PRODUCT_OUT/system-qemu.img,if=none,id=system -device virtio-blk-device,drive=system -append "console=ttyAMA0 earlyprintk=ttyAMA0 androidboot.hardware=fvpbase androidboot.boot_devices=a003e00.virtio_mmio loglevel=9 printk.devkmsg=on buildvariant=eng" -m 512 -nographic -no-reboot
+
+If I do this then QEMU crashes like so:
+
+**
+ERROR:../target/arm/mte_helper.c:558:mte_check_fail: code should not be reached
+Bail out! ERROR:../target/arm/mte_helper.c:558:mte_check_fail: code should not be reached
+
+The error is caused by an MTE tag check fault from an LDTR instruction in __arch_copy_from_user. At this point TCF=0 and TCF0=2.
+
+I have this patch that gets me past the error but it is unclear whether this is the correct fix since there may be other confusion between TCF and TCF0 elsewhere.
+
+diff --git a/target/arm/mte_helper.c b/target/arm/mte_helper.c
+index 153bd1e9df..aa5db4eac4 100644
+--- a/target/arm/mte_helper.c
++++ b/target/arm/mte_helper.c
+@@ -552,10 +552,8 @@ static void mte_check_fail(CPUARMState *env, uint32_t desc,
+     case 0:
+         /*
+          * Tag check fail does not affect the PE.
+-         * We eliminate this case by not setting MTE_ACTIVE
+-         * in tb_flags, so that we never make this runtime call.
+          */
+-        g_assert_not_reached();
++        break;
+ 
+     case 2:
+         /* Tag check fail causes asynchronous flag set.  */
+
+The workaround patch above is insufficient if I change userspace to set TCF0=1. With that I get a kernel panic:
+
+[   13.336255][    C0] Bad mode in Synchronous Abort handler detected on CPU0, code 0x92000011 -- DABT (lower EL)
+[   13.337437][    C0] CPU: 0 PID: 1 Comm: init Not tainted 5.10.0-rc7-mainline-00300-gf4328758abb6 #1
+[   13.338086][    C0] Hardware name: linux,dummy-virt (DT)
+[   13.338948][    C0] pstate: 20400005 (nzCv daif +PAN -UAO -TCO BTYPE=--)
+[   13.339951][    C0] pc : __arch_copy_from_user+0x1e4/0x340
+[   13.340483][    C0] lr : _copy_from_user+0xbc/0x564
+[   13.340930][    C0] sp : ffffffc01000bda0
+[   13.341385][    C0] x29: ffffffc01000bda0
+[   13.342295][    C0] x28: ffffff804011c100
+[   13.342951][    C0]
+[   13.343321][    C0] x27: 0000000000000000
+[   13.343759][    C0] x26: 0000000000000000
+[   13.344178][    C0]
+[   13.344513][    C0] x25: 0000000000000000
+[   13.344954][    C0] x24: 0000000000000000
+[   13.345382][    C0]
+[   13.345713][    C0] x23: 0300007e18aca850
+[   13.346153][    C0] x22: 0300007e18aca860
+[   13.346809][    C0]
+[   13.347144][    C0] x21: ffffff8043d1ef80
+[   13.347596][    C0] x20: 0300007e18aca850
+[   13.348023][    C0]
+[   13.348354][    C0] x19: ffffff8043295000
+[   13.348806][    C0] x18: ffffff8040103c38
+[   13.349232][    C0]
+[   13.349557][    C0] x17: 0000000004000000
+[   13.349998][    C0] x16: 0000007fffffffff
+[   13.350634][    C0]
+[   13.350965][    C0] x15: 0000007f9fed34f8
+[   13.351409][    C0] x14: 006d65747379730c
+[   13.351844][    C0]
+[   13.352167][    C0] x13: 00000000000001ed
+[   13.352610][    C0] x12: 0000000000000000
+[   13.353034][    C0]
+[   13.353358][    C0] x11: 0000000000000000
+[   13.353802][    C0] x10: 0000000000000000
+[   13.354232][    C0]
+[   13.354785][    C0] x9 : 006d65747379730c
+[   13.355236][    C0] x8 : 0000000000000000
+[   13.355673][    C0]
+[   13.355998][    C0] x7 : 0000000000000000
+[   13.356448][    C0] x6 : ffffff8043295040
+[   13.356874][    C0]
+[   13.357200][    C0] x5 : ffffff8043296000
+[   13.357646][    C0] x4 : 0000000000000000
+[   13.358077][    C0]
+[   13.358423][    C0] x3 : 0000000000000001
+[   13.359055][    C0] x2 : 0000000000000f80
+[   13.359497][    C0]
+[   13.359829][    C0] x1 : 0300007e18aca8c0
+[   13.360278][    C0] x0 : ffffff8043295000
+[   13.360705][    C0]
+[   13.362315][    C0] Kernel panic - not syncing: bad mode
+[   13.362377][    C0] CPU: 0 PID: 1 Comm: init Not tainted 5.10.0-rc7-mainline-00300-gf4328758abb6 #1
+[   13.362410][    C0] Hardware name: linux,dummy-virt (DT)
+[   13.362442][    C0] Call trace:
+[   13.362474][    C0]  dump_backtrace+0x0/0x1e0
+[   13.362507][    C0]  show_stack+0x1c/0x2c
+[   13.362539][    C0]  dump_stack+0xd0/0x154
+[   13.362570][    C0]  panic+0x158/0x370
+[   13.362602][    C0]  bad_el0_sync+0x0/0x5c
+[   13.362634][    C0]  el1_inv+0x3c/0x5c
+[   13.362666][    C0]  el1_sync_handler+0x64/0x8c
+[   13.362698][    C0]  el1_sync+0x84/0x140
+[   13.362730][    C0]  __arch_copy_from_user+0x1e4/0x340
+[   13.362762][    C0]  copy_mount_options+0x40/0x1d0
+[   13.362794][    C0]  __arm64_sys_mount+0x84/0x13c
+[   13.362826][    C0]  el0_svc_common+0xc0/0x1b4
+[   13.362858][    C0]  do_el0_svc+0x20/0x30
+[   13.362890][    C0]  el0_svc+0x14/0x24
+[   13.362922][    C0]  el0_sync_handler+0x88/0xec
+[   13.362953][    C0]  el0_sync+0x17c/0x180
+[   13.363547][    C0] Kernel Offset: 0x2abd800000 from 0xffffffc010000000
+[   13.363580][    C0] PHYS_OFFSET: 0x40000000
+[   13.363613][    C0] CPU features: 0x27e0152,6180a230
+[   13.363644][    C0] Memory Limit: none
+
+It looks like the tag check fault coming from the LDTR is reported using the wrong EL.
+
+From the hash id in your patch, it would appear that you are using a fork of qemu.
+
+This should be fixed by 50244cc76abc present in the qemu 5.2 release.
+
+This isn't a fork of qemu, it was an upstream checkout based on commit 944fdc5e27a5b5adbb765891e8e70e88ba9a00ec (well, okay, I did have the ARM HVF series applied to this checkout, but I wouldn't expect that to affect TCG). I verified that 50244cc76abc is present in my checkout.
+
+Let me see if I can reproduce with the current upstream master.
+
+Ok, I'll have a deeper look as well.
+
+rebuild_hflags_a64 is not consistent with mte_check_fail,
+which leads to the assert reported.
+
+The instructions for building the android kernel are opaque,
+assuming tools not in evidence.
+
+Thanks, I will try that patch.
+
+Apologies, the instructions assume some familiarity with building Android. You will find instructions for downloading the "repo" tool and the Android source tree here:
+
+https://source.android.com/setup/build/downloading
+
+This isn't the first time I've received this kind of feedback. I will add a link to that page to the document.
+
+Thanks for the patch. I've verified that it fixes the assertion failure with both TCF0=1 and TCF0=2.
+
+You can disregard the kernel panic from comment #1 since it turns out that it was from an older build of QEMU that did not have 50244cc76abc.
+
+https://gitlab.com/qemu-project/qemu/-/commit/cc97b0019bb590b9b3c
+

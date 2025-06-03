@@ -1,0 +1,66 @@
+other: 0.902
+instruction: 0.850
+device: 0.838
+mistranslation: 0.836
+vnc: 0.816
+graphic: 0.811
+network: 0.810
+boot: 0.793
+semantic: 0.783
+assembly: 0.779
+KVM: 0.768
+socket: 0.760
+
+nested 9pfs read fail
+
+tl;dr: A virtfs read fails. The init being on this virtfs (mounted by the initrd), the linux kernel guest is unable to boot, and kernel panics. The fact that qemu still takes 100%cpu after the kernel panic makes me think it's a qemu bug.
+
+Here is the setup (some hashes replaced with "..."):
+ * A (NixOS) host system, with /nix/store as a btrfs on lvm on cryptsetup
+ * Running a qemu-kvm NixOS guest, with /nix/.ro-store as a virtfs mapping to host /nix/store:
+```
+exec /nix/store/...-qemu-x86-only-for-vm-tests-2.8.0/bin/qemu-kvm \
+    -name test \
+    -m 8192 \
+    -cpu kvm64 \
+    -net nic,vlan=0,model=virtio -net user,vlan=0 \
+    -virtfs local,path=/nix/store,security_model=none,mount_tag=store \
+    -virtfs local,path=/tmp/nix-vm..../xchg,security_model=none,mount_tag=xchg \
+    -virtfs local,path=/tmp/nix-vm..../xchg,security_model=none,mount_tag=shared \
+    -drive index=0,id=drive1,file=/home/ekleog/nixos/test.qcow2,if=virtio,cache=writeback,werror=report \
+-kernel /nix/store/...-nixos-system-test-17.09.git.deee8da/kernel \
+-initrd /nix/store/...-nixos-system-test-17.09.git.deee8da/initrd \
+-append "$(cat /nix/store/...-nixos-system-test-17.09.git.deee8da/kernel-params) init=/nix/store/...-nixos-system-test-17.09.git.deee8da/init regInfo=/nix/store/...-reginfo" \
+    -vga std -usbdevice tablet
+```
+ * With /nix/store as an overlayfs between /nix/.ro-store and /nix/.rw-store
+ * Running a qemu-kvm NixOS guest, with /nix/.ro-store as a virtfs mapping to host /nix/store/...-vm-nginx-store:
+```
+/nix/store/...-qemu-2.8.0/bin/qemu-kvm \
+  -name nginx -m 128 -smp 2 -cpu kvm64 \
+  -nographic -serial unix:"/var/lib/vm/consoles/nginx/socket.unix",server,nowait \
+  -drive file="/var/lib/vm/images/nginx.img",if=virtio,media=disk \
+  -virtfs local,path="/nix/store/...-vm-nginx-store",security_model=none,mount_tag=store \
+  -netdev type=tap,id=net0,ifname=vm-nginx,script=no,dscript=no -device virtio-net-pci,netdev=net0,mac=56:00:00:00:00:01 \
+  -kernel /nix/store/...-nixos-system-nginx-17.09.git.deee8da/kernel \
+  -initrd /nix/store/...-nixos-system-nginx-17.09.git.deee8da/initrd \
+  -append "$(cat /nix/store/...-nixos-system-nginx-17.09.git.deee8da/kernel-params) init=/nix/store/...-nixos-system-nginx-17.09.git.deee8da/init console=ttyS0 boot.shell_on_fail" \
+  -virtfs local,path="/var/lib/vm/persist/nginx/home",security_model=mapped-xattr,mount_tag="shared1" \
+  -virtfs local,path="/var/lib",security_model=mapped-xattr,mount_tag="shared2" \
+  -virtfs local,path="/tmp",security_model=mapped-xattr,mount_tag="shared3"
+```
+ * With /nix/store as an overlayfs between /nix/.ro-store and /nix/.rw-store
+ * With init in /nix/store
+
+What happens is that at boot time the inner VM doesn't manage to read the init script after the initrd has mounted the 9pfs and overlayfs.
+
+What makes me think it's a qemu bug is that htop in the outer VM shows the inner VM's qemu as using 100% cpu, despite the fact the kernel it's running is under kernel panic, thus doing nothing.
+
+What do you think about this?
+
+Oh, I forgot to mention: it first worked for some time, then in the middle of a shell session running over a screen /var/lib/vm/consoles/nginx/screen from the outer VM (socat-linked to /var/lib/vm/consoles/nginx/socket.unix to provide a predictable pty link), the 9pfs stopped returning any data, and it didn't go away after a reboot of the inner VM, as it then no longer managed to boot.
+
+I was unfortunately unable to identify exactly which operation caused the thing to "stop working", but I'd say it is due to zsh's path-full autocompletion in paths including directories with ~700 entries, without being certain of that.
+
+Hmm, actually it looks like a kernel in kernel panic always takes 100% CPU (just got another unrelated one), so I guess it's not necessarily a qemu bug but can arise from anywhere in the stack. I'm marking the bug as invalid as a consequence.
+

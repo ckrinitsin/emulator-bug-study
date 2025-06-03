@@ -1,0 +1,147 @@
+other: 0.778
+boot: 0.741
+mistranslation: 0.736
+instruction: 0.735
+graphic: 0.720
+vnc: 0.714
+assembly: 0.711
+socket: 0.706
+semantic: 0.704
+device: 0.700
+KVM: 0.680
+network: 0.680
+
+qemu 4.2 bootloops with -cpu host and nested hypervisor
+
+I've noticed that after upgrading from Ubuntu 18.04 to 20.04 that nested virtualization isn't working anymore.
+
+I have a simple repro where I create a Windows 10 2004 guest and enable Hyper-V in it. This worked fine in 18.04 and specifically qemu <4.2 (I specifically tested Qemu 2.11-4.1 which work fine).
+
+The -cpu arg I'm passing is simply:
+    -cpu host,l3-cache=on,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time
+
+Using that Windows won't boot because the nested hypervisor (Hyper-V) is unable to be initialize and so it just boot loops. Using the exact same qemu command works fine with 4.1 and lower.
+
+Switching to a named CPU model like Skylake-Client-noTSX-IBRS instead of host lets the VM boot but causes some weird behaviour later trying to use nested VMs.
+
+If I had to guess I think it would probably be related to this change https://github.com/qemu/qemu/commit/20a78b02d31534ae478779c2f2816c273601e869 which would line up with 4.2 being the first bad version but unsure.
+
+For now I just have to keep an older build of QEMU to work around this. Let me know if there's anything else needed. I can also try out any patches. I already have at least a dozen copies of qemu lying around now.
+
+
+
+
+
+Ok, after bisect between stable-4.1 and stable-4.2 I did confirm that https://github.com/qemu/qemu/commit/20a78b02d31534ae478779c2f2816c273601e869 is the first bad commit.
+
+The full qemu command line is:
+
+qemu-system-x86_64 \
+    -name guest=test,debug-threads=on \
+    -serial none \
+    -enable-kvm \
+    -nodefaults \
+    -no-user-config \
+    -M q35,accel=kvm,kernel_irqchip=on,mem-merge=off \
+    -m 8192 -mem-prealloc -no-hpet \
+    -cpu host,kvm=off,l3-cache=on,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
+    -smp 8,sockets=1,cores=4,threads=2 \
+    -global kvm-pit.lost_tick_policy=discard \
+    -rtc base=localtime \
+    -boot order=c \
+    -usb \
+    -device pcie-root-port,bus=pcie.0,id=root_port1,chassis=0,slot=0 \
+    -device vfio-pci,host=01:00.0,id=hostdev1,bus=root_port1,addr=0x00,multifunction=on \
+    -device vfio-pci,host=01:00.1,id=hostdev2,bus=root_port1,addr=0x00.1 \
+    -drive if=pflash,format=raw,readonly,file=OVMF_CODE.fd \
+    -drive if=pflash,format=raw,file=OVMF_VARS.fd \
+    -drive if=none,id=drivec,file=disk.img,format=qcow2,cache=none,aio=threads \
+    -object iothread,id=iothread1 \
+    -device virtio-blk-pci,drive=drivec,scsi=off,iothread=iothread1 \
+    -monitor unix:/tmp/monitor.sock,server,nowait \
+    -device virtio-mouse-pci,id=input0 \
+    -device virtio-keyboard-pci,id=input1 \
+    -object input-linux,id=kbd1,evdev=/dev/input/by-id/xxxxxxx,grab_all=yes,repeat=on \
+    -object input-linux,id=mouse1,evdev=/dev/input/by-id/xxxxxx \
+    -netdev tap,ifname=vnet,id=net0,script=no,downscript=no \
+    -device e1000,netdev=net0
+
+
+
+Ok, so I narrowed done one possible issue: the BNDCFGS bits in the vm entry/exit control MSRs are not set but HyperV expects them to be set if xsave is supported. This quick patch actually lets Hyper-V initialize and continue booting: https://gist.github.com/552baa8be026e67bef2d223076b81636
+
+An alternative to that patch is just telling Hyper-V xsave is disabled. In the guest before enabling Hyper-V: bcdedit /set xsavedisable 1
+
+Unfortunately while this does let the guest Hyper-V initialize, the nested (root) Windows guest doesn't boot and still gets stuck in a bootloop.
+
+Try instead disabling MPX with "-cpu host,-mpx".
+
+
+Aha! The final boot loop issue is resolved if I either upgrade to 5.10 or downgrade to 5.4 from 5.8.
+
+So the main issue then seems to be the missing control bits.
+
+Adding -mpx doesn't seem to help on 5.8, the guest still bootloops.
+
+If you can bisect between 5.9 (I understand it's bad?) and 5.10 we could propose it for stable kernels.
+
+I haven't tried 5.9, just:
+- 5.4.0-58                     Works
+- 5.8.0-33 (20.04 HWE Edge)    Bootloop
+- 5.10.1-051001                Works
+
+If I have time later I can try narrowing down which kernel causes the issue.
+
+But is the BNDCFGS MSR issue considered a bug in qemu or what?
+
+It's more likely to be a bug in KVM.
+
+Oh, and I guess I misinterpreted what -mpx was for. To be clear, I was running into 2 issues:
+
+1. Hyper-V fails to initialize.
+   "Fixed" by one of:
+     a) using named cpu model
+     b) cpu=host and running `bcdedit /set xsavedisable 1` in Windows before enabling Hyper-V
+     c) cpu=host,-mpx
+     d) my hack-y patch from earlier
+
+    (b) just tells Hyper-V to disable XSAVE support for its (nested) guests altogether whereas (c) is more fine=grained and just disables the BNDCFGx bits.
+
+2. Hyper-V initializes but Windows bootloops. I only seem to run into this with 5.8 but not 5.4 or 5.10.
+
+Ran into the same issue on Proxmox 6.3-3
+Setting `bcdedit /set xsavedisable 1` and using cpu=host works for me
+Without I get bootloops and other options that luqmana posted, Hyper-V fails to start
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+Looking at the comments here, I assume this has been a bug in the kernel, not in QEMU, so I'm closing this one now. If you still think this is something that needs fixing in QEMU, please open a new ticket in the new bug tracker at https://gitlab.com/qemu-project/qemu/-/issues instead.
+

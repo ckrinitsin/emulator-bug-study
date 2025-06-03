@@ -1,0 +1,81 @@
+vnc: 0.841
+other: 0.828
+semantic: 0.822
+assembly: 0.816
+mistranslation: 0.804
+device: 0.743
+instruction: 0.719
+graphic: 0.701
+KVM: 0.695
+network: 0.597
+boot: 0.593
+socket: 0.547
+
+dataplane interrupt handler doesn't support msi
+
+hw/block/dataplane/virtio-blk.c commit 1010cadf62332017648abee0d7a3dc7f2eef9632
+
+in the function notify_guest_bh, the function virtio_notify_irqfd is called
+to deliver the interrupt corresponding to the vq
+
+however, without the dataplane, hw/block/virtio_blk_req_complete calls
+virtio_notify to deliver the interrupt (immediately). this goes though
+a slightly more involved path that calls virtio_pci_notify which includes
+a case to handle msi interrupts.
+
+so, msi interrupts with block devices aren't serviced when using dataplane
+batching.
+
+diff --git a/hw/block/dataplane/virtio-blk.c b/hw/block/dataplane/virtio-blk.c
+index 101f32c..31d9eb8 100644
+--- a/hw/block/dataplane/virtio-blk.c
++++ b/hw/block/dataplane/virtio-blk.c
+@@ -73,7 +73,7 @@ static void notify_guest_bh(void *opaque)
+             unsigned i = j + ctzl(bits);
+             VirtQueue *vq = virtio_get_queue(s->vdev, i);
+
+-            virtio_notify_irqfd(s->vdev, vq);
++            virtio_notify(s->vdev, vq);
+
+             bits &= bits - 1; /* clear right-most bit */
+         }
+
+
+oh right, another note. this only manifests when using kvm.
+
+
+On Mon, May 14, 2018 at 03:00:44AM -0000, eric hoffman wrote:
+> diff --git a/hw/block/dataplane/virtio-blk.c b/hw/block/dataplane/virtio-blk.c
+> index 101f32c..31d9eb8 100644
+> --- a/hw/block/dataplane/virtio-blk.c
+> +++ b/hw/block/dataplane/virtio-blk.c
+> @@ -73,7 +73,7 @@ static void notify_guest_bh(void *opaque)
+>              unsigned i = j + ctzl(bits);
+>              VirtQueue *vq = virtio_get_queue(s->vdev, i);
+> 
+> -            virtio_notify_irqfd(s->vdev, vq);
+> +            virtio_notify(s->vdev, vq);
+> 
+>              bits &= bits - 1; /* clear right-most bit */
+>          }
+
+Please send patches to <email address hidden>.  Guidelines for submitting
+patches are here:
+https://wiki.qemu.org/Contribute/SubmitAPatch
+
+The issue with this approach is that hw/pci/msi.c:msi_send_message()
+invokes device emulation outside the QEMU global mutex (it calls into
+the APIC to send MSIs).  I've CCed Paolo Bonzini to check whether doing
+this is thread-safe.
+
+Stefan
+
+
+thanks for looking at this Stefan - since I don't have any context of exactly the kind of environmental issues like threading, the patch posted here isn't really a suggested fix.
+
+it does in general seem helpful if batched interrupts have the same delivery semantics as non-deferred. 
+
+This bug is invalid. MSI/MSI-X interrupts are properly serviced when dataplane batching is used. The original problem was in the incorrect virtio driver initialization sequence (virtqueues and MSI-X interrupts configured after DRIVER_OK bit is set).
+
+This bug can be closed as INVALID.
+

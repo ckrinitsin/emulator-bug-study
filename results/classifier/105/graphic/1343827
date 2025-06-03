@@ -1,0 +1,66 @@
+graphic: 0.838
+device: 0.699
+instruction: 0.624
+socket: 0.622
+boot: 0.409
+semantic: 0.405
+network: 0.385
+vnc: 0.262
+other: 0.260
+mistranslation: 0.186
+assembly: 0.136
+KVM: 0.064
+
+block.c: multiwrite_merge() truncates overlapping requests
+
+If the list of requests passed to multiwrite_merge() contains two requests where the first is for a range of sectors that is a strict subset of the second's, the second request is truncated to end where the first starts, so the second half of the second request is lost.
+
+This is easy to reproduce by running fio against a virtio-blk device running on qemu 2.1.0-rc1 with the below fio script. At least with fio 2.0.13, the randwrite pass will issue overlapping bios to the block driver, which the kernel is happy to pass along to qemu:
+
+[global]
+randrepeat=0
+ioengine=libaio
+iodepth=64
+direct=1
+size=1M
+numjobs=1
+verify_fatal=1
+verify_dump=1
+
+filename=$dev
+
+[seqwrite]
+blocksize_range=4k-1M
+rw=write
+verify=crc32c-intel
+
+[randwrite]
+stonewall
+blocksize_range=4k-1M
+rw=randwrite
+verify=meta
+
+Here is a naive fix for the problem that simply avoids merging problematic requests. I guess a better solution would be to redo qemu_iovec_concat() to do the right thing.
+
+diff -ur old/qemu-2.1.0-rc2/block.c qemu-2.1.0-rc2/block.c
+--- old/qemu-2.1.0-rc2/block.c  2014-07-15 14:49:14.000000000 -0700
++++ qemu-2.1.0-rc2/block.c      2014-07-17 23:03:14.224169741 -0700
+@@ -4460,7 +4460,9 @@
+         int64_t oldreq_last = reqs[outidx].sector + reqs[outidx].nb_sectors;
+ 
+         // Handle exactly sequential writes and overlapping writes.
+-        if (reqs[i].sector <= oldreq_last) {
++        // If this request ends before the previous one, don't merge.
++        if (reqs[i].sector <= oldreq_last &&
++            reqs[i].sector + reqs[i].nb_sectors >= oldreq_last) {
+             merge = 1;
+         }
+
+Thanks for reporting this bug.  I'm writing a test case and fix, will CC you on the patches.
+
+Please keep in mind that no ordering is guaranteed between requests that are in-flight at the same time.  Therefore it is unusual to submit overlapping requests and could indicate a bug in the application.
+
+Triaging old bug tickets... has Stefan's fix be included? Could we close this ticket nowadays?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

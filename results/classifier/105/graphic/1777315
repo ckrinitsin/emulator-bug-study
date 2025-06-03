@@ -1,0 +1,153 @@
+graphic: 0.921
+KVM: 0.895
+vnc: 0.892
+mistranslation: 0.888
+other: 0.881
+instruction: 0.855
+semantic: 0.851
+assembly: 0.844
+socket: 0.830
+device: 0.826
+network: 0.777
+boot: 0.740
+
+IDE short PRDT abort
+
+Hi,
+QEMU 'hw/ide/core.c:871' Denial of Service Vulnerability in version qemu-2.12.0
+
+run the program in qemu-2.12.0:
+#define _GNU_SOURCE 
+#include <endian.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <stdint.h>
+#include <string.h>
+
+static uintptr_t syz_open_dev(uintptr_t a0, uintptr_t a1, uintptr_t a2)
+{
+        if (a0 == 0xc || a0 == 0xb) {
+                char buf[128];
+                sprintf(buf, "/dev/%s/%d:%d", a0 == 0xc ? "char" : "block", (uint8_t)a1, (uint8_t)a2);
+                return open(buf, O_RDWR, 0);
+        } else {
+                char buf[1024];
+                char* hash;
+strncpy(buf, (char*)a0, sizeof(buf) - 1);
+                buf[sizeof(buf) - 1] = 0;
+                while ((hash = strchr(buf, '#'))) {
+                        *hash = '0' + (char)(a1 % 10);
+                        a1 /= 10;
+                }
+                return open(buf, a2, 0);
+        }
+}
+
+uint64_t r[2] = {0xffffffffffffffff, 0xffffffffffffffff};
+void loop()
+{
+        long res = 0;
+memcpy((void*)0x20000000, "/dev/sg#", 9);
+        res = syz_open_dev(0x20000000, 0, 2);
+        if (res != -1)
+                r[0] = res;
+        res = syscall(__NR_dup2, r[0], r[0]);
+        if (res != -1)
+                r[1] = res;
+*(uint8_t*)0x20000ec0 = 0;
+*(uint8_t*)0x20000ec1 = 0;
+*(uint8_t*)0x20000ec2 = 0;
+*(uint8_t*)0x20000ec3 = 0;
+*(uint32_t*)0x20000ec8 = 0;
+*(uint8_t*)0x20000ed8 = 0;
+*(uint8_t*)0x20000ed9 = 0;
+*(uint8_t*)0x20000eda = 0;
+*(uint8_t*)0x20000edb = 0;
+memcpy((void*)0x20000ee0, "\x9c\x4d\xe7\xd5\x0a\x62\x43\xa7\x77\x53\x67\xb3", 12);
+        syscall(__NR_write, r[1], 0x20000ec0, 0x323);
+}
+
+int main()
+{
+        syscall(__NR_mmap, 0x20000000, 0x1000000, 3, 0x32, -1, 0);
+        loop();
+        return 0;
+}
+this will crash qemu, output information:
+ qemu-system-x86_64: hw/ide/core.c:843: ide_dma_cb: Assertion `n * 512 == s->sg.size' failed.
+
+
+Thanks 
+owl337
+
+Are you going to provide a patch for this to the mailing list? (since you've assigned the bug to yourself)
+
+Oh no, this is a misunderstanding.
+
+More Details:
+use this script https://raw.githubusercontent.com/google/syzkaller/master/tools/create-image.sh create 
+ wheezy.img
+than run: 
+qemu-system-x86_64 -m 2048 -smp 1 -net nic -net user,host=10.0.2.10,hostfwd=tcp::59199-:22 -display none -serial stdio -no-reboot -enable-kvm -hda /home/icy/linux-master/wheezy.img -snapshot -kernel /home/icy/linux-master/arch/x86/boot/bzImage -append "console=ttyS0 earlyprintk=serial oops=panic nmi_watchdog=panic panic_on_warn=1 panic=86400 ftrace_dump_on_oops=orig_cpu rodata=n vsyscall=native net.ifnames=0 biosdevname=0 kvm-intel.nested=1 kvm-intel.unrestricted_guest=1 kvm-intel.vmm_exclusive=1 kvm-intel.fasteoi=1 kvm-intel.ept=1 kvm-intel.flexpriority=1 kvm-intel.vpid=1 kvm-intel.emulate_invalid_guest_state=1 kvm-intel.eptad=1 kvm-intel.enable_shadow_vmcs=1 kvm-intel.pml=1 kvm-intel.enable_apicv=1 root=/dev/sda"
+
+bzImage is obtained by compiling v4.17 kernel(I am not sure if it works in other kernel version).
+
+than execute the program in the virtual machine: ./repro 
+qemu will crash, output innformation:
+ qemu-system-x86_64: hw/ide/core.c:843: ide_dma_cb: Assertion `n * 512 == s->sg.size' failed. 
+
+this bug influences at least qemu-2.9.94 - qemu-2.12.0.
+
+
+A repro for the bug is setup at https://github.com/asurati/1777315, although the rfc-patch that was sent yesterday is pending testing. Unless qemu-devel advises otherwise, I am available to test and present it as a bugfix, by tomorrow.
+
+
+FYI: we've hit this as will with syzkaller testing; this is still reproducible as-is with latest qemu (commit a6ae238), and the latest Linux kernel (5.1-rc7).
+
+Here's a qtest reproducer:
+
+./i386-softmmu/qemu-system-i386 -M pc,accel=qtest \
+-qtest null -nographic -vga qxl -qtest stdio \
+-drive if=none,id=drive0,file=null-co://,file.read-zeroes=on,format=raw \
+-drive if=none,id=drive1,file=null-co://,file.read-zeroes=on,format=raw \
+-device ide-cd,drive=drive0 -device ide-hd,drive=drive1 -nodefaults \
+< attachment
+
+With -trace ide*:
+
+[R +0.020410] outw 0x171 0xffff
+28186@1594494474.407743:ide_ioport_write IDE PIO wr @ 0x171 (Features); val 0xff; bus 0x55e383419100 IDEState 0x55e383419188
+28186@1594494474.407747:ide_ioport_write IDE PIO wr @ 0x172 (Sector Count); val 0xff; bus 0x55e383419100 IDEState 0x55e383419188
+OK
+[S +0.020428] OK
+[R +0.020433] outw 0x176 0x35fb
+28186@1594494474.407756:ide_ioport_write IDE PIO wr @ 0x176 (Device/Head); val 0xfb; bus 0x55e383419100 IDEState 0x55e383419188
+28186@1594494474.407757:ide_ioport_write IDE PIO wr @ 0x177 (Command); val 0x35; bus 0x55e383419100 IDEState 0x55e383419558
+28186@1594494474.407759:ide_exec_cmd IDE exec cmd: bus 0x55e383419100; state 0x55e383419558; cmd 0x35
+....
+28186@1594494474.411019:ide_dma_cb IDEState 0x55e383419558; sector_num=1 n=511 cmd=DMA WRITE
+OK
+[S +0.023732] OK
+[R +0.023736] outb 0x376 0x8f
+28186@1594494474.411060:ide_cmd_write IDE PIO wr @ 0x376 (Device Control); val 0x8f; bus 0x55e383419100
+OK
+[S +0.023741] OK
+[R +0.023742] outw 0x376 0x2779
+28186@1594494474.411064:ide_cmd_write IDE PIO wr @ 0x376 (Device Control); val 0x79; bus 0x55e383419100
+OK
+[S +0.023745] OK
+qemu-system-i386: /home/alxndr/Development/qemu/hw/ide/core.c:880: void ide_dma_cb(void *, int): Assertion `n * 512 == s->sg.size' failed.
+
+
+
+This is an automated cleanup. This bug report has been moved
+to QEMU's new bug tracker on gitlab.com and thus gets marked
+as 'expired' now. Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/57
+
+

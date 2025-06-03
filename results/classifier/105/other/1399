@@ -1,0 +1,85 @@
+other: 0.978
+vnc: 0.977
+device: 0.973
+semantic: 0.971
+instruction: 0.970
+boot: 0.969
+socket: 0.966
+assembly: 0.966
+network: 0.964
+KVM: 0.962
+mistranslation: 0.960
+graphic: 0.959
+
+Early faults when direct booting large Linux kernel images on x86_64 and aarch64 guests.
+Description of problem:
+When attempting to load a Linux kernel image for direct boot via the `-kernel` command line option, a triple fault occurs shortly after attempting to hand off execution to the kernel if the kernel image is ‘large’ in size (this can be easily reproduced with a custom kernel build by embedding an initramfs in the kernel that includes a few large but mostly incompressible files). I’m not certain of the exact cutoff, but a 75 MB kernel image on x86_64, and a 67 MB kernel image on AArch64 both exhibit the issue, while a 13 MB kernel image on x86_64 does not.
+Steps to reproduce:
+1. Attempt to direct boot an exceptionally large kernel image as an x86_64 or aarch64 guest.
+Additional information:
+I have not yet been able to track down exactly where the initial fault is happening, and am not even certain that it’s in Linux’s early boot code, but the fact that this is reproducible across multiple architectures and is unaffected by things like KASLR and the exact compression algorithm for the guest kernel suggests to me that it’s more likely to be an issue in QEMU’s loader code for direct kernel boot than in the Linux kernel itself.
+
+Running on x86_64, the initial fault appears to be a general protection fault, followed by a double and then triple fault. Output from running QEMU as above with `-d int,guest_error -no-reboot’:
+
+```
+check_exception old: 0xffffffff new 0xd
+     0: v=0d e=0000 i=0 cpl=0 IP=0010:000000000789f7f0 pc=000000000789f7f0 SP=0018:00000000078e6fd8 env->regs[R_EAX]=0000000000000000
+RAX=0000000000000000 RBX=6fb84fe3052f53e2 RCX=00000000fb600000 RDX=00000000078fbed0
+RSI=00000000078f6000 RDI=00000000078e80e0 RBP=00000000078e80e0 RSP=00000000078e6fd8
+R8 =00000000078fb000 R9 =00000000fb600000 R10=000fffffffe00000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=000000000789f7f0 RFL=00000006 [-----P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 00000000 00000000
+CS =0010 0000000000000000 ffffffff 00af9a00 DPL=0 CS64 [-R-]
+SS =0018 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+DS =0018 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+FS =0000 0000000000000000 00000000 00000000
+GS =0000 0000000000000000 00000000 00000000
+LDT=0000 0000000000000000 00000000 00008200 DPL=0 LDT
+TR =0020 0000000000000000 00000fff 00808900 DPL=0 TSS64-avl
+GDT=     00000000078b1030 0000002f
+IDT=     00000000078b1070 000001ff
+CR0=80050033 CR2=6fb84fe3052f53ee CR3=00000000078f6000 CR4=00000020
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=0000000000000018 CCD=6fb84fe3052f53e2 CCO=LOGICQ
+EFER=0000000000000500
+check_exception old: 0xd new 0xd
+     1: v=08 e=0000 i=0 cpl=0 IP=0010:000000000789f7f0 pc=000000000789f7f0 SP=0018:00000000078e6fd8 env->regs[R_EAX]=0000000000000000
+RAX=0000000000000000 RBX=6fb84fe3052f53e2 RCX=00000000fb600000 RDX=00000000078fbed0
+RSI=00000000078f6000 RDI=00000000078e80e0 RBP=00000000078e80e0 RSP=00000000078e6fd8
+R8 =00000000078fb000 R9 =00000000fb600000 R10=000fffffffe00000 R11=0000000000000000
+R12=0000000000000000 R13=0000000000000000 R14=0000000000000000 R15=0000000000000000
+RIP=000000000789f7f0 RFL=00000006 [-----P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 00000000 00000000
+CS =0010 0000000000000000 ffffffff 00af9a00 DPL=0 CS64 [-R-]
+SS =0018 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+DS =0018 0000000000000000 ffffffff 00cf9300 DPL=0 DS   [-WA]
+FS =0000 0000000000000000 00000000 00000000
+GS =0000 0000000000000000 00000000 00000000
+LDT=0000 0000000000000000 00000000 00008200 DPL=0 LDT
+TR =0020 0000000000000000 00000fff 00808900 DPL=0 TSS64-avl
+GDT=     00000000078b1030 0000002f
+IDT=     00000000078b1070 000001ff
+CR0=80050033 CR2=6fb84fe3052f53ee CR3=00000000078f6000 CR4=00000020
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+CCS=0000000000000018 CCD=6fb84fe3052f53e2 CCO=LOGICQ
+EFER=0000000000000500
+check_exception old: 0x8 new 0xd
+```
+
+Running on AArch64, the emulated CPU gets stuck in a loop trying to handle ‘exception 5’, showing the following output when run as above with `-d int, guest_error -no-reboot`, repeated infinitely until the emulator gets killed:
+
+```
+Taking exception 5 [IRQ] on CPU 0
+...from EL1 to EL1
+...with ESR 0x15/0x56000000
+...with ELR 0xffffffef0dee4098
+...to EL1 PC 0xffffffef0d810a80 PSTATE 0x3c5
+Exception return from AArch64 EL1 to AArch64 EL1 PC 0xffffffef0dee4098
+```
+
+I have also attempted to reproduce this on 64-bit little-endian POWER using qemu-system-ppc64 and an equivalent kernel config, and was _not_ able to reproduce it there with a 69 MB kernel image.
+
+I can provide Linux kernel configs for the affected kernels upon request, but am not (currently) able to provide full system images (the project I was working on when I came across this is not yet public).

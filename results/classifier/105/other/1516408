@@ -1,0 +1,129 @@
+other: 0.893
+assembly: 0.873
+socket: 0.872
+semantic: 0.868
+device: 0.867
+instruction: 0.860
+mistranslation: 0.841
+graphic: 0.839
+vnc: 0.804
+boot: 0.796
+KVM: 0.746
+network: 0.736
+
+sh4: Unsupported syscall: 186
+
+Hello!
+
+I'm currently testing qemu as a possibility to set up a buildd for the Debian sh4 port.
+
+I set up qemu and an sh4 chroot as described in the Debian Wiki [1]. This seems to be working mostly fine (besides the fact that qemu segfaults on an amd64 host while it runs fine on an i386 host, I'll file a separate bug report). However, when installing python3.4 in the sh4 chroot, qemu repeatedly printed an error message about an unimplemented syscall: 186:
+
+qemu: Unsupported syscall: 186
+
+From the source code in linux-user/sh4/syscall_nr.h it's apparent that 186 is defined as 
+
+#define TARGET_NR_sigaltstack   186
+
+Looking at the implementation part, it becomes obvious that this syscall is not enabled for sh4:
+
+#if defined(TARGET_I386) || defined(TARGET_ARM) || defined(TARGET_MIPS) || \
+    defined(TARGET_SPARC) || defined(TARGET_PPC) || defined(TARGET_ALPHA) || \
+    defined(TARGET_M68K) || defined(TARGET_S390X) || defined(TARGET_OPENRISC)
+        ret = do_sigaltstack(arg1, arg2, get_sp_from_cpustate((CPUArchState *)cpu_env));
+        break;
+#else
+        goto unimplemented;
+#endif
+
+Is there any particular reason why TARGET_NR_sigaltstack is not enabled on sh4? If not, could you enable it?
+
+Thanks,
+Adrian
+
+> [1] https://wiki.debian.org/QemuUserEmulation
+
+I have enabled this syscall in the source code now and performing a test build and run and will report back.
+
+Furthermore, looking at the kernel sources, both the 32-bit and 64-bit Linux SH-specific code defines "sigaltstack" as syscall 186:
+
+> https://github.com/torvalds/linux/blob/master/arch/sh/kernel/syscalls_32.S#L205
+> https://github.com/torvalds/linux/blob/master/arch/sh/kernel/syscalls_64.S#L209
+
+The whole syscall also doesn't appear to be architecture-specific after reading the manpage for sigaltstack. Is it?
+
+Will report back after further testing.
+
+Thanks,
+Adrian
+
+Hello!
+
+The attached patch enables the sigaltstack syscall in qemu-sh4.
+
+The following minimal test code verifies that sigaltstack works as expected:
+
+=============================================================
+
+#include <setjmp.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+jmp_buf exit_jmp;
+
+void handler(int x)
+{
+  longjmp(exit_jmp, 1);
+}
+
+int f(void)
+{
+  return f();
+}
+
+int main(void)
+{
+  stack_t sigstack;
+  sigstack.ss_sp = malloc(1024*1024);
+  sigstack.ss_size = 1024*1024;
+  sigstack.ss_flags = 0;
+  sigaltstack(&sigstack, NULL);
+  struct sigaction sa;
+  sa.sa_handler = handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_ONSTACK;
+  sigaction(SIGSEGV, &sa, NULL);
+  if (setjmp(exit_jmp) == 0)
+  {
+    return f();
+  }
+  puts("recovered");
+  return 0;
+}
+
+=============================================================
+
+Without sigaltstack enabled, this code produces a segmentation fault. With sigaltstack enabled, it prints out "recovered".
+
+Also posted on qemu-devel mailing list:
+
+> http://lists.nongnu.org/archive/html/qemu-devel/2015-11/msg04300.html
+> http://lists.nongnu.org/archive/html/qemu-devel/2015-11/msg04301.html
+
+Cheers,
+Adrian
+
+Ping. Any chance to get this merged?
+
+I don't think this patch could have any particular bad impact on qemu as it affects the sh4 emulation only and so far my tests with building packages on qemu-sh4 have shown no regressions. But with the patch, sigaltstack now works fine on sh4 which the above testcase also positively has proven.
+
+Having this bug and #1254824 fixed would help the sh4 porters in Debian quite a lot as qemu-sh4 can be used to set up a virtual buildd for this architecture.
+
+Adrian
+
+> [1] https://bugs.launchpad.net/ubuntu/+source/qemu-linaro/+bug/1254824
+
+Looks like we fixed this in commit c0d35736323e5b in December, which was released as part of QEMU 2.6.
+
+

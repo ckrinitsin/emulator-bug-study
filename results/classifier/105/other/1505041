@@ -1,0 +1,113 @@
+other: 0.968
+mistranslation: 0.963
+socket: 0.962
+semantic: 0.957
+vnc: 0.954
+assembly: 0.954
+network: 0.951
+graphic: 0.949
+device: 0.949
+instruction: 0.937
+boot: 0.923
+KVM: 0.921
+
+Live snapshot revert times increases linearly with snapshot age
+
+The WineTestBot (https://testbot.winehq.org/) uses QEmu live snapshots to ensure the Wine tests are always run in a pristine Windows environment. However the revert times keep increasing linearly with the age of the snapshot, going from tens of seconds to thousands. While the revert takes place the qemu process takes 100% of a core and there is no disk activity. Obviously waiting over 20 minutes before being able to run a 10 second test is not viable.
+
+Only some VMs are impacted. Based on libvirt's XML files the common point appears to be the presence of the following <timer> tags:
+
+    <clock offset='localtime'>
+      <timer name='rtc' tickpolicy='delay'/>
+      <timer name='pit' tickpolicy='delay'/>
+      <timer name='hpet' present='no'/>
+    </clock>
+
+Where the unaffected VMs have the following clock definition instead:
+
+    <clock offset='localtime'/>
+
+Yet shutting down the affected VMs, changing the clock definition, creating a live snapshot and trying to revert to it 6 months later results in slow revert times (>400 seconds).
+
+Changing the tickpolicy to catchup for rtc and/or pit has no effect on the revert time (and unsurprisingly causes the clock to run fast in the guest).
+
+
+To reproduce this problem do the following:
+* Create a Windows VM (either 32 or 64 bits). This is known to happen with at least Windows 2000, XP, 2003, 2008 and 10.
+* That VM will have the <timer> tags shown above, with the possible addition of an hypervclock timer.
+* Shut down the VM.
+* date -s "2014/04/01"
+* Start the VM.
+* Take a live snapshot.
+* Shut down the VM.
+* date -s "<your current date>"
+* Revert to the live snapshot.
+
+If the revert takes more than 2 minutes then there is a problem.
+
+
+A workaround is to set track='guest' on the rtc timer. This makes the revert fast and may even be the correct solution. But why is it not the default or better documented?
+ * It setting track='wall' or omitting track, then the revert is slow and the clock in the guest is not updated.
+ * It setting track='guest' the revert is fast and the clock in the guest is not updated.
+
+
+I found three past mentions of this issue but as far as I can tell none of them got anywhere:
+
+* [Qemu-discuss] massive slowdown for reverts after given amount of time on any newer versions
+   https://lists.gnu.org/archive/html/qemu-discuss/2013-02/msg00000.html
+
+* The above post references another one from 2011 wrt qemu 0.14:
+   https://lists.gnu.org/archive/html/qemu-devel/2011-03/msg02645.html
+
+* Comment #9 of Launchpad bug 1174654 matches this slow revert issue. However
+   the bug was really about another issue so this was not followed on.
+   https://bugs.launchpad.net/qemu/+bug/1174654/comments/9
+
+
+I'm currently running into this issue with QEmu 2.1 but it looks like this bug has been there all along.
+1:2.1+dfsg-12+deb8u2 qemu-kvm
+1:2.1+dfsg-12+deb8u2 qemu-system-common
+1:2.1+dfsg-12+deb8u2 qemu-system-x86
+
+I'm unsure why clock time would affect snapshot revert, but one thing to note is that the general recommended timer settings for guest OS are different from what you have. virt-manager/oVirt/OpenStack would all set:
+
+    <clock offset='localtime'>
+      <timer name='rtc' tickpolicy='catchup'/>
+      <timer name='pit' tickpolicy='delay'/>
+      <timer name='hpet' present='no'/>
+    </clock>
+
+in general for all guest OS, and if they have new enough QEMU (>= 2.0.0) + libvirt (>= 1.2.2), they'd go further and for Windows guests would set this
+
+
+    <clock offset='localtime'>
+      <timer name='rtc' tickpolicy='catchup'/>
+      <timer name='pit' tickpolicy='delay'/>
+      <timer name='hpet' present='no'/>
+      <timer name='hypervclock' present='yes'/>
+    </clock>
+    
+           <features>
+             <hyperv>
+               <relaxed state='on'/>
+               <vapic state='on'/>
+               <spinlocks state='on' retries='8191'/>
+             </hyperv>
+           <features/>
+
+This is fairly important to ensure reliable guest OS clock operation. It also avoids random BSOD on SMP guests from Windows 7 onwards.
+
+The timer settings I showed were from a Windows XP VM but a Windows 10 VM I created recently (with qemu 2.1 and libvirt 1.2.9) does have the hypervclock timer and defaults to tickpolicy='catchup' for rtc but it is missing the hyperv features you mentioned. I'll investigate those.
+
+I'm wary of tickpolicy='catchup' though. My understanding is that it's needed for the guest's clock to remain accurate over time. However our VMs stay up at most 30 minutes before being reverted so I don't think the clock will have drifted by any amount we care about. Really it can be off by a few days without impacting the tests.
+
+One nasty effect of tickpolicy='catchup' is that when we revert to our live snapshot the clock runs 10 times as fast as it tries to catch up to the current date. That would definitely impact our tests, particularly around timing sound play times or checking serial baud rates. We normally manually reset the time from within the guest so maybe that would stop it from running fast. My other concern is that I'm not sure trying to compensate for missing ticks is better for our tests than maintaining the illusion that the VM is running at a normal speed even if it's in reality running at half real time speed. I feel that for our tests agreement between the audio, serial card and various timer devices is more important than staying in sync with the outside world.
+
+See also:
+https://bugs.launchpad.net/qemu/+bug/1174654
+
+
+Looking through old bug tickets... is this still an issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,858 @@
+other: 0.954
+instruction: 0.922
+assembly: 0.912
+graphic: 0.910
+mistranslation: 0.909
+semantic: 0.909
+device: 0.896
+socket: 0.888
+vnc: 0.861
+KVM: 0.842
+network: 0.842
+boot: 0.833
+
+Heap-use-after-free in virtio_gpu_ctrl_response
+
+Hello,
+Here is a reproducer (build with --enable-sanitizers):
+cat << EOF | ./i386-softmmu/qemu-system-i386 -nographic -M pc -nodefaults -m 512M -device virtio-vga -qtest stdio
+outl 0xcf8 0x80001018
+outl 0xcfc 0xe0800000
+outl 0xcf8 0x80001020
+outl 0xcf8 0x80001004
+outw 0xcfc 0x7
+writeq 0xe0801024 0x10646c00776c6cff
+writeq 0xe080102d 0xe0801000320000
+writeq 0xe0801015 0x12b2901ba000000
+write 0x10646c02 0x1 0x2c
+write 0x999 0x1 0x25
+write 0x8 0x1 0x78
+write 0x2c7 0x1 0x32
+write 0x2cb 0x1 0xff
+write 0x2cc 0x1 0x7e
+writeq 0xe0803000 0xf2b8f0540ff83
+EOF
+
+The ASAN trace:
+==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+READ of size 8 at 0x60d0000050e8 thread T0
+    #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+    #1 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+    #2 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+    #3 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+    #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+    #5 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+    #6 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+    #7 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+    #8 0x56062a919571 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:217:9
+    #9 0x56062a919571 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:240:5
+    #10 0x56062a919571 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:516:11
+    #11 0x560629094a64 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1676:9
+    #12 0x56062a749ab5 in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+    #13 0x7f0d5cd55e0a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x26e0a)
+    #14 0x5606288ba889 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x24d0889)
+
+0x60d0000050e8 is located 56 bytes inside of 136-byte region [0x60d0000050b0,0x60d000005138)
+freed by thread T0 here:
+    #0 0x56062893250d in free (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254850d)
+    #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+    #2 0x560628e81d34 in virtio_reset /home/alxndr/Development/qemu/hw/virtio/virtio.c:1999:9
+    #3 0x560629f08773 in virtio_pci_reset /home/alxndr/Development/qemu/hw/virtio/virtio-pci.c:1841:5
+    #4 0x560629043ab6 in memory_region_write_accessor /home/alxndr/Development/qemu/softmmu/memory.c:483:5
+    #5 0x560629043473 in access_with_adjusted_size /home/alxndr/Development/qemu/softmmu/memory.c:544:18
+    #6 0x560629042c99 in memory_region_dispatch_write /home/alxndr/Development/qemu/softmmu/memory.c
+    #7 0x560628990a37 in flatview_write_continue /home/alxndr/Development/qemu/exec.c:3176:23
+    #8 0x56062899041a in address_space_write_cached_slow /home/alxndr/Development/qemu/exec.c:3789:12
+    #9 0x560628e6f9bb in vring_used_write /home/alxndr/Development/qemu/hw/virtio/virtio.c:347:5
+    #10 0x560628e6f9bb in virtqueue_split_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:788:5
+    #11 0x560628e6f9bb in virtqueue_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:852:9
+    #12 0x560628e7205e in virtqueue_push /home/alxndr/Development/qemu/hw/virtio/virtio.c:917:5
+    #13 0x560629814246 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:180:5
+    #14 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+    #15 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+    #16 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+    #17 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+    #18 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+    #19 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+    #20 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+
+previously allocated by thread T0 here:
+    #0 0x56062893278d in malloc (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254878d)
+    #1 0x7f0d5e1d5500 in g_malloc (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x54500)
+    #2 0x560628e7844b in virtqueue_split_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1524:12
+    #3 0x560628e7844b in virtqueue_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1693:16
+    #4 0x560629829633 in virtio_gpu_handle_ctrl /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:878:15
+    #5 0x560629829633 in virtio_gpu_ctrl_bh /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:893:5
+    #6 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+    #7 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+    #8 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+    #9 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+
+
+With -trace virtio\* -trace pci\* :
+[I 1595480025.666147] OPENED
+31900@1595480025.706962:virtio_set_status vdev 0x633000019640 val 0
+31900@1595480025.710297:virtio_set_status vdev 0x633000019640 val 0
+[R +0.046276] outl 0xcf8 0x80001018
+OK
+[S +0.046313] OK
+[R +0.046332] outl 0xcfc 0xe0800000
+31900@1595480025.712490:pci_cfg_write virtio-vga 02:0 @0x18 <- 0xe0800000
+OK
+[S +0.046356] OK
+[R +0.046365] outl 0xcf8 0x80001020
+OK
+[S +0.046370] OK
+[R +0.046379] outl 0xcf8 0x80001004
+OK
+[S +0.046383] OK
+[R +0.046391] outw 0xcfc 0x7
+31900@1595480025.712544:pci_cfg_write virtio-vga 02:0 @0x4 <- 0x7
+31900@1595480025.712551:pci_update_mappings_add d=0x633000000800 00:02.0 2,0xe0800000+0x4000
+OK
+[S +0.047572] OK
+[R +0.047597] writeq 0xe0801024 0x10646c00776c6cff
+OK
+[S +0.047610] OK
+[R +0.047619] writeq 0xe080102d 0xe0801000320000
+OK
+[S +0.047627] OK
+[R +0.047636] writeq 0xe0801015 0x12b2901ba000000
+OK
+[S +0.047650] OK
+[R +0.047660] write 0x10646c02 0x1 0x2c
+OK
+[S +0.047769] OK
+[R +0.047782] write 0x999 0x1 0x25
+OK
+[S +0.047907] OK
+[R +0.047920] write 0x8 0x1 0x78
+OK
+[S +0.047927] OK
+[R +0.047935] write 0x2c7 0x1 0x32
+OK
+[S +0.047941] OK
+[R +0.047949] write 0x2cb 0x1 0xff
+OK
+[S +0.047954] OK
+[R +0.047962] write 0x2cc 0x1 0x7e
+OK
+[S +0.047967] OK
+[R +0.047975] writeq 0xe0803000 0xf2b8f0540ff83
+31900@1595480025.714133:virtio_queue_notify vdev 0x633000019640 n 0 vq 0x7fe20b13d800
+OK
+[S +0.047996] OK
+31900@1595480025.714386:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+31900@1595480025.714406:virtio_gpu_features virgl 0
+31900@1595480025.714413:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+31900@1595480025.714421:virtio_set_status vdev 0x633000019640 val 0
+*CRASH*
+
+Please let me know if I can provide any further info.
+-Alex
+
+CC-ing virtio-gpu Maintainers.
+
+On 200723 0455, Alexander Bulekov wrote:
+> Public bug reported:
+> 
+> Hello,
+> Here is a reproducer (build with --enable-sanitizers):
+> cat << EOF | ./i386-softmmu/qemu-system-i386 -nographic -M pc -nodefaults -m 512M -device virtio-vga -qtest stdio
+> outl 0xcf8 0x80001018
+> outl 0xcfc 0xe0800000
+> outl 0xcf8 0x80001020
+> outl 0xcf8 0x80001004
+> outw 0xcfc 0x7
+> writeq 0xe0801024 0x10646c00776c6cff
+> writeq 0xe080102d 0xe0801000320000
+> writeq 0xe0801015 0x12b2901ba000000
+> write 0x10646c02 0x1 0x2c
+> write 0x999 0x1 0x25
+> write 0x8 0x1 0x78
+> write 0x2c7 0x1 0x32
+> write 0x2cb 0x1 0xff
+> write 0x2cc 0x1 0x7e
+> writeq 0xe0803000 0xf2b8f0540ff83
+> EOF
+> 
+> The ASAN trace:
+> ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+> READ of size 8 at 0x60d0000050e8 thread T0
+>     #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+>     #1 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+>     #2 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+>     #3 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+>     #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>     #5 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>     #6 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>     #7 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+>     #8 0x56062a919571 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:217:9
+>     #9 0x56062a919571 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:240:5
+>     #10 0x56062a919571 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:516:11
+>     #11 0x560629094a64 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1676:9
+>     #12 0x56062a749ab5 in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+>     #13 0x7f0d5cd55e0a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x26e0a)
+>     #14 0x5606288ba889 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x24d0889)
+> 
+> 0x60d0000050e8 is located 56 bytes inside of 136-byte region [0x60d0000050b0,0x60d000005138)
+> freed by thread T0 here:
+>     #0 0x56062893250d in free (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254850d)
+>     #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+>     #2 0x560628e81d34 in virtio_reset /home/alxndr/Development/qemu/hw/virtio/virtio.c:1999:9
+>     #3 0x560629f08773 in virtio_pci_reset /home/alxndr/Development/qemu/hw/virtio/virtio-pci.c:1841:5
+>     #4 0x560629043ab6 in memory_region_write_accessor /home/alxndr/Development/qemu/softmmu/memory.c:483:5
+>     #5 0x560629043473 in access_with_adjusted_size /home/alxndr/Development/qemu/softmmu/memory.c:544:18
+>     #6 0x560629042c99 in memory_region_dispatch_write /home/alxndr/Development/qemu/softmmu/memory.c
+>     #7 0x560628990a37 in flatview_write_continue /home/alxndr/Development/qemu/exec.c:3176:23
+>     #8 0x56062899041a in address_space_write_cached_slow /home/alxndr/Development/qemu/exec.c:3789:12
+>     #9 0x560628e6f9bb in vring_used_write /home/alxndr/Development/qemu/hw/virtio/virtio.c:347:5
+>     #10 0x560628e6f9bb in virtqueue_split_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:788:5
+>     #11 0x560628e6f9bb in virtqueue_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:852:9
+>     #12 0x560628e7205e in virtqueue_push /home/alxndr/Development/qemu/hw/virtio/virtio.c:917:5
+>     #13 0x560629814246 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:180:5
+>     #14 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+>     #15 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+>     #16 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+>     #17 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>     #18 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>     #19 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>     #20 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> 
+> previously allocated by thread T0 here:
+>     #0 0x56062893278d in malloc (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254878d)
+>     #1 0x7f0d5e1d5500 in g_malloc (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x54500)
+>     #2 0x560628e7844b in virtqueue_split_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1524:12
+>     #3 0x560628e7844b in virtqueue_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1693:16
+>     #4 0x560629829633 in virtio_gpu_handle_ctrl /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:878:15
+>     #5 0x560629829633 in virtio_gpu_ctrl_bh /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:893:5
+>     #6 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>     #7 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>     #8 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>     #9 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> 
+> 
+> With -trace virtio\* -trace pci\* :
+> [I 1595480025.666147] OPENED
+> 31900@1595480025.706962:virtio_set_status vdev 0x633000019640 val 0
+> 31900@1595480025.710297:virtio_set_status vdev 0x633000019640 val 0
+> [R +0.046276] outl 0xcf8 0x80001018
+> OK
+> [S +0.046313] OK
+> [R +0.046332] outl 0xcfc 0xe0800000
+> 31900@1595480025.712490:pci_cfg_write virtio-vga 02:0 @0x18 <- 0xe0800000
+> OK
+> [S +0.046356] OK
+> [R +0.046365] outl 0xcf8 0x80001020
+> OK
+> [S +0.046370] OK
+> [R +0.046379] outl 0xcf8 0x80001004
+> OK
+> [S +0.046383] OK
+> [R +0.046391] outw 0xcfc 0x7
+> 31900@1595480025.712544:pci_cfg_write virtio-vga 02:0 @0x4 <- 0x7
+> 31900@1595480025.712551:pci_update_mappings_add d=0x633000000800 00:02.0 2,0xe0800000+0x4000
+> OK
+> [S +0.047572] OK
+> [R +0.047597] writeq 0xe0801024 0x10646c00776c6cff
+> OK
+> [S +0.047610] OK
+> [R +0.047619] writeq 0xe080102d 0xe0801000320000
+> OK
+> [S +0.047627] OK
+> [R +0.047636] writeq 0xe0801015 0x12b2901ba000000
+> OK
+> [S +0.047650] OK
+> [R +0.047660] write 0x10646c02 0x1 0x2c
+> OK
+> [S +0.047769] OK
+> [R +0.047782] write 0x999 0x1 0x25
+> OK
+> [S +0.047907] OK
+> [R +0.047920] write 0x8 0x1 0x78
+> OK
+> [S +0.047927] OK
+> [R +0.047935] write 0x2c7 0x1 0x32
+> OK
+> [S +0.047941] OK
+> [R +0.047949] write 0x2cb 0x1 0xff
+> OK
+> [S +0.047954] OK
+> [R +0.047962] write 0x2cc 0x1 0x7e
+> OK
+> [S +0.047967] OK
+> [R +0.047975] writeq 0xe0803000 0xf2b8f0540ff83
+> 31900@1595480025.714133:virtio_queue_notify vdev 0x633000019640 n 0 vq 0x7fe20b13d800
+> OK
+> [S +0.047996] OK
+> 31900@1595480025.714386:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> 31900@1595480025.714406:virtio_gpu_features virgl 0
+> 31900@1595480025.714413:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> 31900@1595480025.714421:virtio_set_status vdev 0x633000019640 val 0
+> *CRASH*
+> 
+> Please let me know if I can provide any further info.
+> -Alex
+> 
+> ** Affects: qemu
+>      Importance: Undecided
+>          Status: New
+> 
+> -- 
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1888606
+> 
+> Title:
+>   Heap-use-after-free in virtio_gpu_ctrl_response
+> 
+> Status in QEMU:
+>   New
+> 
+> Bug description:
+>   Hello,
+>   Here is a reproducer (build with --enable-sanitizers):
+>   cat << EOF | ./i386-softmmu/qemu-system-i386 -nographic -M pc -nodefaults -m 512M -device virtio-vga -qtest stdio
+>   outl 0xcf8 0x80001018
+>   outl 0xcfc 0xe0800000
+>   outl 0xcf8 0x80001020
+>   outl 0xcf8 0x80001004
+>   outw 0xcfc 0x7
+>   writeq 0xe0801024 0x10646c00776c6cff
+>   writeq 0xe080102d 0xe0801000320000
+>   writeq 0xe0801015 0x12b2901ba000000
+>   write 0x10646c02 0x1 0x2c
+>   write 0x999 0x1 0x25
+>   write 0x8 0x1 0x78
+>   write 0x2c7 0x1 0x32
+>   write 0x2cb 0x1 0xff
+>   write 0x2cc 0x1 0x7e
+>   writeq 0xe0803000 0xf2b8f0540ff83
+>   EOF
+> 
+>   The ASAN trace:
+>   ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+>   READ of size 8 at 0x60d0000050e8 thread T0
+>       #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+>       #1 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+>       #2 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+>       #3 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+>       #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>       #5 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>       #6 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>       #7 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+>       #8 0x56062a919571 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:217:9
+>       #9 0x56062a919571 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:240:5
+>       #10 0x56062a919571 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:516:11
+>       #11 0x560629094a64 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1676:9
+>       #12 0x56062a749ab5 in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+>       #13 0x7f0d5cd55e0a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x26e0a)
+>       #14 0x5606288ba889 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x24d0889)
+> 
+>   0x60d0000050e8 is located 56 bytes inside of 136-byte region [0x60d0000050b0,0x60d000005138)
+>   freed by thread T0 here:
+>       #0 0x56062893250d in free (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254850d)
+>       #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+>       #2 0x560628e81d34 in virtio_reset /home/alxndr/Development/qemu/hw/virtio/virtio.c:1999:9
+>       #3 0x560629f08773 in virtio_pci_reset /home/alxndr/Development/qemu/hw/virtio/virtio-pci.c:1841:5
+>       #4 0x560629043ab6 in memory_region_write_accessor /home/alxndr/Development/qemu/softmmu/memory.c:483:5
+>       #5 0x560629043473 in access_with_adjusted_size /home/alxndr/Development/qemu/softmmu/memory.c:544:18
+>       #6 0x560629042c99 in memory_region_dispatch_write /home/alxndr/Development/qemu/softmmu/memory.c
+>       #7 0x560628990a37 in flatview_write_continue /home/alxndr/Development/qemu/exec.c:3176:23
+>       #8 0x56062899041a in address_space_write_cached_slow /home/alxndr/Development/qemu/exec.c:3789:12
+>       #9 0x560628e6f9bb in vring_used_write /home/alxndr/Development/qemu/hw/virtio/virtio.c:347:5
+>       #10 0x560628e6f9bb in virtqueue_split_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:788:5
+>       #11 0x560628e6f9bb in virtqueue_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:852:9
+>       #12 0x560628e7205e in virtqueue_push /home/alxndr/Development/qemu/hw/virtio/virtio.c:917:5
+>       #13 0x560629814246 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:180:5
+>       #14 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+>       #15 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+>       #16 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+>       #17 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>       #18 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>       #19 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>       #20 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> 
+>   previously allocated by thread T0 here:
+>       #0 0x56062893278d in malloc (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254878d)
+>       #1 0x7f0d5e1d5500 in g_malloc (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x54500)
+>       #2 0x560628e7844b in virtqueue_split_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1524:12
+>       #3 0x560628e7844b in virtqueue_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1693:16
+>       #4 0x560629829633 in virtio_gpu_handle_ctrl /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:878:15
+>       #5 0x560629829633 in virtio_gpu_ctrl_bh /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:893:5
+>       #6 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+>       #7 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+>       #8 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+>       #9 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> 
+>   
+>   With -trace virtio\* -trace pci\* :
+>   [I 1595480025.666147] OPENED
+>   31900@1595480025.706962:virtio_set_status vdev 0x633000019640 val 0
+>   31900@1595480025.710297:virtio_set_status vdev 0x633000019640 val 0
+>   [R +0.046276] outl 0xcf8 0x80001018
+>   OK
+>   [S +0.046313] OK
+>   [R +0.046332] outl 0xcfc 0xe0800000
+>   31900@1595480025.712490:pci_cfg_write virtio-vga 02:0 @0x18 <- 0xe0800000
+>   OK
+>   [S +0.046356] OK
+>   [R +0.046365] outl 0xcf8 0x80001020
+>   OK
+>   [S +0.046370] OK
+>   [R +0.046379] outl 0xcf8 0x80001004
+>   OK
+>   [S +0.046383] OK
+>   [R +0.046391] outw 0xcfc 0x7
+>   31900@1595480025.712544:pci_cfg_write virtio-vga 02:0 @0x4 <- 0x7
+>   31900@1595480025.712551:pci_update_mappings_add d=0x633000000800 00:02.0 2,0xe0800000+0x4000
+>   OK
+>   [S +0.047572] OK
+>   [R +0.047597] writeq 0xe0801024 0x10646c00776c6cff
+>   OK
+>   [S +0.047610] OK
+>   [R +0.047619] writeq 0xe080102d 0xe0801000320000
+>   OK
+>   [S +0.047627] OK
+>   [R +0.047636] writeq 0xe0801015 0x12b2901ba000000
+>   OK
+>   [S +0.047650] OK
+>   [R +0.047660] write 0x10646c02 0x1 0x2c
+>   OK
+>   [S +0.047769] OK
+>   [R +0.047782] write 0x999 0x1 0x25
+>   OK
+>   [S +0.047907] OK
+>   [R +0.047920] write 0x8 0x1 0x78
+>   OK
+>   [S +0.047927] OK
+>   [R +0.047935] write 0x2c7 0x1 0x32
+>   OK
+>   [S +0.047941] OK
+>   [R +0.047949] write 0x2cb 0x1 0xff
+>   OK
+>   [S +0.047954] OK
+>   [R +0.047962] write 0x2cc 0x1 0x7e
+>   OK
+>   [S +0.047967] OK
+>   [R +0.047975] writeq 0xe0803000 0xf2b8f0540ff83
+>   31900@1595480025.714133:virtio_queue_notify vdev 0x633000019640 n 0 vq 0x7fe20b13d800
+>   OK
+>   [S +0.047996] OK
+>   31900@1595480025.714386:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+>   31900@1595480025.714406:virtio_gpu_features virgl 0
+>   31900@1595480025.714413:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+>   31900@1595480025.714421:virtio_set_status vdev 0x633000019640 val 0
+>   *CRASH*
+> 
+>   Please let me know if I can provide any further info.
+>   -Alex
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1888606/+subscriptions
+> 
+
+
+On 200723 1351, Li Qiang wrote:
+> Alexander Bulekov <email address hidden> 于2020年7月23日周四 下午1:02写道：
+> >
+> > Public bug reported:
+> >
+> > Hello,
+> > Here is a reproducer (build with --enable-sanitizers):
+> > cat << EOF | ./i386-softmmu/qemu-system-i386 -nographic -M pc -nodefaults -m 512M -device virtio-vga -qtest stdio
+> > outl 0xcf8 0x80001018
+> > outl 0xcfc 0xe0800000
+> > outl 0xcf8 0x80001020
+> > outl 0xcf8 0x80001004
+> > outw 0xcfc 0x7
+> > writeq 0xe0801024 0x10646c00776c6cff
+> > writeq 0xe080102d 0xe0801000320000
+> > writeq 0xe0801015 0x12b2901ba000000
+> > write 0x10646c02 0x1 0x2c
+> > write 0x999 0x1 0x25
+> > write 0x8 0x1 0x78
+> > write 0x2c7 0x1 0x32
+> > write 0x2cb 0x1 0xff
+> > write 0x2cc 0x1 0x7e
+> > writeq 0xe0803000 0xf2b8f0540ff83
+> > EOF
+> >
+> > The ASAN trace:
+> > ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+> > READ of size 8 at 0x60d0000050e8 thread T0
+> >     #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+> >     #1 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+> >     #2 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+> >     #3 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+> >     #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >     #5 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >     #6 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >     #7 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >     #8 0x56062a919571 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:217:9
+> >     #9 0x56062a919571 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:240:5
+> >     #10 0x56062a919571 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:516:11
+> >     #11 0x560629094a64 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1676:9
+> >     #12 0x56062a749ab5 in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+> >     #13 0x7f0d5cd55e0a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x26e0a)
+> >     #14 0x5606288ba889 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x24d0889)
+> >
+> > 0x60d0000050e8 is located 56 bytes inside of 136-byte region [0x60d0000050b0,0x60d000005138)
+> > freed by thread T0 here:
+> >     #0 0x56062893250d in free (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254850d)
+> >     #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+> >     #2 0x560628e81d34 in virtio_reset /home/alxndr/Development/qemu/hw/virtio/virtio.c:1999:9
+> >     #3 0x560629f08773 in virtio_pci_reset /home/alxndr/Development/qemu/hw/virtio/virtio-pci.c:1841:5
+> >     #4 0x560629043ab6 in memory_region_write_accessor /home/alxndr/Development/qemu/softmmu/memory.c:483:5
+> >     #5 0x560629043473 in access_with_adjusted_size /home/alxndr/Development/qemu/softmmu/memory.c:544:18
+> >     #6 0x560629042c99 in memory_region_dispatch_write /home/alxndr/Development/qemu/softmmu/memory.c
+> >     #7 0x560628990a37 in flatview_write_continue /home/alxndr/Development/qemu/exec.c:3176:23
+> >     #8 0x56062899041a in address_space_write_cached_slow /home/alxndr/Development/qemu/exec.c:3789:12
+> >     #9 0x560628e6f9bb in vring_used_write /home/alxndr/Development/qemu/hw/virtio/virtio.c:347:5
+> >     #10 0x560628e6f9bb in virtqueue_split_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:788:5
+> >     #11 0x560628e6f9bb in virtqueue_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:852:9
+> >     #12 0x560628e7205e in virtqueue_push /home/alxndr/Development/qemu/hw/virtio/virtio.c:917:5
+> >     #13 0x560629814246 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:180:5
+> >     #14 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+> >     #15 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+> >     #16 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+> >     #17 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >     #18 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >     #19 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >     #20 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >
+> 
+> Seems again when we write back to virtio used vring, we write to the
+> MMIO addresspace.
+
+Yes it seems to have a similar flavor as LP#1886362, but this time with
+BHes in the mix, which we would hope avoid the reentrancy issues.
+-Alex
+
+> Thanks,
+> Li Qiang
+> 
+> 
+> > previously allocated by thread T0 here:
+> >     #0 0x56062893278d in malloc (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254878d)
+> >     #1 0x7f0d5e1d5500 in g_malloc (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x54500)
+> >     #2 0x560628e7844b in virtqueue_split_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1524:12
+> >     #3 0x560628e7844b in virtqueue_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1693:16
+> >     #4 0x560629829633 in virtio_gpu_handle_ctrl /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:878:15
+> >     #5 0x560629829633 in virtio_gpu_ctrl_bh /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:893:5
+> >     #6 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >     #7 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >     #8 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >     #9 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >
+> >
+> > With -trace virtio\* -trace pci\* :
+> > [I 1595480025.666147] OPENED
+> > 31900@1595480025.706962:virtio_set_status vdev 0x633000019640 val 0
+> > 31900@1595480025.710297:virtio_set_status vdev 0x633000019640 val 0
+> > [R +0.046276] outl 0xcf8 0x80001018
+> > OK
+> > [S +0.046313] OK
+> > [R +0.046332] outl 0xcfc 0xe0800000
+> > 31900@1595480025.712490:pci_cfg_write virtio-vga 02:0 @0x18 <- 0xe0800000
+> > OK
+> > [S +0.046356] OK
+> > [R +0.046365] outl 0xcf8 0x80001020
+> > OK
+> > [S +0.046370] OK
+> > [R +0.046379] outl 0xcf8 0x80001004
+> > OK
+> > [S +0.046383] OK
+> > [R +0.046391] outw 0xcfc 0x7
+> > 31900@1595480025.712544:pci_cfg_write virtio-vga 02:0 @0x4 <- 0x7
+> > 31900@1595480025.712551:pci_update_mappings_add d=0x633000000800 00:02.0 2,0xe0800000+0x4000
+> > OK
+> > [S +0.047572] OK
+> > [R +0.047597] writeq 0xe0801024 0x10646c00776c6cff
+> > OK
+> > [S +0.047610] OK
+> > [R +0.047619] writeq 0xe080102d 0xe0801000320000
+> > OK
+> > [S +0.047627] OK
+> > [R +0.047636] writeq 0xe0801015 0x12b2901ba000000
+> > OK
+> > [S +0.047650] OK
+> > [R +0.047660] write 0x10646c02 0x1 0x2c
+> > OK
+> > [S +0.047769] OK
+> > [R +0.047782] write 0x999 0x1 0x25
+> > OK
+> > [S +0.047907] OK
+> > [R +0.047920] write 0x8 0x1 0x78
+> > OK
+> > [S +0.047927] OK
+> > [R +0.047935] write 0x2c7 0x1 0x32
+> > OK
+> > [S +0.047941] OK
+> > [R +0.047949] write 0x2cb 0x1 0xff
+> > OK
+> > [S +0.047954] OK
+> > [R +0.047962] write 0x2cc 0x1 0x7e
+> > OK
+> > [S +0.047967] OK
+> > [R +0.047975] writeq 0xe0803000 0xf2b8f0540ff83
+> > 31900@1595480025.714133:virtio_queue_notify vdev 0x633000019640 n 0 vq 0x7fe20b13d800
+> > OK
+> > [S +0.047996] OK
+> > 31900@1595480025.714386:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> > 31900@1595480025.714406:virtio_gpu_features virgl 0
+> > 31900@1595480025.714413:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> > 31900@1595480025.714421:virtio_set_status vdev 0x633000019640 val 0
+> > *CRASH*
+> >
+> > Please let me know if I can provide any further info.
+> > -Alex
+> >
+> > ** Affects: qemu
+> >      Importance: Undecided
+> >          Status: New
+> >
+> > --
+> > You received this bug notification because you are a member of qemu-
+> > devel-ml, which is subscribed to QEMU.
+> > https://bugs.launchpad.net/bugs/1888606
+> >
+> > Title:
+> >   Heap-use-after-free in virtio_gpu_ctrl_response
+> >
+> > Status in QEMU:
+> >   New
+> >
+> > Bug description:
+> >   Hello,
+> >   Here is a reproducer (build with --enable-sanitizers):
+> >   cat << EOF | ./i386-softmmu/qemu-system-i386 -nographic -M pc -nodefaults -m 512M -device virtio-vga -qtest stdio
+> >   outl 0xcf8 0x80001018
+> >   outl 0xcfc 0xe0800000
+> >   outl 0xcf8 0x80001020
+> >   outl 0xcf8 0x80001004
+> >   outw 0xcfc 0x7
+> >   writeq 0xe0801024 0x10646c00776c6cff
+> >   writeq 0xe080102d 0xe0801000320000
+> >   writeq 0xe0801015 0x12b2901ba000000
+> >   write 0x10646c02 0x1 0x2c
+> >   write 0x999 0x1 0x25
+> >   write 0x8 0x1 0x78
+> >   write 0x2c7 0x1 0x32
+> >   write 0x2cb 0x1 0xff
+> >   write 0x2cc 0x1 0x7e
+> >   writeq 0xe0803000 0xf2b8f0540ff83
+> >   EOF
+> >
+> >   The ASAN trace:
+> >   ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+> >   READ of size 8 at 0x60d0000050e8 thread T0
+> >       #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+> >       #1 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+> >       #2 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+> >       #3 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+> >       #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >       #5 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >       #6 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >       #7 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >       #8 0x56062a919571 in glib_pollfds_poll /home/alxndr/Development/qemu/util/main-loop.c:217:9
+> >       #9 0x56062a919571 in os_host_main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:240:5
+> >       #10 0x56062a919571 in main_loop_wait /home/alxndr/Development/qemu/util/main-loop.c:516:11
+> >       #11 0x560629094a64 in qemu_main_loop /home/alxndr/Development/qemu/softmmu/vl.c:1676:9
+> >       #12 0x56062a749ab5 in main /home/alxndr/Development/qemu/softmmu/main.c:49:5
+> >       #13 0x7f0d5cd55e0a in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x26e0a)
+> >       #14 0x5606288ba889 in _start (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x24d0889)
+> >
+> >   0x60d0000050e8 is located 56 bytes inside of 136-byte region [0x60d0000050b0,0x60d000005138)
+> >   freed by thread T0 here:
+> >       #0 0x56062893250d in free (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254850d)
+> >       #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+> >       #2 0x560628e81d34 in virtio_reset /home/alxndr/Development/qemu/hw/virtio/virtio.c:1999:9
+> >       #3 0x560629f08773 in virtio_pci_reset /home/alxndr/Development/qemu/hw/virtio/virtio-pci.c:1841:5
+> >       #4 0x560629043ab6 in memory_region_write_accessor /home/alxndr/Development/qemu/softmmu/memory.c:483:5
+> >       #5 0x560629043473 in access_with_adjusted_size /home/alxndr/Development/qemu/softmmu/memory.c:544:18
+> >       #6 0x560629042c99 in memory_region_dispatch_write /home/alxndr/Development/qemu/softmmu/memory.c
+> >       #7 0x560628990a37 in flatview_write_continue /home/alxndr/Development/qemu/exec.c:3176:23
+> >       #8 0x56062899041a in address_space_write_cached_slow /home/alxndr/Development/qemu/exec.c:3789:12
+> >       #9 0x560628e6f9bb in vring_used_write /home/alxndr/Development/qemu/hw/virtio/virtio.c:347:5
+> >       #10 0x560628e6f9bb in virtqueue_split_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:788:5
+> >       #11 0x560628e6f9bb in virtqueue_fill /home/alxndr/Development/qemu/hw/virtio/virtio.c:852:9
+> >       #12 0x560628e7205e in virtqueue_push /home/alxndr/Development/qemu/hw/virtio/virtio.c:917:5
+> >       #13 0x560629814246 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:180:5
+> >       #14 0x56062981adc8 in virtio_gpu_ctrl_response_nodata /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:193:5
+> >       #15 0x56062981adc8 in virtio_gpu_simple_process_cmd /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:791:9
+> >       #16 0x5606298175f8 in virtio_gpu_process_cmdq /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:820:9
+> >       #17 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >       #18 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >       #19 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >       #20 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >
+> >   previously allocated by thread T0 here:
+> >       #0 0x56062893278d in malloc (/home/alxndr/Development/qemu/build/i386-softmmu/qemu-system-i386+0x254878d)
+> >       #1 0x7f0d5e1d5500 in g_malloc (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x54500)
+> >       #2 0x560628e7844b in virtqueue_split_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1524:12
+> >       #3 0x560628e7844b in virtqueue_pop /home/alxndr/Development/qemu/hw/virtio/virtio.c:1693:16
+> >       #4 0x560629829633 in virtio_gpu_handle_ctrl /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:878:15
+> >       #5 0x560629829633 in virtio_gpu_ctrl_bh /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:893:5
+> >       #6 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> >       #7 0x56062a887b9d in aio_dispatch /home/alxndr/Development/qemu/util/aio-posix.c:380:5
+> >       #8 0x56062a8f6b1c in aio_ctx_dispatch /home/alxndr/Development/qemu/util/async.c:306:5
+> >       #9 0x7f0d5e1cf9ed in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x4e9ed)
+> >
+> >
+> >   With -trace virtio\* -trace pci\* :
+> >   [I 1595480025.666147] OPENED
+> >   31900@1595480025.706962:virtio_set_status vdev 0x633000019640 val 0
+> >   31900@1595480025.710297:virtio_set_status vdev 0x633000019640 val 0
+> >   [R +0.046276] outl 0xcf8 0x80001018
+> >   OK
+> >   [S +0.046313] OK
+> >   [R +0.046332] outl 0xcfc 0xe0800000
+> >   31900@1595480025.712490:pci_cfg_write virtio-vga 02:0 @0x18 <- 0xe0800000
+> >   OK
+> >   [S +0.046356] OK
+> >   [R +0.046365] outl 0xcf8 0x80001020
+> >   OK
+> >   [S +0.046370] OK
+> >   [R +0.046379] outl 0xcf8 0x80001004
+> >   OK
+> >   [S +0.046383] OK
+> >   [R +0.046391] outw 0xcfc 0x7
+> >   31900@1595480025.712544:pci_cfg_write virtio-vga 02:0 @0x4 <- 0x7
+> >   31900@1595480025.712551:pci_update_mappings_add d=0x633000000800 00:02.0 2,0xe0800000+0x4000
+> >   OK
+> >   [S +0.047572] OK
+> >   [R +0.047597] writeq 0xe0801024 0x10646c00776c6cff
+> >   OK
+> >   [S +0.047610] OK
+> >   [R +0.047619] writeq 0xe080102d 0xe0801000320000
+> >   OK
+> >   [S +0.047627] OK
+> >   [R +0.047636] writeq 0xe0801015 0x12b2901ba000000
+> >   OK
+> >   [S +0.047650] OK
+> >   [R +0.047660] write 0x10646c02 0x1 0x2c
+> >   OK
+> >   [S +0.047769] OK
+> >   [R +0.047782] write 0x999 0x1 0x25
+> >   OK
+> >   [S +0.047907] OK
+> >   [R +0.047920] write 0x8 0x1 0x78
+> >   OK
+> >   [S +0.047927] OK
+> >   [R +0.047935] write 0x2c7 0x1 0x32
+> >   OK
+> >   [S +0.047941] OK
+> >   [R +0.047949] write 0x2cb 0x1 0xff
+> >   OK
+> >   [S +0.047954] OK
+> >   [R +0.047962] write 0x2cc 0x1 0x7e
+> >   OK
+> >   [S +0.047967] OK
+> >   [R +0.047975] writeq 0xe0803000 0xf2b8f0540ff83
+> >   31900@1595480025.714133:virtio_queue_notify vdev 0x633000019640 n 0 vq 0x7fe20b13d800
+> >   OK
+> >   [S +0.047996] OK
+> >   31900@1595480025.714386:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> >   31900@1595480025.714406:virtio_gpu_features virgl 0
+> >   31900@1595480025.714413:virtio_notify vdev 0x633000019640 vq 0x7fe20b13d800
+> >   31900@1595480025.714421:virtio_set_status vdev 0x633000019640 val 0
+> >   *CRASH*
+> >
+> >   Please let me know if I can provide any further info.
+> >   -Alex
+> >
+> > To manage notifications about this bug go to:
+> > https://bugs.launchpad.net/qemu/+bug/1888606/+subscriptions
+> >
+> 
+
+
+  Hi,
+
+> > The ASAN trace:
+> > ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+> > READ of size 8 at 0x60d0000050e8 thread T0
+> >     #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+> >     #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+
+> >     #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+
+So it looks like the bottom half accesses stuff released by reset.
+
+Guess the reset should cancel any scheduled bh calls to avoid that ...
+
+Does the patch below help?
+
+thanks,
+  Gerd
+
+diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+index 5f0dd7c15002..18f0011b5a0a 100644
+--- a/hw/display/virtio-gpu.c
++++ b/hw/display/virtio-gpu.c
+@@ -1144,6 +1144,9 @@ static void virtio_gpu_reset(VirtIODevice *vdev)
+     struct virtio_gpu_simple_resource *res, *tmp;
+     struct virtio_gpu_ctrl_command *cmd;
+ 
++    qemu_bh_cancel(g->ctrl_bh);
++    qemu_bh_cancel(g->cursor_bh);
++
+ #ifdef CONFIG_VIRGL
+     if (g->parent_obj.use_virgl_renderer) {
+         virtio_gpu_virgl_reset(g);
+
+
+
+Hi Gerd,
+Strange... After applying your patch, I re-ran the reproducer, but
+I still see the same crash.
+-Alex
+
+On 200803 0856, Gerd Hoffmann wrote:
+>   Hi,
+> 
+> > > The ASAN trace:
+> > > ==29798==ERROR: AddressSanitizer: heap-use-after-free on address 0x60d0000050e8 at pc 0x560629814761 bp 0x7ffe916eb1e0 sp 0x7ffe916eb1d8
+> > > READ of size 8 at 0x60d0000050e8 thread T0
+> > >     #0 0x560629814760 in virtio_gpu_ctrl_response /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:181:42
+> > >     #4 0x56062a8f1c96 in aio_bh_poll /home/alxndr/Development/qemu/util/async.c:164:13
+> 
+> > >     #1 0x560629827730 in virtio_gpu_reset /home/alxndr/Development/qemu/hw/display/virtio-gpu.c:1160:9
+> 
+> So it looks like the bottom half accesses stuff released by reset.
+> 
+> Guess the reset should cancel any scheduled bh calls to avoid that ...
+> 
+> Does the patch below help?
+> 
+> thanks,
+>   Gerd
+> 
+> diff --git a/hw/display/virtio-gpu.c b/hw/display/virtio-gpu.c
+> index 5f0dd7c15002..18f0011b5a0a 100644
+> --- a/hw/display/virtio-gpu.c
+> +++ b/hw/display/virtio-gpu.c
+> @@ -1144,6 +1144,9 @@ static void virtio_gpu_reset(VirtIODevice *vdev)
+>      struct virtio_gpu_simple_resource *res, *tmp;
+>      struct virtio_gpu_ctrl_command *cmd;
+>  
+> +    qemu_bh_cancel(g->ctrl_bh);
+> +    qemu_bh_cancel(g->cursor_bh);
+> +
+>  #ifdef CONFIG_VIRGL
+>      if (g->parent_obj.use_virgl_renderer) {
+>          virtio_gpu_virgl_reset(g);
+> 
+
+
+I can reproduce this problem with QEMU v5.0, but with the current
+version, it does not run into this problem anymore. Seems like this
+problem got fixed in the course of time? Could you please check whether
+you could still reproduce this?
+
+
+OSS-Fuzz says it was fixed some months ago, and it has not found a reproducer since.
+
+Ok, thanks for checking, so let's mark this as fixed.
+

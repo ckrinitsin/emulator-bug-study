@@ -1,0 +1,354 @@
+KVM: 0.922
+other: 0.864
+device: 0.855
+graphic: 0.853
+assembly: 0.847
+vnc: 0.839
+instruction: 0.825
+boot: 0.812
+socket: 0.809
+mistranslation: 0.797
+network: 0.792
+semantic: 0.790
+
+ARM M: Systick first wrap delayed (qemu-timers/icount prb?)
+
+When running this kind of code with qemu:
+
+static void SysTickISR(void)
+{
+	printf("SysTick\n");
+}
+
+void main()
+{
+	volatile int i, j;
+	printf("setup timer\n");
+	*(uint32_t*) 0xE000E014 = 0x8FFFFF; //reload value
+	*(uint32_t*) 0xE000E018 = 0;        //force reload
+	*(uint32_t*) 0xE000E010 = 7;        //cpu clk + ISR + enable 
+
+	for (j = 0; j < 0x100; j++) {
+		for (i = 0; i < 0x100000; i++)
+			;
+		printf("cnt %08x  -- %8x\n", *(uint32_t*) 0xE000E018, *(uint32_t*)0xE000E010);
+	}
+}
+
+I get the following output (comments added after '#'):
+
+setup timer
+cnt 007cccca  --        7
+cnt 006998a2  --        7
+cnt 00566479  --        7
+cnt 0043304f  --        7
+cnt 002ffc26  --        7
+cnt 001cc7fd  --        7
+cnt 000993d5  --        7
+cnt 00000000  --        7  <--- problem here, systick should wrap and raise isr
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+SysTick                     <--- delayed isr occuring here
+cnt 000986e0  --    10007
+SysTick
+cnt 00865290  --    10007   <---- then running fine as long as regs not modified
+cnt 00731e51  --        7
+cnt 005fea27  --        7
+cnt 004cb5ff  --        7
+cnt 003981d6  --        7
+cnt 00264dad  --        7
+cnt 00131984  --        7
+SysTick
+cnt 008fe545  --    10007
+cnt 007cb106  --        7
+cnt 00697cdd  --        7
+cnt 005648b4  --        7
+cnt 0043148b  --        7
+cnt 002fe061  --        7
+cnt 001cac38  --        7
+cnt 00097810  --        7
+SysTick
+cnt 008643d6  --    10007
+cnt 00730f97  --        7
+cnt 005fdb6d  --        7
+cnt 004ca745  --        7
+cnt 0039731c  --        7
+cnt 00263ef3  --        7
+cnt 00130aca  --        7
+SysTick
+cnt 008fd68b  --    10007
+cnt 007ca24c  --        7
+cnt 00696e23  --        7
+cnt 005639fa  --        7
+cnt 004305d1  --        7
+cnt 002fd1a8  --        7
+cnt 001c9d7f  --        7
+cnt 00096956  --        7
+SysTick
+cnt 0086351d  --    10007
+cnt 007300dd  --        7
+cnt 005fccb4  --        7
+cnt 004c988c  --        7
+cnt 00396463  --        7
+cnt 00263039  --        7
+cnt 0012fc10  --        7
+[...]
+
+Command line and version:
+qemu-system-arm -M lm3s6965evb -nographic -kernel hello.bin -monitor stdio -serial file:/dev/pts/6 -icount 4 -cpu cortex-m4
+QEMU 2.11.50
+
+I am compiling from git repo, head is:
+commit f32408f3b472a088467474ab152be3b6285b2d7b
+Author: Daniel P. Berrangé <email address hidden>
+Date:   Tue Mar 6 13:43:17 2018 +0000
+
+Config options:
+./configure --target-list=arm-softmmu --enable-debug --disable-slirp --enable-tcg-interpreter --disable-blobs --disable-docs --disable-guest-agent --disable-gnutls --disable-nettle --disable-gcrypt --disable-sdl --disable-gtk --disable-vnc --disable-virtfs --disable-mpath --disable-xen --disable-brlapi --disable-curl --disable-bluez --disable-kvm --disable-hax --disable-hvf --disable-whpx --disable-rdma --disable-vde --disable-netmap --disable-linux-aio --disable-cap-ng --disable-attr --disable-vhost-net --disable-spice --disable-rbd --disable-libiscsi --disable-libnfs --disable-smartcard --disable-libusb --disable-live-block-migration --disable-usb-redir --disable-lzo --disable-snappy --disable-bzip2 --disable-seccomp --disable-glusterfs --disable-tpm --disable-libssh2 --disable-numa --disable-libxml2 --disable-tcmalloc --disable-jemalloc --disable-replication --disable-vhost-vsock --disable-opengl --disable-virglrenderer --disable-xfsctl --disable-qom-cast-debug --disable-vxhs --disable-crypto-afalg --disable-vhost-user --disable-capstone --disable-pie --extra-cflags=-mtune=native
+
+
+Not working with git tag 2.10.0 (almost same config)
+
+Working with stock qemu-arm 2.5.0 from Ubuntu 16.04.
+
+I started investigating, though I am not familiar with qemu code and I could see that the execution is not geting out of qemu_tcg_rr_cpu_thread_fn() 'while' loop and timers are not triggered because the values in cpu->icount_extra or cpu->icount_budget are not to modified accordingly after the timer is set (host side) when the systick register is written (target side).
+
+Delay between the counter hitting zero and the ISR firing is architecturally permitted (the interrupt must be recognized in finite time or at a context synchronizing event, but not necessarily at the same 'clock tick' that the counter hits zero). If you want to ensure that an interrupt has been taken before you read the counter value, you need to use an ISB instruction in your loop.
+
+(There are also some buggy behaviours in our systick device implementation, but in this case I don't think you're running into them.)
+
+
+I tried to insert an ISB in the loop but I get more or less the same result.
+
+However, I guess from your response that I did not explain the problem well enough. I understand that qemu will not be cycle accurate, however, here, we are not even "one million cycles accurate"! The counter would have the time to wrap twice before qemu is taking into account the first ISR... and if we check the following ISR time, we have a good accuracy, so I still think this is a bug.
+
+Morever, as said above, if I test with qemu 2.5.0 from Ubuntu package I get an accurate behavior:
+
+setup timer
+cnt 00799997  --        7
+cnt 0063323b  --        7
+cnt 004ccade  --        7
+cnt 00366383  --        7
+cnt 001ffc26  --        7
+cnt 000994ca  --        7
+SysTick
+cnt 00832d5e  --    10007
+cnt 006cc5eb  --        7
+cnt 00565e8f  --        7
+cnt 003ff733  --        7
+cnt 00298fd7  --        7
+cnt 0013287b  --        7
+SysTick
+cnt 008cc108  --    10007
+cnt 00765996  --        7
+cnt 005ff239  --        7
+cnt 00498add  --        7
+cnt 00332381  --        7
+cnt 001cbc24  --        7
+cnt 000654c8  --        7
+SysTick
+cnt 007fed5c  --    10007
+cnt 006985ea  --        7
+cnt 00531e8d  --        7
+cnt 003cb731  --        7
+cnt 00264fd5  --        7
+cnt 000fe879  --        7
+SysTick
+cnt 0089810c  --    10007
+cnt 0073199a  --        7
+cnt 005cb23d  --        7
+[...]
+
+So here I would suspect either a regression in the code or a wrong combination of options when I compile it myself. I am trying to recompile version 2.5 myself to sort this out but I am running in other errors.
+
+
+
+OK, I will see if I can find some time to investigate this. Can you attach your guest binary, please?
+
+
+Please find the binary attached.
+
+I have been trying several versions and it looks like the regression occured between v2.8.0 and v2.9.0.
+
+
+Ok I spent more time trying to identify the commits giving problem.
+
+So before 8d04fb5, qemu is executing the binary as expected:
+
+setup timer
+cnt 007cccca  --        7
+cnt 006998a2  --        7
+cnt 00566479  --        7
+cnt 0043304f  --        7
+cnt 002ffc26  --        7
+cnt 001cc7fd  --        7
+cnt 000993d5  --        7
+SysTick
+cnt 00865f9c  --    10007
+cnt 00732b5c  --        7
+cnt 005ff733  --        7
+cnt 004cc30a  --        7
+[...]
+
+
+Then, after this commit "tcg: drop global lock during TCG code execution":
+
+https://git.qemu.org/?p=qemu.git;a=commit;h=8d04fb55dec381bc5105cb47f29d918e579e8cbd
+
+things start to look bad (but not the same way I first ran into):
+
+setup timer
+SysTick
+cnt 00000000  --    10007
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 008ff3e3  --        7
+cnt 007cbfba  --        7
+cnt 00698b92  --        7
+cnt 00565768  --        7
+cnt 0043233f  --        7
+cnt 002fef16  --        7
+cnt 001cbaed  --        7
+cnt 000986c5  --        7
+SysTick
+cnt 0086528b  --    10007
+cnt 00731e4c  --        7
+cnt 005fea23  --        7
+cnt 004cb5fa  --        7
+cnt 003981d1  --        7
+[...]
+
+Then, not long after, this commit changes a little bit the prb "icount: process QEMU_CLOCK_VIRTUAL timers in vCPU thread"
+
+https://git.qemu.org/?p=qemu.git;a=commit;h=6b8f0187a4d7c263e356302f8d308655372a4b5b    
+
+Output then looks like:
+
+setup timer
+cnt 007cccca  --        7
+cnt 006998a2  --        7
+cnt 00566479  --        7
+cnt 0043304f  --        7
+cnt 002ffc26  --        7
+cnt 001cc7fd  --        7
+cnt 000993d5  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+SysTick
+cnt 000986e0  --    10007
+SysTick
+cnt 00865290  --    10007
+cnt 00731e51  --        7
+cnt 005fea27  --        7
+[...]
+
+... and it seems this very problem has been occurring up to now.
+
+I am here using the binary attached, with this command line:
+
+qemu-system-arm -M lm3s6965evb -nographic -kernel hello.bin -serial file:$(tty) -icount 4 -cpu cortex-m4
+
+And with these build options:
+
+./configure --target-list=arm-softmmu --disable-slirp --disable-blobs --disable-docs --disable-guest-agent --disable-gnutls --disable-nettle --disable-gcrypt --disable-sdl --disable-gtk --disable-vnc --disable-virtfs --disable-xen --disable-brlapi --disable-curl --disable-bluez --disable-kvm --disable-rdma --disable-vde --disable-netmap --disable-linux-aio --disable-cap-ng --disable-attr --disable-vhost-net --disable-spice --disable-rbd --disable-libiscsi --disable-libnfs --disable-smartcard --disable-libusb --disable-usb-redir --disable-lzo --disable-snappy --disable-bzip2 --disable-seccomp --disable-glusterfs --disable-tpm --disable-libssh2 --disable-numa --disable-tcmalloc --disable-jemalloc --disable-opengl --disable-virglrenderer --disable-xfsctl --disable-qom-cast-debug --disable-pie --extra-cflags=-mtune=native
+
+Note that, to prevent MTTCG/icount error, we must modify configure for the arm target with:
+
+     mttcg="no"
+
+
+
+
+I finally implemented a workaround to correct the problem:
+
+in cpus.c : qemu_start_warp_timer(), in the "if (deadline > 0) { ... }" part, I added:
+
+        CPUState *cpu;
+        CPU_FOREACH(cpu) {
+            atomic_mb_set(&cpu->exit_request, 1);
+        }
+
+I do not understand more than 5% of the code I am messing up, so this hack is probably broken...
+
+Then I tested a bit more the code with different testcases... and I found a new bug when writing a reload value smaller than the current counter (the counter will then read as 0). It is due to this piece of code in armv7m_systick.c : systick_read() :
+
+        /* The interrupt in triggered when the timer reaches zero.
+           However the counter is not reloaded until the next clock
+           tick.  This is a hack to return zero during the first tick.  */
+        if (val > s->reload) {
+            val = 0;
+        }
+
+Well this is not really a prb for me with normal code, and it looks like under control, but I can open another bug if needed.
+
+
+
+The workaround I described above is actually not the good one, because of this check occurring just before:
+
+    if (!all_cpu_threads_idle()) {
+        return;
+    }
+
+The exit request setting must be done before, so my code looks like this:
+
+
+    CPUState *cpu;
+    CPU_FOREACH(cpu) {
+        atomic_mb_set(&cpu->exit_request, 1);
+    }
+
+    if (!all_cpu_threads_idle()) {
+        return;
+    }
+
+(version is v2.11.0-2122-g9fa673c-dirty)
+
+
+
+
+Thanks for the test case; that was very useful. I've sent a patch which should fix this bug:
+https://patchwork.ozlabs.org/patch/895693/
+
+The "writing a reload value smaller than the current counter" bug is one of the ones I know about in our systick implementation. I may have time to overhaul that code in the 2.13 timeframe.
+
+
+Hi Peter,
+
+I just tested your patch, I confirm it is also working on my side. Many thanks.
+
+Now fixed in master, commit c52e7132d7c885, and will be in 2.12.0.
+

@@ -1,0 +1,139 @@
+semantic: 0.949
+other: 0.945
+graphic: 0.923
+assembly: 0.923
+mistranslation: 0.905
+instruction: 0.898
+device: 0.888
+boot: 0.819
+socket: 0.717
+KVM: 0.695
+network: 0.631
+vnc: 0.619
+
+cpu_address_space_init fails with assertion
+
+qemu-system-arm does not start with version >= 2.6 and KVM enabled.
+
+  cpu_address_space_init: Assertion `asidx == 0 || !kvm_enabled()' failed.
+
+Hardware is Odroid XU4 with Exynos with 4.9.61+ Tested with Debian Stretch (9) or Buster (10).
+
+Without KVM it is running fine but slow. I'm operating Debian Jessie with qemu 2.1 for a long time with KVM virtualization working flawlessly. When I upgraded to Stretch I ran into the trouble described before. I tried Debian Stretch and Buster with all Kernels provided by the Board manufacturer (Hardkernel).
+
+It seems to be related to the feature introduced in Version 2.6:
+https://wiki.qemu.org/ChangeLog/2.6
+- Support for a separate EL3 address space
+
+KVM is enabled, so I assume the adress space index asidx to be causing the assert to fail.
+
+dmesg | grep -i KVM
+[    0.741714] kvm [1]: 8-bit VMID
+[    0.741721] kvm [1]: IDMAP page: 40201000
+[    0.741729] kvm [1]: HYP VA range: c0000000:ffffffff
+[    0.742543] kvm [1]: Hyp mode initialized successfully
+[    0.742600] kvm [1]: vgic-v2@10484000
+[    0.742924] kvm [1]: vgic interrupt IRQ16
+[    0.742943] kvm [1]: virtual timer IRQ60
+
+Full command line is:
+qemu-system-arm -M vexpress-a15 -smp 2 -m 512 -cpu host -enable-kvm -kernel vmlinuz -initrd initrd.gz -dtb vexpress-v2p-ca15-tc1.dtb -device virtio-blk-device,drive=inst-blk -drive file=PATHTOFILE,id=inst-blk,if=none,format=raw -append "vga=normal rw console=ttyAMA0" -nographic
+
+Is there anything to do to understand, if this is a hardware related failure or probably just a missing parameter?
+
+Regards
+
+Lutz
+
+2.6 is now very old -- can you check whether this is still a problem with a more recent QEMU version, please?
+
+The command line you're using should in theory work, but vexpress-a15 + KVM is a bit of an obscure combination -- most people who want to use virtualization use the 'virt' machine, which supports more RAM and has PCI, unlike the vexpress-a15 board. So it's possible we broke it by accident and didn't notice.
+
+
+Oh, I've just noticed -- we default to enabling EL3 on this board (like the hardware), which won't work with KVM, so if you want KVM you need to disable EL3 with the command line option -machine secure=off
+
+
+We do check for the incompatible option combination in hw/arm/virt.c:
+    if (vms->secure) {
+        if (kvm_enabled()) {
+            error_report("mach-virt: KVM does not support Security extensions");
+            exit(1);
+        }
+
+we just don't have anything equivalent in vexpress.c. We should probably put something in target/arm/cpu.c so we don't have to modify every board.
+
+
+Thank you for the quick and complete investigation. I'll follow your suggestions and will reply any succecss in the next days. I checked the source of the vexpress and found the assert, but wasn't clever enough to compare it to another board.
+
+I would support the idea of checking the incompatible parameter pairing in common code.
+
+I've now tested this with both current head-of-git and with the Debian stretch 2.8.1 qemu-system-arm and I can't reproduce this. We automatically don't enable the EL3 feature if we're using KVM, so a guest runs and sees a non-secure only CPU, without needing to manually add -machine secure=off to the command line. Perhaps we fixed it between 2.6 and 2.8 ?
+
+
+My test setup is now Debian Buster with qemu-system-arm 3.1 and a host with KVM-enabled Kernel 4.9.61 on Odroid XU4.
+
+Following results:
+--------
+qemu-system-arm -M vexpress-a15 -smp 2 -m 512 -kernel vmlinuz -initrd initrd.gz -dtb vexpress-v2p-ca15-tc1.dtb -device virtio-blk-device,drive=inst-blk -drive file=PATHTOFILE,id=inst-blk,if=none,format=raw -append "vga=normal rw console=ttyAMA0" -nographic -enable-kvm
+
+Still not working as above, so it doesn't seem to be fixed for 3.1.
+--------
+qemu-system-arm -M vexpress-a15,secure=off -smp 2 -m 512 -kernel vmlinuz -initrd initrd.gz -dtb vexpress-v2p-ca15-tc1.dtb -device virtio-blk-device,drive=inst-blk -drive file=PATHTOFILE,id=inst-blk,if=none,format=raw -append "vga=normal rw console=ttyAMA0" -nographic -enable-kvm
+
+No errors but no output at all, can switch to qemu monitor, but don't know if system is running
+--------
+Option 1 and Option 2 both start the Debian installer as expected WITHOUT the parameter -enable-kvm
+
+
+I did also tests with the virt board as recommended. With the parameter -enable-kvm none of the different virt-* boards did output anything to the console, without KVM the virt-boards did start. 
+
+virt-2.6 and virt-2.7 did boot into the installer without KVM.
+
+Any more recent version (2.8, 2.9, 2.10, 3.0 and 3.1) returned
+
+"Unable to handle kernel paging request at virtual address 0109ed30" (address is changing)
+
+during the init process. With different guest memory sizes the paging error occurred at a different init step.
+
+Conclusion:
+1) EL3 feature does still seem to be enabled in qemu 3.1 (Debian) even for KVM-enabled guests.
+2) Any recommendation for a support forum to discuss my trouble with the missing console output when enabling KVM and the paging problems with the recent virt boards outside this bug report?
+
+UPDATE: Kernel page handling seems to be related to the -smp 2 parameter. Any number > 1 leads to the paging error while omitting the parameter lead to a running system (without KVM).
+
+I can boot a KVM guest (either with the debian stretch qemu-system-arm 2.8.1, or with a head-of-upstream-git QEMU), which wouldn't work with EL3 enabled, so I'm not sure what is going wrong for you. To try to debug this further you'd need to build QEMU from source and start running it under the debugger to see what exactly is going on and why it's hitting that assertion.
+
+I would be tempted to try a newer kernel to see if that helped. (My working setup is using the debian stretch stock "4.9.0-0.bpo.9-armmp-lpae #1 SMP Debian 4.9.168-1+deb9u3~deb8u1 (2019-06-17)", but in general 4.9 is fairly elderly now.)
+
+For forums to talk about this kind of thing you might also try the qemu-arm mailing list (https://lists.nongnu.org/mailman/listinfo/qemu-arm) or qemu-devel itself (generally best to cc qemu-devel on qemu-arm emails anyway, lots of people don't subscribe to the per-architecture lists).
+
+
+I'm marking this bug 'incomplete' since as in comment #8 I was unable to reproduce, and I'm no longer sure how the assert could be being hit. If you can provide repro instructions and images that work on current head-of-git I can investigate.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+I am having a similar problem. I want to use KVM on jetson nano and boot Raspbian Buster 32bit OS with native machine emulation.
+
+Run into a similar problem. I used latest QEMU. 
+
+
+When I use gdb i see that the assert line uses:
+
+   /* KVM cannot currently support multiple address spaces. */
+    assert(asidx == 0 || !kvm_enabled());
+
+the asidx is 1. So since KVM is not supporting multiple addresses spaces that the Raspi3 requires the assertion occurs.
+
+I wonder what the workaround could be for this 
+
+
+
+
+> I want to use KVM on jetson nano and boot Raspbian Buster 32bit OS with native machine emulation.
+
+The raspi machine doesn't support KVM. You can choose either (1) boot on a board model which does support KVM, which basically means "virt", or (2) use emulation, not KVM.
+
+If all you care about is running a fairly generic Linux userspace then option 1 will probably be good enough.
+
+

@@ -1,0 +1,69 @@
+other: 0.981
+graphic: 0.979
+semantic: 0.979
+device: 0.977
+assembly: 0.976
+vnc: 0.972
+boot: 0.969
+instruction: 0.968
+mistranslation: 0.959
+socket: 0.953
+network: 0.939
+KVM: 0.937
+
+linux-user: may map interpreter at address 0 with nonzero guest_base
+Description of problem:
+QEMU's user-mode emulation will, under certain conditions, map the ELF interpreter at guest address 0. This is not only a violation of Linux's policy never to map anything at the first page of any virtual address space, but also a cause of confusion (and segfaults) within certain libcs; though I only tested with musl. Musl [interprets a NULL base address](https://elixir.bootlin.com/musl/v1.2.4/source/ldso/dlstart.c#L105) as the dynamic linker being invoked directly, causing it to compute its base address incorrectly.
+
+The problem arises in `load_elf_image()`, which chooses a `load_addr` of 0 for the ELF interpreter (i.e. the musl dynamic loader). This is passed to `target_mmap()`. I do not know whether `target_mmap()` is meant to follow the POSIX rule that (in absence of `MAP_FIXED`) "All implementations interpret an *addr* value of 0 as granting the implementation complete freedom in selecting *pa*" or if 0 is requesting 0.
+
+QEMU's usermode mmap() implementation translates the guest address to a host address (this is effectively a no-op with `guest_base == 0`) and passes it along to the host Linux. This means that, when `guest_base == 0`, a NULL input address means "put it anywhere," but when `guest_base != 0`, NULL means "put it at (guest address) 0."
+Steps to reproduce:
+1. Download a rootfs of Alpine Linux AArch64.
+2. Install `gcc` (with `apk add gcc`) in the rootfs. `gcc` is not compiled as PIC, making QEMU use a nonzero `guest_base`.
+3. Attempt to run `gcc` within the rootfs via QEMU.
+Additional information:
+I am interested in submitting a MR that fixes this issue, but I do not know which of 4 possible solutions is preferred:
+
+1. Modify `load_elf_image()` to ensure that `load_addr` is never NULL.
+2. Modify `target_mmap()` so that NULLs are passed to the kernel as NULLs.
+3. Modify the guest<->host translation facilities (`g2h_untagged` et al) to translate NULL as NULL. Overwhelmingly, a NULL pointer semantically means "there is no pointer here" and not "a pointer to the zeroth address," so treating these as valid addresses in the translation functions is arguably going against the grain.
+4. When a nonzero `guest_base` is selected, reserve the first page of the guest VA space, so that the host kernel cannot accidentally put anything there.
+
+Here is my local patch that implements item 2 above, which indeed stops the segfaults for me:
+<details><summary>Patch</summary>
+
+```diff
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index be3b9a6..dad29ef 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -559,7 +559,7 @@ static abi_long mmap_h_eq_g(abi_ulong start, abi_ulong len,
+                             int host_prot, int flags, int page_flags,
+                             int fd, off_t offset)
+ {
+-    void *p, *want_p = g2h_untagged(start);
++    void *p, *want_p = start ? g2h_untagged(start) : 0;
+     abi_ulong last;
+ 
+     p = mmap(want_p, len, host_prot, flags, fd, offset);
+@@ -609,7 +609,7 @@ static abi_long mmap_h_lt_g(abi_ulong start, abi_ulong len, int host_prot,
+                             int mmap_flags, int page_flags, int fd,
+                             off_t offset, int host_page_size)
+ {
+-    void *p, *want_p = g2h_untagged(start);
++    void *p, *want_p = start ? g2h_untagged(start) : 0;
+     off_t fileend_adj = 0;
+     int flags = mmap_flags;
+     abi_ulong last, pass_last;
+@@ -739,7 +739,7 @@ static abi_long mmap_h_gt_g(abi_ulong start, abi_ulong len,
+                             int flags, int page_flags, int fd,
+                             off_t offset, int host_page_size)
+ {
+-    void *p, *want_p = g2h_untagged(start);
++    void *p, *want_p = start ? g2h_untagged(start) : 0;
+     off_t host_offset = offset & -host_page_size;
+     abi_ulong last, real_start, real_last;
+     bool misaligned_offset = false;
+```
+</details>

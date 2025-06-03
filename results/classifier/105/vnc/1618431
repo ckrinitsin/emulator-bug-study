@@ -1,0 +1,273 @@
+vnc: 0.748
+KVM: 0.742
+graphic: 0.681
+mistranslation: 0.637
+other: 0.622
+device: 0.603
+network: 0.575
+instruction: 0.563
+boot: 0.561
+socket: 0.545
+semantic: 0.535
+assembly: 0.532
+
+windows hangs after live migration with virtio
+
+Several of our users reported problems with windows machines hanging
+after live migrations. The common denominator _seems_ to be virtio
+devices.
+I've managed to reproduce this reliably on a windows 10 (+
+virtio-win-0.1.118) guest, always within 1 to 5 migrations, with a
+virtio-scsi hard drive and a virtio-net network device. (When I
+replace the virtio-net device with an e1000 it takes 10 or more
+migrations, and without virtio devices I have not (yet) been able to
+reproduce this problem. I also could not reproduce this with a linux
+guest. Also spice seems to improve the situation, but doesn't solve
+it completely).
+
+I've tested quite a few tags from qemu-git (v2.2.0 through v2.6.1,
+and 2.6.1 with the patches mentioned on qemu-stable by Peter Lieven)
+and the behavior is the same everywhere.
+
+The reproducibility seems to be somewhat dependent on the host
+hardware, which makes investigating this issue that much harder.
+
+Symptoms:
+After the migration the windows graphics stack just hangs.
+Background processes are still running (eg. after installing an ssh
+server I could still login and get a command prompt after the hang was
+triggered... not that I'd know what to do with that on a windows
+machine...) - commands which need no GUI access work, the rest just
+hangs there on the command line, too.
+It's also capable of responding to an NMI sent via the qemu monitor:
+it then seems to "recover" and manages to show the blue sad-face
+screen that something happened, reboots successfully and is usable
+again without restarting the qemu process in between.
+From there whole the process can be repeated.
+
+Here's what our command line usually looks like:
+
+/usr/bin/qemu -daemonize \
+	-enable-kvm \
+	-chardev socket,id=qmp,path=/var/run/qemu-server/101.qmp,server,nowait -mon chardev=qmp,mode=control \
+	-pidfile /var/run/qemu-server/101.pid \
+	-smbios type=1,uuid=07fc916e-24c2-4eef-9827-4ab4026501d4 \
+	-name win10 \
+	-smp 6,sockets=1,cores=6,maxcpus=6 \
+	-nodefaults \
+	-boot menu=on,strict=on,reboot-timeout=1000 \
+	-vga std \
+	-vnc unix:/var/run/qemu-server/101.vnc \
+	-no-hpet \
+	-cpu kvm64,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_runtime,hv_relaxed,+lahf_lm,+sep,+kvm_pv_unhalt,+kvm_pv_eoi,enforce \
+	-m 2048 \
+	-device pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f \
+	-device pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e \
+	-device piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2 \
+	-device usb-tablet,id=tablet,bus=uhci.0,port=1 \
+	-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3 \
+	-iscsi initiator-name=iqn.1993-08.org.debian:01:1ba48d46fb8 \
+	-drive if=none,id=drive-ide0,media=cdrom,aio=threads \
+	-device ide-cd,bus=ide.0,unit=0,drive=drive-ide0,id=ide0,bootindex=200 \
+	-device virtio-scsi-pci,id=scsihw0,bus=pci.0,addr=0x5 \
+	-drive file=/mnt/pve/data1/images/101/vm-101-disk-1.qcow2,if=none,id=drive-scsi0,cache=writeback,discard=on,format=qcow2,aio=threads,detect-zeroes=unmap \
+	-device scsi-hd,bus=scsihw0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,bootindex=100 \
+	-netdev type=tap,id=net0,ifname=tap101i0,script=/var/lib/qemu-server/pve-bridge,downscript=/var/lib/qemu-server/pve-bridgedown,vhost=on \
+	-device virtio-net-pci,mac=F2:2B:20:37:E6:D7,netdev=net0,bus=pci.0,addr=0x12,id=net0,bootindex=300 \
+	-rtc driftfix=slew,base=localtime \
+	-global kvm-pit.lost_tick_policy=discard
+
+I'm not sure it's virtio - I've got similar cases which happen even without any virtio; for me it goes away if you enable hpet or switch you kvm-put.lost_tick_policy=delay.
+
+Dave
+
+As the virtio related parts aren't the ones hanging (network and disks
+still work...) it's unlikely, but it makes a night and day difference.
+
+Removing -no-hpet as suggested does seem to make a difference, too.
+(Changing the tick policy doesn't, for me.)
+However, I've found that there are various options which when changed
+can massively influence the likelihood of hangs - but it's not always
+the same options for all VMs.
+With the difference being hangups after 1 to at most 2 migrations with
+one setting, or the VMs still being alive and kicking after 20 and
+more migrations with the other.
+However the options I've tested appear to be unrelated. Eq. in my test
+setups this happened with VNC settings, CPU types, toggling our
+backend's ssh tunnel for encryption (which should cause nothing but
+changes in timing from the perspective of qemu); and of course
+replacing virtio devices always had this effect in my tests.
+All this might point to some kind of race condition or time keeping
+problem, but I can't seem to pinpoint it.
+
+Enabling hpet isn't a good option btw., since #599958 [Timedrift
+problems with Win7: hpet missing time drift fixups] appears to
+still be an open issue. => https://bugs.launchpad.net/qemu/+bug/599958
+(This entry is from 2010 :-( )
+
+I can reproduce this bug also on Ubuntu 16.04 with libvirt.
+The interesting thing is that this bug triggers faster,
+if I use tunneled migration instead direct.
+Using the virt-manager for migration.
+
+The test VM is a Win10 with virtio driver from fedora 0.1.118.
+
+<!--
+WARNING: THIS IS AN AUTO-GENERATED FILE. CHANGES TO IT ARE LIKELY TO BE
+OVERWRITTEN AND LOST. Changes to this xml configuration should be made using:
+  virsh edit win10-1
+or other application using the libvirt API.
+-->
+
+<domain type='kvm'>
+  <name>win10-1</name>
+  <uuid>4b3533c1-20d4-4556-9d99-4fb3d04b19dc</uuid>
+  <memory unit='KiB'>2097152</memory>
+  <currentMemory unit='KiB'>2097152</currentMemory>
+  <vcpu placement='static'>6</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-wily'>hvm</type>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <hyperv>
+      <relaxed state='on'/>
+      <vapic state='on'/>
+      <spinlocks state='on' retries='8191'/>
+    </hyperv>
+  </features>
+  <cpu mode='custom' match='exact'>
+    <model fallback='allow'>Haswell-noTSX</model>
+    <topology sockets='1' cores='6' threads='1'/>
+  </cpu>
+  <clock offset='localtime'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+    <timer name='hypervclock' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <pm>
+    <suspend-to-mem enabled='no'/>
+    <suspend-to-disk enabled='no'/>
+  </pm>
+  <devices>
+    <emulator>/usr/bin/kvm-spice</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none' io='threads'/>
+      <source file='/mnt/traini3/vm-win10-1.qcow2'/>
+      <target dev='sda' bus='scsi'/>
+      <boot order='1'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/mnt/nasi/template/iso/Win10_EnglishInternational_x64.iso'/>
+      <target dev='hdb' bus='ide'/>
+      <readonly/>
+      <boot order='2'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source file='/mnt/nasi/template/iso/virtio-win-0.1.118.iso'/>
+      <target dev='hdc' bus='ide'/>
+      <readonly/>
+      <boot order='3'/>
+      <address type='drive' controller='0' bus='1' target='0' unit='0'/>
+    </disk>
+    <controller type='usb' index='0' model='ich9-ehci1'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x7'/>
+    </controller>
+    <controller type='usb' index='0' model='ich9-uhci1'>
+      <master startport='0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0' multifunction='on'/>
+    </controller>
+    <controller type='usb' index='0' model='ich9-uhci2'>
+      <master startport='2'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x1'/>
+    </controller>
+    <controller type='usb' index='0' model='ich9-uhci3'>
+      <master startport='4'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x2'/>
+    </controller>
+    <controller type='scsi' index='0' model='virtio-scsi'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </controller>
+    <controller type='ide' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x1'/>
+    </controller>
+    <controller type='pci' index='0' model='pci-root'/>
+    <interface type='bridge'>
+      <mac address='52:54:00:2e:4f:ea'/>
+      <source bridge='vmbr0'/>
+      <model type='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <input type='tablet' bus='usb'/>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>
+    <video>
+      <model type='cirrus' vram='16384' heads='1'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+</domain>
+
+
+When I set -rtc clock=vm the mig problem is solved, but what does this flag exactly?
+
+In the docu there is only 
+
+" If you want to isolate the guest time from the host, you can set clock to "rt" instead.
+  To even prevent it from progressing during suspension, you can set it to "vm"."
+
+what does this means?
+
+Will the VM never be synced with the HW clock and so it will run slower on cpu load on normal running?
+
+Hmm, I'd not tried that one; I don't think that should change the behaviour during normal running, but the behaviour on pause and interactions with things like host ntp clock syncing is probably different - how different I'd have to dig in a bit more.
+
+However,  we've done two patches this week that help windows migration - I'd be interested if either of them help your case;
+
+https://lists.gnu.org/archive/html/qemu-devel/2016-09/msg02658.html is a qemu fix (now in current head qemu) that I wrote that helps one windows migration test case.
+
+https://lkml.org/lkml/2016/9/14/857 is a kernel fix that fixes some related problems.
+
+If one or both of these fixes together help I'd love to know either way!
+
+Dave
+
+Thank I test the 2 patches and they worked for me.
+It works also if you apply only the qemu patch,
+in combination the ubuntu kernel 4.4.0-38.57 and qemu 2.6.1.
+
+Excellent news; thanks for testing!
+
+Hi WOLI,
+  Note, if you pick up a new (4.8 ish) kernel you'll probably find you'll need to also pick up two patches that we've just posted to the qemu list:
+
+    target-i386: introduce kvm_put_one_msr
+    kvm: apic: set APIC base as part of kvm_apic_put
+
+otherwise you get weird reboot hangs with Linux guests.
+
+Dave
+
+The patches should be part of QEMU v2.8 ==> Fix released
+

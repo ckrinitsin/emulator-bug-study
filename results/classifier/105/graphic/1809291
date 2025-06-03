@@ -1,0 +1,144 @@
+semantic: 0.947
+graphic: 0.941
+other: 0.940
+instruction: 0.936
+device: 0.928
+assembly: 0.922
+mistranslation: 0.916
+socket: 0.915
+vnc: 0.890
+boot: 0.853
+network: 0.841
+KVM: 0.836
+
+SD Card not working in Ubuntu 18.10 (CMD 2,3 timeout).  The device worked fine in Ubuntu 18.04 and earlier versions but not in Ubuntu 18.10
+
+ARM PL181 MMC card no longer working in qemu-system-arm in Ubuntu 18.10
+The MMC driver code worked fine in Ubuntu 15.10 to 18.04.
+The command to run qemu-system-arm is
+
+    qemu-system-arm -M versatilepb -m 256M -sd sdimage -kernel t.bin -serial mon:stdio
+
+During SDC initialization, SDC commands 2, 3, 9, 13, 7, 16 all timeout, 
+which cause subsequent read/write commands 17/24 to fail also.
+
+Tried both ARM versatilepb and realview-pb-a8, realview-pbx-a9 boards: all the same.
+
+Hi, from this report your setup is unclear to me.
+Are you saying that QEMU used to work on Ubuntu 15.10/18.04 and stopped working on 18.10,
+or than current QEMU works with the default Linux kernel from Ubuntu 15.10/18.04 and does not work with the 18.10 kernel?
+What is the size of your 'sdimage', what is the kernel used in 't.bin'?
+Please provide more info.
+Thanks,
+Phil.
+
+'Hi, from this report your setup is unclear to me'.
+
+Hi,
+I am not using Linux kernel.
+The t.bin image is a program built with .s and .c files using gcc-arm-none-eabi for ARM
+The sdimage is just a regular 1MB file, which is used by the -sd sdmage as a virtual SDC card for
+qemu-system-arm under Ubuntu 18.10
+The t.bin code calls sdc_init() to initialize the PL181 mmc card, which is
+
+int do_command(int cmd, int arg, int resp)
+{
+  *(u32 *)(base + ARGUMENT) = (u32)arg;
+  *(u32 *)(base + COMMAND)  = 0x400 | (resp<<6) | cmd;
+  delay();
+}
+int sdc_init()
+{
+  u32 RCA = (u32)0x45670000; // QEMU's hard-coded RCA
+  base    = (u32)0x10005000; // PL180 base address
+  printf("sdc_init : ");
+  *(u32 *)(base + POWER) = (u32)0xBF; // power on
+  *(u32 *)(base + CLOCK) = (u32)0xC6; // default CLK
+
+  // send init command sequence
+  do_command(0,  0,   MMC_RSP_NONE);// idle state
+  do_command(55, 0,   MMC_RSP_R1);  // ready state  
+  do_command(41, 1,   MMC_RSP_R3);  // argument must not be zero
+  do_command(2,  0,   MMC_RSP_R2);  // ask card CID
+  do_command(3,  RCA, MMC_RSP_R1);  // assign RCA
+  do_command(7,  RCA, MMC_RSP_R1);  // transfer state: must use RCA
+  do_command(16, 512, MMC_RSP_R1);  // set data block length
+
+  // set interrupt MASK0 registers bits = RxAvail|TxEmpty
+  *(u32 *)(base + MASK0) = (1<<21)|(1<<18); //0x00240000; 
+  printf("done\n");
+}
+ 
+After each command, read the MMC status to check for errors.
+Commands 2, 3, 7, 16 all failed due to timeout, indicating the MMC card does not respond.
+But the PL181 does generate interrupts for read/write sector commands.
+As stated before, the SAME driver code worked fine for all earlier versions of Ubuntu: 15 to 18.04
+
+
+
+Hi -- could you please either provide a guest binary to reproduce with, or a complete set of sources to build to produce the test binary?
+
+
+I'm marking this bug as incomplete since we can't investigate it without a test binary and QEMU command line to reproduce with.
+
+
+I googled some code from comment #2 and got a hit for "u32 RCA = (u32)0x45670000; // QEMU's hard-coded RCA". Then I found kcwang's book: https://link.springer.com/content/pdf/10.1007%2F978-3-319-51517-5.pdf and read:
+"I am also grateful to Springer International Publishing AG for allowing me to disclose the source code of this book to the public for free, which are available at http://www.eecs.wsu.edu/~cs460/ARMhome for download". This link gives 404, however googling again "site:www.eecs.wsu.edu/~cs460" I found https://www.eecs.wsu.edu/~cs460/samples/ which thankfully provides sdc.tgz with the source files and binaries mentioned.
+
+With the command provided in the bug description I could bisect to:
+
+4e5cc6756586e967993187657dfcdde4e00288d9 is the first bad commit
+commit 4e5cc6756586e967993187657dfcdde4e00288d9
+Author: Philippe Mathieu-Daudé <email address hidden>
+Date:   Thu Feb 22 15:12:54 2018 +0000
+
+    sdcard: simplify SD_SEND_OP_COND (ACMD41)
+    
+    replace switch(single case) -> if()
+    
+    Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+    Reviewed-by: Alistair Francis <email address hidden>
+    Message-id: <email address hidden>
+    Signed-off-by: Peter Maydell <email address hidden>
+
+
+The offending code is:
+
+$ git diff -w 4e5cc6756586e967993187657dfcdde4e00288d9~..4e5cc6756586e967993187657dfcdde4e00288d9
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -1537,7 +1537,7 @@ static sd_rsp_type_t sd_app_command(SDState *sd,
+             }
+         }
+ 
+-        if (req.arg & ACMD41_ENQUIRY_MASK) {
++        if (FIELD_EX32(sd->ocr & req.arg, OCR, VDD_VOLTAGE_WINDOW)) {
+             /* We accept any voltage.  10000 V is nothing.
+              *
+              * Once we're powered up, we advance straight to ready state
+
+Dear Dr. KC.Wang, 
+
+Download qemu-4.2.0-rc4 source code, change hw/sd/sd.c at line 1560 like follows and remake 
+
+(line: 1560)
+
+if (req.arg & ACMD41_ENQUIRY_MASK) {
+/*if (FIELD_EX32(sd->ocr & req.arg, OCR, VDD_VOLTAGE_WINDOW)) {*/
+
+BTW,  here is my micro-kernel-os for arm platform based the contents from your books, thanks !
+
+https://github.com/MisaZhu/micro_kernel_os
+
+Misa.Z
+
+The new code in Qemu is correct, the real problem is that the code [1] is trying to negotiate an invalid working voltage with CMD41.
+The SD specification marks the first 15 bits as reserved (except for the 7th, that's the dual-voltage flag) meaning that compliant cards will timeout as well.
+
+If you look closer at the source code you can see that this problem's been patched by replacing the invalid argument 0x1 with a more reasonable 0xFFFF, barely enough to work in the 2.7V range.
+
+[1] https://eecs.wsu.edu/~cs460/samples/LAB5pre/step3/sdc.c
+
+The test expects the card wired as SPI, so adding "-global sd-card.spi=true" makes the test case work.
+

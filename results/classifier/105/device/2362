@@ -1,0 +1,76 @@
+device: 0.866
+other: 0.846
+graphic: 0.845
+semantic: 0.795
+network: 0.774
+socket: 0.752
+assembly: 0.698
+vnc: 0.696
+instruction: 0.671
+mistranslation: 0.660
+boot: 0.646
+KVM: 0.643
+
+short packets dropped by some network cards when using certain network backends
+Description of problem:
+Effectively a duplicate of https://gitlab.com/qemu-project/qemu/-/issues/2058 -- short ethernet packets (such as ARP packets) are discarded by various networking devices now.
+
+QEMU previously padded ethernet frames to 64 bytes when some network cards received them, but this was removed in various commits (140eae9c8f760e9260356fe9b56b802a02f0a9d2, c445f200ad241b443aa7a61a5381b26f56a18f0e, c58da33f2f8410b6f22cd1d33377dadf3a4d8867, 05db4476c5d25e437d807175de9f862bf5bf732c, 6d0d261dbfa6122e9b3bdcab7d934ca49f069c21, 63b901bfd30a0975bc326ba8527880fabac2e66, aee87b43fe2206acb8f5e334b42790df33a1cbad).
+
+969e50b61a285b0cc8dea6d4d2ade3f758d5ecc7 fixed SLIRP and TAP support, however the other various network backends (socket, dgram, vde, others) all have the same issue that some network cards will reject short packets.
+
+This does not fail on older versions of QEMU.
+Steps to reproduce:
+I have a python script that shows connecting two VMs of your choice using a socketpair connected to one of the affected NIC types (pcnet). If you start your OS (I used alpine linux as my test), and give each VM a unique IP address (eg, `ip addr add 192.168.0.1/24 dev eth0`), ping will fail to work. When you run tcpdump, you can see that the OS is sending out short ARP packets, but the other VM cannot see them.
+
+Using an older version of QEMU allows the ping to succeed.
+
+```python
+#!/usr/bin/env python3
+
+import argparse
+import shlex
+import socket
+import subprocess
+
+
+QEMU_PATH = "bin/qemu-system-x86_64"
+NIC = "pcnet"
+vnc = True
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("qcow")
+    args = parser.parse_args()
+
+    p1, p2 = socket.socketpair()
+
+    qargs1 = [
+        QEMU_PATH, "-snapshot",
+        "-m", "2G",
+        "-drive", f"file={args.qcow}",
+        "-device", f"{NIC},netdev=n,mac=52:54:00:00:00:01",
+        "-netdev", f"socket,id=n,fd={p1.fileno()}"
+    ]
+    if vnc:
+        qargs1 += ["-display", "vnc=:2"]
+
+    print("+", shlex.join(qargs1))
+    proc1 = subprocess.Popen(qargs1, pass_fds=[p1.fileno()])
+
+    qargs2 = [
+        QEMU_PATH, "-snapshot",
+        "-m", "2G",
+        "-drive", f"file={args.qcow}",
+        "-device", f"{NIC},netdev=n,mac=52:54:00:00:00:02",
+        "-netdev", f"socket,id=n,fd={p2.fileno()}"
+    ]
+    if vnc:
+        qargs2 += ["-display", "vnc=:3"]
+
+    print("+", shlex.join(qargs2))
+    proc2 = subprocess.Popen(qargs2, pass_fds=[p2.fileno()])
+
+    proc1.wait()
+    proc2.wait()
+```

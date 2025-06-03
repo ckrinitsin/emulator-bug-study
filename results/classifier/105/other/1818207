@@ -1,0 +1,155 @@
+other: 0.965
+device: 0.963
+KVM: 0.960
+assembly: 0.955
+instruction: 0.954
+semantic: 0.930
+graphic: 0.919
+vnc: 0.875
+mistranslation: 0.843
+socket: 0.811
+boot: 0.752
+network: 0.733
+
+[aarch64] VM status remains "running" after it's suspended
+
+The issue is observed on aarch64 (I didn't check x86) with latest upstream QEMU bits. 
+
+Steps to reproduce:
+
+1) start guest
+
+2) suspend guest with this command:
+
+# echo mem > /sys/power/state
+
+  Check console messages, which should indicate that guest has been suspended.
+
+3) check guest status through HMP command "info status":
+
+  (qemu) info status
+   info status
+   VM status: running
+
+Note it's "running", which is incorrect. 
+
+QEMU version:
+
+# qemu-system-aarch64 --version
+QEMU emulator version 3.1.50 (v3.1.0-2203-g9403bcc)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+The issue prevents user from resuming a suspended guest through "system_wakeup" HMP command, because QEMU thinks the guest is in running state and does nothing.
+
+I think the issues occurs because qemu_system_wakeup_request() doesn't get called. It seems the root cause is with ACPI related code.
+
+In order for the guest kernel to expose ACPI S3 suspend to a privileged
+guest user, the guest kernel first checks if the platform (hardware and
+firmware) support ACPI S3. This in turn depends on whether the DSDT
+offers a package called _S3.
+
+For example, on the "pc" machine type, S3 can be disabled on the QEMU
+command line with "-global PIIX4_PM.disable_s3=1". On the "q35" machine
+type, the same is achievable with "-global ICH9-LPC.disable_s3=1". One
+thing both of these switches do is that they hide the _S3 package in the
+DSDT from the guest OS (they prevent the generation of the _S3 package
+in the DSDT).
+
+On the "virt" machine type, the "_S3" package is not generated at all,
+in the DSDT. For this reason, ACPI S3 is never valid for the guest
+kernel to expose.
+
+Now let's look at the kernel docs:
+
+https://www.kernel.org/doc/html/v4.18/admin-guide/pm/sleep-states.html#suspend-to-ram
+
+> On ACPI-based systems [Suspend-to-RAM] is mapped to the S3 system
+> state defined by ACPI.
+
+However, when you write "mem" to "/sys/power/state", the guest kernel is
+not required to Suspend-to-RAM (and hence enter ACPI S3):
+
+https://www.kernel.org/doc/html/v4.18/admin-guide/pm/sleep-states.html#basic-sysfs-interfaces-for-system-suspend-and-hibernation
+
+> The string "mem" is interpreted in accordance with the contents of the
+> mem_sleep file described below
+
+> The strings that may be present in [mem_sleep] are "s2idle", "shallow"
+> and "deep". The string "s2idle" always represents suspend-to-idle and,
+> by convention, "shallow" and "deep" represent standby and
+> suspend-to-RAM, respectively.
+
+This is what I get:
+
+> # uname -r
+> 4.14.0-115.2.2.el7a.aarch64
+>
+> # cat /sys/power/state
+> freeze mem disk
+>
+> # cat /sys/power/mem_sleep
+> [s2idle]
+
+Therefore, when you write "mem" to "/sys/power/state", the guest kernel
+picks "s2idle" (suspend-to-idle,
+<https://www.kernel.org/doc/html/v4.18/admin-guide/pm/sleep-states.html#s2idle>):
+
+> This is a generic, pure software, light-weight variant of system
+> suspend (also referred to as S2I or S2Idle). [...] by freezing user
+> space, suspending the timekeeping and putting all I/O devices into
+> low-power states [...] This state can be used on platforms without
+> support for standby or suspend-to-RAM [...]
+
+And that's why the "info status" HMP command reports "VM status:
+running".
+
+(Side comment: the ArmVirtQemu firmware from edk2 doesn't support ACPI
+S3 either.)
+
+
+Hi Laszlo, 
+
+Thanks much for your detailed explanation. It has been very helpful.
+
+> In order for the guest kernel to expose ACPI S3 suspend to a privileged
+> guest user, the guest kernel first checks if the platform (hardware and
+> firmware) support ACPI S3. This in turn depends on whether the DSDT
+> offers a package called _S3.
+>
+> ...
+> 
+> On the "virt" machine type, the "_S3" package is not generated at all,
+> in the DSDT. For this reason, ACPI S3 is never valid for the guest
+> kernel to expose.
+
+Now that you said that, I googled about this and found ARM has PSCI,
+which is an ARM specific PM interface standard and can be used together
+with ACPI or FDT:
+
+http://infocenter.arm.com/help/topic/com.arm.doc.den0022d/Power_State_Coordination_Interface_PDD_v1_1_DEN0022D.pdf
+
+The spec defines SYSTEM_SUSPEND in section 5.19. The command was 
+introduced in PSCI 1.0 for similar purpose as ACPI S3. It's optional.
+
+Then I find the following: 
+
+1) My VM's firmware supports PCSI v1.0. The following were from dmesg:
+
+[    0.000000] psci: probing for conduit method from ACPI.
+[    0.000000] psci: PSCIv1.0 detected in firmware.
+[    0.000000] psci: Using standard PSCI v0.2 function IDs
+[    0.000000] psci: Trusted OS migration not required
+
+2) The PSCI code in QEMU supports 0.2 version only. See target/arm/psci.c.
+
+I don't completely understand how they work together (for example, I think
+PSCI requests should be handled by firmware, how come QEMU gets a chance
+to handle them), but I guess the issue might be with QEMU not supporting PSCI 1.0.
+
+> # cat /sys/power/mem_sleep
+> [s2idle] 
+
+Yes, I observed the same on both my VM and host (my host's firmware supports
+PSCI 1.0 also, not sure why kernel thinks it doesn't support suspend-to-RAM).
+
+

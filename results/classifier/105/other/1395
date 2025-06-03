@@ -1,0 +1,169 @@
+other: 0.756
+instruction: 0.754
+KVM: 0.748
+vnc: 0.745
+device: 0.744
+mistranslation: 0.711
+graphic: 0.695
+assembly: 0.670
+network: 0.662
+socket: 0.651
+semantic: 0.623
+boot: 0.598
+
+qemu-system-riscv32 cpu_transaction_failed cause Infinite loop when write mstatus ~"target: riscv"
+Description of problem:
+I wanna run FreeRTOS riscv, and use the FreeRTOS/Demo/RISC-V-Qemu-virt_GCC/Makefile to build elf.\
+When qemu execute to write mstatus as 0x1888(enable Interrupt, MIE:1, MIP:1, MPP:3), there is no response.\
+https://github.com/FreeRTOS/FreeRTOS-Kernel/blob/main/portable/GCC/RISC-V/portASM.S\
+line 274: csrrw   x0, mstatus, x5                 /* Interrupts enabled from here! */\
+opcode is hex 30029073\n
+I use pstack to trace qemu thread, there is only one thread is active, and cpu loading is 100%.\
+then I use gdb attatch <pid> to trace the active thread, and it has a loop\
+cpu_loop_exit call siglongjmp and back to sigsetjmp in cpu_exec (cpu=cpu@entry=0x55e2294e4070) at ../accel/tcg/cpu-exec.c:936
+Steps to reproduce:
+1.download FreeRTOS and build FreeRTOS/Demo/RISC-V-Qemu-virt_GCC\
+2.run qemu with gdb\
+3.hang when writing mstatus
+Additional information:
+I find that my issue occur when mtvec is zero and timer interrupt occur when writing mstatus(riscv_cpu_do_interrupt)\
+Although it should jump to 0x0 rather then hanging in while loop.\
+expected flow :cpu_handle_interrupt->check_for_breakpoints->break\
+actually flow: cpu_handle_interrupt->check_for_breakpoints->infinite loop\
+Qemu build command: 
+```
+./configure --target-list=riscv32-softmmu && make
+```
+
+pstack for qemu (only need to debug Thread 3)
+```
+Thread 3 (Thread 0x7f83af6d3640 (LWP 5093) "qemu-system-ris"):
+#0  0x000055cb31b1769f in riscv_cpu_exec_interrupt ()
+#1  0x0000000000000000 in  ()
+Thread 2 (Thread 0x7f83b0119640 (LWP 5092) "qemu-system-ris"):
+#0  0x00007f83b0400a3d in syscall () at /lib/x86_64-linux-gnu/libc.so.6
+#1  0x000055cb31e0bd52 in qemu_event_wait ()
+#2  0x0000000000000000 in  ()
+Thread 1 (Thread 0x7f83b011ac00 (LWP 5090) "qemu-system-ris"):
+#0  0x00007f83b03fae7e in ppoll () at /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f83b0752500 in  () at /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#2  0x000055cb33241b30 in  ()
+#3  0x0000000000000005 in  ()
+#4  0x0000000000000000 in  ()
+```
+backtrace for the infinite loop
+```
+(gdb) bt
+#0  cpu_loop_exit (cpu=0x55e2294e4070) at ../accel/tcg/cpu-exec-common.c:65
+#1  0x000055e2274efde4 in cpu_loop_exit_restore (cpu=cpu@entry=0x55e2294e4070, pc=pc@entry=0)
+    at ../accel/tcg/cpu-exec-common.c:76
+#2  0x000055e22737fff1 in riscv_cpu_do_transaction_failed
+    (cs=0x55e2294e4070, physaddr=<optimized out>, addr=0, size=<optimized out>, access_type=MMU_INST_FETCH, mmu_idx=<optimized out>, attrs=..., response=2, retaddr=0)
+    at ../target/riscv/cpu_helper.c:1165
+#3  0x000055e2274fa4a7 in cpu_transaction_failed
+    (retaddr=0, response=2, attrs=..., mmu_idx=3, access_type=MMU_INST_FETCH, size=<optimized out>, addr=0, physaddr=<optimized out>, cpu=0x55e2294e4070) at ../accel/tcg/cputlb.c:1344
+#4  io_readx
+    (env=env@entry=0x55e2294e53d0, full=full@entry=0x7fd90c029410, mmu_idx=3, addr=addr@entry=0, retaddr=retaddr@entry=0, access_type=access_type@entry=MMU_INST_FETCH, op=MO_16)
+    at ../accel/tcg/cputlb.c:1380
+#5  0x000055e2274fba28 in load_helper
+    (full_load=<optimized out>, code_read=true, op=MO_16, retaddr=0, oi=19, addr=0, env=0x55e2294e53d0) at ../accel/tcg/cputlb.c:1970
+#6  full_lduw_code (env=env@entry=0x55e2294e53d0, addr=addr@entry=0, oi=19, retaddr=0)
+    at ../accel/tcg/cputlb.c:2606
+#7  0x000055e22750827b in cpu_lduw_code (env=env@entry=0x55e2294e53d0, addr=addr@entry=0)
+    at ../accel/tcg/cputlb.c:2612
+#8  0x000055e2274f87fa in translator_lduw
+    (env=env@entry=0x55e2294e53d0, db=db@entry=0x7fd913dfe5a0, pc=0)
+    at ../accel/tcg/translator.c:216
+#9  0x000055e2273e423a in riscv_tr_translate_insn (dcbase=0x7fd913dfe5a0, cpu=<optimized out>)
+    at ../target/riscv/translate.c:1158
+#10 0x000055e2274f83d3 in translator_loop
+    (cpu=cpu@entry=0x55e2294e4070, tb=tb@entry=0x7fd91c000240 <code_gen_buffer+531>, max_insns=<optim
+    ized out>, pc=pc@entry=0, host_pc=host_pc@entry=0x55e2274efe74 <tb_htable_lookup+84>, ops=ops@entry=0x55e227a75c80 <riscv_tr_ops>, db=0x7fd913dfe5a0) at ../accel/tcg/translator.c:96
+#11 0x000055e227411760 in gen_intermediate_code
+    (cs=cs@entry=0x55e2294e4070, tb=tb@entry=0x7fd91c000240 <code_gen_buffer+531>, max_insns=<optimized out>, pc=pc@entry=0, host_pc=host_pc@entry=0x55e2274efe74 <tb_htable_lookup+84>)
+    at ../target/riscv/translate.c:1240
+#12 0x000055e2274f6954 in setjmp_gen_code
+    (env=env@entry=0x55e2294e53d0, tb=tb@entry=0x7fd91c000240 <code_gen_buffer+531>, pc=pc@entry=0, host_pc=0x55e2274efe74 <tb_htable_lookup+84>, max_insns=max_insns@entry=0x7fd913dfe744, ti=<optimized out>) at ../accel/tcg/translate-all.c:761
+#13 0x000055e2274f7294 in tb_gen_code
+    (cpu=cpu@entry=0x55e2294e4070, pc=0, cs_base=0, flags=1085443, cflags=<optimized out>, 
+    cflags@entry=-16777216) at ../accel/tcg/translate-all.c:841
+#14 0x000055e2274f10cf in cpu_exec (cpu=cpu@entry=0x55e2294e4070) at ../accel/tcg/cpu-exec.c:1006
+#15 0x000055e22750a904 in tcg_cpus_exec (cpu=cpu@entry=0x55e2294e4070)
+    at ../accel/tcg/tcg-accel-ops.c:69
+#16 0x000055e22750aa57 in mttcg_cpu_thread_fn (arg=arg@entry=0x55e2294e4070)
+    at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#17 0x000055e227674b21 in qemu_thread_start (args=<optimized out>)
+    at ../util/qemu-thread-posix.c:505
+#18 0x00007fd9611a9b43 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#19 0x00007fd96123ba00 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```
+
+disassembly code 
+```
+80001ac6 <xPortStartFirstTask>:
+80001ac6:	85c1a103          	lw	sp,-1956(gp) # 800809fc <pxCurrentTCB>
+80001aca:	4102                	lw	sp,0(sp)
+80001acc:	4082                	lw	ra,0(sp)
+80001ace:	43c2                	lw	t2,16(sp)
+80001ad0:	4452                	lw	s0,20(sp)
+80001ad2:	44e2                	lw	s1,24(sp)
+80001ad4:	4572                	lw	a0,28(sp)
+80001ad6:	5582                	lw	a1,32(sp)
+80001ad8:	5612                	lw	a2,36(sp)
+80001ada:	56a2                	lw	a3,40(sp)
+80001adc:	5732                	lw	a4,44(sp)
+80001ade:	57c2                	lw	a5,48(sp)
+80001ae0:	5852                	lw	a6,52(sp)
+80001ae2:	58e2                	lw	a7,56(sp)
+80001ae4:	5972                	lw	s2,60(sp)
+80001ae6:	4986                	lw	s3,64(sp)
+80001ae8:	4a16                	lw	s4,68(sp)
+80001aea:	4aa6                	lw	s5,72(sp)
+80001aec:	4b36                	lw	s6,76(sp)
+80001aee:	4bc6                	lw	s7,80(sp)
+80001af0:	4c56                	lw	s8,84(sp)
+80001af2:	4ce6                	lw	s9,88(sp)
+80001af4:	4d76                	lw	s10,92(sp)
+80001af6:	5d86                	lw	s11,96(sp)
+80001af8:	5e16                	lw	t3,100(sp)
+80001afa:	5ea6                	lw	t4,104(sp)
+80001afc:	5f36                	lw	t5,108(sp)
+80001afe:	5fc6                	lw	t6,112(sp)
+80001b00:	52d6                	lw	t0,116(sp)
+80001b02:	0007f317          	auipc	t1,0x7f
+80001b06:	ea232303          	lw	t1,-350(t1) # 800809a4 <pxCriticalNesting>
+80001b0a:	00532023          	sw	t0,0(t1)
+80001b0e:	52e6                	lw	t0,120(sp)
+80001b10:	02a1                	addi	t0,t0,8
+80001b12:	30029073          	csrw	mstatus,t0  <--- hang on this line
+80001b16:	42a2                	lw	t0,8(sp)
+80001b18:	4332                	lw	t1,12(sp)
+80001b1a:	07c10113          	addi	sp,sp,124
+80001b1e:	8082                	ret
+```
+
+```
+(gdb) bt
+#0  cpu_loop_exit (cpu=cpu@entry=0x564cd884b070) at ../accel/tcg/cpu-exec-common.c:65
+#1  0x0000564cd6685631 in helper_lookup_tb_ptr (env=0x564cd884c3d0) at ../accel/tcg/cpu-exec.c:400
+#2  0x00007f55dc00014c in code_gen_buffer ()
+#3  0x0000564cd668521b in cpu_tb_exec
+    (cpu=cpu@entry=0x564cd884b070, itb=itb@entry=0x7f55dc000040 <code_gen_buffer+19>, tb_exit=tb_exit@entry=0x7f56235f67ec) at ../accel/tcg/cpu-exec.c:438
+#4  0x0000564cd6685cfb in cpu_loop_exec_tb
+    (tb_exit=0x7f56235f67ec, last_tb=<synthetic pointer>, pc=<optimized out>, tb=0x7f55dc000040 <code_gen_buffer+19>, cpu=0x564cd884b070) at ../accel/tcg/cpu-exec.c:868
+#5  cpu_exec (cpu=cpu@entry=0x564cd884b070) at ../accel/tcg/cpu-exec.c:1032
+#6  0x0000564cd669f904 in tcg_cpus_exec (cpu=cpu@entry=0x564cd884b070)
+    at ../accel/tcg/tcg-accel-ops.c:69
+#7  0x0000564cd669fa57 in mttcg_cpu_thread_fn (arg=arg@entry=0x564cd884b070)
+    at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#8  0x0000564cd6809b21 in qemu_thread_start (args=<optimized out>)
+    at ../util/qemu-thread-posix.c:505
+#9  0x00007f562429ab43 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#10 0x00007f562432ca00 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```
+
+I also build a very simple elf for qemu-virt-platform, just contain boot-loader and write mstatus as 0x1888, it can't reproduce.\
+I also build different qemu version such v6.0.0, it still can reproduce.\
+I has modify the march to the most simple arch:rv32i, is still can reproduce.
+
+~"target: riscv"

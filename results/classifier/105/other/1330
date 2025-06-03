@@ -1,0 +1,195 @@
+assembly: 0.936
+other: 0.932
+vnc: 0.925
+graphic: 0.923
+device: 0.921
+instruction: 0.914
+semantic: 0.911
+socket: 0.908
+KVM: 0.886
+boot: 0.871
+mistranslation: 0.869
+network: 0.868
+
+qemu-img finishes successfully while having errors in commit or bitmaps operations
+Description of problem:
+Problem raises when trying to merge two images with the top image almost
+full, and base image having stale bitmaps (bitmaps missing from
+the top image).
+In our usercase, the size of the LV that contains the base image is not
+accounting for the stale bitmaps, and therefore, when we run `commit` or
+`bitmap --merge`, it fails with:
+```
+qcow2_free_clusters failed: No space left on device
+qemu-img: Lost persistent bitmaps during inactivation of node '#block308': Failed to write bitmap 'stale-bitmap-002' to file: No space left on device
+qemu-img: Failed to flush the refcount block cache: No space left on device
+```
+However, in both cases `qemu-img` returned successfully,
+while having logs printed to `stderr`, and failing the merge.
+
+For commit operation, the data was commited successfully, it failed as it
+was adding the bitmaps.
+Still, the process exit with success.
+
+On the other hand, for bitmaps operation, since its main purpose is to
+manipulate bitmaps, and it failed, it should not return with code 0.
+The process shall return with error code.
+Also, bitmaps in the base image are left with the `in-use` flag set.
+Steps to reproduce:
+1. Create these lvs and chown them to the user
+```
+sudo lvcreate --name base.qcow2 --size 128m storage
+sudo chown $USER:$USER /dev/mapper/storage-base.qcow2
+sudo lvcreate --name top.qcow2 --size 128m storage
+sudo chown $USER:$USER /dev/mapper/storage-top.qcow2
+```
+2. Run this python script. Note the `STALE_BITMAPS` counter. Using 6, 11, or 13 stale
+   bitmaps, the `commit`, or the `bitmaps` operations shall fail.
+```
+# Reproduce ENOSPC error when merging into base image with lot of bitmaps.
+
+import json
+import subprocess
+
+IMG_SIZE = 1 << 30
+LV_SIZE = 128 << 20
+
+# Testing shows that we can merge successfully with 13 bitmaps, and require
+# size calculation is more strict, allowing up to 11 bitamps.
+STALE_BITMAPS = 11
+
+def run(*cmd):
+    subprocess.run(cmd, check=True)
+
+def output(cmd):
+    cp = subprocess.run(cmd, stdout=subprocess.PIPE, check=True)
+    return json.loads(cp.stdout)
+
+def info(img):
+    return output(["qemu-img", "info", "--output", "json", img])
+
+def measure(img):
+    return output(["qemu-img", "measure", "-f", "qcow2", "-O", "qcow2", "--output", "json", img])
+
+def check(img):
+    cmd = ["qemu-img", "check", "-f", "qcow2", "--output", "json", img]
+    cp = subprocess.run(cmd, stdout=subprocess.PIPE)
+    if cp.returncode not in (0, 3):
+        raise RuntimeError(f"Check failed")
+
+    return json.loads(cp.stdout)
+
+def indent(info):
+    return json.dumps(info, indent=2)
+
+base = "/dev/mapper/storage-base.qcow2"
+top = "/dev/mapper/storage-top.qcow2"
+
+# Start with clean lvs by discarding current data.
+run("blkdiscard", base)
+run("blkdiscard", top)
+
+print("Creating base")
+run("qemu-img", "create", "-f", "qcow2", base, str(IMG_SIZE))
+
+# Simulate stale bitmaps - missing in top.
+for i in range(STALE_BITMAPS):
+    bitmap = f"stale-bitmap-{i:03d}"
+    print(f"Creating stale bitmap {bitmap}")
+    run("qemu-img", "bitmap", "--add", base, bitmap)
+
+print("Info base before merge")
+base_info = info(base)
+print(indent(base_info))
+
+print("Check base before merge")
+base_check = check(base)
+print(indent(base_check))
+
+print("Measure base before merge")
+base_measure = measure(base)
+print(indent(base_measure))
+
+print("Creating top")
+run("qemu-img", "create", "-f", "qcow2", "-b", base, "-F", "qcow2", top)
+
+print("Adding good bitmap to top")
+run("qemu-img", "bitmap", "--add", top, "good-bitmap")
+
+print("Writing data to top")
+cmd = f"write -P {ord('B')} 0 126m"
+run("qemu-io", "-f", "qcow2", "-c", cmd, top)
+
+print("Info top before merge")
+top_info = info(top)
+print(indent(top_info))
+
+print("Check top before merge")
+top_check = check(top)
+print(indent(top_check))
+
+print("Measure top before merge")
+top_measure = measure(top)
+print(indent(top_measure))
+
+print("Commit top into base")
+run("qemu-img", "commit", "-f", "qcow2", "-t", "none", "-b", base, "-d", "-p", top)
+
+print("Add good bitmap to base")
+run("qemu-img", "bitmap", "--add", base, "good-bitmap")
+
+print("Merge good bitmap from top to base")
+run("qemu-img", "bitmap", "--merge", "good-bitmap", "-F", "qcow2", "-b", top,  base, "good-bitmap")
+
+print("Info base after merge")
+print(indent(info(base)))
+
+print("Check base after merge")
+print(indent(check(base)))
+
+print("Measure base after merge")
+print(indent(measure(base)))
+```
+Additional information:
+Example output of the script with 6 stale bitmaps:
+```
+Commit top into base
+    (100.00/100%)
+Image committed.
+Add good bitmap to base
+Merge good bitmap from top to base
+qcow2_free_clusters failed: No space left on device
+qemu-img: Lost persistent bitmaps during inactivation of node '#block159': Failed to write bitmap 'good-bitmap' to file: No space left on device
+qemu-img: Failed to flush the refcount block cache: No space left on device
+Info base after merge
+{
+  "virtual-size": 1073741824,
+  "filename": "/dev/mapper/storage-base.qcow2",
+  "cluster-size": 65536,
+  "format": "qcow2",
+  "actual-size": 0,
+  "format-specific": {
+    "type": "qcow2",
+    "data": {
+      "compat": "1.1",
+      "compression-type": "zlib",
+      "lazy-refcounts": false,
+      "bitmaps": [
+        ...
+        {
+          "flags": [
+            "in-use",
+            "auto"
+          ],
+          "name": "good-bitmap",
+          "granularity": 65536
+        }
+      ],
+      "refcount-bits": 16,
+      "corrupt": false,
+      "extended-l2": false
+    }
+  },
+  "dirty-flag": false
+}
+```

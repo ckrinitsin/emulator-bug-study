@@ -1,0 +1,593 @@
+mistranslation: 0.845
+instruction: 0.746
+device: 0.736
+assembly: 0.716
+graphic: 0.713
+other: 0.707
+semantic: 0.626
+vnc: 0.550
+boot: 0.462
+KVM: 0.388
+network: 0.358
+socket: 0.352
+
+Function not implemented when using libaio
+
+Hello
+
+I experience "Function not implemented" errors when trying to use Linux libaio library in foreign architecture, e.g. aarch64.
+
+I've faced this problem while using https://github.com/multiarch/qemu-user-static, i.e. Docker+QEMU. 
+I understand that I do not use plain QEMU and you may count this report as a "distribution of QEMU"! Just let me know what are the steps to test it with plain QEMU and I will test and update this ticket!
+
+
+Here are the steps to reproduce the issue:
+
+1) On x86_64 machine register QEMU: 
+
+    `docker run -it --rm --privileged multiarch/qemu-user-static --reset --credential yes --persistent yes`
+
+2) Start a Docker image with foreign CPU architecture, e.g. aarch64
+
+    `docker run -it arm64v8/centos:8 bash`
+
+3) Inside the Docker container install GCC and libaio
+
+    `yum install gcc libaio libaio-devel`
+
+4) Compile the following C program
+
+```
+#include <stdio.h>
+#include <errno.h>
+#include <libaio.h>
+#include <stdlib.h>
+
+struct io_control {
+    io_context_t ioContext;
+};
+
+int main() {
+    int queueSize = 10;
+
+    struct io_control * theControl = (struct io_control *) malloc(sizeof(struct io_control));
+    if (theControl == NULL) {
+        printf("theControl is NULL");
+        return 123;
+    }
+
+    int res = io_queue_init(queueSize, &theControl->ioContext);
+    io_queue_release(theControl->ioContext);
+    free(theControl);
+    printf("res is: %d", res);
+}
+```
+
+    ```
+    cat > test.c
+        [PASTE THE CODE ABOVE HERE]
+    ^D
+    ```
+
+    `gcc test.c -o out -laio && ./out`
+
+
+When executed directly on aarch64 machine (i.e. without emulation) or on x86_64 Docker image (e.g. centos:8) it prints `res is: 0`, i.e. it successfully initialized a LibAIO queue.
+
+But when executed on Docker image with foreign/emulated CPU architecture it prints `res is: -38` (ENOSYS). `man io_queue_init` says that error ENOSYS is returned when "Not implemented."
+
+Environment:
+
+QEMU version: 5.0.0.2  (https://github.com/multiarch/qemu-user-static/blob/master/.travis.yml#L24-L28)
+Container application: Docker
+Output of `docker --version`:
+
+```
+Client:
+ Version:           19.03.8
+ API version:       1.40
+ Go version:        go1.13.8
+ Git commit:        afacb8b7f0
+ Built:             Wed Mar 11 23:42:35 2020
+ OS/Arch:           linux/amd64
+ Experimental:      false
+
+Server:
+ Engine:
+  Version:          19.03.8
+  API version:      1.40 (minimum version 1.12)
+  Go version:       go1.13.8
+  Git commit:       afacb8b7f0
+  Built:            Wed Mar 11 22:48:33 2020
+  OS/Arch:          linux/amd64
+  Experimental:     false
+ containerd:
+  Version:          1.3.3-0ubuntu2
+  GitCommit:        
+ runc:
+  Version:          spec: 1.0.1-dev
+  GitCommit:        
+ docker-init:
+  Version:          0.18.0
+  GitCommit:        
+```
+
+Same happens with Ubuntu (arm64v8/ubuntu:focal).
+
+I've tried to `strace` it but :
+
+```
+/usr/bin/strace: ptrace(PTRACE_TRACEME, ...): Function not implemented
+/usr/bin/strace: PTRACE_SETOPTIONS: Function not implemented
+/usr/bin/strace: detach: waitpid(112): No child processes
+/usr/bin/strace: Process 112 detached
+```
+
+Here are the steps to reproduce the problem with strace:
+
+     ```
+     docker run --rm -it --security-opt seccomp:unconfined --security-opt apparmor:unconfined --privileged --cap-add ALL arm64v8/centos:8 bash
+
+     yum install -y strace`
+
+     strace echo Test
+     ```
+
+Note: I used --privileged, disabled seccomp and apparmor, and added all capabilities
+
+Disabling security solves the "Permission denied" problem but then comes the "Not implemented" one.
+
+
+Any idea what could be the problem and how to work it around ?
+I've googled a lot but I wasn't able to find any problems related to libaio on QEMU.
+
+Thank you!
+Martin
+
+On Tue, Jun 23, 2020 at 07:39:58AM -0000, Martin Grigorov wrote:
+> Public bug reported:
+
+CCing Filip and Laurent, who may be interested in adding Linux AIO
+syscalls to qemu-user.
+
+> 
+> Hello
+> 
+> I experience "Function not implemented" errors when trying to use Linux
+> libaio library in foreign architecture, e.g. aarch64.
+> 
+> I've faced this problem while using https://github.com/multiarch/qemu-user-static, i.e. Docker+QEMU. 
+> I understand that I do not use plain QEMU and you may count this report as a "distribution of QEMU"! Just let me know what are the steps to test it with plain QEMU and I will test and update this ticket!
+> 
+> 
+> Here are the steps to reproduce the issue:
+> 
+> 1) On x86_64 machine register QEMU:
+> 
+>     `docker run -it --rm --privileged multiarch/qemu-user-static --reset
+> --credential yes --persistent yes`
+> 
+> 2) Start a Docker image with foreign CPU architecture, e.g. aarch64
+> 
+>     `docker run -it arm64v8/centos:8 bash`
+> 
+> 3) Inside the Docker container install GCC and libaio
+> 
+>     `yum install gcc libaio libaio-devel`
+> 
+> 4) Compile the following C program
+> 
+> ```
+> #include <stdio.h>
+> #include <errno.h>
+> #include <libaio.h>
+> #include <stdlib.h>
+> 
+> struct io_control {
+>     io_context_t ioContext;
+> };
+> 
+> int main() {
+>     int queueSize = 10;
+> 
+>     struct io_control * theControl = (struct io_control *) malloc(sizeof(struct io_control));
+>     if (theControl == NULL) {
+>         printf("theControl is NULL");
+>         return 123;
+>     }
+> 
+>     int res = io_queue_init(queueSize, &theControl->ioContext);
+>     io_queue_release(theControl->ioContext);
+>     free(theControl);
+>     printf("res is: %d", res);
+> }
+> ```
+> 
+>     ```
+>     cat > test.c
+>         [PASTE THE CODE ABOVE HERE]
+>     ^D
+>     ```
+> 
+>     `gcc test.c -o out -laio && ./out`
+> 
+> 
+> When executed directly on aarch64 machine (i.e. without emulation) or on x86_64 Docker image (e.g. centos:8) it prints `res is: 0`, i.e. it successfully initialized a LibAIO queue.
+> 
+> But when executed on Docker image with foreign/emulated CPU architecture
+> it prints `res is: -38` (ENOSYS). `man io_queue_init` says that error
+> ENOSYS is returned when "Not implemented."
+> 
+> Environment:
+> 
+> QEMU version: 5.0.0.2  (https://github.com/multiarch/qemu-user-static/blob/master/.travis.yml#L24-L28)
+> Container application: Docker
+> Output of `docker --version`:
+> 
+> ```
+> Client:
+>  Version:           19.03.8
+>  API version:       1.40
+>  Go version:        go1.13.8
+>  Git commit:        afacb8b7f0
+>  Built:             Wed Mar 11 23:42:35 2020
+>  OS/Arch:           linux/amd64
+>  Experimental:      false
+> 
+> Server:
+>  Engine:
+>   Version:          19.03.8
+>   API version:      1.40 (minimum version 1.12)
+>   Go version:       go1.13.8
+>   Git commit:       afacb8b7f0
+>   Built:            Wed Mar 11 22:48:33 2020
+>   OS/Arch:          linux/amd64
+>   Experimental:     false
+>  containerd:
+>   Version:          1.3.3-0ubuntu2
+>   GitCommit:        
+>  runc:
+>   Version:          spec: 1.0.1-dev
+>   GitCommit:        
+>  docker-init:
+>   Version:          0.18.0
+>   GitCommit:        
+> ```
+> 
+> Same happens with Ubuntu (arm64v8/ubuntu:focal).
+> 
+> I've tried to `strace` it but :
+> 
+> ```
+> /usr/bin/strace: ptrace(PTRACE_TRACEME, ...): Function not implemented
+> /usr/bin/strace: PTRACE_SETOPTIONS: Function not implemented
+> /usr/bin/strace: detach: waitpid(112): No child processes
+> /usr/bin/strace: Process 112 detached
+> ```
+> 
+> Here are the steps to reproduce the problem with strace:
+> 
+>      ```
+>      docker run --rm -it --security-opt seccomp:unconfined --security-opt apparmor:unconfined --privileged --cap-add ALL arm64v8/centos:8 bash
+> 
+>      yum install -y strace`
+> 
+>      strace echo Test
+>      ```
+> 
+> Note: I used --privileged, disabled seccomp and apparmor, and added all
+> capabilities
+> 
+> Disabling security solves the "Permission denied" problem but then comes
+> the "Not implemented" one.
+> 
+> 
+> Any idea what could be the problem and how to work it around ?
+> I've googled a lot but I wasn't able to find any problems related to libaio on QEMU.
+> 
+> Thank you!
+> Martin
+> 
+> ** Affects: qemu
+>      Importance: Undecided
+>          Status: New
+> 
+> -- 
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1884719
+> 
+> Title:
+>   Function not implemented when using libaio
+> 
+> Status in QEMU:
+>   New
+> 
+> Bug description:
+>   Hello
+> 
+>   I experience "Function not implemented" errors when trying to use
+>   Linux libaio library in foreign architecture, e.g. aarch64.
+> 
+>   I've faced this problem while using https://github.com/multiarch/qemu-user-static, i.e. Docker+QEMU. 
+>   I understand that I do not use plain QEMU and you may count this report as a "distribution of QEMU"! Just let me know what are the steps to test it with plain QEMU and I will test and update this ticket!
+> 
+>   
+>   Here are the steps to reproduce the issue:
+> 
+>   1) On x86_64 machine register QEMU:
+> 
+>       `docker run -it --rm --privileged multiarch/qemu-user-static
+>   --reset --credential yes --persistent yes`
+> 
+>   2) Start a Docker image with foreign CPU architecture, e.g. aarch64
+> 
+>       `docker run -it arm64v8/centos:8 bash`
+> 
+>   3) Inside the Docker container install GCC and libaio
+> 
+>       `yum install gcc libaio libaio-devel`
+> 
+>   4) Compile the following C program
+> 
+>   ```
+>   #include <stdio.h>
+>   #include <errno.h>
+>   #include <libaio.h>
+>   #include <stdlib.h>
+> 
+>   struct io_control {
+>       io_context_t ioContext;
+>   };
+> 
+>   int main() {
+>       int queueSize = 10;
+> 
+>       struct io_control * theControl = (struct io_control *) malloc(sizeof(struct io_control));
+>       if (theControl == NULL) {
+>           printf("theControl is NULL");
+>           return 123;
+>       }
+> 
+>       int res = io_queue_init(queueSize, &theControl->ioContext);
+>       io_queue_release(theControl->ioContext);
+>       free(theControl);
+>       printf("res is: %d", res);
+>   }
+>   ```
+> 
+>       ```
+>       cat > test.c
+>           [PASTE THE CODE ABOVE HERE]
+>       ^D
+>       ```
+> 
+>       `gcc test.c -o out -laio && ./out`
+> 
+>   
+>   When executed directly on aarch64 machine (i.e. without emulation) or on x86_64 Docker image (e.g. centos:8) it prints `res is: 0`, i.e. it successfully initialized a LibAIO queue.
+> 
+>   But when executed on Docker image with foreign/emulated CPU
+>   architecture it prints `res is: -38` (ENOSYS). `man io_queue_init`
+>   says that error ENOSYS is returned when "Not implemented."
+> 
+>   Environment:
+> 
+>   QEMU version: 5.0.0.2  (https://github.com/multiarch/qemu-user-static/blob/master/.travis.yml#L24-L28)
+>   Container application: Docker
+>   Output of `docker --version`:
+> 
+>   ```
+>   Client:
+>    Version:           19.03.8
+>    API version:       1.40
+>    Go version:        go1.13.8
+>    Git commit:        afacb8b7f0
+>    Built:             Wed Mar 11 23:42:35 2020
+>    OS/Arch:           linux/amd64
+>    Experimental:      false
+> 
+>   Server:
+>    Engine:
+>     Version:          19.03.8
+>     API version:      1.40 (minimum version 1.12)
+>     Go version:       go1.13.8
+>     Git commit:       afacb8b7f0
+>     Built:            Wed Mar 11 22:48:33 2020
+>     OS/Arch:          linux/amd64
+>     Experimental:     false
+>    containerd:
+>     Version:          1.3.3-0ubuntu2
+>     GitCommit:        
+>    runc:
+>     Version:          spec: 1.0.1-dev
+>     GitCommit:        
+>    docker-init:
+>     Version:          0.18.0
+>     GitCommit:        
+>   ```
+> 
+>   Same happens with Ubuntu (arm64v8/ubuntu:focal).
+> 
+>   I've tried to `strace` it but :
+> 
+>   ```
+>   /usr/bin/strace: ptrace(PTRACE_TRACEME, ...): Function not implemented
+>   /usr/bin/strace: PTRACE_SETOPTIONS: Function not implemented
+>   /usr/bin/strace: detach: waitpid(112): No child processes
+>   /usr/bin/strace: Process 112 detached
+>   ```
+> 
+>   Here are the steps to reproduce the problem with strace:
+> 
+>        ```
+>        docker run --rm -it --security-opt seccomp:unconfined --security-opt apparmor:unconfined --privileged --cap-add ALL arm64v8/centos:8 bash
+> 
+>        yum install -y strace`
+> 
+>        strace echo Test
+>        ```
+> 
+>   Note: I used --privileged, disabled seccomp and apparmor, and added
+>   all capabilities
+> 
+>   Disabling security solves the "Permission denied" problem but then
+>   comes the "Not implemented" one.
+> 
+>   
+>   Any idea what could be the problem and how to work it around ?
+>   I've googled a lot but I wasn't able to find any problems related to libaio on QEMU.
+> 
+>   Thank you!
+>   Martin
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1884719/+subscriptions
+> 
+
+
+ptrace() is not implemented,
+
+it's why we use gdb server rather than gdb and we use QEMU_STRACE variable rather than strace command.
+
+You can test it works with:
+
+  QEMU_STRACE= bash -c "echo Test"
+
+Could you try to execute your test program with it:
+
+  QEMU_STRACE= ./out
+
+
+
+The not-implemented syscalls are:
+
+...
+276 io_setup(10,274877981280,33,274877981296,274877981280,274877981184) = -1 errno=38 (Function not implemented)
+276 io_destroy(0,274877981280,33,274877981296,274877981280,274877981184) = -1 errno=38 (Function not implemented)
+...
+
+Executing `QEMU_STRACE= ./out` here gives:
+
+
+259 brk(NULL) = 0x0000000000421000
+259 uname(0x40008003d8) = 0
+259 faccessat(AT_FDCWD,"/etc/ld.so.preload",R_OK,AT_SYMLINK_NOFOLLOW|0x50) = -1 errno=2 (No such file or directory)
+259 openat(AT_FDCWD,"/etc/ld.so.cache",O_RDONLY|O_CLOEXEC) = 3
+259 fstat(3,0x00000040007ff960) = 0
+259 mmap(NULL,13646,PROT_READ,MAP_PRIVATE,3,0) = 0x0000004000843000
+259 close(3) = 0
+259 openat(AT_FDCWD,"/lib64/libaio.so.1",O_RDONLY|O_CLOEXEC) = 3
+259 read(3,0x7ffb20,832) = 832
+259 fstat(3,0x00000040007ff9b0) = 0
+259 mmap(NULL,131096,PROT_EXEC|PROT_READ,MAP_PRIVATE|MAP_DENYWRITE,3,0) = 0x0000004000847000
+259 mprotect(0x0000004000849000,118784,PROT_NONE) = 0
+259 mmap(0x0000004000866000,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_DENYWRITE|MAP_FIXED,3,0xf000) = 0x0000004000866000
+259 mmap(0x0000004000867000,24,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0) = 0x0000004000867000
+259 close(3) = 0
+259 openat(AT_FDCWD,"/lib64/libc.so.6",O_RDONLY|O_CLOEXEC) = 3
+259 read(3,0x7ffb00,832) = 832
+259 fstat(3,0x00000040007ff990) = 0
+259 mmap(NULL,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0) = 0x0000004000868000
+259 mmap(NULL,1527680,PROT_EXEC|PROT_READ,MAP_PRIVATE|MAP_DENYWRITE,3,0) = 0x000000400086a000
+259 mprotect(0x00000040009c3000,77824,PROT_NONE) = 0
+259 mmap(0x00000040009d6000,24576,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_DENYWRITE|MAP_FIXED,3,0x15c000) = 0x00000040009d6000
+259 mmap(0x00000040009dc000,12160,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0) = 0x00000040009dc000
+259 close(3) = 0
+259 mprotect(0x00000040009d6000,16384,PROT_READ) = 0
+259 mprotect(0x0000004000866000,4096,PROT_READ) = 0
+259 mprotect(0x000000000041f000,4096,PROT_READ) = 0
+259 mprotect(0x0000004000840000,4096,PROT_READ) = 0
+259 munmap(0x0000004000843000,13646) = 0
+259 brk(NULL) = 0x0000000000421000
+259 brk(0x0000000000442000) = 0x0000000000442000
+259 brk(NULL) = 0x0000000000442000
+259 io_setup(10,4330144,4330160,4330144,274886726560,511) = -1 errno=38 (Function not implemented)
+259 io_destroy(0,274886726560,38,274886726560,511,512) = -1 errno=38 (Function not implemented)
+259 fstat(1,0x0000004000800388) = 0
+259 write(1,0x4212c0,11)res is: -38 = 11
+259 exit_group(0)
+
+
+Thanks for looking into this issue, Laurent Vivier!
+
+
+
+Could I help somehow to resolve this issue ?
+
+Martin,
+
+do you want to propose some patches to fix the problem?
+
+Thanks
+
+Laurent,
+
+I am not familiar with the internals of QEMU but if you point me to the source code of similar functionality I could try!
+
+Thanks!
+
+Martin,
+
+after a first look, I can see that asynchronicity introduces more complexity in QEMU than usual ... 
+
+I'm going to try to write the patches. I will ask you some help to test them.
+
+I've already implemented io_setup and io_destroy, but io_submit introduces more complexity because we can only cleanup qemu internal buffers when the I/O are done. To do that we need to intercept events at io_getevents level.
+
+
+I will push my patches here:
+
+https://github.com/vivier/qemu/commits/linux-user-libaio
+
+Thank you for working on this, Laurent!
+Just let me know and I will test your changes!
+
+Hey Laurent!
+
+I know it is the summer holidays season!
+I just wanted to ask you whether I should test your branch or you have more planned work ?
+
+
+
+The code in my branch has two problems:
+
+- it doesn't work if the host is 64bit and the target 32bit (because the context id returned by the host is in fact a virtual address and the data type is long, so the context_id (host long) doesn't fit in target context_id (target long).
+
+- I played with some stress tests and at some points it crashes.
+
+I don't have enough time to work on this for the moment.
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting older bugs to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" within the next 60 days (otherwise it will get
+closed as "Expired"). We will then eventually migrate the ticket auto-
+matically to the new system (but you won't be the reporter of the bug
+in the new system and thus won't get notified on changes anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+Bug has been re-opened here:
+https://gitlab.com/qemu-project/qemu/-/issues/210
+Thanks for copying it over, Martin!
+

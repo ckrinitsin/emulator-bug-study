@@ -1,0 +1,82 @@
+mistranslation: 0.778
+other: 0.706
+graphic: 0.704
+KVM: 0.693
+vnc: 0.683
+instruction: 0.671
+device: 0.664
+semantic: 0.640
+assembly: 0.596
+socket: 0.580
+network: 0.559
+boot: 0.538
+
+Hotplug device(device_add) immediately after starting a virtual machine triggers deadlock.
+Description of problem:
+Sometimes, hotplug device(device_add) immediately after starting a virtual machine triggers deadlock.
+
+Related commits: [7bed8995](https://gitlab.com/qemu-project/qemu/-/commit/7bed89958bfbf40df9ca681cefbdca63abdde39d)
+Steps to reproduce:
+1. start a virtual machine
+
+2. hotplug some device immediately(24 virtio-blk device etc.) 
+
+3. repert step 1 and step 2 for several times, as I tried, deadlock will happen within 100 times.
+Additional information:
+I found similar problem [Issues 650](https://gitlab.com/qemu-project/qemu/-/issues/650)，but problem seems different.
+
+When qemu_main_loop deal with qmp_device_add command which will add a bottom half structure to qemu_aio_context's bh_list. 
+
+At the same time,  UEFI loader writing something to pflash device, address_space_write function get rcu_read_lock and poll aio request. 
+
+Then, it will get the bottom half structure added by qemu_main_loop and go to qmp_device_add function. qmp_device_add function call drain_call_rcu function which will wait for all readers exit. Then it caused a deadlock.
+
+
+
+dead lock thread stack
+
+```
+#0  0x0000ffffb11e8ee4 in syscall () from target:/usr/lib64/libc.so.6
+#1  0x0000aaaadab2ce80 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /Images/jdx/code/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0xffff87bfd890) at ../util/qemu-thread-posix.c:429
+#3  0x0000aaaadab35ed0 in drain_call_rcu () at ../util/rcu.c:347
+#4  0x0000aaaada55fa94 in qmp_device_add (qdict=<optimized out>, ret_data=<optimized out>, errp=<optimized out>) at ../softmmu/qdev-monitor.c:866
+#5  0x0000aaaadab1f01c in do_qmp_dispatch_bh (opaque=0xffffaf987ec8) at ../qapi/qmp-dispatch.c:128
+#6  0x0000aaaadab3d1b4 in aio_bh_call (bh=0xffff382d8190) at ../util/async.c:150
+#7  aio_bh_poll (ctx=ctx@entry=0xaaaaf8836ac0) at ../util/async.c:178
+#8  0x0000aaaadab29010 in aio_poll (ctx=ctx@entry=0xaaaaf8836ac0, blocking=blocking@entry=true) at ../util/aio-posix.c:712
+#9  0x0000aaaadaa060e8 in bdrv_poll_co (s=0xffff87bfda58) at /Images/jdx/code/qemu/block/block-gen.h:44
+#10 0x0000aaaadaa07134 in blk_pwrite (blk=0xaaaaf8b82400, offset=offset@entry=197120, bytes=bytes@entry=512, buf=0xffff87c30200, flags=flags@entry=0) at block/block-gen.c:685
+#11 0x0000aaaada35c330 in pflash_update (pfl=pfl@entry=0xaaaaf8b474f0, offset=197120, offset@entry=197124, size=size@entry=4) at ../hw/block/pflash_cfi01.c:395
+#12 0x0000aaaada35e1f8 in pflash_write (be=0, width=4, value=299045890, offset=197124, pfl=0xaaaaf8b474f0) at ../hw/block/pflash_cfi01.c:523
+#13 pflash_mem_write_with_attrs (opaque=0xaaaaf8b474f0, addr=197124, value=299045890, len=4, attrs=...) at ../hw/block/pflash_cfi01.c:682
+#14 0x0000aaaada918cbc in access_with_adjusted_size (addr=addr@entry=197124, value=value@entry=0xffff87bfdbf8, size=4, access_size_min=<optimized out>, access_size_max=<optimized out>, 
+    access_fn=access_fn@entry=0xaaaada91b260 <memory_region_write_with_attrs_accessor>, mr=0xaaaaf8b478b0, attrs=...) at ../softmmu/memory.c:554
+#15 0x0000aaaada91cfc4 in memory_region_dispatch_write (mr=mr@entry=0xaaaaf8b478b0, addr=197124, data=<optimized out>, op=MO_32, attrs=attrs@entry=...) at ../softmmu/memory.c:1520
+#16 0x0000aaaada9245ec in flatview_write_continue (fv=fv@entry=0xffff38492110, addr=addr@entry=67305988, attrs=attrs@entry=..., ptr=ptr@entry=0xffffb1e13028, len=len@entry=4, addr1=<optimized out>, l=<optimized out>, 
+    mr=0xaaaaf8b478b0) at /Images/jdx/code/qemu/include/qemu/host-utils.h:166
+#17 0x0000aaaada924844 in flatview_write (fv=0xffff38492110, addr=addr@entry=67305988, attrs=attrs@entry=..., buf=buf@entry=0xffffb1e13028, len=len@entry=4) at ../softmmu/physmem.c:2867
+#18 0x0000aaaada92825c in address_space_write (len=4, buf=0xffffb1e13028, attrs=..., addr=67305988, as=0xaaaadb4a4670 <address_space_memory>) at ../softmmu/physmem.c:2963
+#19 address_space_rw (as=0xaaaadb4a4670 <address_space_memory>, addr=67305988, attrs=attrs@entry=..., buf=buf@entry=0xffffb1e13028, len=4, is_write=<optimized out>) at ../softmmu/physmem.c:2973
+#20 0x0000aaaada9c7754 in kvm_cpu_exec (cpu=cpu@entry=0xaaaaf8c80530) at ../accel/kvm/kvm-all.c:2954
+#21 0x0000aaaada9c8adc in kvm_vcpu_thread_fn (arg=arg@entry=0xaaaaf8c80530) at ../accel/kvm/kvm-accel-ops.c:49
+#22 0x0000aaaadab2ba98 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:504
+#23 0x0000ffffb118718c in ?? () from target:/usr/lib64/libc.so.6
+#24 0x0000ffffb11ed15c in ?? () from target:/usr/lib64/libc.so.6
+
+```
+
+call_rcu_thread stack
+```
+Thread 2 (Thread 0xffffb0196900 (LWP 1018210) "qemu-system-aar"):
+#0  0x0000ffffb11e8ee4 in syscall () from target:/usr/lib64/libc.so.6
+#1  0x0000aaaadab2ce80 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /Images/jdx/code/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0xaaaadb4c3bb8 <rcu_gp_event>) at ../util/qemu-thread-posix.c:429
+#3  0x0000aaaadab35ce8 in wait_for_readers () at ../util/rcu.c:138
+#4  synchronize_rcu () at ../util/rcu.c:174
+#5  0x0000aaaadab36160 in call_rcu_thread (opaque=opaque@entry=0x0) at ../util/rcu.c:268
+#6  0x0000aaaadab2ba98 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:504
+#7  0x0000ffffb118718c in ?? () from target:/usr/lib64/libc.so.6
+#8  0x0000ffffb11ed15c in ?? () from target:/usr/lib64/libc.so.6
+
+```

@@ -1,0 +1,195 @@
+other: 0.782
+instruction: 0.778
+device: 0.751
+assembly: 0.733
+semantic: 0.731
+mistranslation: 0.717
+vnc: 0.664
+network: 0.654
+socket: 0.637
+graphic: 0.623
+boot: 0.606
+KVM: 0.594
+
+arm v7M - svc insn doesn't trigger PendSV handler
+
+The svc instruction doesn't work as expected.
+
+-> qemu 0.13.0 rc1 (git)
+
+Test : demo with freeRTOS (for example FreeRTOS-6.0.5/Demo/CORTEX_LM3S811_GCC) with the card lm3s811evb.
+
+If we start the scheduler, it will call that function (__attribute__ (( naked ))) :
+
+void vPortStartFirstTask( void )
+
+{
+
+	__asm volatile(
+
+					" ldr r0, =0xE000ED08 	\n" /* Use the NVIC offset register to locate the stack. */
+
+					" ldr r0, [r0] 			\n"
+
+					" ldr r0, [r0] 			\n"
+
+					" msr msp, r0			\n" /* Set the msp back to the start of the stack. */
+
+					" svc 0					\n" /* System call to start first task. */
+
+				);
+
+}
+
+The 4 first lines in asm work fine. The scv 0 call will rise the right interrupt in qemu (line 151, in arm_gic.c, best_irq = 15). However, it will never call the PendSV Handler (xPortPendSVHandler here). This function is recorded in the nvic vector.
+Next, (after the svc), the processor will execute the line after in code (this is a naked function) so the next function written after vPortStartFirstTask in the code.
+
+
+command line :
+console 1 : qemu-system-arm -M lm3s6965evb -kernel gcc/RTOSDemo.axf -s -S
+console 2 : arm-none-eabi-gdb -ex "target remote localhost:1234" gcc/RTOSDemo.axf
+
+arm-none-eabi from http://www.codesourcery.com/sgpp/lite/arm/portal/release1294
+Same error with another project with arm-elf
+
+processor : arm cortex m3
+
+host : gentoo (2.6.35-r9) (without kqemu)
+
+I made a mistake, there are 2 irq : 11 and 15 and best_irq = 11 after svc call
+So it should launch vPortSVCHandler but it does not.
+
+Issue "solved".
+
+In freeRtos, for the first "context switch" (launch the first task), the register pc is written with an adress with le bit0 equal to 1 (thumb). If I change this and set bit0 to 0 (new_pc = task_to_start_pointer & 0xfffffffe), it is working well. I do not know yet (i will try next week) If it is working with the bit0 equal to 1 on the real target but according to freeRtos, it should work.
+
+
+I had the same problem then was trying to run project based on uC OS2.  So there is no problem in freeRtos or in uCOS and it is better to do change in helper.c in function:
+
+ static void do_v7m_exception_exit(CPUARMState *env)
+
+replace line
+
+ env->regs[15] = v7m_pop(env); 
+
+with
+
+env->regs[15] = v7m_pop(env) & 0xfffffffe;
+
+and everything will be fine.
+
+also you can pay attention to 
+https://bugs.launchpad.net/qemu/+bug/942659
+
+and if you already implemented  byte accessed priority  registers in NVIC
+you will be able to run even nested interrupts.
+
+Nope. That code corresponds to the ARM v7M ARM PopStack() pseudocode which states that it is UNPREDICTABLE if the new PC is not halfword aligned. The bug is in whatever is filling in that stack frame with a bit0-set value.
+
+
+From the manual DDI0403C_arm_architecture_v7m_reference_manual_errata_markup_2_0.pdf
+A6.7.97 POP
+Pop Multiple Registers loads a subset (or possibly all) of the general-purpose registers R0-R12 and the PC
+or the LR from the stack.
+If the registers loaded include the PC, the word loaded for the PC is treated as an address or an exception
+return value and a branch occurs. Bit<0> complies with the ARM architecture interworking rules for
+branches to Thumb state execution and must be 1. If bit<0> is 0, a UsageFault exception occurs.
+
+
+And even more if we will look into  Yiu, Joseph. The definitive guide to the ARM Cortex-M3 / Joseph Yiu.
+chapter 9 Interrupt behavior we will see how actually processor pushes data and in real I thin it does not uses pop and push instructions, we just simulate real behavior with this instructions.
+
+(1) You should be looking at DDI0403D -- revision D of the v7M ARM ARM included some significant clarifications and corrections as well as adding documentation of floating point support.
+
+(2) The behaviour of the POP instruction is irrelevant here because the QEMU function you are proposing to change is not related to it but is in fact implementing the exception return handling. As I said before, this corresponds to the PopStack pseudocode function in the v7m ARM, which is clearly documented as UNPREDICTABLE if the lsbit is set.
+
+(3) Joseph Yiu's book (however good it may be) is not the authoritative reference to the behaviour that v7M software can rely on; that is the architecture reference manual.
+
+(4) It is entirely possible that hardware implementations to date ignore the lsbit in this situation. That doesn't mean that software which relies on this UNPREDICTABLE behaviour is not buggy.
+
+(5) The code in http://freertos.svn.sourceforge.net/viewvc/freertos/trunk/Source/portable/GCC/ARM_CM3/port.c?revision=1660&view=markup pxPortInitialiseStack() is wrong because it does not force the lsbit to zero when setting up its fake stack frame. That (or the equivalent in whichever freertos port you're building) is what you need to fix.
+
+
+Thanks for clarification. Now I understood what you there talking about PopStack pseudocode function.
+
+(4) It is entirely possible that hardware implementations to date ignore the lsbit in this situation. That doesn't mean that software which relies on this UNPREDICTABLE behaviour is not buggy.
+
+It seams true because I have used a lot of different cortex m3 micros  and none of them does not refused to execute such task stack initialization. I have  just looked in Micrium uCOS III sources and in there there is the same usage of THUMB pointer to init PC.
+My point that in production there is a lot of code that does not care about this PREDICTABLE behavior and in my case I just want to run firmware without recompile and changes as it is. And for those who want this it is better at least to mention this behavior in comments or some there else , and maybe this will save a lot of time.
+
+I have been experimenting with Sebastian's patches mentioned earlier (http://git.rtems.org/rtems/tree/c/src/lib/libbsp/arm/lm3s69xx?id=e1ebfebf1bffe3e7731ac529409bd2576285467b) and think I have found another major issue:-(
+
+My reading of the ARM documentation is that the SVC opcode should perform a synchronous exception.
+It doesn't, the calling code continues to execute asynchronously.
+
+This means that 
+
+1) When the execption handler runs, it will not be able to find the SVC argument (because the PC in the execption frame will not allow it to locate the SVC call
+2) Code will be incorrectly executed. For example code after an OS suspend call will be executed before the thread is suspended and resumed....
+
+Cheers
+Mark
+
+On 20 August 2012 17:43, Mark Phillips <email address hidden> wrote:
+> I have been experimenting with Sebastian's patches mentioned earlier
+> (http://git.rtems.org/rtems/tree/c/src/lib/libbsp/arm/lm3s69xx?id=e1ebfebf1bffe3e7731ac529409bd2576285467b)
+> and think I have found another major issue:-(
+>
+> My reading of the ARM documentation is that the SVC opcode should perform a synchronous exception.
+> It doesn't, the calling code continues to execute asynchronously.
+
+If true this would indeed be a significant bug. It's definitely not
+true for A/R profile cores... Do you have some test code /debug trace
+that demonstrates this?
+
+-- PMM
+
+
+OK, I'll re-read the documentation maybe I am wrong!
+It does say "synchronous" in the description and I don't understand how it can work if it is asynchronous because for Cortex the SVC argument is not transfered to a register and the only way the exception code can access it is by reading it from the opcode. If the exception is asynchonous the PC may have moved on and the code won't be able to find the SVC opcode?!
+
+In particular table 2-16 of DUI0552A_Cortex_m3_dgug.pdf states that the Activation of the SVC exception is Synchronous.
+And after the table it states "For an asynchronous exception, other than reset, the processor can execute another instruction 
+between when the exception is triggered and when the processor enters the exception handler." which sort of implies that for a Synchronous exception another opcode can not be executed before the exception?!
+
+Yes, I'm not disputing that the SVC exception should be handled synchronously, I'm asking you to provide a test case demonstrating the wrong behaviour.
+
+
+ok, I'll double check that backing out the local patches doesn't make a difference. If it still happens I will try and come up with a reduced test case.
+
+What do you expect to happen?
+Should the SVC exception 11 run immediately?
+What should happen if a clock tick interrupt is also pending at level 15 with a higher (numerically lower) priority?
+What I currently see happening is neither interrupts happen immediately, the code continues to execute. Then one or more clock tick interrupts occur, before finally I see the SVC interrupt code running.
+
+Cheers
+Mark
+
+I have put together a test program and tried against a vanila copy of qemu 1.1.1
+
+The SVC wil be completely masked unless I apply patch 0002-target-arm-Disable-priority_mask-feature.patch, which hacks arm_gic.c to initialise the gic priority_mask to 0x100 instead of 0xf0. There doesn't appear to be anyway to write to the gix priority_mask from arm code - maybe it should be linked to the ARM Cortex BASEPRI?
+
+Anyway the test code indicates execution does continue after the SVC call before the exception is handled.
+
+Where would you like me to upload/send the test code?
+
+Cheers
+Mark
+
+
+I've made an interesting discovery:-
+
+If I instrument the code to record the sequence of code/exceptions and get a different, and apparently correct result!
+
+If I single step by starting the simulator with the following command line "qemu-system-arm -M lm3s6965evb -cpu cortex-m3 -kernel hack.bin -nographic -serial /dev/null -s -S" then connecting gdb and using stepi I get very different behaviour.
+
+It is beginning look like the buig may actually be that whilst using stepi to advance the code somehow all exceptions are blocked!!!!!
+If you just let the code free-run exceptions appear to happen.
+
+Cheers
+Mark
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

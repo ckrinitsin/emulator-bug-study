@@ -1,0 +1,195 @@
+semantic: 0.877
+instruction: 0.867
+graphic: 0.852
+device: 0.847
+other: 0.846
+socket: 0.831
+boot: 0.831
+assembly: 0.828
+network: 0.828
+vnc: 0.754
+mistranslation: 0.750
+KVM: 0.664
+
+qemu-system-aarch64: with "-display gtk" arrow keys are received as just ^[ on ttyAMA0
+
+I originally observed this on Debian packaged qemu 5.2 at
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=976808
+
+Today I checked out the latest git source at
+Sun, 13 Dec 2020 19:21:09 +0900
+and configured the source as follows:
+
+./configure --prefix=/usr --sysconfdir=/etc --libexecdir=/usr/lib/qemu \
+ --localstatedir=/var --disable-blobs --disable-strip --localstatedir=/var \
+ --libdir=/usr/lib/aarch64-linux-gnu \ 
+ --firmwarepath=/usr/share/qemu:/usr/share/seabios:/usr/lib/ipxe/qemu \ 
+ --target-list=aarch64-softmmu,arm-softmmu --disable-werror \ 
+ --disable-user  --enable-gtk --enable-vnc
+then executed "make" on an ARM64 (not an x86_64) host,
+running the latest Debian testing.
+
+I did the following commands on an arm64 host with the Debian Installer Alpha 3 at
+https://cdimage.debian.org/cdimage/bullseye_di_alpha3/arm64/iso-cd/debian-bullseye-DI-alpha3-arm64-netinst.iso
+
+#!/bin/sh
+
+ARCH=arm64
+IMAGE=`pwd`/qemu-disk-${ARCH}.qcow2
+CDROM=`pwd`/debian-bullseye-DI-alpha3-${ARCH}-netinst.iso
+rm -f $IMAGE
+qemu-img create -f qcow2 -o compat=1.1 -o lazy_refcounts=on -o preallocation=off $IMAGE 20G
+cd /var/tmp
+cp /usr/share/AAVMF/AAVMF_VARS.fd .
+$HOME/qemu-git/qemu/build/qemu-system-aarch64 \
+    -display gtk -enable-kvm -machine virt -cpu host -m 3072 -smp 2\
+    -net nic,model=virtio -net user -object rng-random,filename=/dev/urandom,id=rng0 \
+    -device virtio-rng-pci,rng=rng0,id=rng-device0 \
+    -drive if=virtio,file=${IMAGE},index=0,format=qcow2,discard=unmap,detect-zeroes=unmap,media=disk \
+    -drive if=virtio,file=${CDROM},index=1,format=raw,readonly=on,media=cdrom \
+    -drive if=pflash,format=raw,unit=0,file=/usr/share/AAVMF/AAVMF_CODE.fd,readonly=on \
+    -drive if=pflash,format=raw,unit=1,file=`pwd`/AAVMF_VARS.fd
+
+Then 4 arrow keys on the physical keyboard are received as just "^[".
+
+This symptom was not observed on qemu-system-x86_64.
+This symptom was not observed with virt-manager on my arm64 host, neither.
+This seems unique to -display gtk of qemu-system-aarch64.
+
+An easier way to reproduce the symptom was provided by Alper Nebi Yasak at
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=976808#88
+
+qemu-system-aarch64 \
+    -display gtk -enable-kvm -machine virt -cpu host -m 1G -smp 2 \
+    -kernel /boot/vmlinuz -initrd /boot/initrd.img \
+    -append "break console=ttyAMA0"
+
+Then, run cat on the initramfs shell and see arrow keys result in ^[ .
+For x86_64, it's console=ttyS0 and ^[[A etc.
+
+
+This should be fixed already in head-of-git, by commit 8eb13bbbac08aa077e ; this will be in QEMU 6.0.
+
+
+This bug was fixed in the package qemu - 1:6.0+dfsg-1~ubuntu3
+
+---------------
+qemu (1:6.0+dfsg-1~ubuntu3) impish; urgency=medium
+
+  * d/p/u/lp-1935617-target-ppc-Fix-load-endianness-for-lxvwsx-lxvdsx.patch:
+    fix TCG emulation for ppc64 (LP: #1935617)
+
+qemu (1:6.0+dfsg-1~ubuntu2) impish; urgency=medium
+
+  * d/control: remove fuse2 trial-build (LP 1934510)
+
+qemu (1:6.0+dfsg-1~ubuntu1) impish; urgency=medium
+
+  * Merge with Debian experimental, Among many other things this fixes LP Bugs:
+    (LP: #1907952) broken arrow keys in -display gtk on aarch64
+    - qemu-kvm to systemd unit
+      - d/qemu-kvm-init: script for QEMU KVM preparation modules, ksm,
+        hugepages and architecture specifics
+      - d/qemu-system-common.qemu-kvm.service: systemd unit to call
+        qemu-kvm-init
+      - d/qemu-system-common.install: install helper script
+      - d/qemu-system-common.qemu-kvm.default: defaults for
+        /etc/default/qemu-kvm
+      - d/rules: call dh_installinit and dh_installsystemd for qemu-kvm
+    - Distribution specific machine type
+      (LP: 1304107 1621042 1776189 1761372 1761372 1776189)
+      - d/p/ubuntu/define-ubuntu-machine-types.patch: define distro machine
+        types containing release versioned machine attributes
+      - d/qemu-system-x86.NEWS Info on fixed machine type defintions
+        for host-phys-bits=true
+      - Add an info about -hpb machine type in debian/qemu-system-x86.NEWS
+      - ubuntu-q35 alias added to auto-select the most recent q35 ubuntu type
+    - Enable nesting by default
+      - d/p/ubuntu/enable-svm-by-default.patch: Enable nested svm by default
+        in qemu64 on amd
+        [ No more strictly needed, but required for backward compatibility ]
+    - improved dependencies
+      - Make qemu-system-common depend on qemu-block-extra
+      - Make qemu-utils depend on qemu-block-extra
+      - Let qemu-utils recommend sharutils
+    - tolerate ipxe size change on migrations to >=18.04 (LP: 1713490)
+      - d/p/ubuntu/pre-bionic-256k-ipxe-efi-roms.patch: old machine types
+        reference 256k path
+      - d/control-in: depend on ipxe-qemu-256k-compat-efi-roms to be able to
+        handle incoming migrations from former releases.
+    - d/control-in: Disable capstone disassembler library support (universe)
+    - d/qemu-system-x86.README.Debian: add info about updated nesting changes
+    - d/control*, d/rules: disable xen by default, but provide universe
+      package qemu-system-x86-xen as alternative
+      [includes compat links changes of 5.0-5ubuntu4]
+    - Fix upgrade module handling (LP 1905377)
+      --enable-module-upgrades for qemu-xen which doesn't exist in Debian
+  * Dropped Changes [in 6.0]:
+    - d/p/ubuntu/lp-1907789-build-no-pie-is-no-functional-liker-flag.patch: fix
+      ld usage of -no-pie (LP 1907789)
+    - d/p/u/lp-1916230-hw-s390x-fix-build-for-virtio-9p-ccw.patch: fix
+      virtio-9p-ccw being missing (LP 1916230)
+    - d/p/u/lp-1916705-disas-Fix-build-with-glib2.0-2.67.3.patch: Fix FTFBS due
+      to glib2.0 >=2.67.3 (LP 1916705)
+    - d/p/u/lp-1921754*: add EPYC-Rome-v2 as v1 missed IBRS and thereby fails
+      on some HW/Guest combinations e.g. Windows 10 on Threadripper chips
+      (LP 1921754)
+    - d/p/u/lp-1921880*: add EPYC-Milan features and named cpu type support
+      (LP 1921880)
+    - d/p/u/lp-1922010-linux-user-s390x-Use-the-guest-pointer-for-the-sigre*:
+      fix go in qemu-s390x-static (LP 1922010)
+  * Dropped Changes [in Debian]:
+    - Allow qemu to load old modules post upgrade (LP 1847361)
+      - Drop d/qemu-block-extra.*.in, d/qemu-system-gui.*.in
+      - d/rules: Drop generating package version into maintainer scripts
+  * Dropped Changes [No more needed >21.04]:
+      - d/qemu-system-gui.prerm: add no-op prerm to overcome upgrade issues on
+        the bad old prerm (LP 1906245 1905377)
+  * Added Changes
+    - Disable fuse export (universe dependency)
+    - d/p/ubuntu/enable-svm-by-default.patch: update to match v6.0
+    - d/p/ubuntu/define-ubuntu-machine-types.patch: add ubuntu machine types
+      for v6.0
+    - d/p/ubuntu/lp-1929926-*: avoid segfaults by uretprobes (LP: #1929926)
+    - Ease the use of module retention on upgrades (LP: #1913421)
+      - d/run-qemu.mount, d/rules: provide run-qemu.mount in qemu-block-extra
+      - d/rules: only save modules if /run/qemu isn't noexec
+      - d/rules: clear all (current and former) modules on purge
+      - debian/qemu-block-extra.postinst: enable mount unit on install/upgrade
+    - d/control: qemu 6.0 broke libvirt <7.2 add a breaks to avoid partial
+      upgrade issues (LP: #1932264)
+    - Enable SDL as secondary UI backend (LP: #1256185)
+      - d/control: add build dependency libsdl2-dev
+      - d/control: enable sdl graphics on build
+      - d/qemu-system-gui.install: add ui-sdl.so
+      - d/control: add runtime dependency to libgl1
+    - d/rules: qemu-system-x86-xen builds modules as well now (follows the
+      other packages)
+
+qemu (1:6.0+dfsg-1~exp0) experimental; urgency=medium
+
+  * new upstream release
+  * remove obsolete patches, refresh use-fixed-data-path.patch
+  * use libncurses-dev, not old libncursesw5-dev
+  * enable fuse export (and build-depend on libfuse3-dev)
+  * install (new) manpages for qemu-storage-daemon
+  * enable new hexagon qemu-user target
+  * two patches to fix 3 new spelling mistakes
+  * remove now-unused shared-library-lacks-prerequisites lintian-overrides
+    for qemu-user-static
+
+qemu (1:5.2+dfsg-10) unstable; urgency=medium
+
+  * 5 sdhci fixes from upstream:
+    dont-transfer-any-data-when-command-time-out.patch
+    dont-write-to-SDHC_SYSAD-register-when-transfer-is-in-progress.patch
+    correctly-set-the-controller-status-for-ADMA.patch
+    limit-block-size-only-when-SDHC_BLKSIZE-register-is-writable.patch
+    reset-the-data-pointer-of-s-fifo_buffer-when-a-different-block-size...patch
+    (Closes: #986795, #970937, CVE-2021-3409, CVE-2020-17380, CVE-2020-25085)
+  * mptsas-remove-unused-MPTSASState.pending-CVE-2021-3392.patch
+    fix possible use-after-free in mptsas_free_request
+    (Cloese: #984449, CVE-2021-3392)
+
+ -- Christian Ehrhardt <email address hidden>  Tue, 13 Jul 2021 09:34:55 +0200
+

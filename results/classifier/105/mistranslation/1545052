@@ -1,0 +1,101 @@
+mistranslation: 0.822
+KVM: 0.818
+other: 0.793
+graphic: 0.779
+vnc: 0.769
+instruction: 0.759
+device: 0.720
+semantic: 0.714
+socket: 0.704
+assembly: 0.672
+network: 0.669
+boot: 0.604
+
+RDMA migration will hang forever if target QEMU fails to load vmstate
+
+Get a pair of machines with infiniband support. On one host run
+
+$ qemu-system-x86_64 -monitor stdio -incoming rdma:ibme:4444 -vnc :1 -m 1000
+
+To start an incoming migration.
+
+
+Now on the other host, run QEMU with an intentionally different configuration (ie different RAM size)
+
+$ qemu-system-x86_64 -monitor stdio -vnc :1 -m 2000
+
+Now trigger a migration on this source host
+
+(qemu) migrate rdma:ibpair:4444
+
+
+You will see on the target host, that it failed to load migration:
+
+dest_init RDMA Device opened: kernel name mlx4_0 uverbs device name uverbs0, infiniband_verbs class device path /sys/class/infiniband_verbs/uverbs0, infiniband class device path /sys/class/infiniband/mlx4_0, transport: (2) Ethernet
+qemu-system-x86_64: Length mismatch: pc.ram: 0x7d000000 in != 0x3e800000: Invalid argument
+qemu-system-x86_64: error while loading state for instance 0x0 of device 'ram'
+
+This is to be expected, however, at this point QEMU has hung and no longer responds to the monitor
+
+GDB shows the target host is stuck in this callpath
+
+#0  0x00007ffff39141cd in write () at ../sysdeps/unix/syscall-template.S:81
+#1  0x00007ffff27fe795 in rdma_get_cm_event.part.15 () from /lib64/librdmacm.so.1
+#2  0x000055555593e445 in qemu_rdma_cleanup (rdma=0x7fff9647e010) at migration/rdma.c:2210
+#3  0x000055555593ea45 in qemu_rdma_close (opaque=0x555557796770) at migration/rdma.c:2652
+#4  0x00005555559397cc in qemu_fclose (f=f@entry=0x5555564b1450) at migration/qemu-file.c:270
+#5  0x0000555555936b88 in process_incoming_migration_co (opaque=0x5555564b1450) at migration/migration.c:361
+#6  0x0000555555a25a1a in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at util/coroutine-ucontext.c:79
+#7  0x00007fffef5b3110 in ?? () from /lib64/libc.so.6
+
+
+
+Now, back on the source host again, you would expect to see that the migrate command failed. Instead, this QEMU is hung too. 
+
+GDB shows the source host, migrate thread, is stuck in this callpath:
+
+#0  0x00007ffff391522d in read#1  0x00007ffff00efd93 in ibv_get_cq_event () at /lib64/libibverbs.so.1
+#2  0x00005555559403f2 in qemu_rdma_block_for_wrid (rdma=rdma@entry=0x7fff3d07e010, wrid_requested=wrid_requested@entry=4000, byte_len=byte_len@entry=0x7fff39de370c) at migration/rdma.c:1511
+#3  0x000055555594058a in qemu_rdma_exchange_get_response (rdma=0x7fff3d07e010, head=head@entry=0x7fff39de3780, expecting=expecting@entry=2, idx=idx@entry=0)
+    at migration/rdma.c:1648
+#4  0x0000555555941e71 in qemu_rdma_exchange_send (rdma=0x7fff3d07e010, head=0x7fff39de3840, data=0x0, resp=0x7fff39de3870, resp_idx=0x7fff39de3880, callback=0x0) at migration/rdma.c:1725
+#5  0x00005555559447e4 in qemu_rdma_registration_stop (f=<optimized out>, opaque=<optimized out>, flags=0, data=<optimized out>) at migration/rdma.c:3302
+#6  0x000055555593bc4b in ram_control_after_iterate (f=f@entry=0x5555564c20f0, flags=flags@entry=0) at migration/qemu-file.c:157
+#7  0x0000555555740b59 in ram_save_setup (f=0x5555564c20f0, opaque=<optimized out>) at /home/berrange/src/virt/qemu/migration/ram.c:1959
+#8  0x00005555557451c1 in qemu_savevm_state_begin (f=0x5555564c20f0, params=params@entry=0x555555f6f048 <current_migration.37991+72>)
+    at /home/berrange/src/virt/qemu/migration/savevm.c:919
+#9  0x00005555559381a5 in migration_thread (opaque=0x555555f6f000 <current_migration.37991>) at migration/migration.c:1633
+#10 0x00007ffff390edc5 in start_thread (arg=0x7fff39de4700) at pthread_create.c:308
+
+
+It should have aborted migrate and set the status to failed.
+
+FYI is is tested on current GIT master
+
+commit fc1ec1acffd29d54c0c4266d30d38b2399d42f4f
+Merge: f163684 1834ed3
+Author: Peter Maydell <email address hidden>
+Date:   Thu Feb 11 15:09:33 2016 +0000
+
+    Merge remote-tracking branch 'remotes/mjt/tags/pull-trivial-patches-2016-02-11' into staging
+    
+
+
+Fix series posted upstream:
+0001-migration-rdma-Fix-race-on-source.patch
+0002-migration-Close-file-on-failed-migration-load.patch
+0003-migration-rdma-Allow-cancelling-while-waiting-for-wr.patch
+0004-migration-rdma-Safely-convert-control-types.patch
+0005-migration-rdma-Send-error-during-cancelling.patch
+
+
+Patch series has apparently been merged in time for QEMU v2.10:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=9cf2bab2edca1e651eef
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=3a0f2ceaedcf70ff79b6
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=9c98cfbe72b21d9d84b9
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=482a33c53cbc9d2b0c47
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=32bce196344772df8d68
+So I assume we can close this ticket now?
+
+Yes, we probably can - I'd still not be that sure we've got all the races in the RDMA code, but we're probably  a chunk better of than we were.
+

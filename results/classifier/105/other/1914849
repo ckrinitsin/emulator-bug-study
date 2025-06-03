@@ -1,0 +1,112 @@
+semantic: 0.959
+other: 0.959
+device: 0.958
+assembly: 0.957
+socket: 0.956
+instruction: 0.951
+graphic: 0.951
+KVM: 0.944
+mistranslation: 0.943
+vnc: 0.930
+network: 0.929
+boot: 0.877
+
+mprotect fails after MacOS 11.2 on arm mac
+
+I got the following error when I ran qemu on arm mac(MacOS 11.2).
+
+```
+$ ./qemu-system-x86_64
+qemu-system-x86_64: qemu_mprotect__osdep: mprotect failed: Permission denied
+**
+ERROR:../tcg/tcg.c:844:tcg_region_init: assertion failed: (!rc)
+Bail out! ERROR:../tcg/tcg.c:844:tcg_region_init: assertion failed: (!rc)
+[1]    34898 abort      ./qemu-system-x86_64
+```
+
+I tested the same version of qemu on intel mac(MacOS 11.2), but it works fine.
+
+And my friend told me that they did not have this error with MacOS 11.1.
+
+So, I think it is CPU architecture or an OS version dependent error.
+
+
+Environment:
+
+Qemu commit id: d0dddab40e472ba62b5f43f11cc7dba085dabe71
+OS: MacOS 11.2(20D64)
+Hardware: MacBook Air (M1, 2020)
+
+
+How to build:
+
+```
+mkdir build/
+cd build/
+../configure --target-list=aarch64-softmmu,x86_64-softmmu
+make
+```
+
+
+How to reproduce:
+
+```
+./qemu-system-x86_64
+```
+
+
+Error message:
+
+```
+$ ./qemu-system-x86_64
+qemu-system-x86_64: qemu_mprotect__osdep: mprotect failed: Permission denied
+**
+ERROR:../tcg/tcg.c:844:tcg_region_init: assertion failed: (!rc)
+Bail out! ERROR:../tcg/tcg.c:844:tcg_region_init: assertion failed: (!rc)
+[1]    34898 abort      ./qemu-system-x86_64
+```
+
+Thanks for submitting the ticket.
+I've just stumbled upon it after updating to 11.2.
+
+The question was already asked on apple developer forums: https://developer.apple.com/forums/thread/672804
+
+And there's a thread going on with regard to broken nodejs on 11.2:
+https://github.com/nodejs/node/issues/37061#issuecomment-774175983
+
+I hit the same problem and did some initial investigation with Toshifumi.
+
+Here is a more exhaustive test program I wrote based on the post on the Apple Developer Forums and the result shows that very interesting behavior of mmap and mprotect since macOS 11.2. 
+
+https://gist.github.com/hikalium/75ae822466ee4da13cbbe486498a191f
+
+I and my friend confirmed that all mmap & following mprotect calls with any protection bit combinations are succeeded up to 11.1 on M1 Mac but starting from 11.2 mprotect starts failing if we call mmap with PROT_WRITE + PROT_EXEC. (Surprisingly, mmap itself is not failing even on those patterns.)
+
+It looks like the allocation of code gen buffer in QEMU uses this combination at mmap call:
+https://github.com/qemu/qemu/blob/master/accel/tcg/translate-all.c#L1294
+
+So maybe we need to specify PROT_NONE instead on the initial mmap and change it appropriately afterwards to make it working on M1 Mac after 11.2.
+
+(We tried to fix it but we have no sufficient knowledge about tcg... Could you take a look into it?)
+
+The patch can be used as a workaround for now:
+diff --git a/util/osdep.c b/util/osdep.c
+index 66d01b9160..76be8c295b 100644
+--- a/util/osdep.c
++++ b/util/osdep.c
+@@ -110,6 +110,9 @@ int qemu_mprotect_none(void *addr, size_t size)
+ {
+ #ifdef _WIN32
+     return qemu_mprotect__osdep(addr, size, PAGE_NOACCESS);
++#elif defined(__APPLE__) && defined(__arm64__)
++    /* Workaround mprotect (RWX->NONE) issue on Big Sur 11.2 */
++    return 0;
+ #else
+     return qemu_mprotect__osdep(addr, size, PROT_NONE);
+ #endif
+
+It works for me when I use "./configure --enable-debug-tcg --extra-cflags=-I/opt/homebrew/include".
+
+Fixed here:
+https://gitlab.com/qemu-project/qemu/-/commit/c118881ee607dcac
+

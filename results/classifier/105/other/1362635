@@ -1,0 +1,133 @@
+other: 0.898
+semantic: 0.891
+graphic: 0.878
+assembly: 0.851
+mistranslation: 0.817
+socket: 0.811
+device: 0.784
+boot: 0.780
+vnc: 0.778
+instruction: 0.767
+network: 0.692
+KVM: 0.675
+
+bdrv_read co-routine re-entered recursively
+
+calling bdrv_read in a loop leads to the follwing situation:
+
+bs->drv->bdrv_aio_readv is called, and finally calls bdrv_co_io_em_complete in other thread context.
+there is a possibility of calling bdrv_co_io_em_complete before calling qemu_coroutine_yield in bdrv_co_io_em. And qemu fails with "co-routine re-entered recursively".
+
+static void bdrv_co_io_em_complete(void *opaque, int ret)
+{
+    CoroutineIOCompletion *co = opaque;
+
+    co->ret = ret;
+    qemu_coroutine_enter(co->coroutine, NULL);
+}
+
+static int coroutine_fn bdrv_co_io_em(BlockDriverState *bs, int64_t sector_num,
+                                      int nb_sectors, QEMUIOVector *iov,
+                                      bool is_write)
+{
+    CoroutineIOCompletion co = {
+        .coroutine = qemu_coroutine_self(),
+    };
+    BlockDriverAIOCB *acb;
+
+    if (is_write) {
+        acb = bs->drv->bdrv_aio_writev(bs, sector_num, iov, nb_sectors,
+                                       bdrv_co_io_em_complete, &co);
+    } else {
+        acb = bs->drv->bdrv_aio_readv(bs, sector_num, iov, nb_sectors,
+                                      bdrv_co_io_em_complete, &co);
+    }
+
+    trace_bdrv_co_io_em(bs, sector_num, nb_sectors, is_write, acb);
+    if (!acb) {
+        return -EIO;
+    }
+    qemu_coroutine_yield();
+
+    return co.ret;
+}
+
+is it a bug, or may be I don't understand something?
+
+the problem is taking place only when call bdrv_read frome separate thread.
+
+On Fri, Aug 29, 2014 at 11:16:16AM -0000, senya wrote:
+> the problem is taking place only when call bdrv_read frome separate
+> thread.
+
+You probably shouldn't be using threads.
+
+Can you explain what you are trying to do?
+
+Stefan
+
+
+I'm trying to reanimate github.com/jagane/qemu-kvm-livebackup
+there is a separate thread which connects with client through socket and sends disk blocks to it.
+
+It seems like I only need to put all my bdrv_read's into one co-routine and start it
+
+On Mon, Sep 01, 2014 at 07:55:22AM -0000, senya wrote:
+> I'm trying to reanimate github.com/jagane/qemu-kvm-livebackup
+> there is a separate thread which connects with client through socket and sends disk blocks to it.
+
+Regarding your original question about threads: it is possible to do
+block I/O from threads but there are rules about how to do that safely.
+The natural way to do things in QEMU is not with threads, this was
+always an issue with Jagane's patches (I guess he didn't want to spend
+time integrating it into QEMU's main loop when prototyping the code but
+it's not a good long-term solution).
+
+More about livebackup:
+
+There has been more recent work by Fam Zheng to achieve the same thing.
+The advantage of Fam's approach is that it reuses existing QEMU
+primitives instead of adding special case livebackup code.
+
+Fam has moved on to other work but his latest patches are from May so
+picking them up again shouldn't be that hard.
+
+It consists of two things: image fleecing and dirty bitmap commands.
+
+Image fleecing gives cheap access to a point-in-time snapshot of the
+disk (over NBD).  Internally it uses the run-time NBD server and the
+block-backup command to export a point-in-time snapshot.
+
+The dirty bitmap provides what Jagane did but the plan is to also
+persist bitmaps across QEMU shutdown.  This will make incremental
+backups easy.
+
+Please see Part IV of the "Block layer status report" presentation for
+an overview:
+http://www.linux-kvm.org/wiki/images/4/41/Kvm-forum-2013-block-layer-status-report.pdf
+
+Here are Fam's patch series:
+https://lists.gnu.org/archive/html/qemu-devel/2014-05/msg03880.html
+https://lists.gnu.org/archive/html/qemu-devel/2014-03/msg05250.html
+
+The first step is getting the image fleecing code merged.  Then the
+in-memory dirty bitmap can be merged.  Finally, persistent dirty bitmap
+support can be written.
+
+Stefan
+
+
+Thanks.. I know about Fam's patch, but I need reverse delta backups, and Jagane's work is more appropriate then qemu snapshot approach.
+
+On Mon, Sep 08, 2014 at 08:01:18AM -0000, senya wrote:
+> Thanks.. I know about Fam's patch, but I need reverse delta backups, and
+> Jagane's work is more appropriate then qemu snapshot approach.
+
+Jagane's approach needs a lot of work to make it mergable, that's why I
+suggested Fam's work.
+
+Stefan
+
+
+Closing this ticket now, since it's not about upstream QEMU code.
+

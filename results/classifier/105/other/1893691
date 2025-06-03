@@ -1,0 +1,144 @@
+other: 0.986
+mistranslation: 0.983
+instruction: 0.981
+semantic: 0.981
+assembly: 0.981
+vnc: 0.979
+socket: 0.979
+graphic: 0.979
+network: 0.978
+KVM: 0.977
+device: 0.977
+boot: 0.976
+
+Chardev logfile is not written (regression between 5.0 and 5.1)
+
+After update from version 5.0 to 5.1, logfile stopped being populated with console output. The file is being created, but remains empty.
+
+Relevant command line options:
+
+-mon chardev=char0
+-serial chardev:char0
+-chardev socket,host=127.0.0.10,port=2323,server,nowait,telnet,mux=on,id=char0,logfile=/home/jurkiew/.machiner/runs/2020-08-31T21:46:55-0/internal/log
+
+
+Full command line:
+
+qemu-system-x86_64
+-nodefaults
+-no-user-config
+-snapshot
+-enable-kvm
+-cpu
+host
+-nographic
+-echr
+17
+-mon
+chardev=char0
+-serial
+chardev:char0
+-rtc
+clock=vm
+-object
+rng-random,filename=/dev/urandom,id=rng0
+-device
+virtio-rng-pci,rng=rng0,max-bytes=512,period=1000
+-name
+2020-08-31T21:46:55-0,debug-threads=on
+-smp
+sockets=1,cores=9,threads=2
+-m
+251G
+-overcommit
+cpu-pm=on
+-pidfile
+/home/jurkiew/.machiner/runs/2020-08-31T21:46:55-0/internal/pid
+-net
+nic,model=virtio
+-net
+user,hostfwd=tcp:127.0.0.10:2222-:22,hostfwd=tcp:127.0.0.10:8000-:8000,hostfwd=tcp:127.0.0.10:9000-:9000
+-fsdev
+local,id=machiner_internal_dir,security_model=none,path=/home/jurkiew/.machiner/runs/2020-08-31T21:46:55-0/internal
+-device
+virtio-9p-pci,fsdev=machiner_internal_dir,mount_tag=machiner_internal_dir
+-fsdev
+local,id=machiner_lower_dir,security_model=none,readonly,path=.
+-device
+virtio-9p-pci,fsdev=machiner_lower_dir,mount_tag=machiner_lower_dir
+-fsdev
+local,id=machiner_upper_dir,security_model=mapped-xattr,fmode=0777,dmode=0777,path=/home/jurkiew/.machiner/runs/2020-08-31T21:46:55-0
+-device
+virtio-9p-pci,fsdev=machiner_upper_dir,mount_tag=machiner_upper_dir
+-device
+virtio-scsi
+-drive
+if=none,file=/home/jurkiew/.machiner/images/famtar/image.qcow2,discard=on,id=famtar
+-device
+scsi-hd,drive=famtar
+-chardev
+socket,host=127.0.0.10,port=2323,server,nowait,telnet,mux=on,id=char0,logfile=/home/jurkiew/.machiner/runs/2020-08-31T21:46:55-0/internal/log
+
+(Subscribing Dan Berrange as char person).
+
+Is there any chance you could bisect to see the exact change?
+
+This regression is specific to the "socket" chardev and was caused by this commit:
+
+commit 271094474b65de1ad7aaf729938de3d9b9d0d36f (refs/bisect/bad)
+Author: Dima Stepanov <email address hidden>
+Date:   Thu May 28 12:11:18 2020 +0300
+
+    char-socket: return -1 in case of disconnect during tcp_chr_write
+    
+    During testing of the vhost-user-blk reconnect functionality the qemu
+    SIGSEGV was triggered:
+     start qemu as:
+     x86_64-softmmu/qemu-system-x86_64 -m 1024M -M q35 \
+       -object memory-backend-file,id=ram-node0,size=1024M,mem-path=/dev/shm/qemu,share=on \
+       -numa node,cpus=0,memdev=ram-node0 \
+       -chardev socket,id=chardev0,path=./vhost.sock,noserver,reconnect=1 \
+       -device vhost-user-blk-pci,chardev=chardev0,num-queues=4 --enable-kvm
+     start vhost-user-blk daemon:
+     ./vhost-user-blk -s ./vhost.sock -b test-img.raw
+    
+    If vhost-user-blk will be killed during the vhost initialization
+    process, for instance after getting VHOST_SET_VRING_CALL command, then
+    QEMU will fail with the following backtrace:
+    
+    Thread 1 "qemu-system-x86" received signal SIGSEGV, Segmentation fault.
+    0x00005555559272bb in vhost_user_read (dev=0x7fffef2d53e0, msg=0x7fffffffd5b0)
+        at ./hw/virtio/vhost-user.c:260
+    260         CharBackend *chr = u->user->chr;
+    
+     #0  0x00005555559272bb in vhost_user_read (dev=0x7fffef2d53e0, msg=0x7fffffffd5b0)
+        at ./hw/virtio/vhost-user.c:260
+     #1  0x000055555592acb8 in vhost_user_get_config (dev=0x7fffef2d53e0, config=0x7fffef2d5394 "", config_len=60)
+        at ./hw/virtio/vhost-user.c:1645
+     #2  0x0000555555925525 in vhost_dev_get_config (hdev=0x7fffef2d53e0, config=0x7fffef2d5394 "", config_len=60)
+        at ./hw/virtio/vhost.c:1490
+     #3  0x00005555558cc46b in vhost_user_blk_device_realize (dev=0x7fffef2d51a0, errp=0x7fffffffd8f0)
+        at ./hw/block/vhost-user-blk.c:429
+     #4  0x0000555555920090 in virtio_device_realize (dev=0x7fffef2d51a0, errp=0x7fffffffd948)
+        at ./hw/virtio/virtio.c:3615
+     #5  0x0000555555a9779c in device_set_realized (obj=0x7fffef2d51a0, value=true, errp=0x7fffffffdb88)
+        at ./hw/core/qdev.c:891
+     ...
+    
+    The problem is that vhost_user_write doesn't get an error after
+    disconnect and try to call vhost_user_read(). The tcp_chr_write()
+    routine should return -1 in case of disconnect. Indicate the EIO error
+    if this routine is called in the disconnected state.
+    
+    Signed-off-by: Dima Stepanov <email address hidden>
+    Reviewed-by: Marc-André Lureau <email address hidden>
+    Message-Id: <email address hidden>
+    Reviewed-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Michael S. Tsirkin <email address hidden>
+
+
+
+https://lists.gnu.org/archive/html/qemu-devel/2020-09/msg04809.html
+
+Released with QEMU v5.2.0.
+

@@ -1,0 +1,158 @@
+assembly: 0.992
+instruction: 0.992
+other: 0.990
+socket: 0.990
+device: 0.989
+boot: 0.987
+graphic: 0.986
+semantic: 0.985
+vnc: 0.985
+KVM: 0.973
+mistranslation: 0.971
+network: 0.971
+
+Gdb hangs when trying to single-step after an invalid instruction
+
+When using Gdb to remote-debug a program and manually setting its PC to point to an address containing an invalid instruction, then doing a single step Qemu will never return control to the remote Gdb.
+
+For instance, let's say address 0x114 contains an invalid instruction. On the remote Gdb, we'd do:
+
+(gdb) set $pc = 0x114
+(gdb) stepi
+
+After doing that we won't get the (gdb) prompt unless we do a Ctrl-C. If we do so we'll be left at 0x114 instead of going towards the exception handler as we should. This happens with stepi, step and next. If instead of single-stepping we used continue, the program will proceed into the exception handler as it should.
+
+The reason this is happening is that when Qemu realizes it's about to translate an instruction it doesn't recognize it'll generate a call to helper_exception_with_syndrome(), which will register the exception and then call cpu_loop_exit(). At the same time, because we're doing a single-step, Qemu will also generate a call to helper_exception_internal() passing it an EXCP_DEBUG, which lets the system know it'll give control back to the remote debugger, and it also ends with a call to cpu_loop_exit(). However, because the syndrome exception calls cpu_loop_exit() first, the call to the internal exception won't be reached and Qemu will be stuck in a loop without returning control to the remote debugger.
+
+What makes this a bit tricky to fix is that we must call cpu_loop_exit() at the end of helper_exception_with_syndrome(), otherwise the target exception will go undetected and its handler won't be excecuted.
+
+Tested on latest head by emulating a Stellaris lm3s6965 board and running RTEMS 4.11:
+
+$ qemu-system-arm -nographic -s -S -M lm3s6965evb -kernel my_rtems_app
+
+Commit hash in qemu.git: 30eaca3acdf17d7bcbd1213eb149c02037edfb0b
+
+On 2 September 2014 17:38, martin <email address hidden> wrote:
+> Public bug reported:
+>
+> When using Gdb to remote-debug a program and manually setting its PC to
+> point to an address containing an invalid instruction and then doing a
+> single step, Qemu will never return control to the remote Gdb.
+>
+> For instance, let's say address 0x114 contains an invalid instruction.
+> On the remote Gdb, we'd do:
+>
+> (gdb) set $pc = 0x114
+> (gdb) stepi
+>
+> After doing that we won't get the (gdb) prompt unless we do a Ctrl-C. If
+> we do so we'll be left at 0x114 instead of going towards the exception
+> handler as we should. This happens with stepi, step and next. If instead
+> of single-stepping we used continue, the program will proceed into the
+> exception handler as it should.
+>
+> The reason this is happening is that when Qemu realizes it's about to
+> translate an instruction it doesn't recognize it'll generate a call to
+> helper_exception_with_syndrome(), which will register the exception and
+> then call cpu_loop_exit(). At the same time, because we're doing a
+> single-step, Qemu will also generate a call to
+> helper_exception_internal() passing it an EXCP_DEBUG, which lets the
+> system know it'll give control back to the remote debugger, and it also
+> ends with a call to cpu_loop_exit(). However, because the syndrome
+> exception calls cpu_loop_exit() first, the call to the internal
+> exception won't be reached and Qemu will be stuck in a loop without
+> returning control to the remote debugger.
+
+Just to check, does your system image include a valid handler
+for the undef exception? I'm wondering if we really never return
+control in all cases, or only if we get stuck in an infinite loop
+of exceptions beacuse the exception handler's first instruction
+causes an exception which causes an exception which...
+
+> What makes this a bit tricky to fix is that we must call cpu_loop_exit()
+> at the end of helper_exception_with_syndrome(), otherwise the target
+> exception will go undetected and its handler won't be excecuted.
+
+I suspect there are actually more general issues with the interaction
+of single-stepping with exceptions. See also
+https://bugs.launchpad.net/qemu/+bug/757702 which is a report
+that singlestepping an invalid instruction stops on the insn after
+the first one in the UNDEF handler rather than before it.
+
+thanks
+-- PMM
+
+
+>> Public bug reported:
+>>
+>> When using Gdb to remote-debug a program and manually setting its PC to
+>> point to an address containing an invalid instruction and then doing a
+>> single step, Qemu will never return control to the remote Gdb.
+>>
+>> For instance, let's say address 0x114 contains an invalid instruction.
+>> On the remote Gdb, we'd do:
+>>
+>> (gdb) set $pc = 0x114
+>> (gdb) stepi
+>>
+>> After doing that we won't get the (gdb) prompt unless we do a Ctrl-C. If
+>> we do so we'll be left at 0x114 instead of going towards the exception
+>> handler as we should. This happens with stepi, step and next. If instead
+>> of single-stepping we used continue, the program will proceed into the
+>> exception handler as it should.
+>>
+>> The reason this is happening is that when Qemu realizes it's about to
+>> translate an instruction it doesn't recognize it'll generate a call to
+>> helper_exception_with_syndrome(), which will register the exception and
+>> then call cpu_loop_exit(). At the same time, because we're doing a
+>> single-step, Qemu will also generate a call to
+>> helper_exception_internal() passing it an EXCP_DEBUG, which lets the
+>> system know it'll give control back to the remote debugger, and it also
+>> ends with a call to cpu_loop_exit(). However, because the syndrome
+>> exception calls cpu_loop_exit() first, the call to the internal
+>> exception won't be reached and Qemu will be stuck in a loop without
+>> returning control to the remote debugger.
+>
+> Just to check, does your system image include a valid handler
+> for the undef exception?
+
+Yes, it does. RTEMS sets a default handler for every exception, and just to be sure I added a bunch of small wrappers so I'll be able to know what kind of exception are we dealing with.
+
+Notice there are actually two sides to this problem: not only the internal exception instruction isn't being processed, but also when we go back to the cpu_exec loop the syndrome exception won't have any actual effect since we won't compute the new PC we need in order to jump to the exception handler. This happens because of this (at cpu-exec.c:437):
+
+if (unlikely(cpu->singlestep_enabled & SSTEP_NOIRQ)) {
+    /* Mask out external interrupts for this step. */
+    interrupt_request &= ~CPU_INTERRUPT_SSTEP_MASK;
+ }
+
+Because of that, the interrupt request corresponding to our exception will be ignored and we won't call do_interrupt() as we go on within the loop. Thus, the PC will remain the same as before because of the very fact we're single stepping.
+
+I've found a (very ugly) workaround to this bug by commenting out that line and taking advantage of the fact that env->exception.syndrome isn't cleansed so that when we try to excecute the syndrome exception instruction for the 2nd time it'll notice the syndrome value is the same as before, zero it and procedd without calling cpu_loop_exit().
+
+Right now my question is: do we *really* have to mask out external interrupts when single-stepping? Even if I found a better way to get the internal exception to excecute, I'd still have to get past that check in order to get the correct PC value.
+
+Just wanted to add: after doing some testing, it seems that if we simply don't mask out external interrupts when single-stepping we don't even need to do the syndrome value check. As the interrupt corresponding to the syndrome exception won't be masked, it'll correctly compute the new PC in do_interrupt() and when we proceed through the cpu_exec() loop we'll be generating a new translation block which will also have a call to the internal exception, as we're still in single-step mode.
+
+The end result is that single-stepping an invalid instruction will lead us to the first instruction of our interrupt handler (at least on ARMv7M, whose vector table only has the addresses of the handlers instead of branch instructions - perhaps on other CPUs it'll be a bit different).
+
+Looking through old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+I honestly don't know, since it's been so long. I'm guessing that if
+the code hasn't been touched the issue is still there. In any case, I
+don't think this should be closed without you (or anyone, really)
+trying to reproduce it again. I posted a detailed explanation of why
+the bug happens, so you can even just do some code inspection.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+This shouldn't be "Expired", since the bug is likely still there.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/105
+
+

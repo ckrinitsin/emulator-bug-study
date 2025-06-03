@@ -1,0 +1,59 @@
+KVM: 0.931
+graphic: 0.916
+instruction: 0.916
+other: 0.894
+semantic: 0.848
+assembly: 0.769
+socket: 0.761
+vnc: 0.739
+device: 0.711
+network: 0.688
+mistranslation: 0.657
+boot: 0.520
+
+repeated KVM single step crashes leaks into SMP guest and crashes guest application
+
+Guest: Windows 7 x64
+Host: Ubuntu 18.04.4 (kernel 5.3.0-40-generic)
+QEMU: master 6c599282f8ab382fe59f03a6cae755b89561a7b3
+
+If I try to use GDB to repeatedly single-step a userspace process while running a KVM guest, the userspace process will eventually crash with a 0x80000004 exception (single step). This is easily reproducible on a Windows guest, I've not tried another guest type but I've been told it's the same there also.
+
+On a Ubuntu 16 host with an older kernel, this will hang the entire machine. However, it seems it may have been fixed by https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=5cc244a20b86090c087073c124284381cdf47234 ?
+
+It's not clear to me whether this is a KVM or a QEMU bug. A TCG guest does not crash the userspace process in the same way, but it does hang the VM.
+
+I've tried a variety of QEMU versions (3.0, 4.2, master) and they all exhibit the same behavior. I'm happy to dig into this more if someone can point me in the right direction.
+
+Here's the outline for reproducing the bug:
+
+* Compile iloop.cpp (attached) as a 32-bit application using MSVC
+* Start Windows 7 x64 guest under GDB
+  * Pass '-enable-kvm -smp 4,cores=2 -gdb tcp::4567' to QEMU along with other typical options
+
+(need to get CR3 to ensure we're in the right application context -- if there's an easier way to do this I'd love to hear it!)
+* Install WinDBG on guest
+* Copy SysInternals LiveKD to guest
+* Start iloop.exe in guest, note loop address
+* Run LiveKD from administrative prompt
+  * livekd64.exe -w
+* In WinDBG:
+  * !process 0 0
+  * Search for iloop.exe, note DirBase (this is CR3)
+
+In GDB:
+* Execute 'target remote tcp::4567'
+* Execute 'c'
+* Hit CTRL-C to pause the VM
+* Execute 'p/x $cr3'
+  .. continue if not equal to DirBase in WinDBG, keep stopping until it is equal
+* Once $cr3 is correct value, if you 'stepi' a few times you'll note the process going in a loop, it should keep hitting the address echoed to the console by iloop.exe
+
+Crash the process from GDB:
+* Execute 'stepi 100000000'
+* Watch the process, eventually it'll die with an 0x80000004 error
+
+
+
+Some experimentation with newer kernels indicate that this is most likely a KVM bug.
+

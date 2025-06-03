@@ -1,0 +1,82 @@
+other: 0.652
+semantic: 0.642
+instruction: 0.638
+mistranslation: 0.552
+vnc: 0.521
+graphic: 0.492
+device: 0.472
+network: 0.449
+socket: 0.377
+boot: 0.352
+assembly: 0.260
+KVM: 0.161
+
+qemu-arm for cortex-m33 aborts with unhandled CPU exception 0x8
+
+Hi,
+
+While experimenting with running the GCC testsuite with cortex-m33 as target (to exercise v8-m code), I came across this failure:
+qemu: unhandled CPU exception 0x8 - aborting
+R00=fffeaf58 R01=fffeaf58 R02=00000000 R03=fffeaf5d
+R04=fffeaf5c R05=fffeaf9c R06=00000000 R07=fffeaf80
+R08=00000000 R09=00000000 R10=00019dbc R11=00000000
+R12=000000f0 R13=fffeaf58 R14=000081f3 R15=fffeaf5c
+XPSR=61000000 -ZC- T NS priv-thread
+qemu:handle_cpu_signal received signal outside vCPU context @ pc=0x6033c908
+
+I'm using arm-eabi-gcc, so it targets bare-metal, not linux.
+
+The testcase is GCC's gcc/testsuite/gcc.c-torture/execute/20000822-1.c; it works when compiled at -O2, but crashes when compiled at -Os. The test uses nested functions, so it creates a trampoline on the stack, whose address may be a problem. But since the stack address seems to be in the same range in the O2 and Os cases, it's not that clear.
+
+I'm attaching the C source, asm, binary executables and qemu traces with in_asm,cpu.
+
+I execute the binaries with:
+qemu-arm --cpu cortex-m33  ./20000822-1.exe.Os
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+This happens because we're applying a loose test for the v8m magic
+exception return address.
+
+There are two possible fixes for this, and perhaps we should
+apply both of them:
+
+(1) Unset ARM_FEATURE_M_SECURITY for arm-linux-user.
+    This would disable the FNC_RETURN_MIN_MAGIC test,
+    which, unlike EXC_RETURN_MIN_MAGIC, is not protected
+    by a condition that linux-user cannot satisfy (Handler mode).
+
+(2) Limit the address space to 0x7ffffff, the normal end of
+    write-back cached ram.  Since M-profile doesn't have an MMU,
+    this would make linux-user addresses more like what we'd see
+    running the same test under system mode.
+
+The test for v8m magic return addresses is not too loose -- see the v8M pseudocode IsReturn(). Architecturally the whole range of these values is special, even though in fact the exception return address encoding currently doesn't use all the bits that are reserved in this manner.
+
+I would prefer not to unset ARM_FEATURE_M_SECURITY if we can avoid it.
+
+We should definitely not allow guest code to be loaded at weird addresses in linux-user mode, I agree.
+
+
+Just posted 
+https://<email address hidden>/
+
+which is basically RTH's hack from #8 with a big pile of commentary and commit message...
+
+Thanks Peter and Richard for the quick patch. It works for me.
+
+Fixed in master as commit 5e5584c89f36b, will be in the 4.2 release.
+
+

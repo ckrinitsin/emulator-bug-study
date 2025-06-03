@@ -1,0 +1,490 @@
+semantic: 0.930
+assembly: 0.917
+device: 0.915
+instruction: 0.906
+boot: 0.897
+other: 0.893
+vnc: 0.864
+mistranslation: 0.852
+socket: 0.851
+graphic: 0.843
+KVM: 0.838
+network: 0.797
+
+Interacting with NetBSD serial console boot blocks no longer works
+
+The NetBSD boot blocks display a menu allowing the user to make a
+selection using the keyboard.  For example, when booting a NetBSD
+installation CD-ROM, the menu looks like this:
+
+         1. Install NetBSD
+         2. Install NetBSD (no ACPI)
+         3. Install NetBSD (no ACPI, no SMP)
+         4. Drop to boot prompt
+
+    Choose an option; RETURN for default; SPACE to stop countdown.
+    Option 1 will be chosen in 30 seconds.
+
+When booting NetBSD in a recent qemu using an emulated serial console,
+making this menu selection no longer works: when you type the selected
+number, the keyboard input is ignored, and the 30-second countdown
+continues.  In older versions of qemu, it works.
+
+To reproduce the problem, run:
+
+   wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-7.1.1/amd64/installation/cdrom/boot-com.iso
+   qemu-system-x86_64 -nographic -cdrom boot-com.iso
+
+During the 30-second countdown, press 4
+
+Expected behavior: The countdown stops and you get a ">" prompt
+
+Incorrect behavior: The countdown continues
+
+There may also be some corruption of the terminal output; for example,
+"Option 1 will be chosen in 30 seconds" may be displayed as "Option 1
+will be chosen in p0 seconds".
+
+Using bisection, I have determined that the problem appeared with qemu
+commit 083fab0290f2c40d3d04f7f22eed9c8f2d5b6787, in which seabios was
+updated to 1.11 prerelease, and the problem is still there as of
+commit 7398166ddf7c6dbbc9cae6ac69bb2feda14b40ac.  The host operating
+system used for the tests was Debian 9 x86_64.
+
+Credit for discovering this bug goes to Paul Goyette.
+
+Reverting to Seabios 1.10 (version rel-1.10.3.0-gb76661dd) fixes this problem. 
+
+Steps:
+
+$ cd && mkdir seabios-test && cd seabios-test
+$ git clone -b 1.10-stable https://github.com/coreboot/seabios.git
+$ cd seabios
+$ make
+$ qemu-system-x86_64 \
+-drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+-M q35,accel=kvm -m 350M -cpu host -smp $(nproc) \
+-nic user,model=virtio-net-pci,ipv6=off \
+-nographic -bios /home/oc/seabios-test/seabios/out/bios.bin
+
+Result: 
+I can interact with NetBSD boot menu and select one of the available options.
+
+Host:
+Linux e130 4.9.0-11-amd64 #1 SMP Debian 4.9.189-3+deb9u1 (2019-09-20) x86_64 GNU/Linux
+
+QEMU emulator version 4.2.0
+
+
+
+Possibly related thread:
+"Do we need a cpu with TSC support to run SeaBIOS?"
+https://<email address hidden>/msg11726.html
+
+Workaround: add "-vga none" to the qemu command line.
+
+@kraxel-redhat,
+
+I guess "-vga none" is implicit when using -nographic? 
+
+However, for the sake of trying, I've added "-vga none" and it won't solve it for me (when using default bios).
+
+Gerd Hommann wrote:
+> Workaround: add "-vga none" to the qemu command line.
+
+This supposed workaround does not work for me.
+
+
+@kraxel-redhat: This issue bisects to commit d6728f301d7e6e31ba0ee2fa51ed4a24feab8860 ("add serial console support").  seabios.git/master + "[PATCH] sercon: vbe modeset is int 10h function 4f02 not 4f00" still has the issue.
+
+I'm using the following command-line:
+
+  qemu-system-x86_64 -M accel=kvm -m 1G -cpu host -cdrom ~/Downloads/boot-com.iso -nographic
+
+Ah, it's a special serial console boot iso.  I was trying the normal NetBSD-<version>-amd64.iso.
+
+So, it seems seabios sercon and bootloader are fighting over the serial line.
+
+seabios enables sercon for no-graphical guests ("-machine graphics=off", "-nographics" enables this too).
+
+So one option is to turn off seabios sercon: "qemu -nographic -machine graphics=on".
+
+The other option is to turn on seabios sercon and use the normal boot.iso (this needs the "-vga none" workaround from comment 3, or the sercon patch).
+
+On Fri, 6 Mar 2020 at 13:24, Gerd Hoffmann <email address hidden> wrote:
+> So one option is to turn off seabios sercon: "qemu -nographic -machine
+> graphics=on".
+
+This works for me, but only if I turn off "q35", therefore changing
+from a sata disk to a plain ide:
+
+qemu-system-x86_64 \
+-drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+-drive if=virtio,file=/home/oc/VM/img/newdisk2.img,index=1,media=disk \
+-m 300M -cpu host -smp $(nproc) \
+-nic user,hostfwd=tcp::6665-:22,model=virtio-net-pci,ipv6=off \
+-nographic -machine accel=kvm,graphics=on
+
+
+Just to clarify my last comment, and in absence of updates, if I launch the VM as:
+
+qemu-system-x86_64 \
+-drive if=virtio,file=/home/oc/VM/img/openbsd.image,index=0,media=disk \
+-drive if=virtio,file=/home/oc/VM/img/openbsd.image.old,index=1,media=disk \
+-M q35,accel=kvm,graphics=on -m 250M -cpu host -smp $(nproc) \
+-nic user,hostfwd=tcp::6666-:22,model=virtio-net-pci -nographic
+
+(note the -M q35,accel=kvm,graphics=on), the problem still persists.
+
+I'm still on version 4.2 and I haven't updated to 5.0 yet.
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+This bug was fixed long ago, so long ago that I have no idea when!
+
+Please close wiwth an appropriate status.
+
+
+On Thu, 22 Apr 2021, Thomas Huth wrote:
+
+> The QEMU project is currently considering to move its bug tracking to
+> another system. For this we need to know which bugs are still valid
+> and which could be closed already. Thus we are setting older bugs to
+> "Incomplete" now.
+>
+> If you still think this bug report here is valid, then please switch
+> the state back to "New" within the next 60 days, otherwise this report
+> will be marked as "Expired". Or please mark it as "Fix Released" if
+> the problem has been solved with a newer version of QEMU already.
+>
+> Thank you and sorry for the inconvenience.
+>
+> ** Changed in: qemu
+>       Status: New => Incomplete
+>
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1743191
+>
+> Title:
+>  Interacting with NetBSD serial console boot blocks no longer works
+>
+> Status in QEMU:
+>  Incomplete
+>
+> Bug description:
+>  The NetBSD boot blocks display a menu allowing the user to make a
+>  selection using the keyboard.  For example, when booting a NetBSD
+>  installation CD-ROM, the menu looks like this:
+>
+>           1. Install NetBSD
+>           2. Install NetBSD (no ACPI)
+>           3. Install NetBSD (no ACPI, no SMP)
+>           4. Drop to boot prompt
+>
+>      Choose an option; RETURN for default; SPACE to stop countdown.
+>      Option 1 will be chosen in 30 seconds.
+>
+>  When booting NetBSD in a recent qemu using an emulated serial console,
+>  making this menu selection no longer works: when you type the selected
+>  number, the keyboard input is ignored, and the 30-second countdown
+>  continues.  In older versions of qemu, it works.
+>
+>  To reproduce the problem, run:
+>
+>     wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-7.1.1/amd64/installation/cdrom/boot-com.iso
+>     qemu-system-x86_64 -nographic -cdrom boot-com.iso
+>
+>  During the 30-second countdown, press 4
+>
+>  Expected behavior: The countdown stops and you get a ">" prompt
+>
+>  Incorrect behavior: The countdown continues
+>
+>  There may also be some corruption of the terminal output; for example,
+>  "Option 1 will be chosen in 30 seconds" may be displayed as "Option 1
+>  will be chosen in p0 seconds".
+>
+>  Using bisection, I have determined that the problem appeared with qemu
+>  commit 083fab0290f2c40d3d04f7f22eed9c8f2d5b6787, in which seabios was
+>  updated to 1.11 prerelease, and the problem is still there as of
+>  commit 7398166ddf7c6dbbc9cae6ac69bb2feda14b40ac.  The host operating
+>  system used for the tests was Debian 9 x86_64.
+>
+>  Credit for discovering this bug goes to Paul Goyette.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1743191/+subscriptions
+>
+> !DSPAM:60811a8265601949211437!
+>
+>
+
++--------------------+--------------------------+-----------------------+
+| Paul Goyette       | PGP Key fingerprint:     | E-mail addresses:     |
+| (Retired)          | FA29 0E3B 35AF E8AE 6651 | <email address hidden>     |
+| Software Developer | 0786 F758 55DE 53BA 7731 | <email address hidden>   |
++--------------------+--------------------------+-----------------------+
+
+
+Paul Goyette wrote:
+> This bug was fixed long ago, so long ago that I have no idea when!
+
+No, it is not fixed, and I did actually check before I switched the
+bug state back to "new".
+
+Perhaps you are specifying "-machine graphics=on" as suggested in one
+of the comments?  If so, that's a work-around, and an ugly and
+nonintuitive one at that, not a fix.
+-- 
+Andreas Gustafsson, <email address hidden>
+
+
+On Thu, 22 Apr 2021 at 13:46, Andreas Gustafsson
+<email address hidden> wrote:
+>
+> Paul Goyette wrote:
+> > This bug was fixed long ago, so long ago that I have no idea when!
+>
+> No, it is not fixed, and I did actually check before I switched the
+> bug state back to "new".
+>
+> Perhaps you are specifying "-machine graphics=on" as suggested in one
+> of the comments?  If so, that's a work-around, and an ugly and
+> nonintuitive one at that, not a fix.
+> --
+> Andreas Gustafsson, <email address hidden>
+
+I am currently using:
+
+$ qemu-system-x86_64 --version
+QEMU emulator version 5.2.0
+
+And I have no problem selecting from menu in serial console, so I
+assume this is fixed for me. This is my command line:
+
+$ cat opt/bin/boot-netbsd-virtio
+#!/bin/sh
+qemu-system-x86_64 \
+-drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+-drive if=virtio,file=/home/oc/VM/img/netbsd.image.old,index=1,media=disk \
+-M q35,accel=kvm -m 250M -cpu host -smp $(nproc) \
+-nic user,hostfwd=tcp:127.0.0.1:5555-:22,model=virtio-net-pci,ipv6=off  \
+-daemonize -display none  -vga none \
+-serial mon:telnet:127.0.0.1:6665,server,nowait \
+-pidfile /home/oc/VM/pid/netbsd-pid -nodefaults
+
+telnet 127.0.0.1 6665
+
+
+
+-- 
+Ottavio Caruso
+
+
+On Thu, 22 Apr 2021, Ottavio Caruso wrote:
+
+> On Thu, 22 Apr 2021 at 13:46, Andreas Gustafsson
+> <email address hidden> wrote:
+>>
+>> Paul Goyette wrote:
+>>> This bug was fixed long ago, so long ago that I have no idea when!
+>>
+>> No, it is not fixed, and I did actually check before I switched the
+>> bug state back to "new".
+>>
+>> Perhaps you are specifying "-machine graphics=on" as suggested in one
+>> of the comments?  If so, that's a work-around, and an ugly and
+>> nonintuitive one at that, not a fix.
+
+Andreas is correct - I am using the suggested work-around, and the
+original bug is NOT fixed.
+
+I believe Andreas has moved the bug back to New status to reflect
+that it is not fixed.  (Whether or not it is fixed, _I_ should not
+have asked to have _his_ bug closed.  It's been so long, I almost
+believed it was my bug. :)  My apologies to Andreas and everyone
+else.)
+
+
+>> --
+>> Andreas Gustafsson, <email address hidden>
+>
+> I am currently using:
+>
+> $ qemu-system-x86_64 --version
+> QEMU emulator version 5.2.0
+>
+> And I have no problem selecting from menu in serial console, so I
+> assume this is fixed for me. This is my command line:
+>
+> $ cat opt/bin/boot-netbsd-virtio
+> #!/bin/sh
+> qemu-system-x86_64 \
+> -drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+> -drive if=virtio,file=/home/oc/VM/img/netbsd.image.old,index=1,media=disk \
+> -M q35,accel=kvm -m 250M -cpu host -smp $(nproc) \
+> -nic user,hostfwd=tcp:127.0.0.1:5555-:22,model=virtio-net-pci,ipv6=off  \
+> -daemonize -display none  -vga none \
+> -serial mon:telnet:127.0.0.1:6665,server,nowait \
+> -pidfile /home/oc/VM/pid/netbsd-pid -nodefaults
+>
+> telnet 127.0.0.1 6665
+>
+>
+> -- 
+> Ottavio Caruso
+>
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1743191
+>
+> Title:
+>  Interacting with NetBSD serial console boot blocks no longer works
+>
+> Status in QEMU:
+>  New
+>
+> Bug description:
+>  The NetBSD boot blocks display a menu allowing the user to make a
+>  selection using the keyboard.  For example, when booting a NetBSD
+>  installation CD-ROM, the menu looks like this:
+>
+>           1. Install NetBSD
+>           2. Install NetBSD (no ACPI)
+>           3. Install NetBSD (no ACPI, no SMP)
+>           4. Drop to boot prompt
+>
+>      Choose an option; RETURN for default; SPACE to stop countdown.
+>      Option 1 will be chosen in 30 seconds.
+>
+>  When booting NetBSD in a recent qemu using an emulated serial console,
+>  making this menu selection no longer works: when you type the selected
+>  number, the keyboard input is ignored, and the 30-second countdown
+>  continues.  In older versions of qemu, it works.
+>
+>  To reproduce the problem, run:
+>
+>     wget http://ftp.netbsd.org/pub/NetBSD/NetBSD-7.1.1/amd64/installation/cdrom/boot-com.iso
+>     qemu-system-x86_64 -nographic -cdrom boot-com.iso
+>
+>  During the 30-second countdown, press 4
+>
+>  Expected behavior: The countdown stops and you get a ">" prompt
+>
+>  Incorrect behavior: The countdown continues
+>
+>  There may also be some corruption of the terminal output; for example,
+>  "Option 1 will be chosen in 30 seconds" may be displayed as "Option 1
+>  will be chosen in p0 seconds".
+>
+>  Using bisection, I have determined that the problem appeared with qemu
+>  commit 083fab0290f2c40d3d04f7f22eed9c8f2d5b6787, in which seabios was
+>  updated to 1.11 prerelease, and the problem is still there as of
+>  commit 7398166ddf7c6dbbc9cae6ac69bb2feda14b40ac.  The host operating
+>  system used for the tests was Debian 9 x86_64.
+>
+>  Credit for discovering this bug goes to Paul Goyette.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1743191/+subscriptions
+>
+> !DSPAM:608193ed146681924717040!
+>
+>
+
++--------------------+--------------------------+-----------------------+
+| Paul Goyette       | PGP Key fingerprint:     | E-mail addresses:     |
+| (Retired)          | FA29 0E3B 35AF E8AE 6651 | <email address hidden>     |
+| Software Developer | 0786 F758 55DE 53BA 7731 | <email address hidden>   |
++--------------------+--------------------------+-----------------------+
+
+
+Ottavio Caruso wrote:
+> I am currently using:
+> 
+> $ qemu-system-x86_64 --version
+> QEMU emulator version 5.2.0
+> 
+> And I have no problem selecting from menu in serial console, so I
+> assume this is fixed for me. This is my command line:
+> 
+> $ cat opt/bin/boot-netbsd-virtio
+> #!/bin/sh
+> qemu-system-x86_64 \
+> -drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+> -drive if=virtio,file=/home/oc/VM/img/netbsd.image.old,index=1,media=disk \
+> -M q35,accel=kvm -m 250M -cpu host -smp $(nproc) \
+> -nic user,hostfwd=tcp:127.0.0.1:5555-:22,model=virtio-net-pci,ipv6=off  \
+> -daemonize -display none  -vga none \
+> -serial mon:telnet:127.0.0.1:6665,server,nowait \
+> -pidfile /home/oc/VM/pid/netbsd-pid -nodefaults
+> 
+> telnet 127.0.0.1 6665
+
+Have you tried the test case in the original bug report?
+-- 
+Andreas Gustafsson, <email address hidden>
+
+
+On Thu, 22 Apr 2021 at 18:23, Andreas Gustafsson
+<email address hidden> wrote:
+>
+> Ottavio Caruso wrote:
+> > I am currently using:
+> >
+> > $ qemu-system-x86_64 --version
+> > QEMU emulator version 5.2.0
+> >
+> > And I have no problem selecting from menu in serial console, so I
+> > assume this is fixed for me. This is my command line:
+> >
+> > $ cat opt/bin/boot-netbsd-virtio
+> > #!/bin/sh
+> > qemu-system-x86_64 \
+> > -drive if=virtio,file=/home/oc/VM/img/netbsd.image,index=0,media=disk \
+> > -drive if=virtio,file=/home/oc/VM/img/netbsd.image.old,index=1,media=disk \
+> > -M q35,accel=kvm -m 250M -cpu host -smp $(nproc) \
+> > -nic user,hostfwd=tcp:127.0.0.1:5555-:22,model=virtio-net-pci,ipv6=off  \
+> > -daemonize -display none  -vga none \
+> > -serial mon:telnet:127.0.0.1:6665,server,nowait \
+> > -pidfile /home/oc/VM/pid/netbsd-pid -nodefaults
+> >
+> > telnet 127.0.0.1 6665
+>
+> Have you tried the test case in the original bug report?
+> --
+> Andreas Gustafsson, <email address hidden>
+
+You're right. Using the boot-com install image, the problem persists.
+
+
+-- 
+Ottavio Caruso
+
+A: Because it messes up the order in which people normally read text.
+Q: Why is top-posting such a bad thing?
+A: Top-posting.
+Q: What is the most annoying thing in e-mail?
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/147
+
+

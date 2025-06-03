@@ -1,0 +1,285 @@
+semantic: 0.989
+assembly: 0.989
+device: 0.989
+boot: 0.988
+KVM: 0.988
+vnc: 0.988
+socket: 0.987
+other: 0.987
+instruction: 0.985
+graphic: 0.984
+mistranslation: 0.984
+network: 0.983
+
+CVE-2020-13253 QEMU: sd: OOB access could crash the guest resulting in DoS
+
+An out-of-bounds read access issue was found in the SD Memory Card emulator of the QEMU. It occurs while performing block write commands via sdhci_write(), if a guest user has sent 'address' which is OOB of 's->wp_groups'. A guest user/process may use this flaw to crash the QEMU process resulting in DoS.
+
+#!/bin/sh
+
+cat << EOF > inp
+outl 0xcf8 0x80001810
+outl 0xcfc 0xe1068000
+outl 0xcf8 0x80001814
+outl 0xcf8 0x80001804
+outw 0xcfc 0x7
+outl 0xcf8 0x8000fa20
+write 0xe106802c 0x1 0x6d
+write 0xe106800f 0x1 0xf7
+write 0xe106800a 0x6 0x9b4b9b5a9b69
+write 0xe1068028 0x3 0x6d6d6d
+write 0xe106800f 0x1 0x02
+write 0xe1068005 0xb 0x055cfbffffff000000ff03
+write 0xe106800c 0x1d 0x050bc6c6c6c6c6c6c6c6762e4c5e0bc603040000000000e10200110000
+write 0xe1068003 0xd 0x2b6de02c3a6de02c496de02c58
+EOF
+ 
+../bin/qemu-system-x86_64 -qtest stdio -enable-kvm -monitor none \
+     -serial none -M pc-q35-5.0 -device sdhci-pci,sd-spec-version=3 \
+     -device sd-card,drive=mydrive -nographic \
+     -drive if=sd,index=0,file=null-co://,format=raw,id=mydrive < inp
+
+This bug and the reproducer above is shared by - Alexander Bulekov <email address hidden>
+
+Upstream patch thread
+  -> https://lists.gnu.org/archive/html/qemu-devel/2020-05/msg05877.html
+
+Patch reducing the exposure to this bug:
+https://lists.gnu.org/archive/html/qemu-devel/2020-06/msg00823.html
+
+Avoid OOB access by verifying the requested address belong to
+the actual card size. Return ADDRESS_ERROR when not in range.
+
+  "SD Specifications Part 1 Physical Layer Simplified Spec. v3.01"
+
+  4.3.4 Data Write
+
+  * Block Write
+
+  Write command is rejected if BLOCK_LEN_ERROR or ADDRESS_ERROR
+  occurred and no data transfer is performed.
+
+Fixes: CVE-2020-13253
+Reported-by: Alexander Bulekov <email address hidden>
+Buglink: https://bugs.launchpad.net/qemu/+bug/1880822
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Cc: Prasad J Pandit <email address hidden>
+---
+ hw/sd/sd.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 3c06a0ac6d..0ced3b5e14 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -1211,6 +1211,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
+             /* Writing in SPI mode not implemented.  */
+             if (sd->spi)
+                 break;
++            if (addr >= sd->size) {
++                sd->card_status |= ADDRESS_ERROR;
++                return sd_r1;
++            }
+             sd->state = sd_receivingdata_state;
+             sd->data_start = addr;
+             sd->data_offset = 0;
+-- 
+2.21.3
+
+
+
+On 6/4/20 8:03 PM, Paolo Bonzini wrote:
+> On 04/06/20 19:34, Philippe Mathieu-Daudé wrote:
+>> Avoid OOB access by verifying the requested address belong to
+>> the actual card size. Return ADDRESS_ERROR when not in range.
+>>
+>>   "SD Specifications Part 1 Physical Layer Simplified Spec. v3.01"
+>>
+>>   4.3.4 Data Write
+>>
+>>   * Block Write
+>>
+>>   Write command is rejected if BLOCK_LEN_ERROR or ADDRESS_ERROR
+>>   occurred and no data transfer is performed.
+>>
+>> Fixes: CVE-2020-13253
+>> Reported-by: Alexander Bulekov <email address hidden>
+>> Buglink: https://bugs.launchpad.net/qemu/+bug/1880822
+>> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+>> ---
+>> Cc: Prasad J Pandit <email address hidden>
+>> ---
+>>  hw/sd/sd.c | 4 ++++
+>>  1 file changed, 4 insertions(+)
+>>
+>> diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+>> index 3c06a0ac6d..0ced3b5e14 100644
+>> --- a/hw/sd/sd.c
+>> +++ b/hw/sd/sd.c
+>> @@ -1211,6 +1211,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
+>>              /* Writing in SPI mode not implemented.  */
+>>              if (sd->spi)
+>>                  break;
+>> +            if (addr >= sd->size) {
+>> +                sd->card_status |= ADDRESS_ERROR;
+>> +                return sd_r1;
+>> +            }
+>>              sd->state = sd_receivingdata_state;
+>>              sd->data_start = addr;
+>>              sd->data_offset = 0;
+>>
+> 
+> I'm not sure if you want me to queue it, but I did.
+
+Hmm I guess I typed "^RPrasad" in my shell to have the last git-publish
+command with his email, and I didn't noticed you were also there...
+
+Anyway looking at it again, this patch is wrong because I should check
+for addr + blksize < sd_size instead. Can you drop it please?
+
+>  Probably we should
+> add <email address hidden> to the hw/sd stanza.
+
+OK will do.
+
+> 
+> Paolo
+> 
+
+
+Avoid OOB access by verifying the requested address belong to
+the actual card size. Return ADDRESS_ERROR when not in range.
+Only move the state machine to ReceivingData if there is no
+pending error.
+
+  "SD Specifications Part 1 Physical Layer Simplified Spec. v3.01"
+
+  4.3.4 Data Write
+
+  * Block Write
+
+  Write command is rejected if BLOCK_LEN_ERROR or ADDRESS_ERROR
+  occurred and no data transfer is performed.
+
+Fixes: CVE-2020-13253
+Reported-by: Alexander Bulekov <email address hidden>
+Buglink: https://bugs.launchpad.net/qemu/+bug/1880822
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Cc: Prasad J Pandit <email address hidden>
+
+v2: check for blksz in range, only go to sd_receivingdata_state
+    if no error.
+---
+ hw/sd/sd.c | 17 +++++++++--------
+ 1 file changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 3c06a0ac6d..2254dc7acc 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -1211,17 +1211,18 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
+             /* Writing in SPI mode not implemented.  */
+             if (sd->spi)
+                 break;
+-            sd->state = sd_receivingdata_state;
+-            sd->data_start = addr;
+-            sd->data_offset = 0;
+-            sd->blk_written = 0;
+-
+-            if (sd->data_start + sd->blk_len > sd->size)
++            if (addr + sd->blk_len >= sd->size) {
+                 sd->card_status |= ADDRESS_ERROR;
+-            if (sd_wp_addr(sd, sd->data_start))
++            } else if (sd_wp_addr(sd, sd->data_start)) {
+                 sd->card_status |= WP_VIOLATION;
+-            if (sd->csd[14] & 0x30)
++            } else if (sd->csd[14] & 0x30) {
+                 sd->card_status |= WP_VIOLATION;
++            } else {
++                sd->state = sd_receivingdata_state;
++                sd->data_start = addr;
++                sd->data_offset = 0;
++                sd->blk_written = 0;
++            }
+             return sd_r1;
+ 
+         default:
+-- 
+2.21.3
+
+
+
+On 6/4/20 8:25 PM, Philippe Mathieu-Daudé wrote:
+> Avoid OOB access by verifying the requested address belong to
+> the actual card size. Return ADDRESS_ERROR when not in range.
+> Only move the state machine to ReceivingData if there is no
+> pending error.
+> 
+>   "SD Specifications Part 1 Physical Layer Simplified Spec. v3.01"
+> 
+>   4.3.4 Data Write
+> 
+>   * Block Write
+> 
+>   Write command is rejected if BLOCK_LEN_ERROR or ADDRESS_ERROR
+>   occurred and no data transfer is performed.
+> 
+> Fixes: CVE-2020-13253
+> Reported-by: Alexander Bulekov <email address hidden>
+> Buglink: https://bugs.launchpad.net/qemu/+bug/1880822
+
+While the reproducer triggers the OOB via CMD24, other commands have the
+same problem, so I'll post a v3.
+
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+> Cc: Prasad J Pandit <email address hidden>
+> 
+> v2: check for blksz in range, only go to sd_receivingdata_state
+>     if no error.
+> ---
+>  hw/sd/sd.c | 17 +++++++++--------
+>  1 file changed, 9 insertions(+), 8 deletions(-)
+> 
+> diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+> index 3c06a0ac6d..2254dc7acc 100644
+> --- a/hw/sd/sd.c
+> +++ b/hw/sd/sd.c
+> @@ -1211,17 +1211,18 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
+>              /* Writing in SPI mode not implemented.  */
+>              if (sd->spi)
+>                  break;
+> -            sd->state = sd_receivingdata_state;
+> -            sd->data_start = addr;
+> -            sd->data_offset = 0;
+> -            sd->blk_written = 0;
+> -
+> -            if (sd->data_start + sd->blk_len > sd->size)
+> +            if (addr + sd->blk_len >= sd->size) {
+>                  sd->card_status |= ADDRESS_ERROR;
+> -            if (sd_wp_addr(sd, sd->data_start))
+> +            } else if (sd_wp_addr(sd, sd->data_start)) {
+>                  sd->card_status |= WP_VIOLATION;
+> -            if (sd->csd[14] & 0x30)
+> +            } else if (sd->csd[14] & 0x30) {
+>                  sd->card_status |= WP_VIOLATION;
+> +            } else {
+> +                sd->state = sd_receivingdata_state;
+> +                sd->data_start = addr;
+> +                sd->data_offset = 0;
+> +                sd->blk_written = 0;
+> +            }
+>              return sd_r1;
+>  
+>          default:
+> 
+
+
+
+v3:
+https://lists.gnu.org/archive/html/qemu-devel/2020-06/msg01316.html
+
+Fixed in commit 790762e5487114341cccc5bffcec4cb3c022c3cd.
+

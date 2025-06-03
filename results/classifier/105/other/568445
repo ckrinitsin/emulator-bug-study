@@ -1,0 +1,143 @@
+other: 0.946
+semantic: 0.944
+instruction: 0.937
+assembly: 0.928
+device: 0.922
+graphic: 0.917
+mistranslation: 0.913
+KVM: 0.912
+vnc: 0.904
+network: 0.904
+boot: 0.872
+socket: 0.789
+
+LVM backed drives should default to cache='none'
+
+Binary package hint: virt-manager
+
+KVM guests using LVM backed drives appear to experience fairly high iowait times on the host system if the guest has even a moderate amount of disk I/O.  This translates to poor performance for the host and all guests running on the host, and appears to be due to caching as KVM defaults to using writethrough caching when nothing is specified.  Explicitly disabling KVM's caching appears to result in significantly better host and guest performance.
+
+This is recommended in at least a few places:
+http://<email address hidden>/msg17492.html
+http://permalink.gmane.org/gmane.comp.emulators.kvm.devel/48471
+http://<email address hidden>/msg30425.html
+http://virt.kernelnewbies.org/XenVsKVM
+
+The default is cache=writethrough in the interest of data integrity.
+I don't think we want to differ from what upstream KVM provides, on
+this point.
+
+Note that the manpage says:
+
+           Some block drivers perform badly with cache=writethrough, most
+           notably, qcow2.  If performance is more important than correctness,
+           cache=writeback should be used with qcow2.
+
+If you believe that this default should be changed, please have that
+discussion on the upstream kvm and qemu mailing lists.  I believe that
+upstream has discussed this and has chosen data integrity over
+performance as the default.
+
+Thanks,
+:-Dustin
+
+I fail to see how not using a cache provides any less data integrity than using one.  The default caching method, as you quote, is writethrough which according to the manpage states:
+
+           By default, writethrough caching is used for all block device.
+           This means that the host page cache will be used to read and write
+           data but write notification will be sent to the guest only when the
+           data has been reported as written by the storage subsystem.
+
+The same should be true with no caching, correct?  
+
+The fact that the default writethrough caching results in slower VM disk I/O and a subsequently higher host load is fairly obvious.  The links provided in the original report show that LVM backed stores using cache='none' perform significantly better than the default.
+
+Looks like even upstream suggests disabling cache for best performance when using raw volumes:
+http://www.linux-kvm.org/page/Tuning_KVM
+
+From the above page:
+
+QEMU also supports a wide variety of caching modes. Writeback is useful for testing but does not offer storage guarantees. Writethrough (the default) is safer, and relies on the host cache. If you're using raw volumes or partitions, it is best to avoid the cache completely, which reduces data copies and bus traffic:
+
+ qemu -drive file=/dev/mapper/ImagesVolumeGroup-Guest1,cache=none,if=virtio
+
+Copying bug upstream, refiling against qemu-kvm, marking incomplete/wishlist.
+
+Anthony-
+
+Can you share the reasoning for the default disk caching method with upstream QEMU?  Would it be a good or bad idea to change that in Ubuntu?
+
+@Jamin-
+
+Okay, thanks for that last bit.
+
+So given that information, I think this bug is triaged/wishlist against virt-manager.  If virt-manager can detect that you've selected a LVM volume for the backing disk, then it could perhaps force cache=none.
+
+I doubt, however, that we'll have time to work on this.  Feel free to submit a patch, or propose this to the upstream virt-manager community.
+
+The use-case of virt-manager is casual desktop virtualization.  Usually, a user of desktop virtualization benefits from using the host page cache because subsequent launches of a VM are considerably faster since the IO is kept in memory.
+
+You can manipulate the cache settings via libvirt XML if you so desire.
+
+
+
+
+
+
+
+
+
+I noticed the high iowait times a few weeks back when my guest backups were taking a long time to complete.  I believe this was sometime after I added a VM to serve as a transparent proxy for my network, but can't be entirely certain.  Looking at the e-mail'd cron output, it was fairly obvious that the disk I/O was the problem as several of the guest backups were dropping to 2-3MB/sec reported throughput.  These backups are started during the night when there is little to no actual activity on the machines.  Checking the host's load and cpu usage confirmed that the problem appeared to be disk I/O related.  Searching online seemed to indicate similar problems, but they seemed to be with the disk scheduler being cfq and the recommendation was to move to the deadline scheduler, which the system was already using as its default scheduler.
+
+After changing each of the guest's LVM backed drive to cache='none' the backups are completing in much more reasonable time.  Average throughput for the backups remained at 10MB/sec or better, host load remained low even during more intensive operations.
+
+@Anthony,
+
+I'm aware that I can manipulate the cache settings via libvirt's XML.  That's currently what I've been doing, manually after every VM creation.  However, my point is that qemu clearly recommends that caching not be used with disks stored on raw volumes.  Additionally, virt-manager does not provide any means of disabling caching during or after VM creation.  I disagree with your assertion regarding cached IO being faster with KVM.  All of my tests indicate a multiple fold increase in performance with caching disabled.
+
+I fail to see how caching provides and more data integrity than no caching.  Unless I'm mistaken, no caching provides more integrity by definition.  Now, if no caching also provides a mutli-fold performance increase (which it does, as qemu's pages even indicate) why so much resistance to making it the default?
+
+cache=writethrough and cache=none have equivalent data integrity.
+
+FWIW, I believe most recent versions of virt-manager default to cache=none for physical devices.
+
+Can't seem to find anything in the upstream changelogs or source to indicate that such a change was made.
+
+Anthony, upstream virt-manager doesn't change the cache default, though we do in RHEL.
+
+Wasn't the idea of having an adaptive cache default for qemu given the okay on qemu-devel, particularly for cache=none for block devs? or am I imagining things (could be the case since I can't seem to find the thread now).
+
+Description of problem:
+Defaults to using cache with an LVM backed storage.  The use of caching with raw partitions (LVM) results in significantly lower performance than no cache at all.
+
+How reproducible:
+Always
+
+Steps to Reproduce:
+1. Create a new VM using LVM backed storage
+  
+Actual results:
+Cache is enabled for the VM's disks residing within LVM.
+
+Expected results:
+Cache should be disabled for disks residing within LVM.
+
+Additional info:
+http://www.linux-kvm.org/page/Tuning_KVM
+
+Specifically:
+
+QEMU also supports a wide variety of caching modes. Writeback is useful for testing but does not offer storage guarantees. Writethrough (the default) is safer, and relies on the host cache. If you're using raw volumes or partitions, it is best to avoid the cache completely, which reduces data copies and bus traffic:
+
+ qemu -drive file=/dev/mapper/ImagesVolumeGroup-Guest1,cache=none,if=virtio
+
+This has also been reported with Ubuntu at: https://bugs.launchpad.net/ubuntu/+source/virt-manager/+bug/568445
+
+Choice of caching mode is a policy decision. These belong in virt-manager or other apps using libvirt.
+
+AFAIK, this is the place to post feature requests for virt-manager, at least this is where their website directed me.  Intentionally selecting a default mode that results in very poor performance (about 1/5 less) when the upstream for the virtualization engine (qemu/kvm) clearly indicates that another mode is preferable is (IMHO) a bad choice.  Furthermore, from what I can tell, virt-manager doesn't appear to provide any means of changing or overriding the default.  A user must instead manually edit the server's XML definition of the VM in question.
+
+Reopening against virt-manager as recommended on mailing list.
+
+Fixed upstream now
+

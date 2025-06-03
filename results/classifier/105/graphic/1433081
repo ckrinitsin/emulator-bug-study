@@ -1,0 +1,322 @@
+graphic: 0.927
+KVM: 0.913
+device: 0.908
+assembly: 0.903
+semantic: 0.894
+instruction: 0.880
+other: 0.875
+boot: 0.871
+mistranslation: 0.865
+vnc: 0.859
+socket: 0.763
+network: 0.710
+
+kvm hardware error 0xffffffff with vfio-pci VGA passthrough
+
+Hi,
+
+Using qcow2 format for an ide-hd device is causing "KVM: entry failed, hardware error 0xffffffff". When this error occurs, qemu-monitor shows the guest has stopped. The error did not occur immediately, but at the point that the boot, running from an attached Ubuntu 14.04.1 iso, switched to graphical mode after text-mode startup.
+
+The root-cause was verified by switching only the ide-hd disk to raw format (no OS installed), which allowed the guest to boot normally from the iso. The error and fix are reliably repeatable.
+
+The interesting part is that the ide-hd (with no OS installed) with qcow2 format was not actually being used for boot - the boot was from a Ubuntu iso, with the intention of installing an ubuntu guest on the attached ide-hd device. The guest was using a vfio-pci passthrough GPU connected to an external UHD monitor.
+
+The commands used to create the disk images:
+qemu-img create -f qcow2 /media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img 20G
+qemu-img create -f raw /media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img 20G
+
+The script vm1 was used to launch the guests with "sudo ./vm1", with the only difference between launches being the ide-hd format (raw vs qcow2). With qcow2 this resulted in the terminal below. The corresponding dmesg snippets are attached. There were two dmesg entries each time the error occurred.
+
+The same problem occurred when using the latest packages from the ppa:jacob/virtualisation. However, when using jacob's packages, it was not verified that raw format resolves the error (I am running this on my primary system and purged jacob's ppa when this problem first occured).
+
+A fix would be helpful as the qcow2 format allows snapshots, while raw does not.
+
+----------------------------------System info-----------------------------------------------------------
+Linux v2min 3.18.9-031809-generic #201503080036 SMP Sun Mar 8 00:37:46 UTC 2015 x86_64 x86_64 x86_64 GNU/Linux
+
+/var/log/libvirt/libvirt.d is 0 bytes
+
+Libvirt versions are these:
+
+v2min@v2min:~/QCOW2-Error$ dpkg -l | grep libvirt
+ii  libvirt-bin                         1.2.2-0ubuntu13.1.9        amd64        programs for the libvirt library
+rc  libvirt-glib-1.0-0                  0.1.6-1ubuntu2             amd64        libvirt glib mainloop integration
+ii  libvirt0                            1.2.2-0ubuntu13.1.9        amd64        library for interfacing with different virtualization systems
+ii  python-libvirt                      1.2.2-0ubuntu2             amd64        libvirt Python bindings
+
+
+v2min@v2min:~/QCOW2-Error$ dpkg -l | grep qemu
+ii  ipxe-qemu                           1.0.0+git-20131111.c3d1e78-2ubuntu1.1               all          PXE boot firmware - ROM images for qemu
+ii  qemu-keymaps                        2.0.0+dfsg-2ubuntu1.10                              all          QEMU keyboard maps
+ii  qemu-kvm                            2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU Full virtualization on x86 hardware (transitional package)
+ii  qemu-system-common                  2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU full system emulation binaries (common files)
+ii  qemu-system-x86                     2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU full system emulation binaries (x86)
+ii  qemu-utils                          2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU utilities
+
+Passthrough GPU: Zotac GT 730 2GB.
+Processor: AMD A10-5800K APU
+Primary GPU: Radeon R9-290X
+
+
+------------------------------------------vm1 script-----------------------------------------------------
+#!/bin/bash
+
+configfile=/etc/vfio-pci1.cfg
+
+vfiobind() {
+    dev="$1"
+        vendor=$(cat /sys/bus/pci/devices/$dev/vendor)
+        device=$(cat /sys/bus/pci/devices/$dev/device)
+        if [ -e /sys/bus/pci/devices/$dev/driver ]; then
+                echo $dev > /sys/bus/pci/devices/$dev/driver/unbind
+        fi
+        echo $vendor $device > /sys/bus/pci/drivers/vfio-pci/new_id
+   
+}
+
+modprobe vfio-pci
+
+cat $configfile | while read line;do
+    echo $line | grep ^# >/dev/null 2>&1 && continue
+        vfiobind $line
+done
+
+sudo qemu-system-x86_64 -enable-kvm -M q35 -m 4096 -cpu host \
+-smp 2,sockets=1,cores=2,threads=1 \
+-bios /usr/share/qemu/bios.bin -vga none \
+-usb -device usb-host,hostbus=5,hostaddr=8 \
+-device ioh3420,bus=pcie.0,addr=1c.0,multifunction=on,port=1,chassis=1,id=root.1 \
+-device vfio-pci,host=04:00.0,bus=root.1,addr=00.0,multifunction=on,x-vga=on \
+-device vfio-pci,host=04:00.1,bus=root.1,addr=00.1 \
+-drive file=/media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img,id=disk,format=qcow2 -device ide-hd,bus=ide.0,drive=disk \
+-drive file=/media/v2min/Data/Shr/Software/OSes/ubuntu-14.04.1-desktop-amd64.iso,id=isocd -device ide-cd,bus=ide.1,drive=isocd \
+-boot menu=on \
+-boot d
+
+exit 0
+
+------------------------------------------------------------gnome-terminal-----------------------------
+v2min@v2min:~$ sudo ./vm1
+[sudo] password for v2min: 
+KVM: entry failed, hardware error 0xffffffff
+RAX=0000000000000005 RBX=0000000000000000 RCX=0000000000000000 RDX=ffffffff81eaf3e8
+RSI=0000000000000000 RDI=0000000000000000 RBP=ffff880179553930 RSP=ffff880179553910
+R8 =ffffffff81eaf3e0 R9 =000000000000ffff R10=0000000000000206 R11=000000000000000f
+R12=ffff880179597b1c R13=0000000000000028 R14=0000000000000000 R15=ffff880179597800
+RIP=ffffffff8104ed58 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 ffffffff 00800000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 ffffffff 00800000
+FS =0000 00007f51d8a96880 ffffffff 00800000
+GS =0000 ffff88017fd00000 ffffffff 00800000
+LDT=0000 0000000000000000 0000ffff 00000000
+TR =0040 ffff88017fd11900 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88017fd0a000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=00007f51d8a99000 CR3=00000001740be000 CR4=000406e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=00 01 48 c7 c0 6a b0 00 00 31 db 0f b7 0c 01 b8 05 00 00 00 <0f> 01 c1 0f 1f 44 00 00 5b 41 5c 41 5d 41 5e 5d c3 89 f0 31 c9 f0 0f b0 0d 9b 06 e6 00 40
+v2min@v2min:~$ sudo ./vm1
+KVM: entry failed, hardware error 0xffffffff
+RAX=0000000000000005 RBX=0000000000000000 RCX=0000000000000000 RDX=ffffffff81eaf3e8
+RSI=0000000000000000 RDI=0000000000000000 RBP=ffff88017957f9e8 RSP=ffff88017957f9c8
+R8 =ffffffff81eaf3e0 R9 =0000000000000000 R10=ffff88017b001d00 R11=0000000000000246
+R12=ffff880179527ac0 R13=000000000000003e R14=0000000000000000 R15=0000000000000001
+RIP=ffffffff8104ed58 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 ffffffff 00800000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 ffffffff 00800000
+FS =0000 00007f49153a6740 ffffffff 00800000
+GS =0000 ffff88017fd00000 ffffffff 00800000
+LDT=0000 0000000000000000 0000ffff 00000000
+TR =0040 ffff88017fd11900 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88017fd0a000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=00007f4914e82170 CR3=0000000001c0e000 CR4=000406e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=00 01 48 c7 c0 6a b0 00 00 31 db 0f b7 0c 01 b8 05 00 00 00 <0f> 01 c1 0f 1f 44 00 00 5b 41 5c 41 5d 41 5e 5d c3 89 f0 31 c9 f0 0f b0 0d 9b 06 e6 00 40
+
+
+
+
+
+Your kernel is tainted with virtual box drivers, which are potentially incompatible with KVM.  Remove and try again.
+
+Thank you for reviewing this. Removed VirtualBox and tried again, unfortunately same error. Terminal results and dmesg snippets below.
+
+-----------------------terminal-------------------------------------------------
+v2min@v2min:~$ sudo ./vm1
+KVM: entry failed, hardware error 0xffffffff
+RAX=0000000000000005 RBX=0000000000000000 RCX=0000000000000000 RDX=ffffffff81eaf3e8
+RSI=0000000000000000 RDI=0000000000000000 RBP=ffff880179559930 RSP=ffff880179559910
+R8 =ffffffff81eaf3e0 R9 =000000000000ffff R10=0000000000000206 R11=000000000000000f
+R12=ffff8801795feb1c R13=0000000000000028 R14=0000000000000000 R15=ffff8801795fe800
+RIP=ffffffff8104ed58 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 ffffffff 00800000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 ffffffff 00800000
+FS =0000 00007ff2108ed880 ffffffff 00800000
+GS =0000 ffff88017fd00000 ffffffff 00800000
+LDT=0000 0000000000000000 0000ffff 00000000
+TR =0040 ffff88017fd11900 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88017fd0a000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=00007ff2108f0000 CR3=0000000174114000 CR4=000406e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=00 01 48 c7 c0 6a b0 00 00 31 db 0f b7 0c 01 b8 05 00 00 00 <0f> 01 c1 0f 1f 44 00 00 5b 41 5c 41 5d 41 5e 5d c3 89 f0 31 c9 f0 0f b0 0d 9b 06 e6 00 40
+
+---------------------------------------------------------------------dmesg snippet----------------------------------------------------------------
+[  143.638160] vfio-pci 0000:04:00.0: enabling device (0000 -> 0003)
+[  143.641607] vfio-pci 0000:04:00.1: enabling device (0000 -> 0002)
+[  146.481082] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  146.749241] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  146.961035] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  147.161244] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  150.135296] kvm: zapping shadow pages for mmio generation wraparound
+[  163.101237] kvm [4414]: vcpu0 unhandled rdmsr: 0xc0011005
+[  163.101246] kvm [4414]: vcpu0 unhandled rdmsr: 0xc0011021
+[  163.101252] kvm [4414]: vcpu0 unhandled rdmsr: 0xc0010112
+[  163.101266] kvm [4414]: vcpu0 unhandled rdmsr: 0xc0000408
+[  163.243382] kvm [4414]: vcpu0 unimplemented perfctr wrmsr: 0xc0010004 data 0xffff
+[  163.261011] kvm [4414]: vcpu1 unhandled rdmsr: 0xc0011005
+[  163.261024] kvm [4414]: vcpu1 unhandled rdmsr: 0xc0011021
+[  163.261056] kvm [4414]: vcpu1 unhandled rdmsr: 0xc0000408
+[  163.979495] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  166.943830] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  167.687954] usb 5-4.2: reset full-speed USB device number 8 using ehci-pci
+[  167.798019] ------------[ cut here ]------------
+[  167.798078] WARNING: CPU: 2 PID: 4417 at /home/kernel/COD/linux/arch/x86/kvm/emulate.c:4994 x86_emulate_insn+0xa74/0xc30 [kvm]()
+[  167.798082] Modules linked in: xt_CHECKSUM iptable_mangle ipt_MASQUERADE nf_nat_masquerade_ipv4 iptable_nat nf_nat_ipv4 nf_nat nf_conntrack_ipv4 nf_defrag_ipv4 xt_conntrack nf_conntrack ipt_REJECT nf_reject_ipv4 xt_tcpudp iptable_filter ip_tables x_tables bridge stp llc crct10dif_pclmul crc32_pclmul ghash_clmulni_intel nouveau aesni_intel aes_x86_64 lrw gf128mul glue_helper ablk_helper cryptd mxm_wmi wmi ttm drm_kms_helper drm serio_raw i2c_algo_bit k10temp joydev i2c_piix4 snd_hda_codec_realtek snd_hda_codec_generic snd_hda_codec_hdmi snd_hda_intel snd_hda_controller snd_hda_codec snd_hwdep snd_pcm dm_multipath scsi_dh snd_seq_midi snd_seq_midi_event snd_rawmidi fglrx(POE) snd_seq snd_seq_device snd_timer snd amd_iommu_v2 soundcore shpchp 8250_fintek video mac_hid tpm_infineon parport_pc ppdev kvm_amd kvm vfio_pci rfcomm vfio_iommu_type1 vfio bnep it87 hwmon_vid bluetooth lp parport nls_iso8859_1 ses enclosure hid_generic btrfs hid_logitech ff_memless raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor uas usb_storage hid_logitech_dj usbhid hid raid6_pq raid1 raid0 psmouse multipath r8169 ahci linear libahci mii pci_stub
+[  167.798211] CPU: 2 PID: 4417 Comm: qemu-system-x86 Tainted: P           OE  3.18.9-031809-generic #201503080036
+[  167.798215] Hardware name: Gigabyte Technology Co., Ltd. To be filled by O.E.M./F2A88X-D3H, BIOS F5 05/28/2014
+[  167.798219]  0000000000001382 ffff880641e03b68 ffffffff8179ba3d 0000000000000007
+[  167.798226]  0000000000000000 ffff880641e03ba8 ffffffff81074bac 0000000000000004
+[  167.798232]  ffff8805f23e9550 0000000000000006 ffffffffc075f640 ffff8805f23e9550
+[  167.798238] Call Trace:
+[  167.798250]  [<ffffffff8179ba3d>] dump_stack+0x46/0x58
+[  167.798258]  [<ffffffff81074bac>] warn_slowpath_common+0x8c/0xc0
+[  167.798269]  [<ffffffff81074bfa>] warn_slowpath_null+0x1a/0x20
+[  167.798304]  [<ffffffffc07527b4>] x86_emulate_insn+0xa74/0xc30 [kvm]
+[  167.798334]  [<ffffffffc0734f1d>] x86_emulate_instruction+0x13d/0x550 [kvm]
+[  167.798348]  [<ffffffffc066d440>] ? nested_svm_get_tdp_cr3+0x20/0x20 [kvm_amd]
+[  167.798361]  [<ffffffffc066f2a2>] ud_interception+0x22/0x40 [kvm_amd]
+[  167.798372]  [<ffffffffc066d440>] ? nested_svm_get_tdp_cr3+0x20/0x20 [kvm_amd]
+[  167.798385]  [<ffffffffc06724cd>] handle_exit+0x19d/0x320 [kvm_amd]
+[  167.798419]  [<ffffffffc0755b2b>] ? kvm_lapic_set_tpr+0x3b/0x50 [kvm]
+[  167.798431]  [<ffffffffc0670184>] ? svm_vcpu_run+0x364/0x4a0 [kvm_amd]
+[  167.798443]  [<ffffffffc066d440>] ? nested_svm_get_tdp_cr3+0x20/0x20 [kvm_amd]
+[  167.798474]  [<ffffffffc073afd6>] vcpu_enter_guest+0x526/0x8c0 [kvm]
+[  167.798500]  [<ffffffffc0725e70>] ? kvm_vm_ioctl_unregister_coalesced_mmio+0xd0/0xd0 [kvm]
+[  167.798507]  [<ffffffff81080bcf>] ? recalc_sigpending+0x1f/0x60
+[  167.798537]  [<ffffffffc073b508>] __vcpu_run+0x198/0x230 [kvm]
+[  167.798544]  [<ffffffff8108420f>] ? __set_current_blocked+0x3f/0x90
+[  167.798574]  [<ffffffffc073b63d>] kvm_arch_vcpu_ioctl_run+0x9d/0x170 [kvm]
+[  167.798599]  [<ffffffffc0721ecd>] kvm_vcpu_ioctl+0x36d/0x630 [kvm]
+[  167.798607]  [<ffffffff810ee582>] ? futex_wake+0x72/0x140
+[  167.798615]  [<ffffffff811f46e5>] do_vfs_ioctl+0x75/0x2c0
+[  167.798621]  [<ffffffff811fed05>] ? __fget_light+0x25/0x70
+[  167.798626]  [<ffffffff811f49c1>] SyS_ioctl+0x91/0xb0
+[  167.798633]  [<ffffffff817a936d>] system_call_fastpath+0x16/0x1b
+[  167.798638] ---[ end trace e18df1ca74cfaba0 ]---
+[  167.798642] ------------[ cut here ]------------
+[  167.798669] WARNING: CPU: 2 PID: 4417 at /home/kernel/COD/linux/arch/x86/kvm/x86.c:329 inject_pending_event+0x2ae/0x2c0 [kvm]()
+[  167.798672] Modules linked in: xt_CHECKSUM iptable_mangle ipt_MASQUERADE nf_nat_masquerade_ipv4 iptable_nat nf_nat_ipv4 nf_nat nf_conntrack_ipv4 nf_defrag_ipv4 xt_conntrack nf_conntrack ipt_REJECT nf_reject_ipv4 xt_tcpudp iptable_filter ip_tables x_tables bridge stp llc crct10dif_pclmul crc32_pclmul ghash_clmulni_intel nouveau aesni_intel aes_x86_64 lrw gf128mul glue_helper ablk_helper cryptd mxm_wmi wmi ttm drm_kms_helper drm serio_raw i2c_algo_bit k10temp joydev i2c_piix4 snd_hda_codec_realtek snd_hda_codec_generic snd_hda_codec_hdmi snd_hda_intel snd_hda_controller snd_hda_codec snd_hwdep snd_pcm dm_multipath scsi_dh snd_seq_midi snd_seq_midi_event snd_rawmidi fglrx(POE) snd_seq snd_seq_device snd_timer snd amd_iommu_v2 soundcore shpchp 8250_fintek video mac_hid tpm_infineon parport_pc ppdev kvm_amd kvm vfio_pci rfcomm vfio_iommu_type1 vfio bnep it87 hwmon_vid bluetooth lp parport nls_iso8859_1 ses enclosure hid_generic btrfs hid_logitech ff_memless raid10 raid456 async_raid6_recov async_memcpy async_pq async_xor async_tx xor uas usb_storage hid_logitech_dj usbhid hid raid6_pq raid1 raid0 psmouse multipath r8169 ahci linear libahci mii pci_stub
+[  167.798790] CPU: 2 PID: 4417 Comm: qemu-system-x86 Tainted: P        W  OE  3.18.9-031809-generic #201503080036
+[  167.798794] Hardware name: Gigabyte Technology Co., Ltd. To be filled by O.E.M./F2A88X-D3H, BIOS F5 05/28/2014
+[  167.798796]  0000000000000149 ffff880641e03c68 ffffffff8179ba3d 0000000000000007
+[  167.798803]  0000000000000000 ffff880641e03ca8 ffffffff81074bac ffffffffc066d440
+[  167.798808]  ffff8805f23e8000 0000000000000000 0000000000000001 00000000000000ff
+[  167.798814] Call Trace:
+[  167.798821]  [<ffffffff8179ba3d>] dump_stack+0x46/0x58
+[  167.798828]  [<ffffffff81074bac>] warn_slowpath_common+0x8c/0xc0
+[  167.798840]  [<ffffffffc066d440>] ? nested_svm_get_tdp_cr3+0x20/0x20 [kvm_amd]
+[  167.798847]  [<ffffffff81074bfa>] warn_slowpath_null+0x1a/0x20
+[  167.798875]  [<ffffffffc072fc0e>] inject_pending_event+0x2ae/0x2c0 [kvm]
+[  167.798906]  [<ffffffffc073ad4e>] vcpu_enter_guest+0x29e/0x8c0 [kvm]
+[  167.798932]  [<ffffffffc0725e70>] ? kvm_vm_ioctl_unregister_coalesced_mmio+0xd0/0xd0 [kvm]
+[  167.798939]  [<ffffffff81080bcf>] ? recalc_sigpending+0x1f/0x60
+[  167.798970]  [<ffffffffc073b508>] __vcpu_run+0x198/0x230 [kvm]
+[  167.798977]  [<ffffffff8108420f>] ? __set_current_blocked+0x3f/0x90
+[  167.799007]  [<ffffffffc073b63d>] kvm_arch_vcpu_ioctl_run+0x9d/0x170 [kvm]
+[  167.799032]  [<ffffffffc0721ecd>] kvm_vcpu_ioctl+0x36d/0x630 [kvm]
+[  167.799039]  [<ffffffff810ee582>] ? futex_wake+0x72/0x140
+[  167.799046]  [<ffffffff811f46e5>] do_vfs_ioctl+0x75/0x2c0
+[  167.799052]  [<ffffffff811fed05>] ? __fget_light+0x25/0x70
+[  167.799058]  [<ffffffff811f49c1>] SyS_ioctl+0x91/0xb0
+[  167.799064]  [<ffffffff817a936d>] system_call_fastpath+0x16/0x1b
+[  167.799068] ---[ end trace e18df1ca74cfaba1 ]---
+[  167.799074] KVM: FAILED VMRUN WITH VMCB:
+[  167.799077] VMCB Control Area:
+[  167.799080] cr_read:            0011
+[  167.799083] cr_write:           0011
+[  167.799086] dr_read:            00ff
+[  167.799088] dr_write:           00ff
+[  167.799091] exceptions:         000400c0
+[  167.799093] intercepts:         00002e7fbdc48037
+[  167.799096] pause filter count: 3000
+[  167.799099] iopm_base_pa:       000000064157c000
+[  167.799101] msrpm_base_pa:      000000064096a000
+[  167.799104] tsc_offset:         ffffff56c27157b1
+[  167.799106] asid:               33
+[  167.799109] tlb_ctl:            0
+[  167.799111] int_ctl:            010f0100
+[  167.799114] int_vector:         00000000
+[  167.799116] int_state:          00000000
+[  167.799119] exit_code:          ffffffff
+[  167.799121] exit_info1:         0000000000000000
+[  167.799124] exit_info2:         0000000000000000
+[  167.799126] exit_int_info:      00000000
+[  167.799129] exit_int_info_err:  00000000
+[  167.799131] nested_ctl:         1
+[  167.799134] nested_cr3:         0000000032107000
+[  167.799137] event_inj:          800003ff
+[  167.799139] event_inj_err:      00000000
+[  167.799142] lbr_ctl:            0
+[  167.799144] next_rip:           0000000000000000
+[  167.799146] VMCB State Save Area:
+[  167.799150] es:   s: 0000 a: 0000 l: ffffffff b: 0000000000000000
+[  167.799153] cs:   s: 0010 a: 029b l: ffffffff b: 0000000000000000
+[  167.799156] ss:   s: 0018 a: 0c93 l: ffffffff b: 0000000000000000
+[  167.799159] ds:   s: 0000 a: 0000 l: ffffffff b: 0000000000000000
+[  167.799162] fs:   s: 0000 a: 0000 l: ffffffff b: 00007ff2108ed880
+[  167.799166] gs:   s: 0000 a: 0000 l: ffffffff b: ffff88017fd00000
+[  167.799169] gdtr: s: 0000 a: 0000 l: 0000007f b: ffff88017fd0a000
+[  167.799172] ldtr: s: 0000 a: 0000 l: 0000ffff b: 0000000000000000
+[  167.799175] idtr: s: 0000 a: 0000 l: 00000fff b: ffffffffff576000
+[  167.799179] tr:   s: 0040 a: 008b l: 00002087 b: ffff88017fd11900
+[  167.799182] cpl:            0                efer:         0000000000001d01
+[  167.799185] cr0:            000000008005003b cr2:          00007ff2108f0000
+[  167.799188] cr3:            0000000174114000 cr4:          00000000000406e0
+[  167.799191] dr6:            00000000ffff0ff0 dr7:          0000000000000400
+[  167.799195] rip:            ffffffff8104ed58 rflags:       0000000000000046
+[  167.799198] rsp:            ffff880179559910 rax:          0000000000000005
+[  167.799201] star:           0023001000000000 lstar:        ffffffff8172c5f0
+[  167.799205] cstar:          ffffffff8172e510 sfmask:       0000000000043700
+[  167.799208] kernel_gs_base: 0000000000000000 sysenter_cs:  0000000000000010
+[  167.799211] sysenter_esp:   0000000000000000 sysenter_eip: 000000008172e2e0
+[  167.799215] gpat:           0007040600070406 dbgctl:       0000000000000000
+[  167.799218] br_from:        0000000000000000 br_to:        0000000000000000
+[  167.799221] excp_from:      0000000000000000 excp_to:      0000000000000000
+
+
+
+Hi v2min,
+this got to my attention as it was reassigned from upstream to Ubuntu's qemu last Friday.
+
+I've seen various graphics pass-through on xenial but personally never used it on trusty.
+I don't have the HW around atm to test on my own but after that much time I have to ask you anyway if the error is still bugging you.
+Dif you find that either later released fixes or workarounds solve it for you or any other comment to make this updated in mid/end 2016?
+
+
+
+[Expired for qemu (Ubuntu) because there has been no activity for 60 days.]
+

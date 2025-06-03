@@ -1,0 +1,93 @@
+assembly: 0.860
+graphic: 0.823
+other: 0.817
+device: 0.798
+instruction: 0.793
+network: 0.746
+socket: 0.724
+KVM: 0.703
+boot: 0.697
+semantic: 0.675
+mistranslation: 0.659
+vnc: 0.631
+
+Reading sectors from floppy with BIOS INT 13h is broken
+
+I'm developing a game bootable from a floppy disk, written in i386 assembly. I found out it doesn't work on newer QEMU versions. I managed to isolate the issue and it seems that there's a problem with handling of BIOS interrupt 13h when it comes to reading disk sectors (AH=02).
+
+I've written a simple test in assembly. It simply accesses four different floppy disk sectors and prints out the strings they contain. The problem is, the two latter strings don't show up at all nor the BIOS interrupt returns an error (CF set). I've attached the code to this bug report. I use following commands to compile it and run:
+
+$ nasm disk-test.asm -o disk-test.bin
+$ qemu-system-i386 -boot a -fda disk-test.bin
+
+After running, the expected output is:
+
+    I am a test string from boot sector
+    C:H:S 0:0:2 - Hello
+    C:H:S 0:0:3 - there!
+    C:H:S 0:1:4 - In QEMU you can't
+    C:H:S 1:0:5 - see these two lines! :(
+
+while the actual output is:
+
+    I am a test string from boot sector
+    C:H:S 0:0:2 - Hello
+    C:H:S 0:0:3 - there!
+
+
+So far, I found this problem in the current QEMU version for Ubuntu 18.04 (Debian 1:2.11+dfsg-1ubuntu7.8), as well as in the 3.1.0-rc3 and 2.12.1 versions, available on the www.qemu.org website. Thus, the issue doesn't seem to be very recent.
+
+To be sure, I ran the program on my other machine with older QEMU version (Debian 2.0.0+dfsg-2ubuntu1.43) and on my RaspberryPi 2 (Debian 1.1.2+dfsg-6+deb7u25) and everything works as expected there. It also works well in VirtualBox.
+
+I hope these information are useful to you, however, I feel like this bug may be more related to Seabios. If so, please let me know and I will report it somewhere else.
+
+
+
+Hello! Thank you for your kindly and detailed report.
+
+Since this is via the INT 13h mechanism, the problem is likely in SeaBIOS.
+
+If I'm reading the version strings right, it looks like QEMU 2.0.0 QEMU 1.1.2 appear to be working correctly for you, but do you know what versions of the SeaBIOS firmware they're running with?
+
+It might be interesting to see if, on QEMU 2.0.0 but a modern version of SeaBIOS, that it still breaks the same way -- that way we can tell for sure if it's a QEMU regression or a SeaBIOS one.
+
+Thank you,
+--js
+
+I ran plenty of QEMU/SeaBIOS configurations and these are the results:
+
+Ubuntu 18.04:
+	OK  --> QEMU qemu-2.0.0 + SEABIOS rel-1.7.4-0-g96917a8
+	OK  --> QEMU qemu-2.0.0 + SEABIOS 1.10.2-1ubuntu1 (default)
+	BAD --> QEMU Debian 1:2.11+dfsg-1ubuntu7.8 (default) + SEABIOS 1.10.2-1ubuntu1 (default)
+	BAD --> QEMU Debian 1:2.11+dfsg-1ubuntu7.8 (default) + SEABIOS 1.7.4-4ubuntu1
+	BAD --> QEMU qemu-3.1.0-rc3 + SEABIOS rel-1.12.0-0-ga698c89
+	
+Ubuntu 14.04:
+	OK  --> QEMU Debian 2.0.0+dfsg-2ubuntu1.44 (default) + SEABIOS 1.7.4-4ubuntu1 (default)
+	OK  --> QEMU Debian 2.0.0+dfsg-2ubuntu1.44 (default) + SEABIOS rel-1.12.0-0-ga698c89
+	BAD --> QEMU qemu-3.1.0-rc3 + SEABIOS 1.7.4-4ubuntu1 (default)
+	BAD --> QEMU qemu-3.1.0-rc3 + SEABIOS rel-1.12.0-0-ga698c89
+	
+Kali Linux (Debian 4.17.8-1kali1):
+	OK  --> QEMU qemu-2.0.0 + SEABIOS rel-1.7.4-0-g96917a8
+	OK  --> QEMU qemu-2.0.0 + SEABIOS 1.11.1-1 (default)
+	BAD --> QEMU Debian 1:2.12+dfsg-3+b1 (default) + SEABIOS 1.11.1-1 (default)
+	BAD --> QEMU Debian 1:2.12+dfsg-3+b1 (default) + SEABIOS rel-1.7.4-0-g96917a8
+	BAD --> QEMU qemu-3.1.0-rc3 + SEABIOS rel-1.12.0-0-ga698c89
+
+Surprisingly, it seems that the problem is in QEMU. I didn't test versions between 2.0 and 2.12, because I had some issues with building (util/memfd.c:43:12: error: static declaration of ‘memfd_create’ follows non-static declaration). I'll try to fix it by hand and will let you know if I manage to determine what's the first version to cause problems.
+
+Alright, I managed to compile 2.5.0, 2.5.1 and 2.6.0 by simply making memfd_create() non-static.
+
+It turns out that 2.6.0 is the first version causing problems. I tested each of these with the provided SeaBIOS version and with SeaBIOS rel-1.7.4-0-g96917a8.
+
+The memfd_create() compilation failure is a bug in older QEMU versions that was only revealed by a newer glibc version (ie old QEMU built OK with older glibc but fails with newer glibc). It's fixed in git in commit 75e5b70e6b5dcc4f221, so backporting that to the older versions you're trying to build is probably the correct fix there, though it sounds like you've sufficiently worked around it anyway.
+
+I see. That wasn't much of a problem, but thank you for the information. I'll try to keep it in mind when building QEMU in future.
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

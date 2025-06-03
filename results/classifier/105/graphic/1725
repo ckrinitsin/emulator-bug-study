@@ -1,0 +1,34 @@
+graphic: 0.831
+instruction: 0.794
+other: 0.710
+semantic: 0.703
+device: 0.694
+socket: 0.572
+mistranslation: 0.522
+network: 0.501
+vnc: 0.459
+assembly: 0.439
+KVM: 0.369
+boot: 0.260
+
+qemu-system-x86_64 reports wrong thread to GDB on SIGINT
+Description of problem:
+Upon interruption of a thread by GDB, QEMU in some circumstances will send a stop reply with the ID of a thread that had not been resumed.
+
+This happens for the following reasons:
+1. GDB uses `vCont` exclusively to resume and step through threads.
+2. When a thread is interrupted by GDB, QEMU runs `vm_stop(RUN_STATE_PAUSED)`, which triggers `gdb_vm_state_change`, which, in turn, uses whatever CPU is pointed to by `gdbserver_state.c_cpu` at that time to construct the stop reply.
+3. The `vCont` handler in QEMU doesn't set `gdbserver_state.c_cpu` before resuming any CPUs.
+
+Important to note is that stepping is not affected by this issue because the `EXCP_DEBUG` handler sets `gdbserver_state.c_cpu` to the CPU the exception happened in before `gdb_vm_state_change` runs. Which also means single stepping before continuing is an effective way to work around this bug.
+Steps to reproduce:
+1. Run QEMU with at least two threads and the GDB stub enabled.
+2. Run `gdb --nx --ex 'target remote :1234' --ex 'set scheduler-locking on'`
+3. Switch to Thread 1.2 in GDB with `thr 2`
+4. Resume Thread 1.2 in GDB with `c`
+5. Press Ctrl+C to interrupt the VM
+6. Notice that the event is reported as having happened in Thread 1.1, which has not been resumed.
+Additional information:
+Note that, while this bug happens no matter the state of `scheduler-locking`, it only becomes a problem when it is enabled. This is because, when it is disabled, GDB will always resume all threads on `continue`, so it doesn't matter what thread ID QEMU says the interrupt happened in, as it is guaranteed to have been resumed anyway. That, however, is not the case when `scheduler-locking` is enabled.
+
+Regardless, I don't think it makes sense for QEMU to be reporting events happening in threads that weren't resumed through either `s/S/c/C` or `vCont`, which is what it's doing here.

@@ -1,0 +1,65 @@
+other: 0.840
+semantic: 0.839
+graphic: 0.831
+mistranslation: 0.816
+vnc: 0.770
+socket: 0.722
+network: 0.699
+instruction: 0.679
+device: 0.671
+assembly: 0.628
+boot: 0.550
+KVM: 0.531
+
+A bug in RISC-V froundnx.h instruction
+Description of problem:
+According to the RISCV ISA manual, the froundnx.h instruction rounds a half-precision floating-point number in the source register to an integer and writes the integer, represented as a half-precision floating-point number, to the destination register. Because the values are stored in 64-bit width registers, they must be NaN-unboxed/boxed before/after the operation. When an input value lacks the proper form of NaN-boxing, it should be treated as a canonical NaN.
+However, when an incorrectly NaN-boxed value is passed to froundnx.h, QEMU produces 0 instead of the canonical NaN. This is because there is a typo in the definition of helper_froundnx_h:
+```
+// target/riscv/fpu_helper.c
+uint64_t helper_froundnx_h(CPURISCVState *env, uint64_t rs1)
+{
+    float16 frs1 = check_nanbox_s(env, rs1); // This should be check_nanbox_h.
+    frs1 = float16_round_to_int(frs1, &env->fp_status);
+    return nanbox_h(env, frs1);
+}
+```
+Steps to reproduce:
+1. Write `test.c`.
+```
+#include <stdio.h>
+
+char i_F6[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+char o_F5[8];
+
+void __attribute__ ((noinline)) show_state() {
+    for (int i = 0; i < 8; i++) {
+        printf("%02x ", o_F5[i]);
+    }
+    printf("\n");
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        "lui t5, %hi(i_F6)\n"
+        "addi t5, t5, %lo(i_F6)\n"
+        "fld ft6, 0(t5)\n"
+        ".insn 0x445372d3\n" // froundnx.h ft5, ft6
+        "lui t5, %hi(o_F5)\n"
+        "addi t5, t5, %lo(o_F5)\n"
+        "fsd ft5, 0(t5)\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+
+    return 0;
+}
+```
+2. Compile `test.bin` using this command: `riscv64-linux-gnu-gcc-12 -O2 -no-pie -march=rv64iv ./test.c -o ./test.bin`.
+3. Run QEMU using this command: `qemu-riscv64 -L /usr/riscv64-linux-gnu/ ./test.bin`.
+4. The program, runs on top of the buggy QEMU, prints `00 00 ff ff ff ff ff ff`. It should print `00 7e ff ff ff ff ff ff` after the bug is fixed.
+Additional information:
+

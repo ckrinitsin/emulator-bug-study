@@ -1,0 +1,313 @@
+other: 0.961
+assembly: 0.952
+semantic: 0.949
+graphic: 0.947
+device: 0.944
+mistranslation: 0.941
+vnc: 0.938
+instruction: 0.936
+network: 0.935
+KVM: 0.928
+socket: 0.925
+boot: 0.894
+
+mips linux-user builds occasionly crash randomly only to be fixed by a full clean re-build
+
+From time to time I find check-tcg crashes with a one of the MIPS binaries. The last time it crashed was running the test:
+
+  ./mips64el-linux-user/qemu-mips64el ./tests/tcg/mips64el-linux-user/threadcount
+
+Inevitably after some time noodling around wondering what could be causing this weird behaviour I wonder if it is a build issue. I wipe all the mips* build directories, re-run configure and re-build and voila problem goes away.
+
+It seems there must be some sort of build artefact which isn't being properly re-generated on a build update which causes weird problems. Additional data point if I:
+
+  rm -rf mips64el-linux-user
+  ../../configure
+  make
+
+then I see failures in mip32 builds - eg:
+
+    GEN     mipsn32el-linux-user/config-target.h
+  In file included from /home/alex/lsrc/qemu.git/linux-user/syscall_defs.h:10,
+                   from /home/alex/lsrc/qemu.git/linux-user/qemu.h:16,
+                   from /home/alex/lsrc/qemu.git/linux-user/linuxload.c:5:
+  /home/alex/lsrc/qemu.git/linux-user/mips64/syscall_nr.h:1: error: unterminated #ifndef
+   #ifndef LINUX_USER_MIPS64_SYSCALL_NR_H
+
+  make[1]: *** [/home/alex/lsrc/qemu.git/rules.mak:69: linux-user/linuxload.o] Error 1
+  make[1]: *** Waiting for unfinished jobs....
+
+which implies there is a cross dependency between different targets somewhere. If I executed:
+
+  rm -rf mips*
+
+before re-configuring and re-building then everything works again.
+
+syscall_nr.h is generated from syscall_n32.tbl and syscall_n64.tbl, so it should be under your build directory, not the source directory.
+
+But if you did a build before the change, the dependency file .d will store a path in the src dir and the new file will not be generated in the build dir but in the previous place.
+
+linux-user/mips64/Makefile.objs:
+
+ifeq ($(TARGET_SYSTBL_ABI),n32)
+%/syscall_nr.h: $(SRC_PATH)/linux-user/$(TARGET_ABI_DIR)/syscall_n32.tbl $(syshdr)
+        $(call quiet-command, sh $(syshdr) $< $@ n32 "" 6000,"GEN","$@")
+endif
+ifeq ($(TARGET_SYSTBL_ABI),n64)
+%/syscall_nr.h: $(SRC_PATH)/linux-user/$(TARGET_ABI_DIR)/syscall_n64.tbl $(syshdr)
+        $(call quiet-command, sh $(syshdr) $< $@ n64 "" 5000,"GEN","$@")
+endif
+
+Normally this is cleaned up by the configure with:
+
+for arch in alpha hppa m68k xtensa sh4 microblaze arm ppc s390x sparc sparc64 \
+    i386 x86_64 mips mips64 ; do
+    # remove the file if it has been generated in the source directory
+    rm -f "${source_path}/linux-user/${arch}/syscall_nr.h"
+    # remove the dependency files
+    for target in ${arch}*-linux-user ; do
+        test -d "${target}" && find "${target}" -type f -name "*.d" \
+             -exec grep -q "${source_path}/linux-user/${arch}/syscall_nr.h" {} \; \
+             -print | while read file ; do rm "${file}" "${file%.d}.o" ; done
+    done
+don
+
+
+OK the syscall_nr failure is a red hearing - that was affected by a stray generated file in my source tree (maybe I accidentally ran make in the top directory?).
+
+However I've just run into the mips64le-linux-user crash again which didn't go away until I deleted all mips* directories and rebuilt.
+
+четвртак, 18. јун 2020., Cornelia Huck <email address hidden> је написао/ла:
+
+> On Mon, 15 Jun 2020 15:18:48 -0000
+> Alex Bennée <email address hidden> wrote:
+>
+> > Public bug reported:
+> >
+> > >From time to time I find check-tcg crashes with a one of the MIPS
+> > binaries. The last time it crashed was running the test:
+> >
+> >   ./mips64el-linux-user/qemu-mips64el ./tests/tcg/mips64el-linux-
+> > user/threadcount
+> >
+> > Inevitably after some time noodling around wondering what could be
+> > causing this weird behaviour I wonder if it is a build issue. I wipe all
+> > the mips* build directories, re-run configure and re-build and voila
+> > problem goes away.
+> >
+> > It seems there must be some sort of build artefact which isn't being
+> > properly re-generated on a build update which causes weird problems.
+> > Additional data point if I:
+> >
+> >   rm -rf mips64el-linux-user
+> >   ../../configure
+> >   make
+> >
+> > then I see failures in mip32 builds - eg:
+> >
+> >     GEN     mipsn32el-linux-user/config-target.h
+> >   In file included from /home/alex/lsrc/qemu.git/
+> linux-user/syscall_defs.h:10,
+> >                    from /home/alex/lsrc/qemu.git/linux-user/qemu.h:16,
+> >                    from /home/alex/lsrc/qemu.git/
+> linux-user/linuxload.c:5:
+> >   /home/alex/lsrc/qemu.git/linux-user/mips64/syscall_nr.h:1: error:
+> unterminated #ifndef
+> >    #ifndef LINUX_USER_MIPS64_SYSCALL_NR_H
+> >
+> >   make[1]: *** [/home/alex/lsrc/qemu.git/rules.mak:69:
+> linux-user/linuxload.o] Error 1
+> >   make[1]: *** Waiting for unfinished jobs....
+> >
+> > which implies there is a cross dependency between different targets
+> > somewhere. If I executed:
+> >
+> >   rm -rf mips*
+> >
+> > before re-configuring and re-building then everything works again.
+> >
+> > ** Affects: qemu
+> >      Importance: Undecided
+> >          Status: New
+> >
+> >
+> > ** Tags: build linux-user mips
+> >
+>
+> FWIW, this does not seem to be a mips-only issue: I'm seeing the
+> threadcount test fail with s390x-linux-user as well, and it also goes
+> away (only) if I purge the build directory, re-configure, and re-build.
+>
+>
+Valuable info!
+
+
+четвртак, 18. јун 2020., Cornelia Huck <email address hidden> је написао/ла:
+
+> On Mon, 15 Jun 2020 15:18:48 -0000
+> Alex Bennée <email address hidden> wrote:
+>
+> > Public bug reported:
+> >
+> > >From time to time I find check-tcg crashes with a one of the MIPS
+> > binaries. The last time it crashed was running the test:
+> >
+> >   ./mips64el-linux-user/qemu-mips64el ./tests/tcg/mips64el-linux-
+> > user/threadcount
+> >
+> > Inevitably after some time noodling around wondering what could be
+> > causing this weird behaviour I wonder if it is a build issue. I wipe all
+> > the mips* build directories, re-run configure and re-build and voila
+> > problem goes away.
+> >
+> > It seems there must be some sort of build artefact which isn't being
+> > properly re-generated on a build update which causes weird problems.
+> > Additional data point if I:
+> >
+> >   rm -rf mips64el-linux-user
+> >   ../../configure
+> >   make
+> >
+> > then I see failures in mip32 builds - eg:
+> >
+> >     GEN     mipsn32el-linux-user/config-target.h
+> >   In file included from /home/alex/lsrc/qemu.git/
+> linux-user/syscall_defs.h:10,
+> >                    from /home/alex/lsrc/qemu.git/linux-user/qemu.h:16,
+> >                    from /home/alex/lsrc/qemu.git/
+> linux-user/linuxload.c:5:
+> >   /home/alex/lsrc/qemu.git/linux-user/mips64/syscall_nr.h:1: error:
+> unterminated #ifndef
+> >    #ifndef LINUX_USER_MIPS64_SYSCALL_NR_H
+> >
+> >   make[1]: *** [/home/alex/lsrc/qemu.git/rules.mak:69:
+> linux-user/linuxload.o] Error 1
+> >   make[1]: *** Waiting for unfinished jobs....
+> >
+> > which implies there is a cross dependency between different targets
+> > somewhere. If I executed:
+> >
+> >   rm -rf mips*
+> >
+> > before re-configuring and re-building then everything works again.
+> >
+> > ** Affects: qemu
+> >      Importance: Undecided
+> >          Status: New
+> >
+> >
+> > ** Tags: build linux-user mips
+> >
+>
+> FWIW, this does not seem to be a mips-only issue: I'm seeing the
+> threadcount test fail with s390x-linux-user as well, and it also goes
+> away (only) if I purge the build directory, re-configure, and re-build.
+>
+>
+>
+Alex, Cornelia,
+
+Do you perhaps recall how did you obtain the original binaries (those with
+the problem)? What would be your typical workflow? Perhaps "git-pull +
+make" on existing, but not latest source tree?
+
+Thanks,
+Aleksandar
+
+
+Aleksandar, Alex, see comment #1.
+
+I think the problem happens because I moved the syscall_nr.h from source directory to build directory. If source directory is not cleaned up correctly, the build will not generate the new header in the build directory but in source directory and some targets that need 32bit, 64bit or a new API will only use the first one generated (as in this case they are all at the same place).
+
+See the following PR: https://<email address hidden>/
+
+
+Cornelia Huck <email address hidden> writes:
+
+> On Thu, 18 Jun 2020 19:00:34 +0200
+> Aleksandar Markovic <email address hidden> wrote:
+>
+>> четвртак, 18. јун 2020., Cornelia Huck <email address hidden> је написао/ла:
+>> 
+>> > On Mon, 15 Jun 2020 15:18:48 -0000
+>> > Alex Bennée <email address hidden> wrote:
+>> >  
+>> > > Public bug reported:
+>> > >  
+>> > > >From time to time I find check-tcg crashes with a one of the MIPS  
+>> > > binaries. The last time it crashed was running the test:
+>> > >
+>> > >   ./mips64el-linux-user/qemu-mips64el ./tests/tcg/mips64el-linux-
+>> > > user/threadcount
+>> > >
+>> > > Inevitably after some time noodling around wondering what could be
+>> > > causing this weird behaviour I wonder if it is a build issue. I wipe all
+>> > > the mips* build directories, re-run configure and re-build and voila
+>> > > problem goes away.
+>> > >
+>> > > It seems there must be some sort of build artefact which isn't being
+>> > > properly re-generated on a build update which causes weird problems.
+>> > > Additional data point if I:
+>> > >
+>> > >   rm -rf mips64el-linux-user
+>> > >   ../../configure
+>> > >   make
+>> > >
+>> > > then I see failures in mip32 builds - eg:
+>> > >
+>> > >     GEN     mipsn32el-linux-user/config-target.h
+>> > >   In file included from /home/alex/lsrc/qemu.git/  
+>> > linux-user/syscall_defs.h:10,  
+>> > >                    from /home/alex/lsrc/qemu.git/linux-user/qemu.h:16,
+>> > >                    from /home/alex/lsrc/qemu.git/  
+>> > linux-user/linuxload.c:5:  
+>> > >   /home/alex/lsrc/qemu.git/linux-user/mips64/syscall_nr.h:1: error:  
+>> > unterminated #ifndef  
+>> > >    #ifndef LINUX_USER_MIPS64_SYSCALL_NR_H
+>> > >
+>> > >   make[1]: *** [/home/alex/lsrc/qemu.git/rules.mak:69:  
+>> > linux-user/linuxload.o] Error 1  
+>> > >   make[1]: *** Waiting for unfinished jobs....
+>> > >
+>> > > which implies there is a cross dependency between different targets
+>> > > somewhere. If I executed:
+>> > >
+>> > >   rm -rf mips*
+>> > >
+>> > > before re-configuring and re-building then everything works again.
+>> > >
+>> > > ** Affects: qemu
+>> > >      Importance: Undecided
+>> > >          Status: New
+>> > >
+>> > >
+>> > > ** Tags: build linux-user mips
+>> > >  
+>> >
+>> > FWIW, this does not seem to be a mips-only issue: I'm seeing the
+>> > threadcount test fail with s390x-linux-user as well, and it also goes
+>> > away (only) if I purge the build directory, re-configure, and re-build.
+>> >
+>> >
+>> >  
+>> Alex, Cornelia,
+>> 
+>> Do you perhaps recall how did you obtain the original binaries (those with
+>> the problem)? What would be your typical workflow? Perhaps "git-pull +
+>> make" on existing, but not latest source tree?
+>
+> Just a bog-standard "pull some stuff, do make, create a branch and put
+> some patches on it, do make, switch to another branch, do make, etc". No
+> advanced fiddling with git history, doing make on a subtree, etc.
+
+Same here. As I say the syscall_nr breakage was a different one. I'll
+regularly just advance my tree and find this sort of breakage.
+
+-- 
+Alex Bennée
+
+
+Does this problem still persist after we've switched the build system to meson?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

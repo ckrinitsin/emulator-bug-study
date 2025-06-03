@@ -1,0 +1,66 @@
+device: 0.774
+KVM: 0.766
+boot: 0.733
+network: 0.728
+semantic: 0.723
+instruction: 0.716
+assembly: 0.704
+other: 0.700
+mistranslation: 0.685
+graphic: 0.677
+vnc: 0.658
+socket: 0.629
+
+QEMU not able to create vm with pflash and UEFI bios
+
+Running Fedora 24 with the virt-preview repo on QEMU Version 2.7.0 and libvirt version 2.2.0. Tried to install a windows 10 vm with the OVMF bios and this error happens every time, it didnt happen when using the stable version of qemu for fedora 24.
+
+libvirtError: internal error: qemu unexpectedly closed the monitor: 2016-10-29T04:07:29.678518Z qemu-system-x86_64: -drive file=/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw,if=pflash,format=raw,unit=0,readonly=on: oversized backing file, pflash segments cannot be mapped under 00000000ff800000
+
+Any ideas?
+
+Seems to work when using virt-install to do a manual uefi install
+
+This happens because the ArmVirtQemu firmware binary (== UEFI for aarch64 guests) is passed to qemu-system-x86_64.
+
+Normally such errors are not caught at QEMU startup time (similarly to the misconfiguration when you try to boot an aarch64 ISO in an x86_64 guest -- normally you would only notice the problem within the guest); however, in this case, the size of the ArmVirtQemu fw binary (64MB) is above the size that qemu-system-x86_64 permits for firmware binaries. (The pflash chip sizes and their limits are different per target.) That's why QEMU errs out early.
+
+I think this might be related to:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=1295146
+https://www.redhat.com/archives/libvir-list/2016-October/msg00045.html
+
+I'll make the subscribers in that RHBZ aware of this issue.
+
+Zach if you can still reproduce, can you provide the libvirt XML and the associated qemu command line from /var/lib/libvirt/qemu/$VMNAME.log for the working (virt-install) config and the non-working (virt-manager) config?
+
+Hello Cole sorry i didnt get to you sooner, there doesnt seem to be a log anywhere in that specified area but here is the working xml https://u.teknik.io/hp3jG.xml. I did update everything to the latest version and it still does it (with the addition of a new thing where it says my cpu isnt compatible http://pastebin.com/5i7EdHza). I cant seem to find the virt-manager xml config/virt-install.
+
+This is all for PCI passthrough at the end of the day
+
+Alright found them sorry about that 
+Libvirt.conf : https://u.teknik.io/a0rWz.txt
+qemu.conf: https://u.teknik.io/5Gd3Q.txt
+
+Similar report: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=860363
+> This sounds like you are using the x86_64 architecture, but an aarch64 (arm64) firmware. Install ovmf (package in Debian) and use that as a firmware if your goal is to run an x86_64 OS.
+
+(Your /usr/share/edk2/aarch64/QEMU_EFI-pflash.raw is for ARM aarch64, and qemu is x86_64 system, you can't run ARM firmware with x86_64 emulator)
+
+I had same "oversized backing file, pflash .." error message after installing qemu-efi package (https://packages.ubuntu.com/artful/qemu-efi) which is "UEFI firmware for 64-bit ARM virtual machines".
+
+It was fixed after purging qemu-efi (qemu-efi-aarch64) packages, installing ovmf package (https://packages.ubuntu.com/artful/ovmf) and restarting virt-manager.
+New virtual machine was created with correct UEFI firmware: /usr/share/OVMF/OVMF_CODE.fd
+
+My machine xml has line with /usr/share/OVMF/OVMF_CODE.fd
+<domain type='kvm'>
+...
+<os>
+...
+<loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>"
+
+This should be solved by now, minimally by the firmware auto-selection feature. Regarding libvirt commits, see <https://bugzilla.redhat.com/show_bug.cgi?id=1564270#c6> and <https://bugzilla.redhat.com/show_bug.cgi?id=1564270#c9>. Regarding virt-manager commits, the latest related commit I can see is 15a9502b7b7a ("details: Fix showing the firmware type in case of firmware auto selection", 2020-01-15).
+
+
+Just a side note, once you tried to boot the vm with the wrong firmware, it will create an oversized nvram file that you must delete or else you will stil get the same error even after switching to the right firmware.
+

@@ -1,0 +1,87 @@
+instruction: 0.754
+vnc: 0.742
+other: 0.741
+semantic: 0.729
+device: 0.722
+graphic: 0.710
+assembly: 0.703
+boot: 0.678
+mistranslation: 0.618
+KVM: 0.613
+socket: 0.599
+network: 0.568
+
+QEMU hangs sometimes during TRIM command
+Description of problem:
+I encountered a virtual machine freeze when map cache invalidation request was received while executing a TRIM command.
+
+I did some research and i think i found the problem.
+
+1. `xen_invalidate_map_cache` calls `bdrv_drain_all` before invalidation
+2. All BlockBackend devices run into quiesce mode (increment of `blk->quiesce_counter` in `blk_root_drained_begin`)
+3. When processing another block in TRIM command coroutine `blk_co_do_pdiscard` calls `blk_wait_while_drained`
+4. In `blk_wait_while_drained` we go under tre condition, decrement `in_flight` counter and yield the coroutine
+5. After return from `blk_aio_complete_bh` `in_flight` counter of `BlockBackend` device remains with value 1, which prevents `AIO_WAIT_WHILE_UNLOCKED(NULL, bdrv_drain_all_poll());` loop from exiting
+6. So QEMU stays in `bdrv_drain_all_begin` method
+
+Now why `in_flight` counter does not go to zero in point 5?
+
+Below is a call diagram for TRIM command. For example, consider processing of 2 blocks.
+
+![qemu_no_quiesce](/uploads/ddf7c0eca2147988f5bd9e8009b7eb71/qemu_no_quiesce.png)
+
+s can be seen from the diagram `in_flight` counter of BlockBackend at first increments at start of command in `ide_issue_trim`, and next in `blk_aio_prwv` before start of coroutine. But for second and next blocks we get into BH method `blk_aio_complete_bh` and before decrementing `in_flight` we call `acb->common.cb` callback, that is in fact `ide_issue_trim_cb`, so we incrementing `in_flight` again to value of 3. And decrementing to value of 2 before return from `blk_aio_complete`.
+
+So, the value of `blk->in_flight` varies in range [2..3] during block processing.
+
+Now consider the situation when map cache invalidation request is received during a block processing in TRIM command. Below is a call diagram for this situation.
+
+![qemu_quiesce](/uploads/a029c0b6aa0398815dcf761cc4a708e2/qemu_quiesce.png)
+
+In this example we get invalidation request before second block processing. Our BlockBackend device run into quiesce mode, and we yielding the coroutine in `blk_wait_while_drained`, decrementing `in_flight` counter from 3 to 2. Second decrement is made in `blk_aio_complete` (2 to 1).
+
+And now we get in situation, when we not scheduling any block processing methods, as they must be called later from `bdrv_drain_all_end`, and on the other hand, `bdrv_drain_all_poll` always returns true, as we have non-zero `in_flight` counter on one of BlockBackend devices.
+
+As one of possible solutions i try to call `blk_set_disable_request_queuing(s->blk, true);` in `ide_issue_trim` and corresponding `blk_set_disable_request_queuing(blk, false);` in `ide_trim_bh_cb`. Looks like it solves the problem, so TRIM command always process completely, as is ignore quiesce mode and not do coroutine yielding. But i think is not optimal.
+
+I try also remove incrementing and decrementing of `in_flight` counter in `ide_issue_trim` and `ide_trim_bh_cb`, so value of counter varies in range [1..2] during block processing. This also works, but i started to get warings like `Locked DMA mapping while invalidating mapcache!`, as TRIM command probably uses map cache and is not completed before actual map cache invalidation.
+Steps to reproduce:
+1. Run virtual machine
+2. Run progrms, work with files, etc.
+Additional information:
+QEMU trace logs. Enabled trace events: handle_ioreq, ide_dma_cb, dma_blk_io, dma_blk_cb, dma_complete, qemu_coroutime_yield.
+
+Log of TRIM command without freeze excerpt:
+
+```
+…
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=0 df=0 ptr=0 port=0x1f4 data=0x0 count=1 size=1
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=0 df=0 ptr=0 port=0x1f5 data=0x0 count=1 size=1
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=0 df=0 ptr=0 port=0x1f7 data=0x6 count=1 size=1
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=0 df=0 ptr=0 port=0xc160 data=0x1 count=1 size=1
+ide_dma_cb IDEState 0x5559d513ff98; sector_num=0 n=1 cmd=DMA TRIM
+dma_blk_io dbs=0x5559d5c6f350 bs=0x5559d513ff98 offset=0 to_dev=1
+dma_blk_cb dbs=0x5559d5c6f350 ret=0
+dma_blk_cb dbs=0x5559d5c6f350 ret=0
+dma_complete dbs=0x5559d5c6f350 ret=0 cb=0x5559d1585620
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=1 df=0 ptr=0 port=0xc162 data=0x0 count=1 size=1
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=1 df=0 ptr=0 port=0xc162 data=0x0 count=1 size=1
+handle_ioreq I/O=0x7ffc51d5e160 type=0 dir=0 df=0 ptr=0 port=0xc160 data=0x0 count=1 size=1
+…
+```
+
+Log of TRIM command with freeze:
+
+```
+…
+handle_ioreq I/O=0x7ffc52722ae0 type=8 dir=0 df=0 ptr=0 port=0x0 data=0xffffffffffffffff count=0 size=4
+handle_ioreq I/O=0x7ffc52722ae0 type=8 dir=0 df=0 ptr=0 port=0x0 data=0xffffffffffffffff count=0 size=4
+handle_ioreq I/O=0x7ffc52722ae0 type=8 dir=0 df=0 ptr=0 port=0x0 data=0xffffffffffffffff count=0 size=4
+handle_ioreq I/O=0x7ffc52722ae0 type=0 dir=0 df=0 ptr=0 port=0xc160 data=0x1 count=1 size=1
+ide_dma_cb IDEState 0x55c76faccf98; sector_num=0 n=1 cmd=DMA TRIM
+dma_blk_io dbs=0x55c770425b50 bs=0x55c76faccf98 offset=0 to_dev=1
+dma_blk_cb dbs=0x55c770425b50 ret=0
+handle_ioreq I/O=0x7ffc52722ae0 type=8 dir=0 df=0 ptr=0 port=0x0 data=0xffffffffffffffff count=0 size=4
+qemu_coroutine_yield from 0x55c76f4207f0 to 0x7f7fb099e0c0
+[end of log, no more events]
+```

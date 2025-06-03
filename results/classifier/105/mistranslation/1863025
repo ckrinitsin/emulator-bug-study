@@ -1,0 +1,446 @@
+mistranslation: 0.853
+semantic: 0.797
+other: 0.782
+graphic: 0.764
+assembly: 0.709
+instruction: 0.696
+device: 0.696
+vnc: 0.668
+KVM: 0.586
+boot: 0.583
+network: 0.527
+socket: 0.523
+
+Use-after-free after flush in TCG accelerator
+
+I believe I found a UAF in TCG that can lead to a guest VM escape. The security 
+list informed me "This can not be treated as a security issue." and to post it 
+here. I am looking at the 4.2.0 source code. The issue requires a race and I 
+will try to describe it in terms of three concurrent threads.
+
+I am looking 
+at the 4.2.0 source code. The issue requires a race and I will try to describe 
+it in terms of three concurrent threads.
+
+Thread A:
+
+A1. qemu_tcg_cpu_thread_fn runs work loop
+A2. qemu_wait_io_event => qemu_wait_io_event_common => process_queued_cpu_work
+A3. start_exclusive critical section entered
+A4. do_tb_flush is called, TB memory freed/re-allocated
+A5. end_exclusive exits critical section
+
+Thread B:
+
+B1. qemu_tcg_cpu_thread_fn runs work loop
+B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+B3. tcg_tb_alloc obtains a new TB
+
+Thread C:
+
+C1. qemu_tcg_cpu_thread_fn runs work loop
+C2. cpu_exec_step_atomic executes
+C3. TB obtained with tb_lookup__cpu_state or tb_gen_code
+C4. start_exclusive critical section entered
+C5. cpu_tb_exec executes the TB code
+C6. end_exclusive exits critical section
+
+Consider the following sequence of events:
+  B2 => B3 => C3 (same TB as B2) => A3 => A4 (TB freed) => A5 => B2 => 
+  B3 (re-allocates TB from B2) => C4 => C5 (freed/reused TB now executing) => C6
+
+In short, because thread C uses the TB in the critical section, there is no 
+guarantee that the pointer has not been "freed" (rather the memory is marked as 
+re-usable) and therefore a use-after-free occurs.
+
+Since the TCG generated code can be in the same memory as the TB data structure,
+it is possible for an attacker to overwrite the UAF pointer with code generated
+from TCG. This can overwrite key pointer values and could lead to code 
+execution on the host outside of the TCG sandbox.
+
+The bug describes a race whereby cpu_exec_step_atomic can acquire a TB
+which is invalidated by a tb_flush before we execute it. This doesn't
+affect the other cpu_exec modes as a tb_flush by it's nature can only
+occur on a quiescent system. The race was described as:
+
+  B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+  B3. tcg_tb_alloc obtains a new TB
+
+      C3. TB obtained with tb_lookup__cpu_state or tb_gen_code
+          (same TB as B2)
+
+          A3. start_exclusive critical section entered
+          A4. do_tb_flush is called, TB memory freed/re-allocated
+          A5. end_exclusive exits critical section
+
+  B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+  B3. tcg_tb_alloc reallocates TB from B2
+
+      C4. start_exclusive critical section entered
+      C5. cpu_tb_exec executes the TB code that was free in A4
+
+The simplest fix is to widen the exclusive period to include the TB
+lookup. As a result we can drop the complication of checking we are in
+the exclusive region before we end it.
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: Yifan <email address hidden>
+Cc: Bug 1863025 <email address hidden>
+---
+ accel/tcg/cpu-exec.c | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 2560c90eec7..d95c4848a47 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -240,6 +240,8 @@ void cpu_exec_step_atomic(CPUState *cpu)
+     uint32_t cf_mask = cflags & CF_HASH_MASK;
+ 
+     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
++        start_exclusive();
++
+         tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+         if (tb == NULL) {
+             mmap_lock();
+@@ -247,8 +249,6 @@ void cpu_exec_step_atomic(CPUState *cpu)
+             mmap_unlock();
+         }
+ 
+-        start_exclusive();
+-
+         /* Since we got here, we know that parallel_cpus must be true.  */
+         parallel_cpus = false;
+         cc->cpu_exec_enter(cpu);
+@@ -271,14 +271,15 @@ void cpu_exec_step_atomic(CPUState *cpu)
+         qemu_plugin_disable_mem_helpers(cpu);
+     }
+ 
+-    if (cpu_in_exclusive_context(cpu)) {
+-        /* We might longjump out of either the codegen or the
+-         * execution, so must make sure we only end the exclusive
+-         * region if we started it.
+-         */
+-        parallel_cpus = true;
+-        end_exclusive();
+-    }
++
++    /*
++     * As we start the exclusive region before codegen we must still
++     * be in the region if we longjump out of either the codegen or
++     * the execution.
++     */
++    g_assert(cpu_in_exclusive_context(cpu));
++    parallel_cpus = true;
++    end_exclusive();
+ }
+ 
+ struct tb_desc {
+-- 
+2.20.1
+
+
+
+I've attached a variant of the suggested patch which simply expands the exclusive period. It's hard to test extensively as not many things use the EXCP_ATOMIC mechanism. Can I ask how you found the bug and if you can re-test with the suggested patch?
+
+I found it just by launching Ubuntu 19.10 live cd with QXL driver. I will re-test this weekend.
+
+The workaround I had is to check the number of TLB flushes and to re-try obtaining the TB if the number changes. There is a penalty for the case where TLB is flushed but should not degrade performance in most cases. I think obtaining the lock earlier will slow down the VM if EXCP_ATOMIC is used often.
+
+Of course, I am assuming TLB flush is the only way to cause this bug.
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index d1c2b6ea1fd..d83b578299b 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -250,8 +250,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
+     uint32_t flags;
+     uint32_t cflags = 1;
+     uint32_t cf_mask = cflags & CF_HASH_MASK;
++    unsigned flush_count;
+ 
+     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
++retry:
++        flush_count = tb_flush_count();
+         tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+         if (tb == NULL) {
+             mmap_lock();
+@@ -260,6 +263,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
+         }
+ 
+         start_exclusive();
++        /* do_tb_flush() might run and make tb invalid */
++        if (flush_count != tb_flush_count()) {
++            end_exclusive();
++            goto retry;
++        }
+ 
+         /* Since we got here, we know that parallel_cpus must be true.  */
+         parallel_cpus = false;
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 4ed9d0abaf2..ecf7d3b53ff 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -2696,6 +2696,11 @@ void tcg_flush_softmmu_tlb(CPUState *cs)
+ #endif
+ }
+ 
++unsigned tb_flush_count(void)
++{
++    return atomic_read(&tb_ctx.tb_flush_count);
++}
++
+ #if defined(CONFIG_NO_RWX)
+ void tb_exec_memory_lock(void)
+ {
+diff --git a/include/exec/exec-all.h b/include/exec/exec-all.h
+index 5ccc9485812..1bc61fa6d76 100644
+--- a/include/exec/exec-all.h
++++ b/include/exec/exec-all.h
+@@ -584,6 +584,7 @@ void tlb_set_dirty(CPUState *cpu, target_ulong vaddr);
+ void tb_flush_jmp_cache(CPUState *cpu, target_ulong addr);
+ 
+ /* translate-all.c */
++unsigned tb_flush_count(void);
+ #if defined(CONFIG_NO_RWX)
+ void tb_exec_memory_lock(void);
+ bool tb_is_exec(const TranslationBlock *tb);
+
+Apologies, the patch got messed up.
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index c01f59c743..7a9e8c94bd 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -238,8 +238,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
+     uint32_t flags;
+     uint32_t cflags = 1;
+     uint32_t cf_mask = cflags & CF_HASH_MASK;
++    unsigned flush_count;
+ 
+     if (sigsetjmp(cpu->jmp_env, 0) == 0) {
++retry:
++        flush_count = tb_flush_count();
+         tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, cf_mask);
+         if (tb == NULL) {
+             mmap_lock();
+@@ -248,6 +251,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
+         }
+ 
+         start_exclusive();
++        /* do_tb_flush() might run and make tb invalid */
++        if (flush_count != tb_flush_count()) {
++            end_exclusive();
++            goto retry;
++        }
+ 
+         /* Since we got here, we know that parallel_cpus must be true.  */
+         parallel_cpus = false;
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 9f48da9472..2fb7da9b51 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -2674,3 +2674,8 @@ void tcg_flush_softmmu_tlb(CPUState *cs)
+     tlb_flush(cs);
+ #endif
+ }
++
++unsigned tb_flush_count(void)
++{
++    return atomic_read(&tb_ctx.tb_flush_count);
++}
+diff --git a/include/exec/exec-all.h b/include/exec/exec-all.h
+index d85e610e85..aa3c2d219a 100644
+--- a/include/exec/exec-all.h
++++ b/include/exec/exec-all.h
+@@ -579,6 +579,9 @@ void tlb_set_dirty(CPUState *cpu, target_ulong vaddr);
+ /* exec.c */
+ void tb_flush_jmp_cache(CPUState *cpu, target_ulong addr);
+ 
++/* translate-all.c */
++unsigned tb_flush_count(void);
++
+ MemoryRegionSection *
+ address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr addr,
+                                   hwaddr *xlat, hwaddr *plen,
+
+What race are you thinking of in my patch? The obvious race I can
+think of is benign:
+
+Case 1:
+A: does TB flush
+B: read tb_flush_count
+A: increment tb_flush_count
+A: end_exclusive
+B: tb_lookup__cpu_state/tb_gen_code
+B: start_exclusive
+B: read tb_flush_count again (increment seen)
+B: retries
+
+Case 2:
+B: read tb_flush_count
+A: does TB flush
+A: increment tb_flush_count
+A: end_exclusive
+B: tb_lookup__cpu_state/tb_gen_code
+B: start_exclusive
+B: read tb_flush_count again (increment seen)
+B: retries
+
+Case 3:
+A: does TB flush
+A: increment tb_flush_count
+A: end_exclusive
+B: read tb_flush_count
+B: tb_lookup__cpu_state/tb_gen_code
+B: start_exclusive
+B: read tb_flush_count again (no increment seen)
+B: proceeds
+
+Case 1 is the expected case. Case 2, we thought TB was stale but it
+wasn't so we get it again with tb_lookup__cpu_state with minimal extra
+overhead.
+
+Case 3 seems to be bad because we could read tb_flush_count and find
+it already incremented. But if so that means thread A is at the end of
+do_tb_flush and the lookup tables are already cleared and the TCG
+context is already reset. So it should be safe for thread B to call
+tb_lookup__cpu_state or tb_gen_code.
+
+Yifan
+
+On Fri, Feb 14, 2020 at 3:31 PM Richard Henderson
+<email address hidden> wrote:
+>
+> On 2/14/20 6:49 AM, Alex Bennée wrote:
+> > The bug describes a race whereby cpu_exec_step_atomic can acquire a TB
+> > which is invalidated by a tb_flush before we execute it. This doesn't
+> > affect the other cpu_exec modes as a tb_flush by it's nature can only
+> > occur on a quiescent system. The race was described as:
+> >
+> >   B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+> >   B3. tcg_tb_alloc obtains a new TB
+> >
+> >       C3. TB obtained with tb_lookup__cpu_state or tb_gen_code
+> >           (same TB as B2)
+> >
+> >           A3. start_exclusive critical section entered
+> >           A4. do_tb_flush is called, TB memory freed/re-allocated
+> >           A5. end_exclusive exits critical section
+> >
+> >   B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+> >   B3. tcg_tb_alloc reallocates TB from B2
+> >
+> >       C4. start_exclusive critical section entered
+> >       C5. cpu_tb_exec executes the TB code that was free in A4
+> >
+> > The simplest fix is to widen the exclusive period to include the TB
+> > lookup. As a result we can drop the complication of checking we are in
+> > the exclusive region before we end it.
+>
+> I'm not 100% keen on having the tb_gen_code within the exclusive region.  It
+> implies a much larger delay on (at least) the first execution of the atomic
+> operation.
+>
+> But I suppose until recently we had a global lock around code generation, and
+> this is only slightly worse.  Plus, it has the advantage of being dead simple,
+> and without the races vs tb_ctx.tb_flush_count that exist in Yifan's patch.
+>
+> Applied to tcg-next.
+>
+>
+> r~
+
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=886cc68943eb
+
+CVE-2020-24165 was assigned to this:
+https://nvd.nist.gov/vuln/detail/CVE-2020-24165
+
+I had no involvement in the assignment, posting here for reference only.
+
+On Thu, Aug 31, 2023 at 03:40:25PM +0200, Philippe Mathieu-Daudé wrote:
+> Hi Samuel,
+> 
+> On 31/8/23 14:48, Samuel Henrique wrote:
+> > CVE-2020-24165 was assigned to this:
+> > https://nvd.nist.gov/vuln/detail/CVE-2020-24165
+> > 
+> > I had no involvement in the assignment, posting here for reference only.
+> > 
+> > ** CVE added: https://cve.mitre.org/cgi-bin/cvename.cgi?name=2020-24165
+> 
+> QEMU 4.2.0 was released in 2019. The issue you report
+> has been fixed in commit 886cc68943 ("accel/tcg: fix race
+> in cpu_exec_step_atomic (bug 1863025)") which is included
+> in QEMU v5.0, released in April 2020, more than 3 years ago.
+> 
+> What do you expect us to do here? I'm not sure whether assigning
+> CVE for 3 years old code is a good use of engineering time.
+
+In any case per our stated security policy, we do not consider TCG to
+be providing a security boundary between host and guest, and thus bugs
+in TCG aren't considered security flaws:
+
+ https://www.qemu.org/docs/master/system/security.html#non-virtualization-use-case
+
+With regards,
+Daniel
+-- 
+|: https://berrange.com      -o-    https://www.flickr.com/photos/dberrange :|
+|: https://libvirt.org         -o-            https://fstop138.berrange.com :|
+|: https://entangle-photo.org    -o-    https://www.instagram.com/dberrange :|
+
+
+On Thu, Aug 31, 2023 at 3:57 PM Daniel P. Berrangé <email address hidden> wrote:
+>
+> On Thu, Aug 31, 2023 at 03:40:25PM +0200, Philippe Mathieu-Daudé wrote:
+> > Hi Samuel,
+> >
+> > On 31/8/23 14:48, Samuel Henrique wrote:
+> > > CVE-2020-24165 was assigned to this:
+> > > https://nvd.nist.gov/vuln/detail/CVE-2020-24165
+> > >
+> > > I had no involvement in the assignment, posting here for reference only.
+> > >
+> > > ** CVE added: https://cve.mitre.org/cgi-bin/cvename.cgi?name=2020-24165
+> >
+> > QEMU 4.2.0 was released in 2019. The issue you report
+> > has been fixed in commit 886cc68943 ("accel/tcg: fix race
+> > in cpu_exec_step_atomic (bug 1863025)") which is included
+> > in QEMU v5.0, released in April 2020, more than 3 years ago.
+> >
+> > What do you expect us to do here? I'm not sure whether assigning
+> > CVE for 3 years old code is a good use of engineering time.
+>
+> In any case per our stated security policy, we do not consider TCG to
+> be providing a security boundary between host and guest, and thus bugs
+> in TCG aren't considered security flaws:
+>
+>  https://www.qemu.org/docs/master/system/security.html#non-virtualization-use-case
+
+Right, and it is clearly indicated in the referenced launchpad bug:
+'The security list informed me "This can not be treated as a security
+issue"'.
+
+This adds up to CVE-2022-36648, which is also a mystery to me in terms
+of CVE assignment and CVSS scoring (rated as Critical). I don't know
+what's going on with NVD, there must be something wrong on their side.
+
+I disputed both CVEs via https://cveform.mitre.org/.
+
+> With regards,
+> Daniel
+> --
+> |: https://berrange.com      -o-    https://www.flickr.com/photos/dberrange :|
+> |: https://libvirt.org         -o-            https://fstop138.berrange.com :|
+> |: https://entangle-photo.org    -o-    https://www.instagram.com/dberrange :|
+>
+
+-- 
+Mauro Matteo Cascella
+Red Hat Product Security
+PGP-Key ID: BB3410B0
+
+

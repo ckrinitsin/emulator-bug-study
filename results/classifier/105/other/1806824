@@ -1,0 +1,142 @@
+other: 0.978
+assembly: 0.978
+semantic: 0.975
+device: 0.973
+socket: 0.963
+boot: 0.956
+instruction: 0.956
+vnc: 0.954
+KVM: 0.952
+mistranslation: 0.925
+network: 0.889
+graphic: 0.877
+
+SIE-200 (TrustZone) MPC: BLK_MAX returns an incorrect value
+
+Version: 
+$ qemu-system-arm --version
+QEMU emulator version 3.0.92 (v3.1.0-rc2-31-gd522fba244)
+
+Arm SIE-200 Technical Reference Manual describes that BLK_MAX indicates the maximum value of "block based index register" (BLK_IDX). For example, the value 1 would indicate that BLK_IDX can be 0 or 1. According to my experiments, the AN505 FPGA image apparently follows this behavior.
+
+In the current implementation of QEMU, it appears to indicate the number of possible values for BLK_IDX, i.e., one plus the value it's supposed to return.
+
+As per https://www.qemu.org/contribute/report-a-bug/ could you please provide:
+
+  - the command line you are using
+  - details about the guest you are running (or test case)
+
+
+Command line:
+
+    $ qemu-system-arm -kernel Image.elf -machine mps2-an505 -nographic -d guest_errors -s -semihosting
+
+The guest I'm running is an unreleased program for a research purpose. I'm not aware of any publicly-known application or operating system that make use of the hardware register concerned by this issue.
+
+The attached program is an artificial example that reproduces the issue. The program writes a random value to every LUT block within [0, BLK_MAX]. After that, it examines the content of every LUT block to see if it has the intended value or not.
+
+With the AN505 FPGA image, you get the following output (via UART1, 115200 baud):
+
+    ==== The test program has started ====
+     LUT[0x00000000] = 07345a3f
+     LUT[0x00000001] = 020c7cc6
+    ==== The test program has completed ====
+
+With QEMU, you get the following output because the LUT index 0x00000040 doesn't actually exist and is wrapped around to the first block:
+    
+    $ make qemu
+    qemu-system-arm -kernel Image.elf -machine mps2-an505 -nographic -d guest_errors -s -semihosting
+    ==== The test program has started ====
+     LUT[0x00000000] = 07345a3f
+     LUT[0x00000001] = 020c7cc6
+     ...
+     LUT[0x0000003f] = ce3b657b
+     LUT[0x00000040] = f01ed211
+    [ERROR] Verify failed at 0x00000000 - expected 0x07345a3f, got 0xf01ed211.
+    ==== The test program has completed ====
+
+Thanks for the bug report and the test program. The fix seems straightforward -- just adjust what we return for the register value. I've sent a patch:
+http://patchwork.ozlabs.org/patch/1013034/
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> Thanks for the bug report and the test program. The fix seems straightforward -- just adjust what we return for the register value. I've sent a patch:
+> http://patchwork.ozlabs.org/patch/1013034/
+
+I know you had a bunch of M-profile test cases. Once we get tcg system
+tests enabled would it be worth porting some of those into the QEMU src
+tree?
+
+There is already one other ARM system test pending for the microbit
+tests.
+
+
+>
+>
+> ** Changed in: qemu
+>        Status: New => In Progress
+
+
+--
+Alex Bennée
+
+
+On Fri, 14 Dec 2018 at 13:56, Alex Bennée <email address hidden> wrote:
+>
+>
+> Peter Maydell <email address hidden> writes:
+>
+> > Thanks for the bug report and the test program. The fix seems straightforward -- just adjust what we return for the register value. I've sent a patch:
+> > http://patchwork.ozlabs.org/patch/1013034/
+>
+> I know you had a bunch of M-profile test cases. Once we get tcg system
+> tests enabled would it be worth porting some of those into the QEMU src
+> tree?
+
+I don't have anything suitable -- unless we have
+support for "system test of this guest kernel", in which case
+we could add the arm trusted firmware boot/selftests.
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On Fri, 14 Dec 2018 at 13:56, Alex Bennée <email address hidden> wrote:
+>>
+>>
+>> Peter Maydell <email address hidden> writes:
+>>
+>> > Thanks for the bug report and the test program. The fix seems straightforward -- just adjust what we return for the register value. I've sent a patch:
+>> > http://patchwork.ozlabs.org/patch/1013034/
+>>
+>> I know you had a bunch of M-profile test cases. Once we get tcg system
+>> tests enabled would it be worth porting some of those into the QEMU src
+>> tree?
+>
+> I don't have anything suitable -- unless we have
+> support for "system test of this guest kernel", in which case
+> we could add the arm trusted firmware boot/selftests.
+
+That's the next step, enabling the building of a known good test case
+from an external tree and depositing the images in the right place so we
+can use them as tests.
+
+Things like LTP, kvm-unit-tests and various kernels.
+
+>
+> thanks
+> -- PMM
+
+
+--
+Alex Bennée
+
+
+This is now fixed in git master, in commit 619d54a8d854e797bf562, and will be in the upcoming 4.0 release.
+
+

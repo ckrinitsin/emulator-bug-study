@@ -1,0 +1,139 @@
+mistranslation: 0.878
+KVM: 0.871
+graphic: 0.856
+vnc: 0.850
+device: 0.847
+network: 0.840
+instruction: 0.838
+socket: 0.832
+assembly: 0.828
+boot: 0.823
+semantic: 0.821
+other: 0.778
+
+Guest hangs during option rom loading with certain cards
+
+With a Broadcom Corporation NetXtreme II BCM57810 10 Gigabit Ethernet card, device assignment does not work. The guest hangs during option rom execution. Moreover, if an attempt is made to quit qemu when the guest is in the hung state, the card gets into an inoperable state. Only a powercycle then, restores the card back into working order, just unloading/loading the driver does not help.
+
+Qemu version  - 1.6.2 or current master
+Distribution - FC19
+Kernel Version - 3.12.9-201.fc19.x86_64
+
+Details of the card - 
+ # ethtool -i p2p2
+driver: bnx2x
+version: 1.78.17-0
+firmware-version: bc 7.8.22
+bus-info: 0000:08:00.1
+supports-statistics: yes
+supports-test: yes
+supports-eeprom-access: yes
+supports-register-dump: yes
+supports-priv-flags: yes
+
+The output of lspci when the card is broken -
+03:00.0 Ethernet controller: Broadcom Corporation NetXtreme II BCM57810 10 Gigabit Ethernet (rev ff) (prog-if ff)
+	!!! Unknown header type 7f
+	Kernel driver in use: bnx2x
+00: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+10: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+20: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+30: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+
+I will post if I get a chance to try out a newer  than 7.8.22 for the option rom and see if this issue is fixed. However it appears we need to have a unified approach to automatically avoid loading the rom based on certain criteria.  Manually, looking out for fixes to firmware and hard coding decisions based on those is neither desirable nor easy to maintain.
+
+Based on the trace in the attachment, the sequence of config space accesses leading up to the hang - 
+
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x1, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x9430, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa30c, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x7fffffff, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa5dc, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x0, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa2ec, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x3, len=0x4)
+vfio: vfio_pci_read_config(0000:03:00.0, @0x98, len=0x4) 200
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa408, len=0x4)
+vfio: vfio_pci_read_config(0000:03:00.0, @0x80, len=0x4) 8
+
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x86420, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x4, len=0x4)
+vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x86420, len=0x4)
+vfio: vfio_pci_read_config(0000:03:00.0, @0x80, len=0x4) 8
+
+The last 4 writes co-relate to the point where the guest hangs because they get repeated forever
+
+Comments from Alex Williamson :
+> The sequence leading up to this is quite short.  We do standard PCI BAR
+> sizing and setup, read the ROM, then do:
+> 
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x1, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x9430, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa30c, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x7fffffff, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa5dc, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x0, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa2ec, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x3, len=0x4)
+> vfio: vfio_pci_read_config(0000:03:00.0, @0x98, len=0x4) 200
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0xa408, len=0x4)
+> vfio: vfio_pci_read_config(0000:03:00.0, @0x80, len=0x4) 8
+> 
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x86420, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x80, 0x4, len=0x4)
+> vfio: vfio_pci_write_config(0000:03:00.0, @0x78, 0x86420, len=0x4)
+> vfio: vfio_pci_read_config(0000:03:00.0, @0x80, len=0x4) 8
+> 
+> The last 4 operations are repeated forever.
+
+Based on the Linux driver we can see that 0x86420 is MCP_REG_MCPR_NVM_SW_ARB which arbitrates software locking of the nvram on the device.  A write of 4 seems to indicate that we want to lock port 1 for nvram access.  A successful lock would set bit 2 (0x4).  The value 0x8 is read back, so the lock was not successful and the ROM repeats this forever.
+
+Perhaps there's a problem with how the port number is selected?  It seems suspicious that we're using port 1 here.
+
+
+The vfio code has logic that checks if a FLR is possible and attempts it before and after device assignment. Replacing the FLR with a bus reset succeeds past the stuck option rom loading phase and we are able to boot into the guest successfully which means that the first initialization (by the hardware) changes something in the nvram that needs to be reset back to default by a hard (bus) reset. 
+
+We could add an ugly hack to vfio to do a bus reset for this specific card, but it should be noted that FLR if supported, should be able to take care of this condition.
+
+Note that it's really the FLR that's messing up the config space if it's attempted after the sequence of events leading upto the hang.
+
+It's easy to reproduce this using setpci writes to the card followed by a FLR in the following manner -
+
+#!/bin/bash
+setpci -v -s 03:00.0 4.w=2
+setpci -v -s 03:00.0 4.w
+setpci -v -s 03:00.0 4.w=103
+setpci -v -s 03:00.0 4.w
+setpci -v -s 03:00.0 78.l=1
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 80.l=9430
+setpci -v -s 03:00.0 80.l
+setpci -v -s 03:00.0 78.l=a30c
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 80.l=7fffffff
+setpci -v -s 03:00.0 80.l
+setpci -v -s 03:00.0 78.l=a5dc
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 80.l=0
+setpci -v -s 03:00.0 80.l
+setpci -v -s 03:00.0 78.l=a2ec
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 80.l=3
+setpci -v -s 03:00.0 80.l
+setpci -v -s 03:00.0 78.l=a408
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 78.l=86420
+setpci -v -s 03:00.0 78.l
+setpci -v -s 03:00.0 80.l=4
+setpci -v -s 03:00.0 80.l
+
+echo 1 > reset #flr then completely corrupts the config space
+
+
+It has been suggested to blacklist loading of rom for this card (and for any other similar card that exhibit such issues) by default, a patch has been posted upstream and is going several iterations based on reviews. The most uptodate series is 
+[PATCH 0/2 v3] vfio: blacklist loading of unstable roms. A v4 will be posted soon.
+
+
+Patch seems to have been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=4b9430294ed406a00f045d
+

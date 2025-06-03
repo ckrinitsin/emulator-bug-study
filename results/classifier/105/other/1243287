@@ -1,0 +1,144 @@
+other: 0.929
+device: 0.917
+network: 0.909
+instruction: 0.907
+KVM: 0.907
+graphic: 0.902
+boot: 0.896
+vnc: 0.895
+mistranslation: 0.889
+semantic: 0.886
+socket: 0.859
+assembly: 0.857
+
+[KVM/QEMU][ARM][SAUCY] fails to boot cloud-image due to host kvm fail
+
+On booting the cloud image using qemu/kvm fails with the following error:
+
+Cloud-init v. 0.7.3 running 'init' at Thu, 03 Oct 2013 16:45:21 +0000. Up 360.78 seconds.
+ci-info: +++++++++++++++++++++++++Net device info+++++++++++++++++++++++++
+ci-info: +--------+------+-----------+---------------+-------------------+
+ci-info: | Device | Up | Address | Mask | Hw-Address |
+ci-info: +--------+------+-----------+---------------+-------------------+
+ci-info: | lo | True | 127.0.0.1 | 255.0.0.0 | . |
+ci-info: | eth0 | True | 10.0.2.15 | 255.255.255.0 | 52:54:00:12:34:56 |
+ci-info: +--------+------+-----------+---------------+-------------------+
+ci-info: ++++++++++++++++++++++++++++++Route info++++++++++++++++++++++++++++++
+ci-info: +-------+-------------+----------+---------------+-----------+-------+
+ci-info: | Route | Destination | Gateway | Genmask | Interface | Flags |
+ci-info: +-------+-------------+----------+---------------+-----------+-------+
+ci-info: | 0 | 0.0.0.0 | 10.0.2.2 | 0.0.0.0 | eth0 | UG |
+ci-info: | 1 | 10.0.2.0 | 0.0.0.0 | 255.255.255.0 | eth0 | U |
+ci-info: +-------+-------------+----------+---------------+-----------+-------+
+error: kvm run failed Function not implemented
+
+/usr/lib/python2.7/dist-packages/cloudinit/sources/DataSourceAltCloud.py assumes that dmidecode command is availabe (ie it assumes that system is x86) on arm systems there is no dmidecode command so host kvm fails with the message "error: kvm run failed Function not implemented"
+
+The patch makes get_cloud_type() function return with UNKNOWN for ARM systems.
+
+I was able to boot the cloud-image on ARM after applying this change.
+
+
+
+This change is necessary in order to use the image for OpenStack as well, since you could not use the work around of a local data datasource there. I've successfully validated an image with the patch applied works with OpenStack.
+
+The real reason for failure turns out is that cloud-init calls dmidecode in DataSourceAltCloud. In dmidecode we mmap() /dev/mem and try to memcpy() the contents to another memory location. Host kvm dies when you try to memcpy()/memmove() from the address that mmap() returned. The same code on a native arm system, mmap() fails and returns a  -1. NOTE: We can open() and read() /dev/mem. Dmidecode is able to use either mmap() or just open() and read(), this is controlled by a #define USE_MMAP at compile time. But mmap() /dev/mem under kvm mmio seems to be doing bad things. Dmidecode does not print anything useful on ARM, at least the ones that don't have SMBIOS or use BIOS even. Many of tools call dmidecode, and this can cause problems if you run these tools on a cloud instance. I sent a patch upstream to dmidecode debian devel and waiting on comments.
+
+Open /dev/mem and mmap() on native arm system vs kvm cloud instance behaves differently.
+
+===== Native ARM Midway system =====
+ubuntu@m10:~$ sudo ./testmmap
+opened /dev/mem O_RDONLY
+return from mmap() for PROT_READ = ffffffff
+return from mmap() for PROT_READ | PROT_WRITE = ffffffff
+closing /dev/mem
+opened /dev/mem O_RDWR
+return from mmap() for PROT_READ = ffffffff
+return from mmap() for PROT_READ|PROT_WRITE = ffffffff
+===========================================
+
+===== KVM Instance on Midway System =========
+ubuntu@cloudimg:~$ sudo ./testmmap
+sudo: unable to resolve host cloudimg
+opened /dev/mem O_RDONLY
+return from mmap() for PROT_READ = b6eb1000
+return from mmap() for PROT_READ | PROT_WRITE = ffffffff
+closing /dev/mem
+opened /dev/mem O_RDWR
+return from mmap() for PROT_READ = b6ea1000
+return from mmap() for PROT_READ|PROT_WRITE = b6e91000
+trying to copy from srcaddr=0xb6e91000 to destaddr = 0x68d008 len = 0x10000
+bytes
+error: kvm run failed Function not implemented
+ubuntu@m10:~/cloud-image$
+=================================================
+
+mmap() is returning with an address in the KVM instance, the address looks like
+a valid address but if you try to copy from that address using
+memcpy()/mmemove() you will kill kvm. I would expect mmap() to behave the same
+on native and KVM instance.
+
+You can find this testcase in:
+http://kernel.ubuntu.com/~manjo/cloud-image-saucy/testmmap.c
+
+
+Ubuntu kernels use CONFIG_STRICT_MEM which prevents access to physical mem other than BIOS and PCI region so that X or dmidecode tools can read this info. On a native ARM system since there is no BIOS (yet) this causes mmap() of /dev/mem to return a -1. But with KVM/QEMU emulating ARM (mach virt) on native ARM, mmap() /dev/mem does not return a -1 but returns a valid address (or what looks like a valid address). Could it be that kvm/qemu is not passing protections correctly for phy mem ?
+
+(1) If you are trying to mmap /dev/mem then you are going to be accessing physical addresses. This is obviously totally board specific. In particular the memory layout between a Midway system and a KVM virtual machine is likely to be different (you don't say what QEMU configuration you're using) so it is unsurprising that looking at /dev/mem address zero gives different effects between the host and the VM. If dmidecode wants to access physical address space it needs to be aware of the physical memory layout of every board it might run on (and that is an enormous range of systems for ARM).
+
+(2) The guest kernel has sufficient privilege to cause kvm to exit (the easiest way it can do this is to do something that KVM doesn't support, such as trying to access emulated devices via LDM/STM or some other "complex" instruction). If you let your guest userspace open /dev/mem it has equivalent privilege and can do the same thing (again, by trying LDM on device MMIO space)
+
+(3) My kernel sources don't have any references to CONFIG_STRICT_MEM, and the only two google hits are references back to this bug report, so I'm not sure what this is.
+
+My best guess is that there are two underlying bugs here:
+a. CONFIG_STRICT_MEM (whatever that is) either doesn't work with ARM or doesn't work with KVM or doesn't work with KVM/ARM
+b. dmidecode is making bad assumptions about the physical memory layout of the machine it is running on and needs to be fixed somehow (what does it think is the actual data it is copying out of physical memory??)
+
+
+Manoj, dmidecode seems highly x86-specific according to http://www.nongnu.org/dmidecode/, so not running it on arm does seem a correct solution for closing this bug. Suggest you assign it back to cloud-init to have that fixed.
+An alternative to checking for the command's presence would be checking uname or whatever Python offers as equivalent.
+
+What do you expect to read from 0xf0000 to 0xfffff on your arm mach-virt guest? I suggest you file a separate bug report more understandable to QEMU/KVM developers if there's a valid use case failing, along with versions, command line and anything else needed for someone to actually investigate this beyond speculation.
+
+dmidecode itself should probably be checking at runtime what cpu architecture it is running on so it can refuse to read /dev/mem on systems which it doesn't know it understands.
+
+
+Peter, the config option is called: CONFIG_STRICT_DEVMEM
+And /dev/mem behaves differently between doing read() and doing mmap().
+
+As Peter already hinted, the memory layout is different on native Midway (which has DRAM starting at 0) and mach-virt/vexpress (which start at 128MB / 2GB respectively). So accessing 0xf0000 reads memory on native, but faults in stage 2 mapping in the host kernel.
+But the actual problem is that the host kernel passes this abort on to userspace, where QEMU just does abort(), thus crashing the whole virtual machine. Actually I think we should change the host kernel to inject the data abort into the guest. I tested this with a simple patch, it now makes dmidecode crash (due to a signal), but keeps the guest alive.
+
+This approach needs some discussion on the ML, I guess.
+
+But near term we should not call dmidecode on ARM, since AFAIK it does not give any information. There once was a discussion on patching dmidecode to output hardcoded or elsewhere gathered information to make scripts happy, but I don't know where this ended.
+
+
+I agree we should probably make KVM inject a data abort here. That doesn't change the fact that a userspace program that looks in /dev/mem without being 100% sure what hardware it is running on is really dangerous and needs to be fixed.
+
+
+A workaround that we used was to rename dmidecode to /bin/true and .make it persistent.  dpkg-divert --local --divert /path/dmidecode --rename --add /bin/true. But that is just a workaround, any code that maps() /dev/mem can cause these crashes. Is there a fix for this in the horizon ?
+
+The most recent mailing list discussion about the problem is here:
+http://lists.infradead.org/pipermail/linux-arm-kernel/2013-December/219176.html
+
+It does not look likely that there will be a fix soon: it's complicated (and the suggestion to inject a data abort has been rejected), and it only affects broken guest code which has direct access to /dev/mem.
+
+You should get dmidecode and any other similarly broken guest binaries fixed.
+
+
+I just worked around this in cloud-init by disabling the smartOS datasource if the uname arch is arm* or aarch*
+http://bazaar.launchpad.net/~cloud-init-dev/cloud-init/trunk/view/head:/cloudinit/sources/DataSourceSmartOS.py
+
+
+"uname not i386 or x86_64" might be a better check -- restrict to the archs where it actually works.
+
+
+Is there something we can do for ARM32 cloud-images so that customers who might download the image and try to deploy it will not see this issue? Something like:
+
+dpkg-divert --local --divert /path/dmidecode --rename --add /bin/true
+
+Manoj, the fix that Scott just put through should fix it. However, I've gone ahead and put in a fix for the cloud image build process. I would really like to see this fix though in dmidecode. 
+
+I did send a patch for dmidecode to exit gracefully if there is no bios or smbus before it did all the mmap() damage, but no one seemed interested in that patch. I was told that upstream is working on a different approach.
+

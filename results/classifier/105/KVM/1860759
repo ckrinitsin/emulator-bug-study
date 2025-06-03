@@ -1,0 +1,150 @@
+KVM: 0.790
+vnc: 0.759
+mistranslation: 0.721
+other: 0.713
+device: 0.615
+graphic: 0.612
+network: 0.581
+instruction: 0.580
+boot: 0.566
+semantic: 0.565
+socket: 0.548
+assembly: 0.548
+
+[REGRESSION] option `-snapshot` ignored with blockdev
+
+After upgrade of qemu 3.1.0 → 4.2.0 I found that running with libvirt doesn't honor `-snapshot` option anymore. I.e. disk images get modified.
+Using `-hda` option honors `-snapshot`
+
+So I made a test case without libvirt. Testcase using 4.2.0:
+
+> qemu -hda tmp-16G.img -cdrom regular-rescue-latest-x86_64.iso -m 2G
+
+This works fine and tmp-16G.img stays unmodified.
+
+But:
+> /usr/bin/qemu-system-x86_64 -name guest=test-linux,debug-threads=on -S -machine pc-i440fx-3.1,accel=kvm,usb=off,vmport=off,dump-guest-core=off -cpu Broadwell-noTSX,vme=on,ss=on,f16c=on,rdrand=on,hypervisor=on,arat=on,tsc-adjust=on,xsaveopt=on,pdpe1gb=on,abm=on -m 2048 -overcommit mem-lock=off -smp 3,sockets=3,cores=1,threads=1 -uuid d32a9191-f51d-4fae-a419-b73d85b49198 -no-user-config -nodefaults -rtc base=utc,driftfix=slew -global kvm-pit.lost_tick_policy=delay -no-hpet -no-shutdown -global PIIX4_PM.disable_s3=1 -global PIIX4_PM.disable_s4=1 -boot strict=on -device ich9-usb-ehci1,id=usb,bus=pci.0,addr=0x5.0x7 -device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pci.0,multifunction=on,addr=0x5 -device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pci.0,addr=0x5.0x1 -device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pci.0,addr=0x5.0x2 -blockdev \{\"driver\":\"file\",\"filename\":\"/tmp/regular-rescue-latest-x86_64.iso\",\"node-name\":\"libvirt-2-storage\",\"auto-read-only\":true,\"discard\":\"unmap\"} -blockdev \{\"node-name\":\"libvirt-2-format\",\"read-only\":true,\"driver\":\"raw\",\"file\":\"libvirt-2-storage\"} -device ide-cd,bus=ide.0,unit=0,drive=libvirt-2-format,id=ide0-0-0,bootindex=1 -blockdev \{\"driver\":\"file\",\"filename\":\"/tmp/tmp-2G.img\",\"node-name\":\"libvirt-1-storage\",\"auto-read-only\":true,\"discard\":\"unmap\"} -blockdev \{\"node-name\":\"libvirt-1-format\",\"read-only\":false,\"driver\":\"qcow2\",\"file\":\"libvirt-1-storage\",\"backing\":null} -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x7,drive=libvirt-1-format,id=virtio-disk0 -netdev user,id=hostnet0 -device e1000,netdev=hostnet0,id=net0,mac=52:54:00:ab:d8:29,bus=pci.0,addr=0x3 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -device qxl-vga,id=video0,ram_size=67108864,vram_size=67108864,vram64_size_mb=0,vgamem_mb=16,max_outputs=1,bus=pci.0,addr=0x2 -device intel-hda,id=sound0,bus=pci.0,addr=0x4 -device hda-duplex,id=sound0-codec0,bus=sound0.0,cad=0 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x6 -snapshot -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny -msg timestamp=on
+
+This modifies tmp-16G.img.
+
+JFYI, I know that snapshot=on option should be used. But `-snapshot` option exists and must work.
+Also libvirt doesn't yet support it: https://bugzilla.redhat.com/show_bug.cgi?id=508662
+
+
+Hi,
+
+I don’t know much about libvirt, but I would have thought that any manual modification of the qemu command line isn’t supported and might always break.
+
+Anyway, from a QEMU POV, -snapshot only works with -drive (this includes -hda, etc.).  It doesn’t work with -blockdev.  I can see that this isn’t documented for -snapshot, but basically whenever -blockdev is used, the user assumes full responsibility for the block graph (or at least that particular subgraph).  We cannot enable snapshot functionality then.
+
+So this can’t be fixed in qemu, as -snapshot doesn’t make sense for -blockdev.  This behavior should be documented, though.
+
+As for libvirt, I don’t know.  I would be surprised if it had a guarantee for keeping manual qemu command line additions working, and I can’t imagine that it would scan the XML for “legacy” qemu parameters and interpret them itself (which it would need to do to keep -snapshot working for -blockdev).
+
+Max
+
+Max, thanks a lot for the explanation.
+Do you mean that snapshot-ing isn't possible totally for blockdev? Then I
+guess some libvirt users are in trouble :((
+Actually I didn't quite caught the reason why a blockdev supports backing
+but not {backing to a file on /tmp then promptly deleted} ? What's the
+technical difference?
+
+
+On 1/24/20 4:41 AM, Ildar wrote:
+> Max, thanks a lot for the explanation.
+> Do you mean that snapshot-ing isn't possible totally for blockdev? Then I
+> guess some libvirt users are in trouble :((
+> Actually I didn't quite caught the reason why a blockdev supports backing
+> but not {backing to a file on /tmp then promptly deleted} ? What's the
+> technical difference?
+> 
+
+On 1/24/20 4:05 AM, Max Reitz wrote:
+> 
+> 
+> I don’t know much about libvirt, but I would have thought that any
+> manual modification of the qemu command line isn’t supported and might
+> always break.
+> 
+> Anyway, from a QEMU POV, -snapshot only works with -drive (this includes
+> -hda, etc.).  It doesn’t work with -blockdev.  I can see that this isn’t
+> documented for -snapshot, but basically whenever -blockdev is used, the
+> user assumes full responsibility for the block graph (or at least that
+> particular subgraph).  We cannot enable snapshot functionality then.
+
+Libvirt has never produced a qemu command line containing '-snapshot'. 
+Part of this is that libvirt wants to control SELinux settings, and 
+letting qemu create a temporary overlay in /tmp in order to implement 
+-snapshot does not play nicely with libvirt pre-creating all files that 
+qemu is allowed to access.
+
+The fact that you were able to manually add -snapshot to your qemu 
+command line with older libvirt using -drive (I'm assuming you were also 
+not using libvirt's SELinux support, because if you were, qemu would 
+have been unable to create/access the temporary wrapper in /tmp), is a 
+nice hack.  But since modern qemu has declared -snapshot to be 
+unsupported with -blockdev, and modern libvirt has switched to 
+-blockdev, I claim that this is not a qemu bug, but a libvirt feature 
+request.
+
+That said, libvirt has had a vision for a design for implementing the 
+equivalent of -drive -snapshot: the <transient/> sub-element added to 
+the domain/disk/source/driver element has been documented for a long time:
+
+https://libvirt.org/formatdomain.html
+"transient
+     If present, this indicates that changes to the device contents 
+should be reverted automatically when the guest exits. With some 
+hypervisors, marking a disk transient prevents the domain from 
+participating in migration or snapshots. Since 0.9.5 "
+
+However, no one has yet implemented it for libvirt's qemu driver.  Part 
+of our reluctance has been that we knew that implementing it would 
+require libvirt to precreate the wrapper file on every guest start, and 
+it is only very recently that we've even had enough functionality in 
+libvirt's qemu driver coupled with new qemu commands to create qcow2 
+images using QMP rather than having to shell out to qemu-img.  And part 
+of it is that there was no point in implementing something to work with 
+-drive, when we knew we had to rework everything for -blockdev anyways. 
+But now that the work in libvirt to switch to -blockdev is done, it 
+should be a lot easier to implement PROPER support for the <transient/> 
+tag, at least for -blockdev usage.
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+Thank a lot for the detailed answer. Surely it's worth discussing qemu here
+leaving libvirt for RH bugzilla.
+
+> But since modern qemu has declared -snapshot to be unsupported with
+-blockdev, and modern libvirt has switched to -blockdev, I claim that this
+is not a qemu bug, but a libvirt feature request.
+
+I'm convinced this isn't qemu's bug. And everything you wrote is
+well-justified. Yet, one question left unanswered:
+> Do you mean that snapshot-ing isn't possible totally for blockdev?
+> Actually I didn't quite caught the reason why a blockdev supports backing
+but not {backing to a file on /tmp then promptly deleted} ? What's the
+technical difference?
+
+Thanks!
+
+
+Hi,
+
+The technical difference is that -blockdev requires you (the user or management software) to create all block graph nodes explicitly.  -drive snapshot=on implicitly creates a qcow2 node above the actual disk image (and that node points to a temporary image in /tmp).  So because it’s implicit and not explicit, it can’t work with -blockdev.
+
+With -blockdev, the user has to create this temporary overlay, open it in qemu (with blockdev-add or -blockdev), and then delete it.
+
+Max
+
+this answers the whole question. Thanks a lot. closing
+
+
+Internal implementation details aside, from the user PoV it is a *very* serious issue. If -snapshot can't be applied automatically, maybe qemu should warn or better fail if -snapshot is used together with -blockdev.
+

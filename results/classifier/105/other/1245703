@@ -1,0 +1,91 @@
+other: 0.822
+mistranslation: 0.799
+graphic: 0.799
+instruction: 0.770
+device: 0.766
+vnc: 0.738
+network: 0.730
+semantic: 0.729
+socket: 0.725
+KVM: 0.704
+assembly: 0.702
+boot: 0.668
+
+LD_PREFIX option reads directories recursively in an endless loop
+
+If I run qemu user emulation with -L /path/to/my/sysroot/ in which also the proc and dev filesystem is mounted QEMU eats my memory until it gets killed by the kernel.
+
+According to the strace output it follows the symbolic links in the proc filesystem running forever in a recursive loop.
+
+The easiest solution would be to add in the function "add_dir_maybe" in the file util/path.c an additional check for symbolic links that it don't follow them. 
+
+Also I don't really understand the need of doing this. A lot of ressources are wasted everytime QEMU-user is started just by having the directory structure in memory. In my case this are more than 20000 entries which QEMU is loading every time.
+
+On 28 October 2013 23:15, Sebastian Macke <email address hidden> wrote:
+> If I run qemu user emulation with -L /path/to/my/sysroot/ in which also
+> the proc and dev filesystem is mounted QEMU eats my memory until it gets
+> killed by the kernel.
+>
+> According to the strace output it follows the symbolic links in the proc
+> filesystem running forever in a recursive loop.
+>
+> The easiest solution would be to add in the function "add_dir_maybe" in
+> the file util/path.c an additional check for symbolic links that it
+> don't follow them.
+
+Yeah, this -L code is just busted. It's really only intended to work
+with extremely simple sysroot directories which don't have weird
+stuff like proc mounts or symlinks and aren't very big.
+
+If the thing you're looking at isn't like that then you might be better
+off using the "static qemu and chroot into the directory" approach
+instead.
+
+-- PMM
+
+
+Ok, thanks for the info.
+For me it looks like removing the whole path code and putting a one-liner combining two string is the best solution. But maybe I am missing something.
+
+qemu-arm *and* qemu-arm-static 1.5.0+dfsg-3ubuntu5.1 (AMD64 13.10 host) are affected by this.
+
+Steps to reproduce:
+0. mkdir /mnt/mychroot
+1. qemu-debootstrap --arch=armhf wheezy /mnt/mychroot http://ftp.debian.org/debian
+2. qemu-arm-static -L /mnt/mychroot /mnt/mychroot/usr/sbin/chroot /mnt/mychroot /bin/sh
+
+In this case, the loop starts when it meets /mnt/mychroot/dev/fd (which links to /proc/self/fd).
+
+One ugly workaround is, in case anyone needs it:
+
+cp -a /usr/bin/qemu-arm-static /mnt/mychroot/
+chroot /mnt/mychroot /qemu-arm-static /bin/sh
+
+We're (Yocto Project) hit this often.  We're building a root file system and then using userspace qemu to run binaries inside it (such as fc-cache).  If a cyclic symlink appears in the rootfs, it blows up.
+
+
+
+On 26 March 2015 at 21:37, Ross Burton <email address hidden> wrote:
+> We're (Yocto Project) hit this often.  We're building a root file system
+> and then using userspace qemu to run binaries inside it (such as fc-
+> cache).  If a cyclic symlink appears in the rootfs, it blows up.
+
+If you're actually building a rootfs then you're probably
+better off using binfmt-misc and chrooting into it rather
+than using -L. -L really isn't intended to point at a
+full rootfs.
+
+-- PMM
+
+
+We need to be able to run qemu as not root.  Has anyone tried using qemu with fakechroot?
+
+I posted a patch a while back that would fix this:
+
+https://patchwork.kernel.org/patch/9512083/
+
+Fixed by in 4.1.0 by:
+
+f3a8bdc1d5b2 ("util/path: Do not cache all filenames at startup")
+
+

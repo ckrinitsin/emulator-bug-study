@@ -1,0 +1,141 @@
+socket: 0.788
+mistranslation: 0.784
+vnc: 0.782
+instruction: 0.766
+device: 0.761
+network: 0.759
+KVM: 0.714
+graphic: 0.697
+semantic: 0.671
+assembly: 0.651
+boot: 0.623
+other: 0.619
+
+"-serial unix:" option of qemu-system-arm is broken in qemu 2.6.0
+
+I found a bug of "-serial unix:PATH_TO_SOCKET" in qemu 2.6.0 (qemu 2.5.1 works fine).
+Occasionally, a part of the output of qemu disappears in the bug.
+
+It looks like following commit is the cause:
+
+char: ensure all clients are in non-blocking mode (Author: Daniel P. Berrange <email address hidden>)
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=64c800f808748522727847b9cdc73412f22dffb9
+
+In this commit, UNIX socket is set to non-blocking mode, but qemu_chr_fe_write function doesn't handle EAGAIN.
+You should fix code like that:
+
+---
+diff --git a/qemu-char.c b/qemu-char.c
+index b597ee1..0361d78 100644
+--- a/qemu-char.c
++++ b/qemu-char.c
+@@ -270,6 +270,7 @@ static int qemu_chr_fe_write_buffer(CharDriverState *s, const uint8_t *buf, int
+ int qemu_chr_fe_write(CharDriverState *s, const uint8_t *buf, int len)
+ {
+     int ret;
++    int offset = 0;
+ 
+     if (s->replay && replay_mode == REPLAY_MODE_PLAY) {
+         int offset;
+@@ -280,7 +281,21 @@ int qemu_chr_fe_write(CharDriverState *s, const uint8_t *buf, int len)
+     }
+ 
+     qemu_mutex_lock(&s->chr_write_lock);
+-    ret = s->chr_write(s, buf, len);
++
++    while (offset < len) {
++    retry:
++        ret = s->chr_write(s, buf, len);
++        if (ret < 0 && errno == EAGAIN) {
++            g_usleep(100);
++            goto retry;
++        }
++
++        if (ret <= 0) {
++            break;
++        }
++
++        offset += ret;
++    }
+ 
+     if (ret > 0) {
+         qemu_chr_fe_write_log(s, buf, ret);
+---
+
+Or please do "git revert 64c800f808748522727847b9cdc73412f22dffb9".
+
+I'm unable to reproduce the problem mentioned myself, and code inspection shows no problem for x86_64 at least.
+
+Specifically hw/char/serial.c has a   serial_xmit() method which calls qemu_chr_fe_write(), and if it sees EAGAIN, it sets up a event notification to re-try the write later.
+
+Can you provide the full QEMU command line you are using, include the emulator binary.
+
+Looking at the code in 2.5.0, the qemu_chr_fe_write method would see EAGAIN too, because the tcp_chr_accept() method would always set the newly connected client to non-blocking mode. So thre's no obvious change in behaviour between 2.5 and 2.6 wrt to blocking sockets.
+
+Sorry, this issue only occur in qemu-system-arm (vexpress-a9).
+In hw/char/pl011.c, qemu_chr_fe_write function is called directly and EAGAIN isn't handled.
+
+http://git.qemu.org/?p=qemu.git;a=blob;f=hw/char/pl011.c;h=210c87b4c2bd000d80c359ca5c05d43c64210677;hb=bfc766d38e1fae5767d43845c15c79ac8fa6d6af#l148
+
+So I use following a patch.
+
+----
+diff --git a/hw/char/pl011.c b/hw/char/pl011.c
+index c0fbf8a..6e29db8 100644
+--- a/hw/char/pl011.c
++++ b/hw/char/pl011.c
+@@ -146,7 +146,7 @@ static void pl011_write(void *opaque, hwaddr offset,
+         /* ??? Check if transmitter is enabled.  */
+         ch = value;
+         if (s->chr)
+-            qemu_chr_fe_write(s->chr, &ch, 1);
++            qemu_chr_fe_write_all(s->chr, &ch, 1);
+         s->int_level |= PL011_INT_TX;
+         pl011_update(s);
+         break;
+----
+
+qemu_chr_fe_write_all function handles EAGAIN.
+
+I wrote small code which reproduces this issue.
+
+https://bitbucket.org/redcap97/puts-hello-x80000-armv7-kernel/downloads/puts-HELLO-x80000
+
+Above binary outputs "HELLO!" 80000 times to UART.
+
+# Please execute in terminal
+socat unix-listen:a.sock stdout | tee actual
+
+# Please execute in another terminal
+qemu-system-arm -M vexpress-a9 -nographic -kernel puts-HELLO-x80000 -serial unix:a.sock
+
+# Check results
+yes 'HELLO!' | head -n 80000 > expected
+diff -u expected actual
+
+Occasionally, a part of the output of qemu disappears.
+
+
+Source code of the binary
+https://bitbucket.org/redcap97/puts-hello-x80000-armv7-kernel/src
+
+
+> Looking at the code in 2.5.0, the qemu_chr_fe_write method would see EAGAIN too, because the tcp_chr_accept() method would always set the newly connected client to non-blocking mode. So thre's no obvious change in behaviour between 2.5 and 2.6 wrt to blocking sockets.
+
+It looks like tcp_chr_accept function isn't called in above command.
+tcp_chr_wait_connected function is called instead.
+
+So the socket is blocking mode and doesn't return EAGAIN in Qemu 2.5.0.
+
+Ok, now it makes more sense. You are using the socket chardev in TCP outgoing client mode, which used to be blocking by default. In 2.6 this switched to match TCP server mode,  in wich the incoming client was always in non-blocking mode. 
+
+IOW, this arm code was already broken in 2.5 just depending on which chardev config was used.
+
+So, we'll need to put a fix in pl011_write.  I'm unsure whether use writeall() is the correct behaviour - I'll come to other serial backends.
+
+Fix posted https://lists.gnu.org/archive/html/qemu-devel/2016-08/msg00684.html
+
+Fix has been committed here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=6ab3fc32ea640026726b
+... and been released with QEMU version 2.8
+

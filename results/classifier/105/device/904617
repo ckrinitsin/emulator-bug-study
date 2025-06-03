@@ -1,0 +1,179 @@
+semantic: 0.978
+device: 0.976
+socket: 0.975
+assembly: 0.975
+other: 0.974
+graphic: 0.973
+mistranslation: 0.965
+KVM: 0.964
+network: 0.960
+instruction: 0.960
+vnc: 0.947
+boot: 0.931
+
+device_add usb-hub causes segfault in qemu-1.0
+
+When calling the command
+
+(qemu) device_add usb-hub,bus=usb.0,port=4
+
+qemu replies
+
+Error: usb port 4 (bus usb.0) not found (in use?)
+
+Then qemu crashes with a segfault:
+
+[ 1546.177627] qemu-system-x86[1710]: segfault at 0 ip b75d3f8b sp bfddb0b0 error 6 in qemu-system-x86_64[b7488000+2e2000]
+
+Maybe it might be related to the docs/usb2.txt where UHCI has only 2 ports. But a mistake in the port number should not cause qemu to crash
+
+Commit f462141f18ffdd75847f6459ef83d90b831d12c0 introduced clean up code
+when usb_qdev_init() fails.  Unfortunately it calls .handle_destroy()
+when .init() was never invoked or failed.  This can lead to crashes when
+.handle_destroy() tries to clean up things that were never initialized.
+
+This patch is careful to undo only those steps that completed along the
+usb_qdev_init() code path.  It's not as pretty as the unified error
+handling in f462141f18ffdd75847f6459ef83d90b831d12c0 but it's necessary.
+
+Signed-off-by: Stefan Hajnoczi <email address hidden>
+---
+ hw/usb-bus.c |   12 +++++-------
+ 1 files changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/hw/usb-bus.c b/hw/usb-bus.c
+index 8cafb76..8203390 100644
+--- a/hw/usb-bus.c
++++ b/hw/usb-bus.c
+@@ -77,23 +77,21 @@ static int usb_qdev_init(DeviceState *qdev, DeviceInfo *base)
+     QLIST_INIT(&dev->strings);
+     rc = usb_claim_port(dev);
+     if (rc != 0) {
+-        goto err;
++        return rc;
+     }
+     rc = dev->info->init(dev);
+     if (rc != 0) {
+-        goto err;
++        usb_release_port(dev);
++        return rc;
+     }
+     if (dev->auto_attach) {
+         rc = usb_device_attach(dev);
+         if (rc != 0) {
+-            goto err;
++            usb_qdev_exit(qdev);
++            return rc;
+         }
+     }
+     return 0;
+-
+-err:
+-    usb_qdev_exit(qdev);
+-    return rc;
+ }
+ 
+ static int usb_qdev_exit(DeviceState *qdev)
+-- 
+1.7.7.3
+
+
+
+On Thu, Dec 15, 2011 at 08:18:31AM -0000, Erik Rull wrote:
+> Public bug reported:
+> 
+> When calling the command
+> 
+> (qemu) device_add usb-hub,bus=usb.0,port=4
+> 
+> qemu replies
+> 
+> Error: usb port 4 (bus usb.0) not found (in use?)
+> 
+> Then qemu crashes with a segfault:
+> 
+> [ 1546.177627] qemu-system-x86[1710]: segfault at 0 ip b75d3f8b sp
+> bfddb0b0 error 6 in qemu-system-x86_64[b7488000+2e2000]
+> 
+> Maybe it might be related to the docs/usb2.txt where UHCI has only 2
+> ports. But a mistake in the port number should not cause qemu to crash
+
+Thanks for the bug report.  I confirmed this bug is present in
+qemu.git/master and have submitted a patch to fix it.
+
+Please consider sending backtraces when you encounter segfaults in the
+future, they make it possible to identify the bug immediately in many
+cases.  Here's how I reproduced this and got the backtrace:
+
+$ gdb --args x86_64-softmmu/qemu-system-x86_64 -usb
+(gdb) r
+(qemu) device_add usb-hub,bus=usb.0,port=4
+Program received signal SIGSEGV, Segmentation fault.
+0x00005555556d786a in usb_unregister_port (bus=0x5555567f2ac0, port=0x555556956b40)
+    at /home/stefanha/qemu/hw/usb-bus.c:231
+231         QTAILQ_REMOVE(&bus->free, port, next);
+(gdb) bt
+
+
+On 12/15/2011 04:05 AM, Stefan Hajnoczi wrote:
+> Commit f462141f18ffdd75847f6459ef83d90b831d12c0 introduced clean up code
+> when usb_qdev_init() fails.  Unfortunately it calls .handle_destroy()
+> when .init() was never invoked or failed.  This can lead to crashes when
+> .handle_destroy() tries to clean up things that were never initialized.
+>
+> This patch is careful to undo only those steps that completed along the
+> usb_qdev_init() code path.  It's not as pretty as the unified error
+> handling in f462141f18ffdd75847f6459ef83d90b831d12c0 but it's necessary.
+>
+> Signed-off-by: Stefan Hajnoczi<email address hidden>
+
+Applied.  Thanks.
+
+Regards,
+
+Anthony Liguori
+
+> ---
+>   hw/usb-bus.c |   12 +++++-------
+>   1 files changed, 5 insertions(+), 7 deletions(-)
+>
+> diff --git a/hw/usb-bus.c b/hw/usb-bus.c
+> index 8cafb76..8203390 100644
+> --- a/hw/usb-bus.c
+> +++ b/hw/usb-bus.c
+> @@ -77,23 +77,21 @@ static int usb_qdev_init(DeviceState *qdev, DeviceInfo *base)
+>       QLIST_INIT(&dev->strings);
+>       rc = usb_claim_port(dev);
+>       if (rc != 0) {
+> -        goto err;
+> +        return rc;
+>       }
+>       rc = dev->info->init(dev);
+>       if (rc != 0) {
+> -        goto err;
+> +        usb_release_port(dev);
+> +        return rc;
+>       }
+>       if (dev->auto_attach) {
+>           rc = usb_device_attach(dev);
+>           if (rc != 0) {
+> -            goto err;
+> +            usb_qdev_exit(qdev);
+> +            return rc;
+>           }
+>       }
+>       return 0;
+> -
+> -err:
+> -    usb_qdev_exit(qdev);
+> -    return rc;
+>   }
+>
+>   static int usb_qdev_exit(DeviceState *qdev)
+
+
+
+Stefan's patch had been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=db3a5ed7e4422491dac
+==> Fix released
+

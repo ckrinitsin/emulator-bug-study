@@ -1,0 +1,71 @@
+other: 0.974
+semantic: 0.956
+graphic: 0.951
+mistranslation: 0.946
+assembly: 0.928
+instruction: 0.918
+device: 0.917
+vnc: 0.904
+KVM: 0.885
+boot: 0.846
+network: 0.844
+socket: 0.841
+
+NVIC CCR register not 8-bit accessible using Cortex-M4
+
+Head at commit b29c3e23f64938.
+
+Running with '-d unimp,guest_errors -trace nvic\*' I get:
+
+8871@1581892794.295746:nvic_sysreg_read NVIC sysreg read addr 0xd88 data 0xf00000 size 4
+8871@1581892794.295752:nvic_sysreg_write NVIC sysreg write addr 0xd88 data 0xf00000 size 4
+8871@1581892794.297780:nvic_sysreg_write NVIC sysreg write addr 0xd08 data 0x4200 size 4
+8871@1581892794.298040:nvic_sysreg_write NVIC sysreg write addr 0xd15 data 0x0 size 1
+NVIC: Bad write of size 1 at offset 0xd15
+8871@1581892794.298081:nvic_sysreg_write NVIC sysreg write addr 0xd16 data 0x0 size 1
+NVIC: Bad write of size 1 at offset 0xd16
+8871@1581892794.298116:nvic_sysreg_write NVIC sysreg write addr 0xd17 data 0x0 size 1
+NVIC: Bad write of size 1 at offset 0xd17
+8871@1581892794.298156:nvic_sysreg_write NVIC sysreg write addr 0xd18 data 0x0 size 1
+8871@1581892794.298161:nvic_set_prio NVIC set irq 4 secure-bank 0 priority 0
+8871@1581892794.298164:nvic_recompute_state NVIC state recomputed: vectpending 0 vectpending_prio 256 exception_prio 256
+8871@1581892794.298168:nvic_irq_update NVIC vectpending 0 pending prio 256 exception_prio 256: setting irq line to 0
+8871@1581892794.298201:nvic_sysreg_write NVIC sysreg write addr 0xd19 data 0x0 size 1
+8871@1581892794.298206:nvic_set_prio NVIC set irq 5 secure-bank 0 priority 0
+
+I am not sure this register can not be accessed differently than 32-bit.
+Still I used this patch as a kludge, but it doesn't seem a clean fix:
+
+-- >8 --
+--- a/hw/intc/armv7m_nvic.c
++++ b/hw/intc/armv7m_nvic.c
+@@ -2160,6 +2161,10 @@ static MemTxResult nvic_sysreg_read(void *opaque, hwaddr addr,
+             }
+         }
+         break;
++    case 0xd14 ... 0xd17: /* Configuration and Control Register */
++        val = extract32(nvic_readl(s, offset & ~3, attrs),
++                        (offset - 0xd14) * 8, size * 8);
++        break;
+     case 0xd18 ... 0xd1b: /* System Handler Priority (SHPR1) */
+         if (!arm_feature(&s->cpu->env, ARM_FEATURE_M_MAIN)) {
+             val = 0;
+@@ -2282,6 +2287,11 @@ static MemTxResult nvic_sysreg_write(void *opaque, hwaddr addr,
+         }
+         nvic_irq_update(s);
+         goto exit_ok;
++    case 0xd14 ... 0xd17: /* Configuration and Control Register */
++        value = deposit32(value, (offset - 0xd14) * 8, size * 8,
++                          nvic_readl(s, offset & ~3, attrs));
++        nvic_writel(s, offset & ~3, value, attrs);
++        goto exit_ok;
+     case 0xd18 ... 0xd1b: /* System Handler Priority (SHPR1) */
+         if (!arm_feature(&s->cpu->env, ARM_FEATURE_M_MAIN)) {
+             goto exit_ok;
+---
+
+Architecturally the CCR is not byte-accessible. The v7M Arm ARM defines in B3.1.1 "General rules for PPB register accesses" that unless otherwise stated, register support word accesses only, and the CCR register definition does not say that byte access is supported. This is true also in v8M, where the CCR register definition explicitly marks halfword and byte accesses to CCR as UNPREDICTABLE.
+
+So this looks like buggy guest code to me...
+
+

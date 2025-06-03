@@ -1,0 +1,41 @@
+graphic: 0.883
+instruction: 0.821
+device: 0.773
+KVM: 0.764
+semantic: 0.715
+boot: 0.647
+socket: 0.637
+other: 0.504
+vnc: 0.494
+network: 0.457
+assembly: 0.408
+mistranslation: 0.408
+
+guest panics when attempting to perform loadvm operation on x86_64 platform with kvm_intel ept=0
+Description of problem:
+The guest experiences a panic when attempting to perform the `loadvm` operation after it has been running for a while on the x86_64 platform with `kvm_intel ept=0`. I'm unsure if this operation is permitted or not, but it functions properly when using `kvm_intel ept=1`.
+Steps to reproduce:
+1. Load the `kvm-intel` module with the parameter `ept=0`.
+2. savevm  
+Boot the first guest using the previous command line and switch to the QEMU console to execute the `savevm` operation. After that, proceed to shutting down the guest.
+3. loadvm  
+Boot the second guest using the same command line and switch to the QEMU console to execute the `loadevm` operation. After that, the guest panics.
+Additional information:
+I have performed some debugging and it seems that the issue lies in the fact that the VMM modifies the guest memory without informing the KVM module. Upon further investigation, I noticed that the `loadvm` operation only restores the memory and does not execute any ioctl to modify the user memory region recorded in the KVM module.
+
+The KVM module calls `kvm_mmu_reset_context()` to unload the current EPT or SPT page table when guest system registers (CR0/CR3/CR4) are restored. However, for EPT, the EPT page table is released directly and can be reconstructed at a later stage. In contrast, for SPT, the KVM only decreases the reference count and retains the outdated SPT page table in the active list that is maintained by the KVM. As a result, this outdated SPT page table is reused later, leading to incorrect mapping.
+
+To address this, I attempted to call `kvm_arch_flush_shadow_all()` to zap all the page tables in `kvm_mmu_reset_context()`, which allowed the guest to function properly with SPT after the `loadvm` operation.
+
+Therefore, I believe that QEMU should notify the KVM to clear all the page tables if the KVM is using shadow paging. However, it appears that there is no appropriate ioctl available for the VMM to achieve this.
+
+guest panic output:
+![image](/uploads/f7f3ad03c9bc5633105788f784b0544a/image.png)
+
+Trace the `kvm_mmu_get_page()` event and observe that only one record indicates that the outdated page table is reused instead of being recreated.
+
+
+```shell
+perf record -a -e kvmmmu:kvm_mmu_get_page
+```
+![image](/uploads/1393aefb585ad80050f8cc5ba7939fc3/image.png)

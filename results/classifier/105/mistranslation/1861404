@@ -1,0 +1,223 @@
+mistranslation: 0.825
+instruction: 0.821
+assembly: 0.797
+other: 0.797
+device: 0.782
+graphic: 0.773
+socket: 0.740
+network: 0.740
+semantic: 0.730
+KVM: 0.709
+boot: 0.708
+vnc: 0.697
+
+AVX instruction VMOVDQU implementation error for YMM registers
+
+Hi,
+
+Tested with Qemu 4.2.0, and with git version bddff6f6787c916b0e9d63ef9e4d442114257739.
+
+The x86 AVX instruction VMOVDQU doesn't work properly with YMM registers (32 bytes).
+It works with XMM registers (16 bytes) though.
+
+See the attached test case `ymm.c`: when copying from memory-to-ymm0 and then back from ymm0-to-memory using VMOVDQU, Qemu only copies the first 16 of the total 32 bytes.
+
+```
+user@ubuntu ~/Qemu % gcc -o ymm ymm.c -Wall -Wextra -Werror
+
+user@ubuntu ~/Qemu % ./ymm
+00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F
+
+user@ubuntu ~/Qemu % ./x86_64-linux-user/qemu-x86_64 -cpu max ymm
+00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+This seems to be because in `translate.c > gen_sse()`, the case handling the VMOVDQU instruction calls `gen_ldo_env_A0` which always performs a 16 bytes copy using two 8 bytes load and store operations (with `tcg_gen_qemu_ld_i64` and `tcg_gen_st_i64`).
+
+Instead, the `gen_ldo_env_A0` function should generate a copy with a size corresponding to the used register.
+
+
+```
+static void gen_sse(CPUX86State *env, DisasContext *s, int b,
+                    target_ulong pc_start, int rex_r)
+{
+        [...]
+        case 0x26f: /* movdqu xmm, ea */
+            if (mod != 3) {
+                gen_lea_modrm(env, s, modrm);
+                gen_ldo_env_A0(s, offsetof(CPUX86State, xmm_regs[reg]));
+            } else { 
+        [...]
+```
+
+```
+static inline void gen_ldo_env_A0(DisasContext *s, int offset)
+{
+    int mem_index = s->mem_index;
+    tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, mem_index, MO_LEQ);
+    tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(0)));
+    tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+    tcg_gen_qemu_ld_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
+    tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
+}
+```
+
+
+
+Note: Qemu has been built with the following commands:
+```
+% ./configure --target-list=x86_64-linux-user && make
+OR
+% ./configure --target-list=x86_64-linux-user --enable-avx2 && make
+```
+
+On Friday, January 31, 2020, Alex Bennée <email address hidden> wrote:
+
+> ** Tags added: tcg testcase
+>
+> --
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1861404
+>
+> Title:
+>   AVX instruction VMOVDQU implementation error for YMM registers
+>
+>
+If I remember well, there is no support for AVX instructions in linux-user
+mode.
+
+If that is true, how come handling of unsupported instruction went that far?
+
+Did you try other AVX instructions?
+
+Aleksandar
+
+
+
+
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   Hi,
+>
+>   Tested with Qemu 4.2.0, and with git version
+>   bddff6f6787c916b0e9d63ef9e4d442114257739.
+>
+>   The x86 AVX instruction VMOVDQU doesn't work properly with YMM registers
+> (32 bytes).
+>   It works with XMM registers (16 bytes) though.
+>
+>   See the attached test case `ymm.c`: when copying from memory-to-ymm0
+>   and then back from ymm0-to-memory using VMOVDQU, Qemu only copies the
+>   first 16 of the total 32 bytes.
+>
+>   ```
+>   user@ubuntu ~/Qemu % gcc -o ymm ymm.c -Wall -Wextra -Werror
+>
+>   user@ubuntu ~/Qemu % ./ymm
+>   00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17
+> 18 19 1A 1B 1C 1D 1E 1F
+>
+>   user@ubuntu ~/Qemu % ./x86_64-linux-user/qemu-x86_64 -cpu max ymm
+>   00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 00 00 00 00 00 00 00 00
+> 00 00 00 00 00 00 00 00
+>   ```
+>
+>   This seems to be because in `translate.c > gen_sse()`, the case
+>   handling the VMOVDQU instruction calls `gen_ldo_env_A0` which always
+>   performs a 16 bytes copy using two 8 bytes load and store operations
+>   (with `tcg_gen_qemu_ld_i64` and `tcg_gen_st_i64`).
+>
+>   Instead, the `gen_ldo_env_A0` function should generate a copy with a
+>   size corresponding to the used register.
+>
+>
+>   ```
+>   static void gen_sse(CPUX86State *env, DisasContext *s, int b,
+>                       target_ulong pc_start, int rex_r)
+>   {
+>           [...]
+>           case 0x26f: /* movdqu xmm, ea */
+>               if (mod != 3) {
+>                   gen_lea_modrm(env, s, modrm);
+>                   gen_ldo_env_A0(s, offsetof(CPUX86State, xmm_regs[reg]));
+>               } else {
+>           [...]
+>   ```
+>
+>   ```
+>   static inline void gen_ldo_env_A0(DisasContext *s, int offset)
+>   {
+>       int mem_index = s->mem_index;
+>       tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, mem_index, MO_LEQ);
+>       tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg,
+> ZMM_Q(0)));
+>       tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+>       tcg_gen_qemu_ld_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
+>       tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg,
+> ZMM_Q(1)));
+>   }
+>   ```
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1861404/+subscriptions
+>
+>
+
+
+Because the sse code is sloppy, and it was interpreted
+as the sse instruction movdqu.
+
+AVX support was coded for GSoC last year,
+
+https://lists.nongnu.org/archive/html/qemu-devel/2019-08/msg05369.html
+
+but it has not been completely reviewed and committed.
+
+There is no support for AVX in master.
+
+Thanks for your answers.
+
+I thought the fact that there was not any warning/exception meant that VMOVDQU was supported, but if it's mistakenly interpreted as MOVDQU then I understand.
+
+I read the mailing list messages on the AVX GSoC you point out, but couldn't find any branch where this work is located. Is there a non-released version of this that can be tested?
+
+If I understand correctly, Qemu (or more precisely TCG) supports x86 SIMD instructions up to SSE4.1, but not AVX/AVX2/AVX-512?
+
+Thanks.
+
+Hi,
+
+I also noticed that the 4.2.0 release changelog mentions support for some AVX512 instructions.
+
+https://wiki.qemu.org/ChangeLog/4.2#x86
+```
+Support for AVX512 BFloat16 extensions.
+```
+
+Is this support in TCG or in another component?
+If so, it would mean that TCG support some AVX512 instructions but not AVX. 
+
+Also, allow me to ask again, where can I find the work of last year's GSoC on AVX support for TCG?
+
+> AVX support was coded for GSoC last year,
+> https://lists.nongnu.org/archive/html/qemu-devel/2019-08/msg05369.html
+
+Thanks.
+
+The "AVX512 BFloat16" patch is for KVM support.
+
+As for finding the GSoC work, please follow that link,
+and the ones buried inside that.  There are hundreds
+of patches involved.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/132
+
+

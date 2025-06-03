@@ -1,0 +1,120 @@
+other: 0.855
+graphic: 0.839
+semantic: 0.838
+instruction: 0.813
+device: 0.811
+assembly: 0.802
+network: 0.775
+mistranslation: 0.764
+vnc: 0.742
+boot: 0.735
+socket: 0.735
+KVM: 0.709
+
+x86-64 MTTCG Does not update page table entries atomically
+
+It seems like the qemu tcg code for x86-64 doesn't write the access and dirty flags of the page table entries atomically. Instead, they first read the entry, see if they need to set the page table entry, and then overwrite the entry. So if you have two threads running at the same time, one accessing the virtual address over and over again, and the other modifying the page table entry, it is possible that after the second thread modifies the page table entry, qemu overwrites the value with the old page table entry value, with the access/dirty flags set.
+
+Here's a unit test that reproduces this behavior:
+
+https://github.com/mvanotti/kvm-unit-tests/commit/09f9722807271226a714b04f25174776454b19cd
+
+You can run it with:
+
+```
+/usr/bin/qemu-system-x86_64 --no-reboot -nodefaults \
+-device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+-vnc none -serial stdio -device pci-testdev \
+-smp 4 -machine q35 --accel tcg,thread=multi \
+-kernel x86/mmu-race.flat # -initrd /tmp/tmp.avvPpezMFf
+```
+
+Expected output (failure):
+
+```
+kvm-unit-tests$ make && /usr/bin/qemu-system-x86_64 --no-reboot -nodefaults -device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 -vnc none -serial stdio -device pci-testdev -smp 4 -machine q35 --accel tcg,thread=multi  -kernel x86/mmu-race.flat # -initrd /tmp/tmp.avvPpezMFf
+enabling apic
+enabling apic
+enabling apic
+enabling apic
+paging enabled
+cr0 = 80010011
+cr3 = 627000
+cr4 = 20
+found 4 cpus
+PASS: Need more than 1 CPU
+Detected overwritten PTE:
+        want: 0x000000000062e007
+        got:  0x000000000062d027
+FAIL: PTE not overwritten
+PASS: All Reads were zero
+SUMMARY: 3 tests, 1 unexpected failures
+```
+
+This bug has allows user-to-root privilege escalation inside the guest VM: if the user is able overwrite an entry that belongs to a second-to-last level page table, and is able to allocate the referenced page, then the user would be in control of a last-level page table, being able to map any memory they want. This is not uncommon in situations where memory is being decomitted.
+
+Yeah, it's a long standing API deficiency inside QEMU that we don't have a way to do atomic modifications in things like page-table-walk code: mostly you don't notice unless you go looking for it, but we really ought to fix this. Thanks for the unit test.
+
+
+Not strictly i386 specific -- any arch that wants to do read-modify-update to its page tables runs into this. There are some not-yet-implemented Arm architecture extensions that require this, and likely other archs too.
+
+
+We only tested it on x86-64 and aarch64, but we couldn't repro on arm. It is possible that this affects other platforms as well, but note that this is specifically mentioned in the qemu wiki as one of the cases that should be covered when porting mttcg to a new platform: https://wiki.qemu.org/Features/tcg-multithread
+
+BTW, the RISC-V MMU code _does_ get this right and the model could be followed by the x86 version - - something like https://github.com/vsrinivas/qemu/commit/1efa7dc689c4572d8fe0880ddbe44ec22f8f4348, (but with more compiling + working) might solve this problem and more closely model h/w.
+
+On Tue, 2 Feb 2021 at 05:07, Venkatesh Srinivas
+<email address hidden> wrote:
+> BTW, the RISC-V MMU code _does_ get this right and the model could be
+> followed by the x86 version - - something like
+> https://github.com/vsrinivas/qemu/commit/1efa7dc689c4572d8fe0880ddbe44ec22f8f4348,
+> (but with more compiling + working) might solve this problem and more
+> closely model h/w
+
+target/i386 is the wrong place to put the fix, though:
+the abstraction layers for working with AddressSpaces need to
+provide atomic operations and then under the hood do the right
+thing to implement them. target-specific code shouldn't need
+to manually do the translation, fish out a MemoryRegion,
+check whether it's really host RAM, and so on.
+
+thanks
+-- PMM
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+This issue has been migrated to gitlab issue #279. See https://gitlab.com/qemu-project/qemu/-/issues/279
+
+Closing issue as it has been migrated to https://gitlab.com/qemu-project/qemu/-/issues/279
+
+Closing issue as it has been migrated to https://gitlab.com/qemu-project/qemu/-/issues/279
+

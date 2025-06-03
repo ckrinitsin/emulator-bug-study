@@ -1,0 +1,78 @@
+graphic: 0.901
+other: 0.892
+KVM: 0.890
+vnc: 0.888
+semantic: 0.880
+mistranslation: 0.872
+assembly: 0.862
+instruction: 0.837
+device: 0.811
+network: 0.796
+socket: 0.780
+boot: 0.740
+
+qcow2 rejects request to use preallocation with backing file
+
+The 'preallocation=full' option to qemu-img / qcow2 block driver instructs QEMU to fully allocate the host file to the maximum size needed by the logical disk size.
+
+$ qemu-img create -f qcow2 -o preallocation=full base.qcow2 200M
+Formatting 'base.qcow2', fmt=qcow2 size=209715200 encryption=off cluster_size=65536 preallocation='full' lazy_refcounts=off refcount_bits=16
+
+$ ls -alhs base.qcow2 
+201M -rw-r--r--. 1 berrange berrange 201M Jan 27 12:49 base.qcow2
+
+
+When specifying a backing file for the qcow2 file, however, it rejects the preallocation request
+
+$ qemu-img create -f qcow2 -o preallocation=full,backing_file=base.qcow2 front.qcow2 200M
+Formatting 'front.qcow2', fmt=qcow2 size=209715200 backing_file='base.qcow2' encryption=off cluster_size=65536 preallocation='full' lazy_refcounts=off refcount_bits=16
+qemu-img: front.qcow2: Backing file and preallocation cannot be used at the same time
+
+
+It might seem like requesting full preallocation is redundant because most data associated with the image will be present in the backing file, as so the top layer is unlikely to ever need the full preallocation.  Rejecting this, however, means it is not (officially) possible to reserve disk space for the top layer to guarantee that future copy-on-writes will never get ENOSPC.
+
+OpenStack in particular uses backing files with all images, in order to avoid the I/O overhead of copying the backing file contents into the per-VM disk image. It, however, still wants to have a guarantee that the per-VM image will never hit an ENOSPC scenario.
+
+Currently it has to hack around QEMU's refusal to allow backing_file + preallocation, by calling 'fallocate' on the qcow2 file after it has been created. This is an inexact fix though, because it doesn't take account of fact that qcow2 metadata can takes some MBs of space.
+
+Thus, it would like to see preallocation=full supported in combination with backing files.
+
+Using any preallocation value other than none will result in all data clusters of the new image being used. That means that any I/O request will be served by that image, and never by the backing file. This is why preallocating an image with a backing file is not supported, because it generally doesn't make any sense. The backing file will never be seen anyway.
+
+In order to support this, qcow2 will need to support preallocated data clusters which are explicitly marked as empty (where "empty" is not "zero"; "empty" means "fall through to the backing file"). This has been proposed before, but has not been implemented so far.
+
+By the way, this is the very reason why explicitly forbidding the combination of backing file and preallocation is very reasonable: Right now, the backing file would be invisible, a preallocated image always returns zeros when read. With the above feature implemented, the backing file would be visible. In order to allow this change in behavior, we have to make the combination an error for now.
+
+Max
+
+PS: The reason I write this is so that you know that this is not a bug, but correct behavior in view of a missing feature (that should indeed be implemented).
+
+> In order to support this, qcow2 will need to support preallocated data clusters which are explicitly marked as empty (where "empty" is not "zero"; "empty" means "fall through to the backing file"). This has been proposed before, but has not been implemented so far.
+
+This sounds like a bit of extra work, but I'm puzzelled why we can't have a preallocation option which simply calls fallocate() to grow the file to the right size. From qcow2 pov, the extra clusters won't be allocated - we're just making sure the filesystem has reserved sufficient space for when qcow2 does later allocate the clusters during a copy-on-write.  Perhaps this would imply a new option to the 'preallocation' option rather than 'full'
+
+The idea that qcow2 could just reserve enough space that it will never need any additional clusters stands on somewhat shaky ground anyway. You can count in metadata such as refcount tables/blocks and the L1/L2 table for an image with the full virtual disk size used. This doesn't cover things like snapshots or in the future bitmaps; I'm not completely sure, but it might also fail to cover some scenarios that involve discard and where some space isn't immediately reused due to image fragmentation. Whether or not a given static size is sufficient for an image depends primarily on how the image is going to be used.
+
+What you seem to want isn't really qcow2 preallocation (which would involve, as Max said, preallocating all clusters on the qcow2 level), but preallocation of the image file in the file system layer to a size that matches your use of qcow2. I'm afraid that doing this in the management layer, which actually knows best how it's going to use the image, makes more sense than letting qemu guess and implement a hack that preallocates only on the file system, but not the image format level.
+
+Preallocating the understanding image file at the management layer though means that the mgmt tool has to understand the full details of the qcow2 file format. The mgmt layer knows it created a 20 GB qcow2 file, but does not know that once you have stored 20 GB of user data in it, it will actually consume  20 GB + NNN MB extra. Calculating hat NNN MB extra is trivial for qemu since it knows the file format already, but hard for the mgmt app
+
+It is not exactly trivial, and it being in qemu does not make it simpler. http://git.qemu.org/?p=qemu.git;a=blob;f=block/qcow2.c;h=fd8436c5f8b13ab0e8c605147ce76e6b6a8e5f95;hb=HEAD#l2105 is the code that calculates the size; as you can see, it is pretty self-contained.
+
+Max
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

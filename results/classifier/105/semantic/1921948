@@ -1,0 +1,606 @@
+semantic: 0.858
+boot: 0.842
+device: 0.842
+other: 0.825
+assembly: 0.818
+network: 0.810
+instruction: 0.793
+graphic: 0.767
+KVM: 0.753
+socket: 0.713
+vnc: 0.699
+mistranslation: 0.563
+
+MTE tags not checked properly for unaligned accesses at EL1
+
+For kernel memory accesses that span across two memory granules, QEMU's MTE implementation only checks the tag of the first granule but not of the second one.
+
+To reproduce this, build the Linux kernel with CONFIG_KASAN_HW_TAGS enabled, apply the patch below, and boot the kernel:
+
+diff --git a/sound/last.c b/sound/last.c
+index f0bb98780e70..04745cb30b74 100644
+--- a/sound/last.c
++++ b/sound/last.c
+@@ -5,12 +5,18 @@
+  */
+ 
+ #include <linux/init.h>
++#include <linux/slab.h>
+ #include <sound/core.h>
+ 
+ static int __init alsa_sound_last_init(void)
+ {
+        struct snd_card *card;
+        int idx, ok = 0;
++
++       char *ptr = kmalloc(128, GFP_KERNEL);
++       pr_err("KASAN report should follow:\n");
++       *(volatile unsigned long *)(ptr + 124);
++       kfree(ptr);
+        
+        printk(KERN_INFO "ALSA device list:\n");
+        for (idx = 0; idx < SNDRV_CARDS; idx++) {
+
+KASAN tags the 128 allocated bytes with the same tag as the returned pointer. The memory granule that follows the 128 allocated bytes has a different tag (with 1/15 probability).
+
+Expected result: a tag fault is detected and a KASAN report is printed when accessing bytes [124, 130).
+Observed result: no tag fault is detected and no KASAN report is printed.
+
+Here are the flags that I use to run QEMU if they matter:
+
+qemu-system-aarch64 -s -machine virt,mte=on -cpu max -m 2G -smp 2 -net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 -net nic -nographic -kernel ./Image -append "console=ttyAMA0 root=/dev/vda earlyprintk=serial" -drive file=./fs.img,format=raw,if=virtio -no-shutdown -no-reboot
+
+I believe that you're correct, and that I mis-read the MTE specification.
+
+I believed that exactly one mte tag check was made for any single memory
+access.  But I missed that unaligned accesses are as-if a sequence of byte
+accesses -- in the Arm ARM, see aarch64/functions/memory/Mem[].
+
+I'm still trying to verify this via the Arm FVP, but so far I've not
+found the right incantation of parameters to properly enable MTE.
+(I can enable the instructions, but a simple stg/ldg test suggests
+that there is no tag storage enabled -- all tags read as 0.)
+
+The flags that you need to pass to FVP to enable MTE are listed near the end of the README here:
+
+https://cs.android.com/android/platform/superproject/+/master:device/generic/goldfish/fvpbase/README.md
+
+Ah, perfect, I was missing dram_metadata.is_enabled.
+
+And my userland unaligned test case demonstrates that
+the second granule is tested, as reported.
+
+https://<email address hidden>/
+
+Hi Richard,
+
+I tried your patch, but QEMU crashes with:
+
+ERROR:../target/arm/mte_helper.c:588:mte_check_fail: code should not be reached
+Bail out! ERROR:../target/arm/mte_helper.c:588:mte_check_fail: code should not be reached
+
+when running KASAN tests.
+
+Thanks!
+
+Yeah, I saw an error right after posting.  Please try v2:
+
+https://<email address hidden>/
+
+With v2, a lot of KASAN tests start failing. This likely means that MTE tag faults stop being generated in certain cases.
+
+With v3 [1], no MTE faults are generated at all.
+
+[1] https://<email address hidden>/
+
+
+Richard Henderson <email address hidden> writes:
+
+> We were incorrectly assuming that only the first byte of an MTE access
+> is checked against the tags.  But per the ARM, unaligned accesses are
+> pre-decomposed into single-byte accesses.  So by the time we reach the
+> actual MTE check in the ARM pseudocode, all accesses are aligned.
+>
+> Therefore, the first failure is always either the first byte of the
+> access, or the first byte of the granule.
+>
+> In addition, some of the arithmetic is off for last-first -> count.
+> This does not become directly visible until a later patch that passes
+> single bytes into this function, so ptr == ptr_last.
+>
+> Buglink: https://bugs.launchpad.net/bugs/1921948
+
+Minor note: you can Cc: Bug 1921948 <email address hidden> to
+automatically copy patches to the appropriate bugs which is useful if
+you don't have the Cc for the reporter.
+
+Anyway I'm trying to get the kasas unit tests running as a way of
+testing this (and maybe expanding with a version of Andrey's test). I
+suspect this may be a PEBCAC issue but I built an MTE enabled kernel
+with:
+
+  CONFIG_HAVE_ARCH_KASAN=y
+  CONFIG_HAVE_ARCH_KASAN_SW_TAGS=y
+  CONFIG_HAVE_ARCH_KASAN_HW_TAGS=y
+  CONFIG_CC_HAS_KASAN_GENERIC=y
+  CONFIG_KASAN=y
+  # CONFIG_KASAN_GENERIC is not set
+  CONFIG_KASAN_HW_TAGS=y
+  CONFIG_KASAN_STACK=1
+  CONFIG_KASAN_KUNIT_TEST=m
+  CONFIG_TEST_KASAN_MODULE=m
+
+and was able to boot it. But when I insmod the kasan tests:
+
+  insmod test_kasan.ko
+
+it looks like it just keeps looping failing on the same test:
+
+  Ignoring spurious kernel translation fault at virtual address dead00000000010a
+  WARNING: CPU: 0 PID: 1444 at arch/arm64/mm/fault.c:364 __do_kernel_fault+0xc4/0x1bc
+  Modules linked in: test_kasan(+)
+  CPU: 0 PID: 1444 Comm: kunit_try_catch Tainted: G    B   W         5.11.0-ajb-kasan #3
+  Hardware name: linux,dummy-virt (DT)
+  pstate: 60400009 (nZCv daif +PAN -UAO -TCO BTYPE=--)
+  pc : __do_kernel_fault+0xc4/0x1bc
+  lr : __do_kernel_fault+0xc4/0x1bc
+  sp : ffffffc01191b900
+  x29: ffffffc01191b900 x28: fcffff8001f7a880
+  x27: fcffff8001c01e00 x26: 0000000000000000
+  x25: 0000000000000001 x24: 00000000000000f4
+  x23: 0000000020400009 x22: dead00000000010a
+  x21: 0000000000000025 x20: ffffffc01191b9d0
+  x19: 0000000097c08004 x18: 0000000000000000
+  x17: 000000000000000a x16: 000017a83fb75794
+  x15: 0000000000000030 x14: 6c656e72656b2073
+  x13: ffffffc010e21be0 x12: 00000000000001aa
+  x11: 000000000000008e x10: ffffffc010e2d930
+  x9 : 000000000003a6d0 x8 : ffffffc010e21be0
+  x7 : ffffffc010e2cbe0 x6 : 0000000000000d50
+  x5 : ffffff8007f9c850 x4 : ffffffc01191b700
+  x3 : 0000000000000001 x2 : 0000000000000000
+  x1 : 0000000000000000 x0 : fcffff8001f7a880
+  Call trace:
+   __do_kernel_fault+0xc4/0x1bc
+   do_translation_fault+0x98/0xb0
+   do_mem_abort+0x44/0xb0
+   el1_abort+0x40/0x6c
+   el1_sync_handler+0x6c/0xb0
+   el1_sync+0x70/0x100
+   kasan_update_kunit_status+0x6c/0x1ac
+   kasan_report_invalid_free+0x34/0xa0
+   ____kasan_slab_free.constprop.0+0xf8/0x1a0
+   __kasan_slab_free+0x10/0x20
+   slab_free_freelist_hook+0xf8/0x1a0
+   kfree+0x148/0x25c
+   kunit_destroy_resource+0x15c/0x1bc
+   string_stream_destroy+0x20/0x80
+   kunit_do_assertion+0x190/0x1e4
+   kmalloc_double_kzfree+0x158/0x190 [test_kasan]
+   kunit_try_run_case+0x78/0xa4
+   kunit_generic_run_threadfn_adapter+0x20/0x2c
+   kthread+0x134/0x144
+   ret_from_fork+0x10/0x38
+  ---[ end trace 5acd02cdb9b3d3f0 ]---
+
+but maybe I'm using the kunit tests wrong. It's my first time playing
+with them.
+
+> Signed-off-by: Richard Henderson <email address hidden>
+> ---
+>  target/arm/mte_helper.c | 38 +++++++++++++++++---------------------
+>  1 file changed, 17 insertions(+), 21 deletions(-)
+>
+> diff --git a/target/arm/mte_helper.c b/target/arm/mte_helper.c
+> index 8be17e1b70..c87717127c 100644
+> --- a/target/arm/mte_helper.c
+> +++ b/target/arm/mte_helper.c
+> @@ -757,10 +757,10 @@ uint64_t mte_checkN(CPUARMState *env, uint32_t desc,
+>                      uint64_t ptr, uintptr_t ra)
+>  {
+>      int mmu_idx, ptr_tag, bit55;
+> -    uint64_t ptr_last, ptr_end, prev_page, next_page;
+> -    uint64_t tag_first, tag_end;
+> -    uint64_t tag_byte_first, tag_byte_end;
+> -    uint32_t esize, total, tag_count, tag_size, n, c;
+> +    uint64_t ptr_last, prev_page, next_page;
+> +    uint64_t tag_first, tag_last;
+> +    uint64_t tag_byte_first, tag_byte_last;
+> +    uint32_t total, tag_count, tag_size, n, c;
+>      uint8_t *mem1, *mem2;
+>      MMUAccessType type;
+>  
+> @@ -779,29 +779,27 @@ uint64_t mte_checkN(CPUARMState *env, uint32_t desc,
+>  
+>      mmu_idx = FIELD_EX32(desc, MTEDESC, MIDX);
+>      type = FIELD_EX32(desc, MTEDESC, WRITE) ? MMU_DATA_STORE : MMU_DATA_LOAD;
+> -    esize = FIELD_EX32(desc, MTEDESC, ESIZE);
+>      total = FIELD_EX32(desc, MTEDESC, TSIZE);
+>  
+>      /* Find the addr of the end of the access, and of the last element. */
+> -    ptr_end = ptr + total;
+> -    ptr_last = ptr_end - esize;
+> +    ptr_last = ptr + total - 1;
+>  
+>      /* Round the bounds to the tag granule, and compute the number of tags. */
+>      tag_first = QEMU_ALIGN_DOWN(ptr, TAG_GRANULE);
+> -    tag_end = QEMU_ALIGN_UP(ptr_last, TAG_GRANULE);
+> -    tag_count = (tag_end - tag_first) / TAG_GRANULE;
+> +    tag_last = QEMU_ALIGN_DOWN(ptr_last, TAG_GRANULE);
+> +    tag_count = ((tag_last - tag_first) / TAG_GRANULE) + 1;
+>  
+>      /* Round the bounds to twice the tag granule, and compute the bytes. */
+>      tag_byte_first = QEMU_ALIGN_DOWN(ptr, 2 * TAG_GRANULE);
+> -    tag_byte_end = QEMU_ALIGN_UP(ptr_last, 2 * TAG_GRANULE);
+> +    tag_byte_last = QEMU_ALIGN_DOWN(ptr_last, 2 * TAG_GRANULE);
+>  
+>      /* Locate the page boundaries. */
+>      prev_page = ptr & TARGET_PAGE_MASK;
+>      next_page = prev_page + TARGET_PAGE_SIZE;
+>  
+> -    if (likely(tag_end - prev_page <= TARGET_PAGE_SIZE)) {
+> +    if (likely(tag_last - prev_page <= TARGET_PAGE_SIZE)) {
+>          /* Memory access stays on one page. */
+> -        tag_size = (tag_byte_end - tag_byte_first) / (2 * TAG_GRANULE);
+> +        tag_size = ((tag_byte_last - tag_byte_first) / (2 * TAG_GRANULE)) + 1;
+>          mem1 = allocation_tag_mem(env, mmu_idx, ptr, type, total,
+>                                    MMU_DATA_LOAD, tag_size, ra);
+>          if (!mem1) {
+> @@ -815,9 +813,9 @@ uint64_t mte_checkN(CPUARMState *env, uint32_t desc,
+>          mem1 = allocation_tag_mem(env, mmu_idx, ptr, type, next_page - ptr,
+>                                    MMU_DATA_LOAD, tag_size, ra);
+>  
+> -        tag_size = (tag_byte_end - next_page) / (2 * TAG_GRANULE);
+> +        tag_size = ((tag_byte_last - next_page) / (2 * TAG_GRANULE)) + 1;
+>          mem2 = allocation_tag_mem(env, mmu_idx, next_page, type,
+> -                                  ptr_end - next_page,
+> +                                  ptr_last - next_page + 1,
+>                                    MMU_DATA_LOAD, tag_size, ra);
+>  
+>          /*
+> @@ -838,15 +836,13 @@ uint64_t mte_checkN(CPUARMState *env, uint32_t desc,
+>      }
+>  
+>      /*
+> -     * If we failed, we know which granule.  Compute the element that
+> -     * is first in that granule, and signal failure on that element.
+> +     * If we failed, we know which granule.  For the first granule, the
+> +     * failure address is @ptr, the first byte accessed.  Otherwise the
+> +     * failure address is the first byte of the nth granule.
+>       */
+>      if (unlikely(n < tag_count)) {
+> -        uint64_t fail_ofs;
+> -
+> -        fail_ofs = tag_first + n * TAG_GRANULE - ptr;
+> -        fail_ofs = ROUND_UP(fail_ofs, esize);
+> -        mte_check_fail(env, desc, ptr + fail_ofs, ra);
+> +        uint64_t fault = (n == 0 ? ptr : tag_first + n * TAG_GRANULE);
+> +        mte_check_fail(env, desc, fault, ra);
+>      }
+>  
+>   done:
+
+
+-- 
+Alex Bennée
+
+
+This warning is caused by "virtualization=on" QEMU option. This is another QEMU bug AFAIU, see [1] and [2].
+
+[1] https://lore.kernel<email address hidden>/
+[2] https://<email address hidden>/T/
+
+It gets further without but still spams a lot of failure messages:
+
+The buggy address belongs to the object at ffffff80036a2200
+ which belongs to the cache kmalloc-128 of size 128
+The buggy address is located 11 bytes to the right of
+ 128-byte region [ffffff80036a2200, ffffff80036a2280)
+The buggy address belongs to the page:
+page:0000000046e01872 refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x436a2
+flags: 0x3fc0000000000200(slab)
+raw: 3fc0000000000200 dead000000000100 dead000000000122 f9ffff8001c01e00
+raw: 0000000000000000 0000000080100010 00000001ffffffff f3ffff80036a2401
+page dumped because: kasan: bad access detected
+pages's memcg:f3ffff80036a2401
+
+Memory state around the buggy address:
+ ffffff80036a2000: f6 f6 f6 f6 f6 f6 f6 f6 fe fe fe fe fe fe fe fe
+ ffffff80036a2100: fa fa fa fa fe fe fe fe fe fe fe fe fe fe fe fe
+>ffffff80036a2200: f9 f9 f9 f9 f9 f9 f9 f9 fe fe fe fe fe fe fe fe
+                                           ^
+ ffffff80036a2300: fc fc fc fc fe fe fe fe fe fe fe fe fe fe fe fe
+ ffffff80036a2400: f3 f3 f3 f3 f3 f3 f3 f3 fe fe fe fe fe fe fe fe
+==================================================================
+Disabling lock debugging due to kernel taint
+    # kmalloc_oob_right: EXPECTATION FAILED at lib/test_kasan.c:86
+    Expected fail_data.report_expected == fail_data.report_found, but
+        fail_data.report_expected == 1
+        fail_data.report_found == 0
+    not ok 1 - kmalloc_oob_right
+    # kmalloc_oob_left: EXPECTATION FAILED at lib/test_kasan.c:98
+    Expected fail_data.report_expected == fail_data.report_found, but
+        fail_data.report_expected == 1
+        fail_data.report_found == 0
+    not ok 2 - kmalloc_oob_left
+    # kmalloc_node_oob_right: EXPECTATION FAILED at lib/test_kasan.c:110
+    Expected fail_data.report_expected == fail_data.report_found, but
+        fail_data.report_expected == 1
+        fail_data.report_found == 0
+    not ok 3 - kmalloc_node_oob_right
+    # kmalloc_pagealloc_oob_right: EXPECTATION FAILED at lib/test_kasan.c:130
+    Expected fail_data.report_expected == fail_data.report_found, but
+        fail_data.report_expected == 1
+        fail_data.report_found == 0
+    not ok 4 - kmalloc_pagealloc_oob_right
+    # kmalloc_pagealloc_uaf: EXPECTATION FAILED at lib/test_kasan.c:148
+    Expected fail_data.report_expected == fail_data.report_found, but
+        fail_data.report_expected == 1
+        fail_data.report_found == 0
+    not ok 5 - kmalloc_pagealloc_uaf
+
+
+Is this with QEMU master without the patches mentioned in this bug?
+
+Which kernel version do you use?
+
+Could you share your kernel config?
+
+Re comments #8 and #10, I don't replicate that.
+I get full pass on KASAN_UNIT_TEST with
+and without virtualization enabled.
+
+Re comment #9, if there are bugs suspected in qemu, they
+need to be reported, or we'll never hear about them.
+
+
+Andrey Konovalov <email address hidden> writes:
+
+> Is this with QEMU master without the patches mentioned in this bug?
+
+This is with Richard's latest series.
+
+>
+> Which kernel version do you use?
+
+v5.11
+
+> Could you share your kernel config?
+
+We are just testing with Richard's config and eliminating compiler
+shenanigans now.
+
+
+-- 
+Alex Bennée
+
+
+
+Alex Bennée <email address hidden> writes:
+
+> Andrey Konovalov <email address hidden> writes:
+>
+>> Is this with QEMU master without the patches mentioned in this bug?
+>
+> This is with Richard's latest series.
+>
+>>
+>> Which kernel version do you use?
+>
+> v5.11
+>
+>> Could you share your kernel config?
+>
+> We are just testing with Richard's config and eliminating compiler
+> shenanigans now.
+
+OK with v5.12-rc5 and Richard's config I get a clean pass.
+
+
+-- 
+Alex Bennée
+
+
+Ah, there's v4 now.
+
+Tested with KASAN tests + a custom test to check unaligned accesses that span across two granules, everything works.
+
+Thank you!
+
+On Wed, 7 Apr 2021 at 19:54, Alex Bennée <email address hidden> wrote:
+>
+>
+> Richard Henderson <email address hidden> writes:
+>
+> > We were incorrectly assuming that only the first byte of an MTE access
+> > is checked against the tags.  But per the ARM, unaligned accesses are
+> > pre-decomposed into single-byte accesses.  So by the time we reach the
+> > actual MTE check in the ARM pseudocode, all accesses are aligned.
+> >
+> > Therefore, the first failure is always either the first byte of the
+> > access, or the first byte of the granule.
+> >
+> > In addition, some of the arithmetic is off for last-first -> count.
+> > This does not become directly visible until a later patch that passes
+> > single bytes into this function, so ptr == ptr_last.
+> >
+> > Buglink: https://bugs.launchpad.net/bugs/1921948
+>
+> Minor note: you can Cc: Bug 1921948 <email address hidden> to
+> automatically copy patches to the appropriate bugs which is useful if
+> you don't have the Cc for the reporter.
+
+I'm not sure cc'ing bugs on patches is very useful, though (and especially
+not for big series). I usually prefer to just add a note to the bug with
+the URL of the series in patchew afterwards.
+
+-- PMM
+
+
+
+Richard Henderson <email address hidden> writes:
+
+> On 4/7/21 11:39 AM, Alex Bennée wrote:
+>> Richard Henderson <email address hidden> writes:
+>> 
+>>> We were incorrectly assuming that only the first byte of an MTE access
+>>> is checked against the tags.  But per the ARM, unaligned accesses are
+>>> pre-decomposed into single-byte accesses.  So by the time we reach the
+>>> actual MTE check in the ARM pseudocode, all accesses are aligned.
+>>>
+>>> Therefore, the first failure is always either the first byte of the
+>>> access, or the first byte of the granule.
+>>>
+<snip>
+
+I replicated the original test case as a kunit test:
+
+  static void kmalloc_node_oob_span_right(struct kunit *test)
+  {
+          char *ptr;
+          size_t size = 128;
+
+          ptr = kmalloc_node(size, GFP_KERNEL, 0);
+          KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+
+          KUNIT_EXPECT_KASAN_FAIL(test, *(volatile unsigned long *)(ptr + 124) = 0);
+          kfree(ptr);
+  }
+
+which before this fix triggered:
+
+  [    6.753429]     # kmalloc_node_oob_span_right: EXPECTATION FAILED at lib/test_kasan.c:163
+  [    6.753429]     Expected ({ do { extern void __compiletime_assert_337(void) __attribute__((__error__("Unsupported access size for {READ,WRITE}_ONCE()."))); if (!((sizeof(
+  fail_data.report_expected) == sizeof(char) || sizeof(fail_data.report_expected) == sizeof(short) || sizeof(fail_data.report_expected) == sizeof(int) || sizeof(fail_data.repo
+  rt_expected) == sizeof(long)) || sizeof(fail_data.report_expected) == sizeof(long long))) __compiletime_assert_337(); } while (0); (*(const volatile typeof( _Generic((fail_d
+  ata.report_expected), char: (char)0, unsigned char: (unsigned char)0, signed char: (signed char)0, unsigned short: (unsigned short)0, signed short: (signed short)0, unsigned
+   int: (unsigned int)0, signed int: (signed int)0, unsigned long: (unsigned long)0, signed long: (signed long)0, unsigned long long: (unsigned long long)0, signed long long:
+  (signed long long)0, default: (fail_data.report_expected))) *
+  [    6.759388]     not ok 4 - kmalloc_node_oob_span_right
+
+And is OK by the end of the series:
+
+  [    6.587381] The buggy address belongs to the object at ffff000003325800
+  [    6.587381]  which belongs to the cache kmalloc-128 of size 128
+  [    6.588372] The buggy address is located 0 bytes to the right of
+  [    6.588372]  128-byte region [ffff000003325800, ffff000003325880)
+  [    6.589354] The buggy address belongs to the page:
+  [    6.589948] page:(____ptrval____) refcount:1 mapcount:0 mapping:0000000000000000 index:0x0 pfn:0x43325
+  [    6.590911] flags: 0x3fffc0000000200(slab)
+  [    6.591648] raw: 03fffc0000000200 dead000000000100 dead000000000122 fdff000002401200
+  [    6.592346] raw: 0000000000000000 0000000080100010 00000001ffffffff 0000000000000000
+  [    6.593007] page dumped because: kasan: bad access detected
+  [    6.593532]
+  [    6.593775] Memory state around the buggy address:
+  [    6.594360]  ffff000003325600: f3 f3 f3 f3 f3 f3 f3 f3 fe fe fe fe fe fe fe fe
+  [    6.594991]  ffff000003325700: fd fd fd fd fd fd fd fd fe fe fe fe fe fe fe fe
+  [    6.595594] >ffff000003325800: f8 f8 f8 f8 f8 f8 f8 f8 fe fe fe fe fe fe fe fe
+  [    6.596180]                                            ^
+  [    6.596714]  ffff000003325900: f7 f7 f7 f7 fe fe fe fe fe fe fe fe fe fe fe fe
+  [    6.597309]  ffff000003325a00: f4 f4 fe fe fe fe fe fe fe fe fe fe fe fe fe fe
+  [    6.597925] ==================================================================
+  [    6.598513] Disabling lock debugging due to kernel taint
+  [    6.600353]     ok 1 - kmalloc_node_oob_span_right
+  [    6.600554] ok 1 - kasan
+
+But it still fails this patch until:
+
+ target/arm: Fix unaligned checks for mte_check1, mte_probe1
+
+So I guess that is the one that should have the buglink.
+
+Anyway code wise:
+
+Reviewed-by: Alex Bennée <email address hidden>
+
+-- 
+Alex Bennée
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On Wed, 7 Apr 2021 at 19:54, Alex Bennée <email address hidden> wrote:
+>>
+>>
+>> Richard Henderson <email address hidden> writes:
+>>
+>> > We were incorrectly assuming that only the first byte of an MTE access
+>> > is checked against the tags.  But per the ARM, unaligned accesses are
+>> > pre-decomposed into single-byte accesses.  So by the time we reach the
+>> > actual MTE check in the ARM pseudocode, all accesses are aligned.
+>> >
+>> > Therefore, the first failure is always either the first byte of the
+>> > access, or the first byte of the granule.
+>> >
+>> > In addition, some of the arithmetic is off for last-first -> count.
+>> > This does not become directly visible until a later patch that passes
+>> > single bytes into this function, so ptr == ptr_last.
+>> >
+>> > Buglink: https://bugs.launchpad.net/bugs/1921948
+>>
+>> Minor note: you can Cc: Bug 1921948 <email address hidden> to
+>> automatically copy patches to the appropriate bugs which is useful if
+>> you don't have the Cc for the reporter.
+>
+> I'm not sure cc'ing bugs on patches is very useful, though (and especially
+> not for big series). I usually prefer to just add a note to the bug with
+> the URL of the series in patchew afterwards.
+
+Ideally the tooling would pick up bug links in Patchew and automatically
+update the relevant bugs when new series are posted. I only mentioned it
+because the original bug reporters weren't Cc'ed on the patches and lo
+now they know about the iteration they have tested it ;-)
+
+-- 
+Alex Bennée
+
+
+It looks like there's still a bug here: I'm seeing false positive MTE faults for unaligned accesses that touch multiple pages. This userspace assembly program demonstrates the problem, but for some reason it only reproduces some of the time for me:
+
+.arch_extension memtag
+
+.globl _start
+_start:
+mov x0, #0x37 // PR_SET_TAGGED_ADDR_CTRL
+mov x1, #0x3 // PR_TAGGED_ADDR_ENABLE | PR_MTE_TCF_ASYNC
+mov x2, #0
+mov x3, #0
+mov x4, #0
+mov x8, #0xa7 // prctl
+svc #0
+
+mov x0, xzr
+mov w1, #0x2000
+mov w2, #0x23 // PROT_READ|PROT_WRITE|PROT_MTE
+mov w3, #0x22 // MAP_PRIVATE|MAP_ANONYMOUS
+mov w4, #0xffffffff
+mov x5, xzr
+mov x8, #0xde // mmap
+svc #0
+
+mov x1, #(1 << 56)
+add x0, x0, x1
+add x0, x0, #0xff0
+stg x0, [x0]
+stg x0, [x0, #16]
+str x1, [x0, #12]
+
+mov x0, #0
+mov x8, #0x5d // exit
+svc #0
+
+(s/PR_MTE_TCF_ASYNC/PR_MTE_TCF_SYNC/g in the above program -- but the actual constant is correct)
+
+I see something similar in memset
+
+It SEGV on
+stur	q0, [x4, #-16] 
+for x4 set to 0xd000055214fe008
+
+and near tags are 0xd000055214fdff0 and 0xd000055214fe000
+
+I happened to notice that you're moving your bug tracker to gitlab so I refiled this issue over there: https://gitlab.com/qemu-project/qemu/-/issues/403
+
+Thanks for opening the new ticket. I'm closing this one here on Launchpad now so that we don't accidentally migrate it later automatically.
+

@@ -1,0 +1,210 @@
+other: 0.860
+semantic: 0.853
+instruction: 0.824
+device: 0.809
+graphic: 0.801
+assembly: 0.781
+boot: 0.670
+socket: 0.613
+vnc: 0.605
+mistranslation: 0.552
+network: 0.515
+KVM: 0.496
+
+libreoffice armhf FTBFS
+
+We have been experiencing FTBFS of LibreOffice 3.5.7, 12.04, armhf in the launchpad buildds. We believe this is likely due to an error in qemu.
+
+While we do not have a small test case yet, we do have a build log (attaching here).
+
+The relevant snippet from the build log is:
+
+3.5.7/solver/unxlngr.pro/bin/jaxp.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/juh.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/parser.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/xt.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/unoil.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/ridl.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/jurt.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/xmlsearch.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/LuceneHelpWrapper.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/HelpIndexerTool.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/lucene-core-2.3.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/lucene-analyzers-2.3.jar" com.sun.star.help.HelpIndexerTool -lang cs -mod swriter -zipdir ../../unxlngr.pro/misc/ziptmpswriter_cs -o ../../unxlngr.pro/bin/swriter_cs.zip.unxlngr.pro
+dmake:  Error code 132, while making '../../unxlngr.pro/bin/swriter_cs.zip'
+
+We believe this is from bash error code 128 + 4, where 4 is illegal instruction, thus leading us to suspect qemu.
+
+Any help in tracking this down would be appreciated.
+
+
+
+Serge, I asked Alex to escalate this because it has required us to make a devirtualised PPA for a commercial project that involves libreoffice builds.  This has some risk of being an operational problem, because it's going to be using Ubuntu build resources rather than the usual PPA ones.  I'd appreciate any help you can offer in sorting this out so that we can go back to using virtualised PPAs for this.
+
+I believe that this is with qemu 1.3.0+dfsg-1~exp3ubuntu8~3.IS.12.04 and Linux 2.6.24-32-xen.
+
+Well, the first step would be to provide a reasonably tractable set of reproduce instructions (at minimum, something like "do this to set up a chroot, then in the chroot run this command and watch it SIGILL".) Also checking it still repros on 1.4.0 (just released) would be nice (though I don't think we've fixed anything in this area, it's an easy thing to try...)
+
+However I would not be too optimistic -- Java is typically heavily threaded, and QEMU user-mode has a number of known problems with handling multithreaded guests. It's possible this will turn out to be a fairly easy fix, but it's equally possible it will just be another manifestation of problems like LP:668799.
+
+
+Trying to reproduce...
+
+On a stock ubuntu raring system, I did
+
+sudo apt-get install lxc qemu-user qemu-user-static
+sudo lxc-create -t ubuntu -n r1 -- -a armhf
+sudo lxc-start -n r1
+# log into console as ubuntu/ubuntu, there do:
+sudo apt-get install ca-certificates-java
+
+That gave me the attached error (reproducible).
+
+"The relevant snippet from the build log" doesn't even show the complete command ...
+
+
+The actual command from the build log:
+
+/usr/lib/jvm/java-6-openjdk-armhf/bin/java   -cp ".:../../unxlngr.pro/class:/usr/lib/jvm/java-6-openjdk-armhf/jre/lib/rt.jar:.:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin
+/jaxp.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/juh.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/parser.jar:/build/buildd/libreoffice-3.5.7/solver/unx
+lngr.pro/bin/xt.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/unoil.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/ridl.jar:/build/buildd/libreoffice-3.5.7/
+solver/unxlngr.pro/bin/jurt.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/xmlsearch.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/LuceneHelpWrapper.jar:/bu
+ild/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/HelpIndexerTool.jar:/build/buildd/libreoffice-3.5.7/solver/unxlngr.pro/bin/lucene-core-2.3.jar:/build/buildd/libreoffice-3.5.7/so
+lver/unxlngr.pro/bin/lucene-analyzers-2.3.jar" com.sun.star.help.HelpIndexerTool -lang cs -mod swriter -zipdir ../../unxlngr.pro/misc/ziptmpswriter_cs -o ../../unxlngr.pro/bin/swrit
+er_cs.zip.unxlngr.pro
+dmake:  Error code 132, while making '../../unxlngr.pro/bin/swriter_cs.zip'
+
+
+Interestingly, this happens after we've successfully run exactly the same Java command to produce swriter_foo.zip for various other values of 'foo' (different locales/languages?) My suspicion is that (a) maybe we're running out of address space? (b) this is going to be really painful to track down because it's obviously dependent on the data input to the tool. Does the build reproducibly fail on exactly the same bit every time?
+
+Serge: that also looks like it's probably some issue with running Java under QEMU, but it doesn't seem to be the same thing at all as the LibreOffice errors in the build log...
+
+
+Having rebuilt from upstream qemu, the bug when installing ca-certificates-java is solved.  Now trying the main package build.
+
+ubuntu@r1:~$ /usr/lib/jvm/default-java/bin/javac --version
+Segmentation fault (core dumped)
+
+
+ubuntu@r1:~$ /usr/lib/jvm/default-java/bin/javac --version
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  Internal Error (os_linux_zero.cpp:285), pid=326, tid=4120921200
+#  fatal error: caught unhandled signal 11
+#
+# JRE version: 7.0_13-b20
+# Java VM: OpenJDK Zero VM (22.0-b10 mixed mode linux-arm )
+# Derivative: IcedTea7 2.3.6   
+# Distribution: Ubuntu Raring Ringtail (development branch), package 7u13-2.3.6-1ubuntu1
+# Failed to write core dump. Core dumps have been disabled. To enable core dumping, try
+"ulimit -c unlimited" before starting Java again
+#
+# An error report file with more information is saved as:
+# /home/ubuntu/hs_err_pid326.log
+#
+# If you would like to submit a bug report, please include
+# instructions on how to reproduce the bug and visit:
+#   https://bugs.launchpad.net/ubuntu/+source/openjdk-7/
+# The crash happened outside the Java Virtual Machine in native code.
+# See problematic frame for where to report the bug.
+#
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted (core dumped)  
+
+
+coredump from running javac -version
+
+hs_err log file from same javac -version run.
+
+(I understand that still looks like a different error...  but i can't get to the reported error to reproduce without getting past this one)
+
+The patch at least allows java to run without segfaulting.  I have not tried to build libreoffice yet.
+
+Late in 2012 libc started using FUTEX_WAIT_BITSET instead of FUTEX_WAIT so teach qemu about it so it will forward the call to the host kernel rather than returning -TARGET_ENOSYS.  The patch also fixes a problem with qemu strace printing when the FUTEX_CLOCK_REALTIME bit is present in the futex cmd.
+
+Thanks for the patch. John, since you're going to be doing more QEMU work in future I'd encourage you to go through the process of submitting it to upstream's mailing list and shepherding it through the patch review process.  Upstream's patch submission guidelines are here: http://wiki.qemu.org/Contribute/SubmitAPatch. A couple of remarks about this patch specifically:
+ * it's going to need a signed-off-by: line
+ * it's fixing two different bugs (the actual futex bug and the strace error) and they will need to be in two different patches
+ * you don't need to treat FUTEX_WAIT and _WAIT_BITSET separately, you can just always pass val3 to sys_futex in both cases (if the op is not FUTEX_WAIT_BITSET the kernel will just ignore the extra parameter)
+
+Optional but nice: try the futex related bits of the LTP (http://wiki.qemu.org/Testing/LTP) and see if more of them pass now (or at least that we don't regress).
+
+
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA1
+
+Peter, sorry I attached this quick patch to the bug for Serge to try
+out with the intent of sending a proper patch upstream later.
+-----BEGIN PGP SIGNATURE-----
+Version: GnuPG v1.4.11 (GNU/Linux)
+Comment: Using GnuPG with undefined - http://www.enigmail.net/
+
+iEYEARECAAYFAlEpNucACgkQnZiV2bTs2IrVxwCgyV0unFmrEiZIZuLVo9j92imn
+QlYAoIj858HtwqzlaXomae0aLaGNUAJx
+=sDo2
+-----END PGP SIGNATURE-----
+
+
+Thanks, I'll give that a shot!
+
+@John,
+
+with that patch applied on top of 1.4.0, I still get segfault when running javac --version.
+
+It turns out it is javac in raring chroots which gives me the problem.  I finally realized that the bug is about a libreoffice build in a precise chroot.  I'm running a build (which has been running most of the day) with qemu-arm-static from a hand-built qemu source tree with this morning's latest HEAD.  No bugs yet.  I suspect 1.4.0 in general fixes it.
+
+Could you try an updated raring with qemu-user-static 1.4.0?
+
+Trying to build on a raring amd64 host in a raring armhf chroot, two failures so far.  First time was a hang checking ant, an xlc-ls showed several java threads hung.  Second time was a segfault again in java.  So I have no problems reproducing this now locally.   Hang seems like thread waiting for futex not being awakened but that is just my speculation.  I will chase this further.
+
+One more point, these two failures were locally build 1.4.0 with my FUTEX_WAIT_BITSET patches applied.
+
+John: you might also like to try with this patchset applied:
+http://lists.nongnu.org/archive/html/qemu-devel/2013-02/msg04207.html
+as that fixes one category of races. There are still other races that can cause segfaults and other problems (as the cover letter describes) but it's possible this particular case will be fixed by it.
+
+
+@John,
+
+as the bug description was about the 12.04 libreoffice build, i'm actually using a raring host with 1.4.0 qemu-user-static, with a *precise* armhf container.  The precise libreoffice has been building all day friday and friday so far with no incidents.
+
+In a raring chroot, I've not been able to get past the javac crash.  Once I'm sure the precise package builds, I intend to do some printf debugging to get past the javac crash.
+
+I see the same thing javac hanging.  This is with a raring chroot on raring host with qemu compiled from upstream 1.4.0 plus Peter's patches and my linux-user patches
+
+I noticed for the case where javac --version hangs the process has several threads all waiting on futexes.  Details attached.
+
+John: it would be interesting to try to determine whether that hang has the same root cause as the cmake and boehm-gc hangs, ie the thing that is supposed to post the futex is a signal handler whose signal comes in either just before or during the syscall [either way, the emulated code for the handler won't be able to run until the syscall returns, which it never does].
+
+
+cmake bug: LP:955379.
+sketch of how to fix signal races: http://lists.gnu.org/archive/html/qemu-devel/2011-12/msg00384.html
+
+
+@Peter,
+
+so you'd recommend testing for the javac hang with https://launchpadlibrarian.net/124927320/cmake.patch ?
+
+(will try until you shout "no, you idiot")
+
+Well, you can try, but I don't think it is very likely to help. The patch is a hacky workaround for select() in particular, not for the entire class of hangs.
+
+
+javac switched from hanging forever to segfaulting.
+
+@Alex,
+
+in a
+   armhf precise container
+on a
+   raring host with qemu-user-static version 1.4.0+dfsg-1expubuntu2
+
+a libreoffice build has now been going for 6 days with no failures
+yet.  (How long does that thing go on? :)
+
+Unless you say otherwise I'm now going to shift to looking into the
+javac failure in a *raring* container.
+
+
+Can you still reproduce this issue with the latest upstream version of QEMU?
+
+The attachment "FUTEX_WAIT_BITSET.patch" seems to be a patch.  If it isn't, please remove the "patch" flag from the attachment, remove the "patch" tag, and if you are a member of the ~ubuntu-reviewers, unsubscribe the team.
+
+[This is an automated message performed by a Launchpad user owned by ~brian-murray, for any issues please contact him.]
+
+There hasn't been a reply to my question in comment #32 within
+months, so I assume nobody cares about this anymore. So I'm closing this
+ticket now...
+
+[Expired for qemu (Ubuntu) because there has been no activity for 60 days.]
+

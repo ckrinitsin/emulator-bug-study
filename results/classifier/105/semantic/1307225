@@ -1,0 +1,485 @@
+semantic: 0.873
+other: 0.844
+mistranslation: 0.796
+assembly: 0.788
+graphic: 0.784
+device: 0.772
+instruction: 0.756
+KVM: 0.750
+vnc: 0.707
+boot: 0.671
+network: 0.643
+socket: 0.527
+
+Running a virtual machine on a Haswell system produces machine check events
+
+I'm running a virtual Windows SBS 2003 installation on a Xeon E3 Haswell system running Gentoo Linux. First, I used Qemu 1.5.3 (the latest stable version on Gentoo). I got a lot of machine check events ("mce: [Hardware Error]: Machine check events logged") in dmesg that always looked like (using mcelog):
+
+Hardware event. This is not a software error.
+MCE 7
+CPU 2 BANK 0 
+TIME 1390267908 Tue Jan 21 02:31:48 2014
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 6 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+
+I found this discussion on the vmware community: https://communities.vmware.com/thread/452344
+
+It seems that this is (at least partly) caused by the Qemu machine. I switched to Qemu 1.7.0, the first version to use "pc-i440fx-1.7". With this version, the errors almost disappeared, but from time to time, I still get machine check events. Anyways, they so not seem to affect neither the vm, nor the host.
+
+I created the virtual machine on an older Core 2 Duo machine and ran it for several weeks without a single error message, so I think this is actually some problem with the Haswell architecture. The errors didn't show up until I copied the virtual machine to my new machine.
+
+Still happens with qemu 2.0.0 and the same environment (Windows SBS 2003 32 bit guest on a Gentoo Linux amd64 Haswell host).
+
+Running the VM with "-cpu Haswell" set still causes those "Internal Parity Errors", but not so many …
+
+Used QEMU this morning, noticed mce error in log, searched, found this.
+
+* model name: Intel(R) Core(TM) i3-4130 CPU @ 3.40GHz (it's a Haswell)
+* kernel 3.14.4-gentoo
+* app-emulation/qemu-1.6.1
+* qemu-system-i386   -enable-kvm andsoon
+* [73468.545378] mce: [Hardware Error]: Machine check events logged
+
+# mcelog 
+Hardware event. This is not a software error.
+MCE 0
+CPU 0 BANK 0 
+TIME 1400824994 Fri May 23 08:03:14 2014
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c07 APICID 0 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+
+I don't have anything to contribute other than that Tobias is not the only one who gets this hardware error message when using QEMU on a Haswell.
+
+I can confirm this.
+
+Using qemu-kvm for three virtual machines on Ubuntu 14.04 LTS using a Intel i7-4770 Haswell based server.
+
+dmesg: 
+[63429.847437] mce: [Hardware Error]: Machine check events logged
+[65996.795630] mce: [Hardware Error]: Machine check events logged
+
+mcelog:
+Hardware event. This is not a software error.
+MCE 0
+CPU 2 BANK 0
+TIME 1406265172 Fri Jul 25 07:12:52 2014
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0
+CPUID Vendor Intel Family 6 Model 60
+
+It's the same error everytime, only APICID and CPU numbers are different. 
+The mce errors did not happen until i migrated the virtual machines from another system, the haswell-server was up for three days without any incidents, now, while running qemu-kvm there is a mce error every 6-12 hours. 
+After the first errors, i called the support of my server provider, they first exchanged RAM, upgraded BIOS... 
+Then, they replaced the whole server, only swapping my harddisks to the new one. But even that didn't help, i still got MCE errors. The harddisks where replaced too, one at a time (to resync raid). Now, i have a completely swapped hardware, but the MCE errors are still popping up.
+
+system information attached
+
+attachment
+logfiles, dmidecode, system information
+
+I got a new Haswell based system a few days ago. It has been running fine without warnings but today I started a VirtualBox VM and got a MCE soon afterwards. "MCA: Internal parity error" like everyone else. From reading this bug and the vmware link in the first post it seems like this problem occurs on all virtualization solutions using hardware acceleration on Haswell based systems. It happens on Qemu, Virtualbox and Vmware and it happens on both Linux and Windows.
+
+Do anyone have connections within Intel and can pull some strings to have them look at this? It looks like the MCE is always non fatal but perhaps there are other unknown side effects. A microcode update might solve it.
+
+Try adding this to the Linux commandline, in your bootloader:
+
+mce=nobootlog
+
+From Documentation/x86/x86_64/boot-options.txt:
+
+   mce=bootlog
+        Enable logging of machine checks left over from booting.
+        Disabled by default on AMD because some BIOS leave bogus ones.
+        If your BIOS doesn't do that it's a good idea to enable though
+        to make sure you log even machine check events that result
+        in a reboot. On Intel systems it is enabled by default.
+   mce=nobootlog
+        Disable boot machine check logging.
+
+How will this help to solve the problem?
+
+I think this is related to the Haswell erratum 131 of the 'Intel® Xeon® Processor E3-1200  v3 Product Family Specification Update' at:
+http://www.intel.com/content/dam/www/public/us/en/documents/specification-updates/xeon-e3-1200v3-spec-update.pdf
+
+  HSW131. Spurious Corrected Errors May be Reported
+  Problem: Due this erratum, spurious corrected errors may be logged in the IA32_MC0_STATUS 
+    register with the valid field (bit 63) set, the uncorrected error field (bit 61) not set, a 
+    Model Specific Error Code (bits [31:16]) of 0x000F, and an MCA Error Code (bits 
+    [15:0]) of 0x0005. If CMCI is enabled, these spurious corrected errors also signal interrupts.
+  Implication: When this erratum occurs, software may see corrected errors that are benign. These 
+    corrected errors may be safely ignored.
+  Workaround: None identified.
+  Status: For the steppings affected, see the Summary Table of Changes
+
+
+I propose to work around this by mce=ignore_ce, as this is a spurious 'corrected error':
+From Documentation/x86/x86_64/boot-options.txt:
+   mce=ignore_ce
+                Disable features for corrected errors, e.g. polling timer
+                and CMCI.  All events reported as corrected are not cleared
+                by OS and remained in its error banks.
+                Usually this disablement is not recommended, however if
+                there is an agent checking/clearing corrected errors
+                (e.g. BIOS or hardware monitoring applications), conflicting
+                with OS's error handling, and you cannot deactivate the agent,
+                then this option will be a help.
+
+But I have not tried this yet.
+
+
+So, at least, this does not seem to be something to worry about. But anyways, why does it only happen if a virtual machine is executed?
+
+Just my 2 cents. I have two Haswell boxes with Ubuntu Server 14.04 each running bunch of VMs. The first one is Intel Core i7-4770K and it runs only Linux VMs. There is no single MCE here for at least one year.  The second box is Intel Core i7-4790K and it runs mix of Linux and Windows 2003 VMs. MCEs regularly appear in logs here.
+
+mce=ignore_ce indeed "fixes" the messages. However, it will mask real (important) errors as well.
+
+Since Intel can't or won't correct the bug with a microcode update, how about filtering it in the kernel?
+
+http://svnweb.freebsd.org/base/head/sys/x86/x86/mca.c?r1=269052&r2=269051&pathrev=269052
+
+I'm seeing these MCE messages too. 
+
+My hardware is i7 4790K on a Gigabyte Z97X Gaming GT motherboard.
+
+I run a mixture of Linux and Windows (client and server editions) guests. Hipervisor is kvm. I'm seeing these MCE messages since I virtualized a Windows Server 2008 R2 SP1. Neither Windows XP nor Windows 8.1 guests showed any messages.
+
+For a few minutes I was worried my hardware was faulty, but this bug reports somewhat gives me hope the hardware is OK.
+
+Pasted below is my /var/log/mcelog 
+
+
+
+mcelog: failed to prefill DIMM database from DMI data
+Hardware event. This is not a software error.
+MCE 0
+CPU 0 BANK 0 
+TIME 1440943174 Sun Aug 30 10:59:34 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 0 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 1
+CPU 0 BANK 0 
+TIME 1441015741 Mon Aug 31 07:09:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 0 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 0
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 1
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 2
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 3
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 4
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 5
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 6
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 7
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 8
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 9
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 10
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 11
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 12
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 13
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 0
+CPU 2 BANK 0 
+TIME 1441064341 Mon Aug 31 20:39:01 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 90000040000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+Hardware event. This is not a software error.
+MCE 0
+CPU 2 BANK 0 
+TIME 1441064371 Mon Aug 31 20:39:31 2015
+MCG status:
+MCi status:
+Error overflow
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS d0000200000f0005 MCGSTATUS 0
+MCGCAP c09 APICID 4 SOCKETID 0 
+CPUID Vendor Intel Family 6 Model 60
+
+
+Minor Update: Bug occurs under Intel Skylake, too. 
+
+System-information: Intel Core i7-6700 with 4x8 GB Samsung M378A1G43DB0-CPB DDR4-2133 RAM, Motherboard: Fujitsu D3401-H1
+
+
+Dec 15 06:53:30 srv01 kernel: [224214.850599] mce: [Hardware Error]: Machine check events logged
+Dec 15 06:55:08 srv01 kernel: [224312.001142] mce: [Hardware Error]: Machine check events logged
+Dec 15 06:57:12 srv01 kernel: [224435.836130] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:03:35 srv01 kernel: [224818.079136] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:07:55 srv01 kernel: [225077.697589] mce_notify_irq: 1 callbacks suppressed
+Dec 15 07:07:55 srv01 kernel: [225077.697592] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:08:51 srv01 kernel: [225134.136571] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:12:25 srv01 kernel: [225347.598995] mce_notify_irq: 1 callbacks suppressed
+Dec 15 07:12:25 srv01 kernel: [225347.598998] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:15:03 srv01 kernel: [225504.880462] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:17:49 srv01 kernel: [225670.907609] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:21:49 srv01 kernel: [225911.163547] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:22:57 srv01 kernel: [225978.227807] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:24:32 srv01 kernel: [226073.681985] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:28:31 srv01 kernel: [226312.111733] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:34:04 srv01 kernel: [226644.639095] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:35:58 srv01 kernel: [226757.904937] mce_notify_irq: 2 callbacks suppressed
+Dec 15 07:35:58 srv01 kernel: [226757.904940] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:36:10 srv01 kernel: [226770.139237] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:41:14 srv01 kernel: [227073.719040] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:41:16 srv01 kernel: [227075.399257] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:44:14 srv01 kernel: [227253.699541] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:44:57 srv01 kernel: [227296.490305] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:52:44 srv01 kernel: [227762.621344] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:52:49 srv01 kernel: [227767.372259] mce: [Hardware Error]: Machine check events logged
+Dec 15 07:54:39 srv01 kernel: [227877.219677] mce_notify_irq: 1 callbacks suppressed
+Dec 15 07:54:39 srv01 kernel: [227877.219680] mce: [Hardware Error]: Machine check events logged
+...
+
+mcelog: Family 6 Model 5e CPU: only decoding architectural errors
+Hardware event. This is not a software error.
+MCE 29
+CPU 0 BANK 0
+TIME 1450162369 Tue Dec 15 07:52:49 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 9000004000010005 MCGSTATUS 0
+MCGCAP c0a APICID 0 SOCKETID 0
+CPUID Vendor Intel Family 6 Model 94
+mcelog: Family 6 Model 5e CPU: only decoding architectural errors
+Hardware event. This is not a software error.
+MCE 30
+CPU 2 BANK 0
+TIME 1450162422 Tue Dec 15 07:53:42 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 9000004000010005 MCGSTATUS 0
+MCGCAP c0a APICID 4 SOCKETID 0
+CPUID Vendor Intel Family 6 Model 94
+mcelog: Family 6 Model 5e CPU: only decoding architectural errors
+Hardware event. This is not a software error.
+MCE 31
+CPU 1 BANK 0
+TIME 1450162479 Tue Dec 15 07:54:39 2015
+MCG status:
+MCi status:
+Corrected error
+Error enabled
+MCA: Internal parity error
+STATUS 9000004000010005 MCGSTATUS 0
+MCGCAP c0a APICID 2 SOCKETID 0
+CPUID Vendor Intel Family 6 Model 94
+
+
+
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+I'm not sure if this can still be reproduces but I've found a workaround quite a while ago. The problem disappeared once I migrated the virtual machines using 32 bit OS images to 64 bit. The mix of 32 and 64 bit VMs was the causing these problems at least on my server.
+
+Last time I saw this error in my mcelog was in August. Probably, some update fixed it. I'll check the next days/weeks if I still see it. This is a quite long time, at the time of my original bug report, I got the errors multiple times a day and later multiple times a week.
+
+About the workaround moving to 64 bit OS images: Well, if you're (like in my case) stuck with dinosaur OS (Windows SBS 2003), there's no way to simply move to a 64 bit image ;-)
+
+But as said: I think it simply disappeared by some update. I'm using 2.10.0 at the moment.
+
+The errors still keep appearing. The mcelog still shows the exact errors posted in the very fist comment.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/101
+
+

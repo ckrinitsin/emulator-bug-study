@@ -1,0 +1,135 @@
+graphic: 0.731
+vnc: 0.677
+KVM: 0.654
+other: 0.653
+semantic: 0.619
+mistranslation: 0.596
+network: 0.547
+socket: 0.538
+device: 0.535
+boot: 0.529
+instruction: 0.497
+assembly: 0.493
+
+qemu-system-arm: ../hw/usb/hcd-dwc2.c:666: dwc2_glbreg_read: Assertion `addr <= GINTSTS2' failed.
+
+When trying to run the 2016-05-27 Raspbian image on the emulated raspi2 platform, the system boots but shortly after the login prompt QEMU (master; commit ID ca489cd037e4d50dc6c40570a167504ad7e5a521) dies with:
+
+qemu-system-arm: ../hw/usb/hcd-dwc2.c:666: dwc2_glbreg_read: Assertion `addr <= GINTSTS2' failed.
+
+Steps to reproduce:
+
+1. Get the image: wget http://downloads.raspberrypi.org/raspbian/images/raspbian-2016-05-31/2016-05-27-raspbian-jessie.zip
+
+2. Extract the kernel image and DTB:
+
+sudo losetup -f --show -P 2016-05-27-raspbian-jessie.img
+sudo mkdir /mnt/rpi
+sudo mount /dev/loop11p1 /mnt/rpi/
+cp /mnt/rpi/kernel7.img .                                                                                                                                                                                                                                                                         
+cp /mnt/rpi/bcm2709-rpi-2-b.dtb .                                                                                                                                                                                                                                                                 
+sudo umount /mnt/rpi 
+sudo losetup -d /dev/loop11 
+
+3. Run QEMU:
+qemu-system-arm -M raspi2 -m 1G -dtb bcm2709-rpi-2-b.dtb -kernel kernel7.img -append "rw earlyprintk loglevel=8 console=ttyAMA0,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2" -sd 2016-05-27-raspbian-jessie.img -smp 4 -serial stdio -display none
+
+A few seconds after the login prompt is displayed, QEMU will exit with the assertion failure.
+
+I also tried changing all of the asserts to if statements that (for MMIO reads) returned 0 and (for writes) just returned, but this resulted in a non-responsive system.
+
+Note for bisection: it looks like it works fine as of tag stable-4.2 .
+
+What happens if you add "dwc_otg.fiq_fsm_enable=0" to the kernel command
+line? This is noted as a requirement in the changelog at
+https://wiki.qemu.org/ChangeLog/5.1
+
+Yep, it looks like that works! Sorry for the bogus report, I didn't think to check the Changelog.
+
+It is still a bug in QEMU -- we shouldn't allow guest behaviour to make QEMU assert(). If there's unimplemented functionality in the USB controller model that can be logged with qemu_log_mask(LOG_UNIMP, ...)
+
+
+Hmm, yes agreed. I started a 2-week holiday on Monday, I can work on
+this after I get back on Sept. 7
+
+for me the output is:
+% qemu-system-arm -M raspi2 -m 1G -dtb bcm2709-rpi-2-b.dtb -kernel kernel7.img -append "rw earlyprintk loglevel=8 console=ttyAMA0,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2" -sd 2016-05-27-raspbian-jessie.img -smp 4 -serial stdio -display none
+
+WARNING: Image format was not specified for '2016-05-27-raspbian-jessie.img' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+qemu-system-arm: Invalid SD card size: 3.74 GiB
+SD card size has to be a power of 2, e.g. 4 GiB.
+You can resize disk images with 'qemu-img resize <imagefile> <new-size>'
+(note that this will lose data if you make the image smaller than it currently is).
+
+
+That part is easily fixed by running
+
+qemu-img resize 2016-05-27-raspbian-jessie.img 4G
+
+ah, well then its the same error:
+qemu-system-arm: /build/qemu/src/qemu-5.1.0/hw/usb/hcd-dwc2.c:666: dwc2_glbreg_read: Assertion `addr <= GINTSTS2' failed.
+
+
+Are you able to modify the -append string to add "dwc_otg.fiq_fsm_enable=0", and if so does it fix the problem?
+
+Nope:
+
+qemu-system-arm -M raspi2 -m 1G -dtb bcm2709-rpi-2-b.dtb -kernel kernel7.img -append "rw earlyprintk loglevel=8 console=ttyAMA0,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 dwc_otg.fiq_fsm_enable=0" -sd 2016-05-27-raspbian-jessie.img -smp 4 -serial stdio -display none
+
+raspberrypi login: qemu-system-arm: /build/qemu/src/qemu-5.1.0/hw/usb/hcd-dwc2.c:666: dwc2_glbreg_read: Assertion `addr <= GINTSTS2' failed.
+[1]    65608 abort (core dumped)  qemu-system-arm -M raspi2 -m 1G -dtb bcm2709-rpi-2-b.dtb -kernel kernel7.img 
+
+Hmm, that's odd. I will try to reproduce this.
+
+Something very strange is going on with the dwc_otg driver in 2016-05-27-raspbian-jessie.img. Something is reading and writing incrementally throughout the register space of the hcd-dwc2 host.
+And adding the "dwc_otg.fiq_fsm_enable=0" kernel option does not fix it.
+
+Brendan, Petunia, is there a reason why you are testing with such an old version of Raspbian? I used 2019-09-26-raspbian-buster.img when developing the hcd-dwc2 emulation, and it works fine, other than needing the "dwc_otg.fiq_fsm_enable=0" kernel option.
+
+The URL to the image I used is http://downloads.raspberrypi.org/raspbian/images/raspbian-2019-09-30/2019-09-26-raspbian-buster.zip
+
+For my use case the newer image is fine too. I'm mildly curious what the dwc_otg driver is doing in the older image though.
+
+I also tried http://downloads.raspberrypi.org/raspbian/images/raspbian-2016-09-28/2016-09-23-raspbian-jessie.zip, which is the next Raspbian release after the cursed one, and it works OK too. So I assume any release after that will also work OK. Just in case anyone wants to use the older releases because they are smaller than the later ones.
+
+So I dug into this a little more, and it looks like this issue has nothing to do with hcd-dwc2, other than it served as a canary because of the assert that fired. With hcd-dwc2 removed from the build, the 2016-05-27 Raspbian image still doesn't work, it hangs shortly after the login prompt appears on the console, before the GUI starts.
+
+I tested with Qemu 4.0.0 and 4.2.1 and they are fine. The issue started with Qemu 5.0.0. hcd-dwc2 wasn't introduced until 5.1.0, so it can't be the root cause.
+
+Since the issue doesn't seem to appear with any Raspbian distro since 2016-05-27, I don't know if anyone will be motivated to look into this any further. Should we just close this bug?
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+Fixed in commit 69958d8a3d9
+("usb: hcd-dwc2: change assert()s to qemu_log_mask(LOG_GUEST_ERROR...)")
+

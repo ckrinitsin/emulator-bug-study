@@ -1,0 +1,97 @@
+graphic: 0.848
+semantic: 0.810
+other: 0.750
+device: 0.643
+instruction: 0.601
+assembly: 0.577
+socket: 0.524
+vnc: 0.518
+mistranslation: 0.463
+KVM: 0.460
+network: 0.431
+boot: 0.429
+
+ARM64 SME ST1Q incorrectly stores 9 bytes (rather than 16) per 128-bit element
+Description of problem:
+QEMU incorrectly stores 9 bytes instead of 16 per 128-bit element in the ST1Q SME instruction (https://developer.arm.com/documentation/ddi0602/2022-06/SME-Instructions/ST1Q--Contiguous-store-of-quadwords-from-128-bit-element-ZA-tile-slice-). It copies the first byte of the upper 64-bits, then lower the 64-bits.
+
+This seems to be a simple issue; I tracked it down to:
+https://gitlab.com/qemu-project/qemu/-/blob/master/target/arm/tcg/sme_helper.c?ref_type=heads#L382
+
+Updating that `+ 1` to a `+ 8` fixes the problem.
+Steps to reproduce:
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+void st1q_sme_copy_test(uint8_t* src,  uint8_t* dest) {
+  asm volatile(
+    "smstart sm\n"
+    "smstart za\n"
+    "ptrue p0.b\n"
+    "mov x12, xzr\n"
+    "ld1q {za0h.q[w12, 0]}, p0/z, %0\n"
+    "st1q {za0h.q[w12, 0]}, p0, %1\n"
+    "smstop za\n"
+    "smstop sm\n" : : "m"(*src), "m"(*dest) : "w12", "p0");
+}
+
+void print_first_128(uint8_t* data) {
+  putchar('[');
+  for (int i = 0; i < 16; i++) {
+    printf("%02d", data[i]);
+    if (i != 15)
+      printf(", ");
+  }
+  printf("]\n");
+}
+
+int main() {
+  _Alignas(16) uint8_t dest[512] = { };
+  _Alignas(16) uint8_t src[512] = { };
+  for (int i = 0; i < sizeof(src); i++)
+    src[i] = i;
+  puts("Before");
+  printf(" src: ");
+  print_first_128(src);
+  printf("dest: ");
+  print_first_128(dest);
+  st1q_sme_copy_test(src, dest);
+  puts("\nAfter ");
+  printf(" src: ");
+  print_first_128(src);
+  printf("dest: ");
+  print_first_128(dest);
+}
+```
+
+Compile with (requires at least clang ~14, tested with clang 16):<br/>
+`clang ./qemu_repro.c -march=armv9-a+sme+sve -o ./qemu_repro` 
+
+Run with:<br/>
+`qemu-aarch64 -cpu max,sme=on ./qemu_repro`
+
+It's expected just to copy from `src` to `dest` and output:
+```
+Before
+ src: [00, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15]
+dest: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]
+
+After 
+ src: [00, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15]
+dest: [00, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15]
+```
+
+But currently outputs:
+```
+Before
+ src: [00, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15]
+dest: [00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]
+
+After 
+ src: [00, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15]
+dest: [00, 08, 09, 10, 11, 12, 13, 14, 15, 00, 00, 00, 00, 00, 00, 00]
+```
+Additional information:
+N/A

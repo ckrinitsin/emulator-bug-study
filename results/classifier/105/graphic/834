@@ -1,0 +1,72 @@
+graphic: 0.900
+mistranslation: 0.726
+instruction: 0.726
+device: 0.724
+semantic: 0.717
+vnc: 0.642
+network: 0.621
+assembly: 0.619
+socket: 0.613
+other: 0.598
+KVM: 0.525
+boot: 0.459
+
+linux-user: fails to deliver signals raised during pselect
+Description of problem:
+When run via qemu a program which blocks signals but unmasks them during `pselect` does not catch these signals when returning from `pselect`.
+
+Used as reference on expected behavior: [The new pselect() system call](https://lwn.net/Articles/176911/)
+Steps to reproduce:
+A minimal test case below mimics behavior as encountered in the test suite of `p11-kit` ([link](https://github.com/p11-glue/p11-kit)) (which attempts to catch `SIGTERM` in a similar way and results in lingering processes after running the test suite).
+
+```C
+#include <stdio.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/select.h>
+
+static void handler(int sig)
+{
+	puts("SIGNAL");
+}
+
+int main(int argc, char *argv[])
+{
+	struct sigaction sa;
+
+	fd_set rfds;
+	sigset_t emptyset, blockset;
+
+	sigemptyset (&blockset);
+	sigemptyset (&emptyset);
+	sigaddset (&blockset, SIGUSR1);
+
+	sa.sa_handler = handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	sigaction(SIGUSR1, &sa, NULL);
+
+	sigprocmask (SIG_BLOCK, &blockset, NULL);
+
+	FD_ZERO(&rfds);
+
+	while(1) {
+		pselect(0, &rfds, NULL, NULL, NULL, &emptyset);
+	}
+
+	return 0;
+}
+```
+
+Running this without qemu should print _SIGNAL_ when sent `SIGUSR1`:
+
+```
+$ ./a.out &
+[1] 1683587
+$ kill -USR1 %1
+$ SIGNAL
+```
+
+When run with `qemu-x86_64` however, it does not (also qemu's `-strace` confirms the signal isn't received whereas a strace of qemu shows it's in fact delivered).
+
+The pselect call itself _is_ interrupted, but the signal goes missing.

@@ -1,0 +1,108 @@
+other: 0.948
+device: 0.905
+semantic: 0.900
+instruction: 0.900
+graphic: 0.895
+assembly: 0.881
+socket: 0.874
+boot: 0.859
+network: 0.834
+vnc: 0.833
+mistranslation: 0.828
+KVM: 0.823
+
+qemu-system-arm: crashes raspian kernels with divide-by-zero
+
+While trying to boot a arm kernel for a raspi2 machine (kernel7-4.9.41-stretch.img in my case, but applies to other versions, too) the kernel crash with a division by zero. The output on the sreial console is:
+[   10.022377] [<8011d344>] (__warn) from [<8011d42c>] (warn_slowpath_null+0x30/0x38)
+[   10.024726] [<8011d42c>] (warn_slowpath_null) from [<804da378>] (uart_get_baud_rate+0xf8/0x160)
+
+...
+
+[   10.094933] Hardware name: BCM2835
+[   10.101507] [<8010fb3c>] (unwind_backtrace) from [<8010c058>] (show_stack+0x20/0x24)
+[   10.105413] [<8010c058>] (show_stack) from [<80455f84>] (dump_stack+0xd4/0x118)
+[   10.140268] [<80455f84>] (dump_stack) from [<8010bed4>] (__div0+0x24/0x28)
+[   10.143065] [<8010bed4>] (__div0) from [<8045498c>] (Ldiv0+0x8/0x14)
+[   10.145553] [<8045498c>] (Ldiv0) from [<804e5538>] (pl011_set_termios+0x9c/0x37c)
+[   10.148017] [<804e5538>] (pl011_set_termios) from [<804da954>] (uart_change_speed+0x40/0xfc)
+[   10.185887] [<804da954>] (uart_change_speed) from [<804ddedc>] (uart_startup.part.3+0xa4/0x13c)
+[   10.222187] [<804ddedc>] (uart_startup.part.3) from [<804ddfcc>] (uart_port_activate+0x58/0x64)
+[   10.226014] [<804ddfcc>] (uart_port_activate) from [<804c93b8>] (tty_port_open+0xa0/0xe0)
+[   10.228398] [<804c93b8>] (tty_port_open) from [<804dce64>] (uart_open+0x40/0x48)
+[   10.264254] [<804dce64>] (uart_open) from [<804c1d70>] (tty_open+0xc0/0x678)
+[   10.266697] [<804c1d70>] (tty_open) from [<802753f0>] (chrdev_open+0xe0/0x1a0)
+[   10.269049] [<802753f0>] (chrdev_open) from [<8026d964>] (do_dentry_open+0x1f4/0x314)
+[   10.271620] [<8026d964>] (do_dentry_open) from [<8026ec00>] (vfs_open+0x60/0x8c)
+[   10.275245] [<8026ec00>] (vfs_open) from [<8027f39c>] (path_openat+0x2bc/0x1040)
+[   10.312827] [<8027f39c>] (path_openat) from [<80281040>] (do_filp_open+0x70/0xd4)
+[   10.317860] [<80281040>] (do_filp_open) from [<8026efd8>] (do_sys_open+0x120/0x1d0)
+[   10.320370] [<8026efd8>] (do_sys_open) from [<8026f0b4>] (SyS_open+0x2c/0x30)
+[   10.357033] [<8026f0b4>] (SyS_open) from [<801080c0>] (ret_fast_syscall+0x0/0x1c)
+
+Tracking that down in the linux kernel source, it looks like somehow uart_get_baud_rate() returns 0.
+
+The same kernel could be booted without problem with qemu version 2.11.
+Trying to bisecting the issue revealed commit @d9f8bbd8eb4e95db97cf02bd03af86a3d606f4f1 as the culprit.
+
+Commandline to run was:
+qemu-system-arm -M raspi2 \
+	-kernel "$KERNEL" \
+	-m 1024 \
+	-d guest_errors,unimp \
+	-dtb bcm2709-rpi-2-b.dtb \
+	-drive file="$IMG,if=sd,format=raw"
+
+Distribution is SuSE tumbleweed (x86_64, kernel 4.17.2), but same problem also happens with a freshly compiled qemu from git repository.
+
+This isn't a kernel crash, it's just a warning (which I think is safely ignorable). The problem is that QEMU doesn't implement the 'cprman' clock control hardware, which means Linux thinks the UART is running at a zero baud rate. Unfortunately the cprman hardware is as far as I can determine undocumented, so it's not really possible to write an emulation of it.
+
+I'm not sure your bisection has landed on the right thing, as d9f8bbd8eb4e95 should be a no-behaviour-change commit.
+
+
+On Donnerstag, 28. Juni 2018 11:32:08 CEST Peter Maydell wrote:
+
+Thanks for your quick answer.
+
+> I'm not sure your bisection has landed on the right thing, as
+> d9f8bbd8eb4e95 should be a no-behaviour-change commit.
+
+Yes, i saw that already. But strangely, the commit before worked (tested 
+manually after the bisect), and with that commit i get the division by zero.
+
+The problem is that the kernel stops booting at this point (maybe not because 
+of the exception, but that is the last message printed)
+
+>Unfortunately the cprman hardware is as far as I can
+>determine undocumented
+
+Would there be some way to fake it at least, so that linux does not get a zero 
+baudrate?
+
+
+
+
+
+This does not appear to be DIRECTLY a bug in QEMU, but 'something' has changed in the RPi Kernel to cause this issue.
+
+The actual cause of the panic is (in my situation) because the kernel is unable to mount root, and this is caused by it being unable to access the SD interface, as it can't get timing.
+
+This is a random working kernel (using QEMU 3.0) - https://pastebin.com/wvkneNNF
+
+This is the latest 4.14 kernel (using the identical QEMU) - https://pastebin.com/QTwgCkV2
+
+The actual error is on line 160:
+
+[    1.706622] sdhost-bcm2835 3f202000.mmc: could not get clk, deferring probe
+
+This never actually activates the mmc controller, and the root volume is not available.
+
+
+
+Thanks for the followup. Yes, that sounds like the problem is indeed that we don't currently emulate enough of the clock-control in the raspi's SoC. There were a couple of patches on list a while back that were trying to provide at least a basic dummy emulation of that device; I'm not sure what happened to them.
+
+This should be fixed for the 5.2 release, as we now have a model of the cprman clock control module.
+
+
+Released with QEMU v5.2.0.
+

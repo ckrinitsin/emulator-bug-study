@@ -1,0 +1,175 @@
+network: 0.963
+device: 0.955
+boot: 0.953
+instruction: 0.951
+other: 0.950
+assembly: 0.940
+KVM: 0.938
+semantic: 0.938
+graphic: 0.930
+socket: 0.927
+vnc: 0.906
+mistranslation: 0.740
+
+Installed firmware descriptor files contain (invalid) relative paths
+
+Unless the Qemu build is configured using `./configure --datadir=<path> where <path> is some absolute path which is a subdirectory of <prefix>, the resulting installed firmware descriptor files contain relative paths for their `mapping.filename` properties. These relative paths will not be accepted as valid by tools like `virt-install`, resulting in the inability to configure new VMs using these firmware descriptors.
+
+# QEMU version
+$ qemu-system-x86_64 -version
+QEMU emulator version 5.2.0
+
+(I've also reproduced the issue with QEMU built from Git master @ v5.2.0-1300-g0e32462630, see next comment.)
+
+# OS version
+Void Linux x86_64 (glibc)
+
+Steps to reproduce (with results on my system):
+
+# Verify the symptom
+
+$ virt-install --boot firmware=efi --disk none --memory 2048
+Using default --name vm4
+WARNING  No operating system detected, VM performance may suffer. Specify an OS with --os-variant for optimal results.
+
+Starting install...
+ERROR    Failed to open file 'share/qemu/edk2-i386-vars.fd': No such file or directory
+Domain installation does not appear to have been successful.
+If it was, you can restart your domain by running:
+  virsh --connect qemu:///session start vm4
+otherwise, please restart your installation.
+
+# Verify most likely cause
+
+$ grep filename /usr/share/qemu/firmware/*i386*.json 
+/usr/share/qemu/firmware/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-secure-code.fd",
+/usr/share/qemu/firmware/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-vars.fd",
+/usr/share/qemu/firmware/60-edk2-i386.json:            "filename": "share/qemu/edk2-i386-code.fd",
+/usr/share/qemu/firmware/60-edk2-i386.json:            "filename": "share/qemu/edk2-i386-vars.fd",
+
+There is an issue on Void Linux packages issue tracker about this bug[1]
+
+# Steps to verify the issue on a fresh Git clone of QEMU source
+
+$ git clone https://github.com/qemu/qemu
+$ cd qemu
+$ make DEBUG=1 docker-test-misc@alpine
+[...]
+  COPY    RUNNER
+    RUN test-misc in qemu/alpine 
+* Prepared to run command:
+  ./test-misc
+* Hit Ctrl-D to continue, or type 'exit 1' to abort
+
+bash-5.1$ . common-rc
+[...]
+bash-5.1$ configure_qemu --disable-system --disable-user
+Configure options:
+--enable-werror --prefix=/tmp/qemu-test/install --disable-system --disable-user
+cross containers  no
+The Meson build system
+Version: 0.56.2
+Source dir: /tmp/qemu-test/src
+Build dir: /tmp/qemu-test/src/tests/docker
+Build type: native build
+Project name: qemu
+Project version: 5.2.50
+[...]
+bash-5.1$ grep filename pc-bios/descriptors/*
+pc-bios/descriptors/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-secure-code.fd",
+pc-bios/descriptors/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-vars.fd",
+[...all other matches have relative paths...]
+bash-5.1$ exit 1
+[...]
+
+# Research
+
+The filename path substitution appears to be done in the file `pc-bios/descriptors/meson.build`.
+In particular, occurrences of `@DATADIR@` in the template files get substituted using the value of `qemu_datadir`:
+
+  configure_file(input: files(f),                                               
+                 output: f,                                                     
+                 configuration: {'DATADIR': qemu_datadir},                      
+                 install: get_option('install_blobs'),                          
+                 install_dir: qemu_datadir / 'firmware')
+
+The variable `qemu_datadir` gets initialized from toplevel `meson.build` file using:
+
+   qemu_datadir = get_option('datadir') / get_option('qemu_suffix')
+
+From the Meson documentation on built-in (build) options[2], `datadir` option gets initialized to `"share"` (note: a relative path!) by default, unless `datadir` build option is configured explicitly, so the value of `qemu_datadir`, as well as the substitution made ends up being a relative path as well.
+
+I found a commit which I think is relevant to why this choice was made[3].
+
+# Test a workaround, try #1: specify `datadir` manually
+
+$ make DEBUG=1 docker-test-misc@alpine
+[...]
+bash-5.1$ configure_qemu --datadir=/usr/share --disable-system --disable-user
+Configure options:
+--enable-werror --prefix=/tmp/qemu-test/install --datadir=/usr/share --disable-system --disable-user
+cross containers  no
+The Meson build system
+Version: 0.56.2
+Source dir: /tmp/qemu-test/src
+Build dir: /tmp/qemu-test/src/tests/docker
+Build type: native build
+
+../../meson.build:1:0: ERROR: The value of the 'datadir' option is '/usr/share' which must be a subdir of the prefix '/tmp/qemu-test/install'.
+Note that if you pass a relative path, it is assumed to be a subdir of prefix.
+
+A full log can be found at /tmp/qemu-test/src/tests/docker/meson-logs/meson-log.txt
+
+ERROR: meson setup failed
+
+Ah! So perhaps `datadir` can be an absolute path, but then it must be a subdir of the (already specified) `prefix`.
+Let's try again.
+
+# Test a workaround, try #2: specify `datadir` as subdir of <prefix> manually
+
+$ make DEBUG=1 docker-test-misc@alpine
+[...]
+bash-5.1$ configure_qemu --datadir=/tmp/qemu-test/install/share --disable-system --disable-user
+Configure options:
+--enable-werror --prefix=/tmp/qemu-test/install --datadir=/tmp/qemu-test/install/share --disable-system --disable-user
+[...]
+bash-5.1$ grep filename pc-bios/descriptors/*
+pc-bios/descriptors/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-secure-code.fd",
+pc-bios/descriptors/50-edk2-i386-secure.json:            "filename": "share/qemu/edk2-i386-vars.fd",
+bash-5.1$ exit 1
+
+Getting there, but the paths are still relative, missing the initial `/`.
+
+[1]: https://github.com/void-linux/void-packages/issues/27965
+[2]: https://mesonbuild.com/Builtin-options.html
+[3]: https://github.com/qemu/qemu/commit/ab4c0996f80d43d1fc28c6e76f4ecb27423a7e29
+
+
+
+I think this needs to be fixed in QEMU source. The `configure_file()` action needs both an absolute path for `configuration` (to substitute into the descriptor files) _and_ a relative path for use with the `install_dir` keyword argument.
+
+Please disregard the `# Test a coworkaround` stuff in comment #1, bad copypasta, too late at night ;-)
+
+Gentoo also noticed the bug: https://bugs.gentoo.org/766743
+
+Jannik Glückert proposed a fix:
+
+```
+--- a/pc-bios/descriptors/meson.build
++++ b/pc-bios/descriptors/meson.build
+@@ -8,7 +8,7 @@ foreach f: [
+ ]
+   configure_file(input: files(f),
+                  output: f,
+-                 configuration: {'DATADIR': qemu_datadir},
++                 configuration: {'DATADIR': get_option('prefix') / qemu_datadir},
+                  install: get_option('install_blobs'),
+                  install_dir: qemu_datadir / 'firmware')
+ endforeach
+```
+
+
+
+Fixed here:
+https://gitlab.com/qemu-project/qemu/-/commit/4b956a399969c0c497a
+

@@ -1,0 +1,412 @@
+other: 0.897
+device: 0.894
+mistranslation: 0.888
+instruction: 0.884
+KVM: 0.875
+network: 0.851
+semantic: 0.846
+graphic: 0.845
+vnc: 0.839
+assembly: 0.837
+socket: 0.834
+boot: 0.827
+
+Loss of network trafic when virtual iommu is enabled
+Steps to reproduce:
+1. Setup the hypervisor
+- Vt-x and Vt-d present
+- IOMMU enabled on the kernel command line (iommu=force intel_iommu=on)
+- OpenvSwitch started with DPDK and IOMMU support
+```shell
+ovs-vsctl --no-wait set Open_vSwitch . other_config:vhost-iommu-support=true
+ovs-vsctl --no-wait set Open_vSwitch . other_config:dpdk-init=true
+```
+- One OVS bridge with DPDK enabled
+```shell
+ovs-vsctl add-br br_dpdk  -- set bridge br_dpdk datapath_type=netdev
+```
+- VM1 makes use of a DPDK port without virtualized IOMMU
+- VM2 makes use of a DPDK port with virtualized IOMMU
+- Add a virtual port (DPDPK) for VM1,
+```shell
+ovs-vsctl add-port br_dpdk dpdk1 -- set Interface dpdk1 \
+      type=dpdkvhostuserclient options:vhost-server-path=/var/run/openvswitch/dpdk1
+```
+- Add a virtual port (DPDPK) for VM2,
+```shell
+ovs-vsctl add-port br_dpdk dpdk2 -- set Interface dpdk2 \
+      type=dpdkvhostuserclient options:vhost-server-path=/var/run/openvswitch/dpdk2
+```
+
+2. Start VM1. This VM is used to generate traffic toward VM2
+- VM1 is started. The way it is started has no impact on the outcome of the test.
+- It declares a vhost-user interface (server mode) with dpdk1 as the source.
+- The guest OS makes use of virtio-pci to handle its network interface.
+- Its interface is having the IP 192.168.3.10/24
+
+3. Start VM2. This VM shows the defect
+- VM2 is started.
+- It declares an iommu device and a vhost-user network interface (server mode) with
+dpdk2 as the source.
+- The vhost-user interface enables iommu and the ats service.
+- It uses the Q35 chipset, it has a PCI topology that ensures that the network interface is its in own IOMMU group
+- The VM is started this way:
+```shell
+qemu-system-x86_64 
+  -enable-kvm \
+  -name guest=debian-iommu,debug-threads=on \
+  -machine pc-q35-3.1,accel=kvm,usb=off,dump-guest-core=off,\
+mem-merge=off,kernel_irqchip=split \
+  -cpu IvyBridge-IBRS,ss=on,movbe=on,hypervisor=on,arat=on,\
+tsc_adjust=on,mpx=on,rdseed=on,smap=on,clflushopt=on,sha-ni=on,\
+umip=on,ssbd=on,xsaveopt=on,xsavec=on,xgetbv1=on,xsaves=on,pdpe1gb=on,\
+3dnowprefetch=on,avx=off,f16c=off \
+  -m 4096 \
+  -mem-prealloc \
+  -overcommit mem-lock=on \
+  -smp 2,sockets=1,cores=2,threads=1 \
+  -object memory-backend-file,id=ram-node0,\
+mem-path=/dev/hugepages/libvirt/qemu/2-debian-iommu,\
+share=yes,size=4294967296 \
+  -numa node,nodeid=0,cpus=0-1,memdev=ram-node0 \
+  -uuid 65847f47-3454-4576-ab6c-6a1c75041ea7 \
+  -display none \
+  -no-user-config \
+  -nodefaults \
+  -rtc base=utc \
+  -no-shutdown \
+  -global ICH9-LPC.disable_s3=1 \
+  -global ICH9-LPC.disable_s4=1 \
+  -boot strict=on \
+  -device intel-iommu,intremap=on,caching-mode=on,eim=off,device-iotlb=on \
+  -device pcie-root-port,port=0x8,chassis=1,id=pci.1,\
+bus=pcie.0,multifunction=off,addr=0x1 \
+  -device pcie-root-port,port=0x10,chassis=2,id=pci.2,\
+bus=pcie.0,multifunction=off,addr=0x2 \
+  -device pcie-root-port,port=0x18,chassis=3,id=pci.3,\
+bus=pcie.0,multifunction=off,addr=0x3 \
+  -device pcie-root-port,port=0x20,chassis=4,id=pci.4,\
+bus=pcie.0,multifunction=off,addr=0x4 \
+  -device pcie-root-port,port=0x28,chassis=5,id=pci.5,\
+bus=pcie.0,multifunction=off,addr=0x5 \
+  -device pcie-root-port,port=0x30,chassis=6,id=pci.6,\
+bus=pcie.0,multifunction=off,addr=0x6 \
+  -device pcie-root-port,port=0x38,chassis=7,id=pci.7,\
+bus=pcie.0,multifunction=off,addr=0x7 \
+  -device qemu-xhci,id=usb,bus=pci.4,addr=0x0 \
+  -drive file=/var/lib/libvirt/images/backing-storage/\
+debian-iommu/debian-iommu-0.qcow2,format=qcow2,if=none,\
+id=drive-virtio-disk0,cache=directsync \
+  -device virtio-blk-pci,scsi=off,bus=pci.5,addr=0x0,\
+drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=off \
+\
+  -chardev socket,id=charnet0,\
+path=/var/run/openvswitch/dpdk2,server=on \
+  -netdev vhost-user,chardev=charnet0,id=hostnet0 \
+  -device virtio-net-pci,mrg_rxbuf=on,netdev=hostnet0,\
+id=net0,mac=52:54:00:c2:bf:aa,bus=pci.1,addr=0x0,iommu_platform=on,ats=on \
+\
+  -chardev pty,id=charserial0 \
+  -device isa-serial,chardev=charserial0,id=serial0 \
+\
+  -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,\
+resourcecontrol=deny \
+  -msg timestamp=on
+```
+
+- the guest OS kernel has IOMMU enabled (iommu=true intel_iommu=on)
+
+4. The DPDK application is started in VM2
+- the network interface is bound to the vfio driver
+```shell
+# echo 0000:01:00.0 > /sys/bus/pci/drivers/virtio-pci/unbind
+# echo vfio-pci > /sys/bus/pci/devices/0000:01:00.0/driver_override
+# echo 0000:01:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+# echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+- the dpdk-testpmd is used to start a forwarding between the network
+interface and a tap device
+```shell
+dpdk-testpmd --pci-whitelist "01:00.0" --iova-mode va --legacy-mem --socket-mem 500 --vdev=net_tap0
+
+EAL: Detected 2 lcore(s)
+EAL: Detected 1 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: No free hugepages reported in hugepages-1048576kB
+EAL: Probing VFIO support...
+EAL: VFIO support initialized
+EAL: WARNING: cpu flags constant_tsc=yes nonstop_tsc=no -> using unreliable clo!
+EAL: PCI device 0000:01:00.0 on NUMA socket -1
+EAL:   Invalid NUMA socket, default to 0
+EAL:   probe driver: 1af4:1041 net_virtio
+EAL:   using IOMMU type 1 (Type 1)
+rte_pmd_tap_probe(): Initializing pmd_tap for net_tap0 as dtap%d
+[   47.283172] tun: Universal TUN/TAP device driver, 1.6
+testpmd: create a new mbuf pool <mbuf_pool_socket_0>: n=155456, size=2176, sock0
+testpmd: preferred mempool ops selected: ring_mp_mc
+Configuring Port 0 (socket 0)
+EAL: Error disabling MSI-X interrupts for fd 267
+Port 0: 52:54:00:C2:BF:AA
+Configuring Port 1 (socket 0)
+Port 1: CE:61:2A:67:F4:B8
+Checking link statuses...
+[   47.562560] device dtap0 entered promiscuous mode
+
+No commandline core given, start packet forwarding
+io packet forwarding - ports=2 - cores=1 - streams=2 - NUMA support enabled, MPe
+Logical Core 1 (socket 0) forwards packets on 2 streams:
+  RX P=0/Q=0 (socket 0) -> TX P=1/Q=0 (socket 0) peer=02:00:00:00:00:01
+  RX P=1/Q=0 (socket 0) -> TX P=0/Q=0 (socket 0) peer=02:00:00:00:00:00
+
+  io packet forwarding packets/burst=32
+  nb forwarding cores=1 - nb forwarding ports=2
+  port 0: RX queue number: 1 Tx queue number: 1
+    Rx offloads=0x0 Tx offloads=0x0
+    RX queue: 0
+      RX desc=0 - RX free threshold=0
+      RX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      RX Offloads=0x0
+    TX queue: 0
+      TX desc=0 - TX free threshold=0
+      TX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      TX offloads=0x0 - TX RS bit threshold=0
+  port 1: RX queue number: 1 Tx queue number: 1
+    Rx offloads=0x0 Tx offloads=0x0
+    RX queue: 0
+      RX desc=0 - RX free threshold=0
+      RX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      RX Offloads=0x0
+    TX queue: 0
+      TX desc=0 - TX free threshold=0
+      TX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      TX offloads=0x0 - TX RS bit threshold=0
+Press enter to exit
+```
+
+- An IP is set on the dtap0 interface
+
+```shell
+^Z
+# ip a a 192.168.3.20/24 dev dtap0
+# fg
+```
+
+5. The traffic is initiated from VM1
+- from the VM1 console a ping the VM2 is started and is working fine.
+
+```shell
+# ping 192.168.3.20
+PING 192.168.3.20 (192.168.3.20) 56(84) bytes of data.
+64 bytes from 192.168.3.20: icmp_seq=1 ttl=64 time=0.320 ms
+64 bytes from 192.168.3.20: icmp_seq=2 ttl=64 time=0.172 ms
+64 bytes from 192.168.3.20: icmp_seq=3 ttl=64 time=0.163 ms
+^C
+--- 192.168.3.20 ping statistics ---
+3 packets transmitted, 3 received, 0% packet loss, time 4ms
+rtt min/avg/max/mdev = 0.163/0.218/0.320/0.072 ms
+```
+- from the VM1 console a UDP iperf is started and is working fine (no server-side iperf is started)
+```shell
+# iperf -c 192.168.3.20 -u
+------------------------------------------------------------
+Client connecting to 192.168.3.20, UDP port 5001
+Sending 1470 byte datagrams, IPG target: 11215.21 us (kalman adjust)
+UDP buffer size:  208 KByte (default)
+------------------------------------------------------------
+[  3] local 192.168.3.10 port 49124 connected with 192.168.3.20 port 5001
+read failed: Connection refused
+[  3] WARNING: did not receive ack of last datagram after 1 tries.
+[ ID] Interval       Transfer     Bandwidth
+[  3]  0.0-10.0 sec  1.25 MBytes  1.05 Mbits/sec
+[  3] Sent 892 datagrams
+```
+- from the VM2 console the <Enter> key is pressed
+```shell
+Telling cores to stop...
+Waiting for lcores to finish...
+
+  ---------------------- Forward statistics for port 0  ----------------------
+  RX-packets: 904            RX-dropped: 0             RX-total: 904
+  TX-packets: 37             TX-dropped: 0             TX-total: 37
+  ----------------------------------------------------------------------------
+
+  ---------------------- Forward statistics for port 1  ----------------------
+  RX-packets: 37             RX-dropped: 0             RX-total: 37
+  TX-packets: 904            TX-dropped: 0             TX-total: 904
+  ----------------------------------------------------------------------------
+
+  +++++++++++++++ Accumulated forward statistics for all ports+++++++++++++++
+  RX-packets: 941            RX-dropped: 0             RX-total: 941
+  TX-packets: 941            TX-dropped: 0             TX-total: 941
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Done.
+
+Stopping port 0...
+Stopping ports...
+Done
+
+Stopping port 1...
+Stopping ports...
+Done
+
+Shutting down port 0...
+Closing ports...
+EAL: Error disabling MSI-X interrupts for fd 267
+Done
+
+Shutting down port 1...
+Closing ports...
+Done
+
+Bye...
+
+```
+
+- the guest OS is rebooted (the QEMU emulator is not restarted)
+```shell
+# shutdown -r now
+```
+
+6. After reboot, impossible to resume the network traffic
+- the same setup is applied (bind the interface to the vfio driver, add enough huge pages, start the dpdk-testpmd program, add an ip to the tap interface). The dpdk-testpmd output shows:
+```shell
+EAL: Detected 2 lcore(s)
+EAL: Detected 1 NUMA nodes
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: No free hugepages reported in hugepages-1048576kB
+EAL: Probing VFIO support...
+EAL: VFIO support initialized
+EAL: WARNING: cpu flags constant_tsc=yes nonstop_tsc=no -> using unreliable clo!
+EAL: PCI device 0000:01:00.0 on NUMA socket -1
+EAL:   Invalid NUMA socket, default to 0
+EAL:   probe driver: 1af4:1041 net_virtio
+EAL:   using IOMMU type 1 (Type 1)
+rte_pmd_tap_probe(): Initializing pmd_tap for net_tap0 as dtap%d
+[   37.865360] tun: Universal TUN/TAP device driver, 1.6
+testpmd: create a new mbuf pool <mbuf_pool_socket_0>: n=155456, size=2176, sock0
+testpmd: preferred mempool ops selected: ring_mp_mc
+Configuring Port 0 (socket 0)
+EAL: Error disabling MSI-X interrupts for fd 267
+Port 0: 52:54:00:C2:BF:AA
+Configuring Port 1 (socket 0)
+Port 1: 0A:78:00:1F:D6:CB
+Checking link statuses...
+[   38.151800] device dtap0 entered promiscuous mode
+
+No commandline core given, start packet forwarding
+io packet forwarding - ports=2 - cores=1 - streams=2 - NUMA support enabled, MPe
+Logical Core 1 (socket 0) forwards packets on 2 streams:
+  RX P=0/Q=0 (socket 0) -> TX P=1/Q=0 (socket 0) peer=02:00:00:00:00:01
+  RX P=1/Q=0 (socket 0) -> TX P=0/Q=0 (socket 0) peer=02:00:00:00:00:00
+
+  io packet forwarding packets/burst=32
+  nb forwarding cores=1 - nb forwarding ports=2
+  port 0: RX queue number: 1 Tx queue number: 1
+    Rx offloads=0x0 Tx offloads=0x0
+    RX queue: 0
+      RX desc=0 - RX free threshold=0
+      RX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      RX Offloads=0x0
+    TX queue: 0
+      TX desc=0 - TX free threshold=0
+      TX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      TX offloads=0x0 - TX RS bit threshold=0
+  port 1: RX queue number: 1 Tx queue number: 1
+    Rx offloads=0x0 Tx offloads=0x0
+    RX queue: 0
+      RX desc=0 - RX free threshold=0
+      RX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      RX Offloads=0x0
+    TX queue: 0
+      TX desc=0 - TX free threshold=0
+      TX threshold registers: pthresh=0 hthresh=0  wthresh=0
+      TX offloads=0x0 - TX RS bit threshold=0
+Press enter to exit
+```
+
+- From the VM2 console, any attempt to send pings or the engage in UDP iperf will fail
+```shell
+# ping 192.168.3.20
+PING 192.168.3.20 (192.168.3.20) 56(84) bytes of data.
+From 192.168.3.10 icmp_seq=1 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=2 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=3 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=4 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=5 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=6 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=7 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=8 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=9 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=10 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=11 Destination Host Unreachable
+From 192.168.3.10 icmp_seq=12 Destination Host Unreachable
+^C
+--- 192.168.3.20 ping statistics ---
+13 packets transmitted, 0 received, +12 errors, 100% packet loss, time 327ms
+
+# iperf -c 192.168.3.20 -u
+------------------------------------------------------------
+Client connecting to 192.168.3.20, UDP port 5001
+Sending 1470 byte datagrams, IPG target: 11215.21 us (kalman adjust)
+UDP buffer size:  208 KByte (default)
+------------------------------------------------------------
+[  3] local 192.168.3.10 port 54228 connected with 192.168.3.20 port 5001
+[  3] WARNING: did not receive ack of last datagram after 10 tries.
+[ ID] Interval       Transfer     Bandwidth
+[  3]  0.0-10.0 sec  1.25 MBytes  1.05 Mbits/sec
+[  3] Sent 892 datagrams
+```
+
+- from the VM2 console the <Enter> key is pressed
+```shell
+Telling cores to stop...
+Waiting for lcores to finish...
+
+  ---------------------- Forward statistics for port 0  ----------------------
+  RX-packets: 0              RX-dropped: 0             RX-total: 0
+  TX-packets: 10             TX-dropped: 0             TX-total: 10
+  ----------------------------------------------------------------------------
+
+  ---------------------- Forward statistics for port 1  ----------------------
+  RX-packets: 10             RX-dropped: 0             RX-total: 10
+  TX-packets: 0              TX-dropped: 0             TX-total: 0
+  ----------------------------------------------------------------------------
+
+  +++++++++++++++ Accumulated forward statistics for all ports+++++++++++++++
+  RX-packets: 10             RX-dropped: 0             RX-total: 10
+  TX-packets: 10             TX-dropped: 0             TX-total: 10
+  ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+Done.
+
+Stopping port 0...
+Stopping ports...
+Done
+
+Stopping port 1...
+Stopping ports...
+Done
+
+Shutting down port 0...
+Closing ports...
+EAL: Error disabling MSI-X interrupts for fd 267
+Done
+
+Shutting down port 1...
+Closing ports...
+Done
+
+Bye...
+```
+Additional information:
+1. How to resume the network traffic
+
+- If VM2 is fully restarted (the QEMU processed is restarted), and the setup is reapplied,
+the trafic with VM1 is restored.
+
+2. Alternate cases
+- Not systematically, it also happens that the trafic is definitively lost only by stopping and then restarting dpdk-testpmd in VM2
+
+- I also met the case while running another DPDK application that is making use of multithreading: one thread is receiving data from the network interface and pushing it to the tap interface, while the other thread is receiving data from the tap interface and pushing it to the network interface. No reboot of the guest OS, no interruption of the DPDK application, the traffic is just flowing for less than a minute until it is definitively lost.
