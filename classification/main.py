@@ -38,7 +38,7 @@ def main():
 
     bugs = list_files_recursive("../results/scraper/mailinglist")
     if args.minimal:
-        bugs = bugs + list_files_recursive("./semantic_issues")
+        bugs = bugs + list_files_recursive("../results/gitlab/scraper/semantic_issues")
     else:
         bugs = bugs + list_files_recursive("../results/scraper/launchpad")
         bugs = bugs + list_files_recursive("../results/scraper/gitlab/issues_text")
