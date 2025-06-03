@@ -1,5 +1,10 @@
 from transformers import pipeline
 from os import path, listdir, makedirs
+from argparse import ArgumentParser
+
+parser = ArgumentParser(prog='main.py')
+parser.add_argument('-m', '--minimal', action='store_true')
+args = parser.parse_args()
 
 positive_categories = ['semantic', 'mistranslation', 'instruction', 'assembly'] # to add: register
 negative_categories = ['other', 'boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket'] # to add: performance
@@ -30,7 +35,13 @@ def main():
     classifier = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
     bugs = list_files_recursive("../results/scraper/mailinglist")
-    bugs = bugs + list_files_recursive("./semantic_issues")
+    if args.minimal:
+        bugs = bugs + list_files_recursive("./semantic_issues")
+    else:
+        bugs = bugs + list_files_recursive("../results/scraper/launchpad")
+        bugs = bugs + list_files_recursive("../results/scraper/gitlab/issues_text")
+
+    print(f"{len(bugs)} number of bugs will be processed")
     for bug in bugs:
         print(f"Processing {bug}")
         with open(bug, "r") as file:
