@@ -1,5 +1,7 @@
 from transformers import pipeline
 from os import path, listdir, makedirs
+from datetime import timedelta
+from time import monotonic
 from argparse import ArgumentParser
 
 parser = ArgumentParser(prog='main.py')
@@ -58,4 +60,7 @@ def main():
         output(text, category, result['labels'], result['scores'], path.basename(bug))
 
 if __name__ == "__main__":
+    start_time = monotonic()
     main()
+    end_time = monotonic()
+    print(timedelta(seconds=end_time - start_time))
