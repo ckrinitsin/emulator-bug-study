@@ -61,6 +61,11 @@ def main():
                 category = "other"
                 break
 
+        if all(i > 0.9 for i in result["scores"]):
+            category = "all"
+        elif all(i < 0.6 for i in result["scores"]):
+            category = "none"
+
         output(text, category, result['labels'], result['scores'], path.basename(bug))
 
 if __name__ == "__main__":
