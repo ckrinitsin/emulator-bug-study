@@ -1,0 +1,298 @@
+other: 0.734
+KVM: 0.713
+vnc: 0.682
+graphic: 0.630
+device: 0.623
+semantic: 0.577
+network: 0.525
+boot: 0.478
+socket: 0.462
+
+[RESEND][BUG FIX HELP] QEMU main thread endlessly hangs in __ppoll()
+
+Hi Genius,
+I am a user of QEMU v4.2.0 and stuck in an interesting bug, which may still
+exist in the mainline.
+Thanks in advance to heroes who can take a look and share understanding.
+
+The qemu main thread endlessly hangs in the handle of the qmp statement:
+{'execute': 'human-monitor-command', 'arguments':{ 'command-line':
+'drive_del replication0' } }
+and we have the call trace looks like:
+#0 0x00007f3c22045bf6 in __ppoll (fds=0x555611328410, nfds=1,
+timeout=<optimized out>, timeout@entry=0x7ffc56c66db0,
+sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:44
+#1 0x000055561021f415 in ppoll (__ss=0x0, __timeout=0x7ffc56c66db0,
+__nfds=<optimized out>, __fds=<optimized out>)
+at /usr/include/x86_64-linux-gnu/bits/poll2.h:77
+#2 qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>,
+timeout=<optimized out>) at util/qemu-timer.c:348
+#3 0x0000555610221430 in aio_poll (ctx=ctx@entry=0x5556113010f0,
+blocking=blocking@entry=true) at util/aio-posix.c:669
+#4 0x000055561019268d in bdrv_do_drained_begin (poll=true,
+ignore_bds_parents=false, parent=0x0, recursive=false,
+bs=0x55561138b0a0) at block/io.c:430
+#5 bdrv_do_drained_begin (bs=0x55561138b0a0, recursive=<optimized out>,
+parent=0x0, ignore_bds_parents=<optimized out>,
+poll=<optimized out>) at block/io.c:396
+#6 0x000055561017b60b in quorum_del_child (bs=0x55561138b0a0,
+child=0x7f36dc0ce380, errp=<optimized out>)
+at block/quorum.c:1063
+#7 0x000055560ff5836b in qmp_x_blockdev_change (parent=0x555612373120
+"colo-disk0", has_child=<optimized out>,
+child=0x5556112df3e0 "children.1", has_node=<optimized out>, node=0x0,
+errp=0x7ffc56c66f98) at blockdev.c:4494
+#8 0x00005556100f8f57 in qmp_marshal_x_blockdev_change (args=<optimized
+out>, ret=<optimized out>, errp=0x7ffc56c67018)
+at qapi/qapi-commands-block-core.c:1538
+#9 0x00005556101d8290 in do_qmp_dispatch (errp=0x7ffc56c67010,
+allow_oob=<optimized out>, request=<optimized out>,
+cmds=0x5556109c69a0 <qmp_commands>) at qapi/qmp-dispatch.c:132
+#10 qmp_dispatch (cmds=0x5556109c69a0 <qmp_commands>, request=<optimized
+out>, allow_oob=<optimized out>)
+at qapi/qmp-dispatch.c:175
+#11 0x00005556100d4c4d in monitor_qmp_dispatch (mon=0x5556113a6f40,
+req=<optimized out>) at monitor/qmp.c:145
+#12 0x00005556100d5437 in monitor_qmp_bh_dispatcher (data=<optimized out>)
+at monitor/qmp.c:234
+#13 0x000055561021dbec in aio_bh_call (bh=0x5556112164bGrateful0) at
+util/async.c:117
+#14 aio_bh_poll (ctx=ctx@entry=0x5556112151b0) at util/async.c:117
+#15 0x00005556102212c4 in aio_dispatch (ctx=0x5556112151b0) at
+util/aio-posix.c:459
+#16 0x000055561021dab2 in aio_ctx_dispatch (source=<optimized out>,
+callback=<optimized out>, user_data=<optimized out>)
+at util/async.c:260
+#17 0x00007f3c22302fbd in g_main_context_dispatch () from
+/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#18 0x0000555610220358 in glib_pollfds_poll () at util/main-loop.c:219
+#19 os_host_main_loop_wait (timeout=<optimized out>) at util/main-loop.c:242
+#20 main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:518
+#21 0x000055560ff600fe in main_loop () at vl.c:1814
+#22 0x000055560fddbce9 in main (argc=<optimized out>, argv=<optimized out>,
+envp=<optimized out>) at vl.c:4503
+We found that we're doing endless check in the line of
+block/io.c:bdrv_do_drained_begin():
+BDRV_POLL_WHILE(bs, bdrv_drain_poll_top_level(bs, recursive, parent));
+and it turns out that the bdrv_drain_poll() always get true from:
+- bdrv_parent_drained_poll(bs, ignore_parent, ignore_bds_parents)
+- AND atomic_read(&bs->in_flight)
+
+I personally think this is a deadlock issue in the a QEMU block layer
+(as we know, we have some #FIXME comments in related codes, such as block
+permisson update).
+Any comments are welcome and appreciated.
+
+---
+thx,likexu
+
+On 2/28/21 9:39 PM, Like Xu wrote:
+Hi Genius,
+I am a user of QEMU v4.2.0 and stuck in an interesting bug, which may
+still exist in the mainline.
+Thanks in advance to heroes who can take a look and share understanding.
+Do you have a test case that reproduces on 5.2? It'd be nice to know if
+it was still a problem in the latest source tree or not.
+--js
+The qemu main thread endlessly hangs in the handle of the qmp statement:
+{'execute': 'human-monitor-command', 'arguments':{ 'command-line':
+'drive_del replication0' } }
+and we have the call trace looks like:
+#0 0x00007f3c22045bf6 in __ppoll (fds=0x555611328410, nfds=1,
+timeout=<optimized out>, timeout@entry=0x7ffc56c66db0,
+sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:44
+#1 0x000055561021f415 in ppoll (__ss=0x0, __timeout=0x7ffc56c66db0,
+__nfds=<optimized out>, __fds=<optimized out>)
+at /usr/include/x86_64-linux-gnu/bits/poll2.h:77
+#2 qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>,
+timeout=<optimized out>) at util/qemu-timer.c:348
+#3 0x0000555610221430 in aio_poll (ctx=ctx@entry=0x5556113010f0,
+blocking=blocking@entry=true) at util/aio-posix.c:669
+#4 0x000055561019268d in bdrv_do_drained_begin (poll=true,
+ignore_bds_parents=false, parent=0x0, recursive=false,
+bs=0x55561138b0a0) at block/io.c:430
+#5 bdrv_do_drained_begin (bs=0x55561138b0a0, recursive=<optimized out>,
+parent=0x0, ignore_bds_parents=<optimized out>,
+poll=<optimized out>) at block/io.c:396
+#6 0x000055561017b60b in quorum_del_child (bs=0x55561138b0a0,
+child=0x7f36dc0ce380, errp=<optimized out>)
+at block/quorum.c:1063
+#7 0x000055560ff5836b in qmp_x_blockdev_change (parent=0x555612373120
+"colo-disk0", has_child=<optimized out>,
+child=0x5556112df3e0 "children.1", has_node=<optimized out>, node=0x0,
+errp=0x7ffc56c66f98) at blockdev.c:4494
+#8 0x00005556100f8f57 in qmp_marshal_x_blockdev_change (args=<optimized
+out>, ret=<optimized out>, errp=0x7ffc56c67018)
+at qapi/qapi-commands-block-core.c:1538
+#9 0x00005556101d8290 in do_qmp_dispatch (errp=0x7ffc56c67010,
+allow_oob=<optimized out>, request=<optimized out>,
+cmds=0x5556109c69a0 <qmp_commands>) at qapi/qmp-dispatch.c:132
+#10 qmp_dispatch (cmds=0x5556109c69a0 <qmp_commands>, request=<optimized
+out>, allow_oob=<optimized out>)
+at qapi/qmp-dispatch.c:175
+#11 0x00005556100d4c4d in monitor_qmp_dispatch (mon=0x5556113a6f40,
+req=<optimized out>) at monitor/qmp.c:145
+#12 0x00005556100d5437 in monitor_qmp_bh_dispatcher (data=<optimized
+out>) at monitor/qmp.c:234
+#13 0x000055561021dbec in aio_bh_call (bh=0x5556112164bGrateful0) at
+util/async.c:117
+#14 aio_bh_poll (ctx=ctx@entry=0x5556112151b0) at util/async.c:117
+#15 0x00005556102212c4 in aio_dispatch (ctx=0x5556112151b0) at
+util/aio-posix.c:459
+#16 0x000055561021dab2 in aio_ctx_dispatch (source=<optimized out>,
+callback=<optimized out>, user_data=<optimized out>)
+at util/async.c:260
+#17 0x00007f3c22302fbd in g_main_context_dispatch () from
+/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#18 0x0000555610220358 in glib_pollfds_poll () at util/main-loop.c:219
+#19 os_host_main_loop_wait (timeout=<optimized out>) at
+util/main-loop.c:242
+#20 main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:518
+#21 0x000055560ff600fe in main_loop () at vl.c:1814
+#22 0x000055560fddbce9 in main (argc=<optimized out>, argv=<optimized
+out>, envp=<optimized out>) at vl.c:4503
+We found that we're doing endless check in the line of
+block/io.c:bdrv_do_drained_begin():
+Â Â Â Â BDRV_POLL_WHILE(bs, bdrv_drain_poll_top_level(bs, recursive, parent));
+and it turns out that the bdrv_drain_poll() always get true from:
+- bdrv_parent_drained_poll(bs, ignore_parent, ignore_bds_parents)
+- AND atomic_read(&bs->in_flight)
+
+I personally think this is a deadlock issue in the a QEMU block layer
+(as we know, we have some #FIXME comments in related codes, such as
+block permisson update).
+Any comments are welcome and appreciated.
+
+---
+thx,likexu
+
+Hi John,
+
+Thanks for your comment.
+
+On 2021/3/5 7:53, John Snow wrote:
+On 2/28/21 9:39 PM, Like Xu wrote:
+Hi Genius,
+I am a user of QEMU v4.2.0 and stuck in an interesting bug, which may
+still exist in the mainline.
+Thanks in advance to heroes who can take a look and share understanding.
+Do you have a test case that reproduces on 5.2? It'd be nice to know if it
+was still a problem in the latest source tree or not.
+We narrowed down the source of the bug, which basically came from
+the following qmp usage:
+{'execute': 'human-monitor-command', 'arguments':{ 'command-line':
+'drive_del replication0' } }
+One of the test cases is the COLO usage (docs/colo-proxy.txt).
+
+This issue is sporadic,the probability may be 1/15 for a io-heavy guest.
+
+I believe it's reproducible on 5.2 and the latest tree.
+--js
+The qemu main thread endlessly hangs in the handle of the qmp statement:
+{'execute': 'human-monitor-command', 'arguments':{ 'command-line':
+'drive_del replication0' } }
+and we have the call trace looks like:
+#0 0x00007f3c22045bf6 in __ppoll (fds=0x555611328410, nfds=1,
+timeout=<optimized out>, timeout@entry=0x7ffc56c66db0,
+sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:44
+#1 0x000055561021f415 in ppoll (__ss=0x0, __timeout=0x7ffc56c66db0,
+__nfds=<optimized out>, __fds=<optimized out>)
+at /usr/include/x86_64-linux-gnu/bits/poll2.h:77
+#2 qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>,
+timeout=<optimized out>) at util/qemu-timer.c:348
+#3 0x0000555610221430 in aio_poll (ctx=ctx@entry=0x5556113010f0,
+blocking=blocking@entry=true) at util/aio-posix.c:669
+#4 0x000055561019268d in bdrv_do_drained_begin (poll=true,
+ignore_bds_parents=false, parent=0x0, recursive=false,
+bs=0x55561138b0a0) at block/io.c:430
+#5 bdrv_do_drained_begin (bs=0x55561138b0a0, recursive=<optimized out>,
+parent=0x0, ignore_bds_parents=<optimized out>,
+poll=<optimized out>) at block/io.c:396
+#6 0x000055561017b60b in quorum_del_child (bs=0x55561138b0a0,
+child=0x7f36dc0ce380, errp=<optimized out>)
+at block/quorum.c:1063
+#7 0x000055560ff5836b in qmp_x_blockdev_change (parent=0x555612373120
+"colo-disk0", has_child=<optimized out>,
+child=0x5556112df3e0 "children.1", has_node=<optimized out>, node=0x0,
+errp=0x7ffc56c66f98) at blockdev.c:4494
+#8 0x00005556100f8f57 in qmp_marshal_x_blockdev_change (args=<optimized
+out>, ret=<optimized out>, errp=0x7ffc56c67018)
+at qapi/qapi-commands-block-core.c:1538
+#9 0x00005556101d8290 in do_qmp_dispatch (errp=0x7ffc56c67010,
+allow_oob=<optimized out>, request=<optimized out>,
+cmds=0x5556109c69a0 <qmp_commands>) at qapi/qmp-dispatch.c:132
+#10 qmp_dispatch (cmds=0x5556109c69a0 <qmp_commands>, request=<optimized
+out>, allow_oob=<optimized out>)
+at qapi/qmp-dispatch.c:175
+#11 0x00005556100d4c4d in monitor_qmp_dispatch (mon=0x5556113a6f40,
+req=<optimized out>) at monitor/qmp.c:145
+#12 0x00005556100d5437 in monitor_qmp_bh_dispatcher (data=<optimized
+out>) at monitor/qmp.c:234
+#13 0x000055561021dbec in aio_bh_call (bh=0x5556112164bGrateful0) at
+util/async.c:117
+#14 aio_bh_poll (ctx=ctx@entry=0x5556112151b0) at util/async.c:117
+#15 0x00005556102212c4 in aio_dispatch (ctx=0x5556112151b0) at
+util/aio-posix.c:459
+#16 0x000055561021dab2 in aio_ctx_dispatch (source=<optimized out>,
+callback=<optimized out>, user_data=<optimized out>)
+at util/async.c:260
+#17 0x00007f3c22302fbd in g_main_context_dispatch () from
+/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#18 0x0000555610220358 in glib_pollfds_poll () at util/main-loop.c:219
+#19 os_host_main_loop_wait (timeout=<optimized out>) at util/main-loop.c:242
+#20 main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:518
+#21 0x000055560ff600fe in main_loop () at vl.c:1814
+#22 0x000055560fddbce9 in main (argc=<optimized out>, argv=<optimized
+out>, envp=<optimized out>) at vl.c:4503
+We found that we're doing endless check in the line of
+block/io.c:bdrv_do_drained_begin():
+Â Â Â Â Â BDRV_POLL_WHILE(bs, bdrv_drain_poll_top_level(bs, recursive, parent));
+and it turns out that the bdrv_drain_poll() always get true from:
+- bdrv_parent_drained_poll(bs, ignore_parent, ignore_bds_parents)
+- AND atomic_read(&bs->in_flight)
+
+I personally think this is a deadlock issue in the a QEMU block layer
+(as we know, we have some #FIXME comments in related codes, such as block
+permisson update).
+Any comments are welcome and appreciated.
+
+---
+thx,likexu
+
+On 3/4/21 10:08 PM, Like Xu wrote:
+Hi John,
+
+Thanks for your comment.
+
+On 2021/3/5 7:53, John Snow wrote:
+On 2/28/21 9:39 PM, Like Xu wrote:
+Hi Genius,
+I am a user of QEMU v4.2.0 and stuck in an interesting bug, which may
+still exist in the mainline.
+Thanks in advance to heroes who can take a look and share understanding.
+Do you have a test case that reproduces on 5.2? It'd be nice to know
+if it was still a problem in the latest source tree or not.
+We narrowed down the source of the bug, which basically came from
+the following qmp usage:
+{'execute': 'human-monitor-command', 'arguments':{ 'command-line':
+'drive_del replication0' } }
+One of the test cases is the COLO usage (docs/colo-proxy.txt).
+
+This issue is sporadic,the probability may be 1/15 for a io-heavy guest.
+
+I believe it's reproducible on 5.2 and the latest tree.
+Can you please test and confirm that this is the case, and then file a
+bug report on the LP:
+https://launchpad.net/qemu
+and include:
+- The exact commit you used (current origin/master debug build would be
+the most ideal.)
+- Which QEMU binary you are using (qemu-system-x86_64?)
+- The shortest command line you are aware of that reproduces the problem
+- The host OS and kernel version
+- An updated call trace
+- Any relevant commands issued prior to the one that caused the hang; or
+detailed reproduction steps if possible.
+Thanks,
+--js
+

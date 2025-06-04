@@ -8,8 +8,8 @@ parser = ArgumentParser(prog='main.py')
 parser.add_argument('-m', '--minimal', action='store_true')
 args = parser.parse_args()
 
-positive_categories = ['semantic', 'mistranslation', 'instruction', 'assembly'] # to add: register
-negative_categories = ['other', 'boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket'] # to add: performance
+positive_categories = ['semantic']
+negative_categories = ['other', 'boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket', 'debug', 'files', 'PID', 'permissions', 'performance']
 categories = positive_categories + negative_categories
 
 def list_files_recursive(directory):
@@ -38,7 +38,7 @@ def main():
 
     bugs = list_files_recursive("../results/scraper/mailinglist")
     if args.minimal:
-        bugs = bugs + list_files_recursive("../results/gitlab/scraper/semantic_issues")
+        bugs = bugs + list_files_recursive("../results/scraper/gitlab/semantic_issues")
     else:
         bugs = bugs + list_files_recursive("../results/scraper/launchpad")
         bugs = bugs + list_files_recursive("../results/scraper/gitlab/issues_text")
@@ -55,6 +55,10 @@ def main():
         for label, score in zip(result["labels"], result["scores"]):
             if label in negative_categories and score >= 0.92:
                 category = label
+                break
+
+            if label == "semantic" and score <= 0.91:
+                category = "other"
                 break
 
         output(text, category, result['labels'], result['scores'], path.basename(bug))

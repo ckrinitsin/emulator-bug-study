@@ -1,0 +1,268 @@
+permissions: 0.964
+files: 0.944
+debug: 0.934
+semantic: 0.928
+device: 0.919
+PID: 0.914
+socket: 0.914
+graphic: 0.910
+performance: 0.897
+other: 0.890
+vnc: 0.871
+network: 0.855
+boot: 0.831
+KVM: 0.814
+
+[BUG][RFC] CPR transfer Issues: Socket permissions and PID files
+
+Hello,
+
+While testing CPR transfer I encountered two issues. The first is that the 
+transfer fails when running with pidfiles due to the destination qemu process 
+attempting to create the pidfile while it is still locked by the source 
+process. The second is that the transfer fails when running with the -run-with 
+user=$USERID parameter. This is because the destination qemu process creates 
+the UNIX sockets used for the CPR transfer before dropping to the lower 
+permissioned user, which causes them to be owned by the original user. The 
+source qemu process then does not have permission to connect to it because it 
+is already running as the lesser permissioned user.
+
+Reproducing the first issue:
+
+Create a source and destination qemu instance associated with the same VM where 
+both processes have the -pidfile parameter passed on the command line. You 
+should see the following error on the command line of the second process:
+
+qemu-system-x86_64: cannot create PID file: Cannot lock pid file: Resource 
+temporarily unavailable
+
+Reproducing the second issue:
+
+Create a source and destination qemu instance associated with the same VM where 
+both processes have -run-with user=$USERID passed on the command line, where 
+$USERID is a different user from the one launching the processes. Then attempt 
+a CPR transfer using UNIX sockets for the main and cpr sockets. You should 
+receive the following error via QMP:
+{"error": {"class": "GenericError", "desc": "Failed to connect to 'cpr.sock': 
+Permission denied"}}
+
+I provided a minimal patch that works around the second issue.
+
+Thank you,
+Ben Chaney
+
+---
+include/system/os-posix.h | 4 ++++
+os-posix.c | 8 --------
+util/qemu-sockets.c | 21 +++++++++++++++++++++
+3 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/include/system/os-posix.h b/include/system/os-posix.h
+index ce5b3bccf8..2a414a914a 100644
+--- a/include/system/os-posix.h
++++ b/include/system/os-posix.h
+@@ -55,6 +55,10 @@ void os_setup_limits(void);
+void os_setup_post(void);
+int os_mlock(bool on_fault);
+
++extern struct passwd *user_pwd;
++extern uid_t user_uid;
++extern gid_t user_gid;
++
+/**
+* qemu_alloc_stack:
+* @sz: pointer to a size_t holding the requested usable stack size
+diff --git a/os-posix.c b/os-posix.c
+index 52925c23d3..9369b312a0 100644
+--- a/os-posix.c
++++ b/os-posix.c
+@@ -86,14 +86,6 @@ void os_set_proc_name(const char *s)
+}
+
+
+-/*
+- * Must set all three of these at once.
+- * Legal combinations are unset by name by uid
+- */
+-static struct passwd *user_pwd; /* NULL non-NULL NULL */
+-static uid_t user_uid = (uid_t)-1; /* -1 -1 >=0 */
+-static gid_t user_gid = (gid_t)-1; /* -1 -1 >=0 */
+-
+/*
+* Prepare to change user ID. user_id can be one of 3 forms:
+* - a username, in which case user ID will be changed to its uid,
+diff --git a/util/qemu-sockets.c b/util/qemu-sockets.c
+index 77477c1cd5..987977ead9 100644
+--- a/util/qemu-sockets.c
++++ b/util/qemu-sockets.c
+@@ -871,6 +871,14 @@ static bool saddr_is_tight(UnixSocketAddress *saddr)
+#endif
+}
+
++/*
++ * Must set all three of these at once.
++ * Legal combinations are unset by name by uid
++ */
++struct passwd *user_pwd; /* NULL non-NULL NULL */
++uid_t user_uid = (uid_t)-1; /* -1 -1 >=0 */
++gid_t user_gid = (gid_t)-1; /* -1 -1 >=0 */
++
+static int unix_listen_saddr(UnixSocketAddress *saddr,
+int num,
+Error **errp)
+@@ -947,6 +955,19 @@ static int unix_listen_saddr(UnixSocketAddress *saddr,
+error_setg_errno(errp, errno, "Failed to bind socket to %s", path);
+goto err;
+}
++ if (user_pwd) {
++ if (chown(un.sun_path, user_pwd->pw_uid, user_pwd->pw_gid) < 0) {
++ error_setg_errno(errp, errno, "Failed to change permissions on socket %s", 
+path);
++ goto err;
++ }
++ }
++ else if (user_uid != -1 && user_gid != -1) {
++ if (chown(un.sun_path, user_uid, user_gid) < 0) {
++ error_setg_errno(errp, errno, "Failed to change permissions on socket %s", 
+path);
++ goto err;
++ }
++ }
++
+if (listen(sock, num) < 0) {
+error_setg_errno(errp, errno, "Failed to listen on socket");
+goto err;
+--
+2.40.1
+
+Thank you Ben.  I appreciate you testing CPR and shaking out the bugs.
+I will study these and propose patches.
+
+My initial reaction to the pidfile issue is that the orchestration layer must
+pass a different filename when starting the destination qemu instance.  When
+using live update without containers, these types of resource conflicts in the
+global namespaces are a known issue.
+
+- Steve
+
+On 3/14/2025 2:33 PM, Chaney, Ben wrote:
+Hello,
+
+While testing CPR transfer I encountered two issues. The first is that the 
+transfer fails when running with pidfiles due to the destination qemu process 
+attempting to create the pidfile while it is still locked by the source 
+process. The second is that the transfer fails when running with the -run-with 
+user=$USERID parameter. This is because the destination qemu process creates 
+the UNIX sockets used for the CPR transfer before dropping to the lower 
+permissioned user, which causes them to be owned by the original user. The 
+source qemu process then does not have permission to connect to it because it 
+is already running as the lesser permissioned user.
+
+Reproducing the first issue:
+
+Create a source and destination qemu instance associated with the same VM where 
+both processes have the -pidfile parameter passed on the command line. You 
+should see the following error on the command line of the second process:
+
+qemu-system-x86_64: cannot create PID file: Cannot lock pid file: Resource 
+temporarily unavailable
+
+Reproducing the second issue:
+
+Create a source and destination qemu instance associated with the same VM where 
+both processes have -run-with user=$USERID passed on the command line, where 
+$USERID is a different user from the one launching the processes. Then attempt 
+a CPR transfer using UNIX sockets for the main and cpr sockets. You should 
+receive the following error via QMP:
+{"error": {"class": "GenericError", "desc": "Failed to connect to 'cpr.sock': 
+Permission denied"}}
+
+I provided a minimal patch that works around the second issue.
+
+Thank you,
+Ben Chaney
+
+---
+include/system/os-posix.h | 4 ++++
+os-posix.c | 8 --------
+util/qemu-sockets.c | 21 +++++++++++++++++++++
+3 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/include/system/os-posix.h b/include/system/os-posix.h
+index ce5b3bccf8..2a414a914a 100644
+--- a/include/system/os-posix.h
++++ b/include/system/os-posix.h
+@@ -55,6 +55,10 @@ void os_setup_limits(void);
+void os_setup_post(void);
+int os_mlock(bool on_fault);
+
++extern struct passwd *user_pwd;
++extern uid_t user_uid;
++extern gid_t user_gid;
++
+/**
+* qemu_alloc_stack:
+* @sz: pointer to a size_t holding the requested usable stack size
+diff --git a/os-posix.c b/os-posix.c
+index 52925c23d3..9369b312a0 100644
+--- a/os-posix.c
++++ b/os-posix.c
+@@ -86,14 +86,6 @@ void os_set_proc_name(const char *s)
+}
+
+
+-/*
+- * Must set all three of these at once.
+- * Legal combinations are unset by name by uid
+- */
+-static struct passwd *user_pwd; /* NULL non-NULL NULL */
+-static uid_t user_uid = (uid_t)-1; /* -1 -1 >=0 */
+-static gid_t user_gid = (gid_t)-1; /* -1 -1 >=0 */
+-
+/*
+* Prepare to change user ID. user_id can be one of 3 forms:
+* - a username, in which case user ID will be changed to its uid,
+diff --git a/util/qemu-sockets.c b/util/qemu-sockets.c
+index 77477c1cd5..987977ead9 100644
+--- a/util/qemu-sockets.c
++++ b/util/qemu-sockets.c
+@@ -871,6 +871,14 @@ static bool saddr_is_tight(UnixSocketAddress *saddr)
+#endif
+}
+
++/*
++ * Must set all three of these at once.
++ * Legal combinations are unset by name by uid
++ */
++struct passwd *user_pwd; /* NULL non-NULL NULL */
++uid_t user_uid = (uid_t)-1; /* -1 -1 >=0 */
++gid_t user_gid = (gid_t)-1; /* -1 -1 >=0 */
++
+static int unix_listen_saddr(UnixSocketAddress *saddr,
+int num,
+Error **errp)
+@@ -947,6 +955,19 @@ static int unix_listen_saddr(UnixSocketAddress *saddr,
+error_setg_errno(errp, errno, "Failed to bind socket to %s", path);
+goto err;
+}
++ if (user_pwd) {
++ if (chown(un.sun_path, user_pwd->pw_uid, user_pwd->pw_gid) < 0) {
++ error_setg_errno(errp, errno, "Failed to change permissions on socket %s", 
+path);
++ goto err;
++ }
++ }
++ else if (user_uid != -1 && user_gid != -1) {
++ if (chown(un.sun_path, user_uid, user_gid) < 0) {
++ error_setg_errno(errp, errno, "Failed to change permissions on socket %s", 
+path);
++ goto err;
++ }
++ }
++
+if (listen(sock, num) < 0) {
+error_setg_errno(errp, errno, "Failed to listen on socket");
+goto err;
+--
+2.40.1
+
