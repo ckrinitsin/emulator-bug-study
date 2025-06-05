@@ -57,9 +57,8 @@ def main():
                 category = label
                 break
 
-            if label == "semantic" and score <= 0.91:
-                category = "other"
-                break
+        if result['labels'][0] == "semantic" and result['scores'][0] <= 0.91:
+            category = "other"
 
         if all(i > 0.9 for i in result["scores"]):
             category = "all"
