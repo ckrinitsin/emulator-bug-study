@@ -1,0 +1,416 @@
+semantic: 0.965
+graphic: 0.962
+debug: 0.958
+permissions: 0.955
+PID: 0.937
+performance: 0.935
+other: 0.927
+vnc: 0.904
+device: 0.901
+boot: 0.900
+files: 0.879
+KVM: 0.857
+network: 0.841
+socket: 0.841
+
+[Qemu-devel] [Bug?] Windows 7's time drift obviously while RTC rate switching frequently between high and low timer rate
+
+Hi,
+
+We tested with the latest QEMU, and found that time drift obviously (clock fast 
+in guest)
+in Windows 7 64 bits guest in some cases.
+
+It is easily to reproduce, using the follow QEMU command line to start windows 
+7:
+
+# x86_64-softmmu/qemu-system-x86_64 -name win7_64_2U_raw -machine 
+pc-i440fx-2.6,accel=kvm,usb=off -cpu host -m 2048 -realtime mlock=off -smp 
+4,sockets=2,cores=2,threads=1 -rtc base=utc,clock=vm,driftfix=slew -no-hpet 
+-global kvm-pit.lost_tick_policy=discard -hda /mnt/nfs/win7_sp1_32_2U_raw -vnc 
+:11 -netdev tap,id=hn0,vhost=off -device rtl8139,id=net-pci0,netdev=hn0 -device 
+piix3-usb-uhci,id=usb -device usb-tablet,id=input0 -device usb-mouse,id=input1 
+-device usb-kbd,id=input2 -monitor stdio
+
+Adjust the VM's time to host time, and run java application or run the follow 
+program
+in windows 7:
+
+#pragma comment(lib, "winmm")
+#include <stdio.h>
+#include <windows.h>
+
+#define SWITCH_PEROID  13
+
+int main()
+{
+        DWORD count = 0;
+
+        while (1)
+        {
+                count++;
+                timeBeginPeriod(1);
+                DWORD start = timeGetTime();
+                Sleep(40);
+                timeEndPeriod(1);
+                if ((count % SWITCH_PEROID) == 0) {
+                        Sleep(1);
+                }
+        }
+        return 0;
+}
+
+After few minutes, you will find that the time in windows 7 goes ahead of the
+host time, drifts about several seconds.
+
+I have dug deeper in this problem. For windows systems that use the CMOS timer,
+the base interrupt rate is usually 64Hz, but running some application in VM
+will raise the timer rate to 1024Hz, running java application and or above
+program will raise the timer rate.
+Besides, Windows operating systems generally keep time by counting timer
+interrupts (ticks). But QEMU seems not emulate the rate converting fine.
+
+We update the timer in function periodic_timer_update():
+static void periodic_timer_update(RTCState *s, int64_t current_time)
+{
+
+        cur_clock = muldiv64(current_time, RTC_CLOCK_RATE, get_ticks_per_sec());
+        next_irq_clock = (cur_clock & ~(period - 1)) + period;
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Here we calculate the next interrupt time by align the current clock with the
+new period, I'm a little confused that why we care about the *history* time ?
+If VM switches from high rate to low rate, the next interrupt time may come
+earlier than it supposed to be. We have observed it in our test. we printed the
+interval time of interrupts and the VM's current time (We got the time from VM).
+
+Here is part of the log:
+... ...
+period=512 irq inject 1534: 15625 us
+Tue Mar 29 04:38:00 2016
+*irq_num_period_32=0, irq_num_period_512=64: [3]: Real time interval is 999696 
+us
+... ...
+*irq_num_period_32=893, irq_num_period_512=9 [81]: Real time interval is 951086 
+us
+Convert 32 --- > 512: 703: 96578 us
+period=512 irq inject 44391: 12702 us
+Convert 512 --- > 32: 704: 12704 us11
+period=32 irq inject 44392: 979 us
+... ...
+32 --- > 512: 705: 24388 us
+period=512 irq inject 44417: 6834 us
+Convert 512 --- > 32: 706: 6830 us
+period=32 irq inject 44418: 978 us
+... ...
+Convert 32 --- > 512: 707: 60525 us
+period=512 irq inject 44480: 1945 us
+Convert 512 --- > 32: 708: 1955 us
+period=32 irq inject 44481: 977 us
+... ...
+Convert 32 --- > 512: 709: 36105 us
+period=512 irq inject 44518: 10741 us
+Convert 512 --- > 32: 710: 10736 us
+period=32 irq inject 44519: 989 us
+... ...
+Convert 32 --- > 512: 711: 123998 us
+period=512 irq inject 44646: 974 us
+period=512 irq inject 44647: 15607 us
+Convert 512 --- > 32: 712: 16560 us
+period=32 irq inject 44648: 980 us
+... ...
+period=32 irq inject 44738: 974 us
+Convert 32 --- > 512: 713: 88828 us
+period=512 irq inject 44739: 4885 us
+Convert 512 --- > 32: 714: 4882 us
+period=32 irq inject 44740: 989 us
+... ...
+period=32 irq inject 44842: 974 us
+Convert 32 --- > 512: 715: 100537 us
+period=512 irq inject 44843: 8788 us
+Convert 512 --- > 32: 716: 8789 us
+period=32 irq inject 44844: 972 us
+... ...
+period=32 irq inject 44941: 979 us
+Convert 32 --- > 512: 717: 95677 us
+period=512 irq inject 44942: 13661 us
+Convert 512 --- > 32: 718: 13657 us
+period=32 irq inject 44943: 987 us
+... ...
+Convert 32 --- > 512: 719: 94690 us
+period=512 irq inject 45040: 14643 us
+Convert 512 --- > 32: 720: 14642 us
+period=32 irq inject 45041: 974 us
+... ...
+Convert 32 --- > 512: 721: 88848 us
+period=512 irq inject 45132: 4892 us
+Convert 512 --- > 32: 722: 4931 us
+period=32 irq inject 45133: 964 us
+... ...
+Tue Mar 29 04:39:19 2016
+*irq_num_period_32:835, irq_num_period_512:11 [82], Real time interval is 
+911520 us
+
+For windows 7, it has got 835 IRQs which injected during the period of 32,
+and got 11 IRQs that injected during the period of 512. it updated the 
+wall-clock
+time with one second, because it supposed it has counted
+(835*976.5+11*15625)= 987252.5 us, but the real interval time is 911520 us.
+
+IMHO, we should calculate the next interrupt time based on the time of last
+interrupt injected, and it seems to be more similar with hardware CMOS timer
+in this way.
+Maybe someone can tell me the reason why we calculated the interrupt timer
+in that way, or is it a bug ? ;)
+
+Thanks,
+Hailiang
+
+ping...
+
+It seems that we can eliminate the drift by the following patch.
+(I tested it for two hours, and there is no drift, before, the timer
+in Windows 7 drifts about 2 seconds per minute.) I'm not sure if it is
+the right way to solve the problem.
+Any comments are welcomed. Thanks.
+
+From bd6acd577cbbc9d92d6376c770219470f184f7de Mon Sep 17 00:00:00 2001
+From: zhanghailiang <address@hidden>
+Date: Thu, 31 Mar 2016 16:36:15 -0400
+Subject: [PATCH] timer/mc146818rtc: fix timer drift in Windows OS while RTC
+ rate converting frequently
+
+Signed-off-by: zhanghailiang <address@hidden>
+---
+ hw/timer/mc146818rtc.c | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/hw/timer/mc146818rtc.c b/hw/timer/mc146818rtc.c
+index 2ac0fd3..e39d2da 100644
+--- a/hw/timer/mc146818rtc.c
++++ b/hw/timer/mc146818rtc.c
+@@ -79,6 +79,7 @@ typedef struct RTCState {
+     /* periodic timer */
+     QEMUTimer *periodic_timer;
+     int64_t next_periodic_time;
++    uint64_t last_periodic_time;
+     /* update-ended timer */
+     QEMUTimer *update_timer;
+     uint64_t next_alarm_time;
+@@ -152,7 +153,8 @@ static void rtc_coalesced_timer(void *opaque)
+ static void periodic_timer_update(RTCState *s, int64_t current_time)
+ {
+     int period_code, period;
+-    int64_t cur_clock, next_irq_clock;
++    int64_t cur_clock, next_irq_clock, pre_irq_clock;
++    bool change = false;
+
+     period_code = s->cmos_data[RTC_REG_A] & 0x0f;
+     if (period_code != 0
+@@ -165,14 +167,28 @@ static void periodic_timer_update(RTCState *s, int64_t 
+current_time)
+         if (period != s->period) {
+             s->irq_coalesced = (s->irq_coalesced * s->period) / period;
+             DPRINTF_C("cmos: coalesced irqs scaled to %d\n", s->irq_coalesced);
++            if (s->period && period) {
++                change = true;
++            }
+         }
+         s->period = period;
+ #endif
+         /* compute 32 khz clock */
+         cur_clock =
+             muldiv64(current_time, RTC_CLOCK_RATE, NANOSECONDS_PER_SECOND);
++        if (change) {
++            int offset = 0;
+
+-        next_irq_clock = (cur_clock & ~(period - 1)) + period;
++            pre_irq_clock = muldiv64(s->last_periodic_time, RTC_CLOCK_RATE,
++                                    NANOSECONDS_PER_SECOND);
++            if ((cur_clock - pre_irq_clock) >  period) {
++                offset =  (cur_clock - pre_irq_clock) / period;
++            }
++            s->irq_coalesced += offset;
++            next_irq_clock = pre_irq_clock + (offset + 1) * period;
++        } else {
++            next_irq_clock = (cur_clock & ~(period - 1)) + period;
++        }
+         s->next_periodic_time = muldiv64(next_irq_clock, 
+NANOSECONDS_PER_SECOND,
+                                          RTC_CLOCK_RATE) + 1;
+         timer_mod(s->periodic_timer, s->next_periodic_time);
+@@ -187,7 +203,9 @@ static void periodic_timer_update(RTCState *s, int64_t 
+current_time)
+ static void rtc_periodic_timer(void *opaque)
+ {
+     RTCState *s = opaque;
+-
++    int64_t next_periodic_time;
++
++    next_periodic_time = s->next_periodic_time;
+     periodic_timer_update(s, s->next_periodic_time);
+     s->cmos_data[RTC_REG_C] |= REG_C_PF;
+     if (s->cmos_data[RTC_REG_B] & REG_B_PIE) {
+@@ -204,6 +222,7 @@ static void rtc_periodic_timer(void *opaque)
+                 DPRINTF_C("cmos: coalesced irqs increased to %d\n",
+                           s->irq_coalesced);
+             }
++            s->last_periodic_time = next_periodic_time;
+         } else
+ #endif
+         qemu_irq_raise(s->irq);
+--
+1.8.3.1
+
+
+On 2016/3/29 19:58, Hailiang Zhang wrote:
+Hi,
+
+We tested with the latest QEMU, and found that time drift obviously (clock fast 
+in guest)
+in Windows 7 64 bits guest in some cases.
+
+It is easily to reproduce, using the follow QEMU command line to start windows 
+7:
+
+# x86_64-softmmu/qemu-system-x86_64 -name win7_64_2U_raw -machine 
+pc-i440fx-2.6,accel=kvm,usb=off -cpu host -m 2048 -realtime mlock=off -smp 
+4,sockets=2,cores=2,threads=1 -rtc base=utc,clock=vm,driftfix=slew -no-hpet 
+-global kvm-pit.lost_tick_policy=discard -hda /mnt/nfs/win7_sp1_32_2U_raw -vnc 
+:11 -netdev tap,id=hn0,vhost=off -device rtl8139,id=net-pci0,netdev=hn0 -device 
+piix3-usb-uhci,id=usb -device usb-tablet,id=input0 -device usb-mouse,id=input1 
+-device usb-kbd,id=input2 -monitor stdio
+
+Adjust the VM's time to host time, and run java application or run the follow 
+program
+in windows 7:
+
+#pragma comment(lib, "winmm")
+#include <stdio.h>
+#include <windows.h>
+
+#define SWITCH_PEROID  13
+
+int main()
+{
+        DWORD count = 0;
+
+        while (1)
+        {
+                count++;
+                timeBeginPeriod(1);
+                DWORD start = timeGetTime();
+                Sleep(40);
+                timeEndPeriod(1);
+                if ((count % SWITCH_PEROID) == 0) {
+                        Sleep(1);
+                }
+        }
+        return 0;
+}
+
+After few minutes, you will find that the time in windows 7 goes ahead of the
+host time, drifts about several seconds.
+
+I have dug deeper in this problem. For windows systems that use the CMOS timer,
+the base interrupt rate is usually 64Hz, but running some application in VM
+will raise the timer rate to 1024Hz, running java application and or above
+program will raise the timer rate.
+Besides, Windows operating systems generally keep time by counting timer
+interrupts (ticks). But QEMU seems not emulate the rate converting fine.
+
+We update the timer in function periodic_timer_update():
+static void periodic_timer_update(RTCState *s, int64_t current_time)
+{
+
+          cur_clock = muldiv64(current_time, RTC_CLOCK_RATE, 
+get_ticks_per_sec());
+          next_irq_clock = (cur_clock & ~(period - 1)) + period;
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Here we calculate the next interrupt time by align the current clock with the
+new period, I'm a little confused that why we care about the *history* time ?
+If VM switches from high rate to low rate, the next interrupt time may come
+earlier than it supposed to be. We have observed it in our test. we printed the
+interval time of interrupts and the VM's current time (We got the time from VM).
+
+Here is part of the log:
+... ...
+period=512 irq inject 1534: 15625 us
+Tue Mar 29 04:38:00 2016
+*irq_num_period_32=0, irq_num_period_512=64: [3]: Real time interval is 999696 
+us
+... ...
+*irq_num_period_32=893, irq_num_period_512=9 [81]: Real time interval is 951086 
+us
+Convert 32 --- > 512: 703: 96578 us
+period=512 irq inject 44391: 12702 us
+Convert 512 --- > 32: 704: 12704 us11
+period=32 irq inject 44392: 979 us
+... ...
+32 --- > 512: 705: 24388 us
+period=512 irq inject 44417: 6834 us
+Convert 512 --- > 32: 706: 6830 us
+period=32 irq inject 44418: 978 us
+... ...
+Convert 32 --- > 512: 707: 60525 us
+period=512 irq inject 44480: 1945 us
+Convert 512 --- > 32: 708: 1955 us
+period=32 irq inject 44481: 977 us
+... ...
+Convert 32 --- > 512: 709: 36105 us
+period=512 irq inject 44518: 10741 us
+Convert 512 --- > 32: 710: 10736 us
+period=32 irq inject 44519: 989 us
+... ...
+Convert 32 --- > 512: 711: 123998 us
+period=512 irq inject 44646: 974 us
+period=512 irq inject 44647: 15607 us
+Convert 512 --- > 32: 712: 16560 us
+period=32 irq inject 44648: 980 us
+... ...
+period=32 irq inject 44738: 974 us
+Convert 32 --- > 512: 713: 88828 us
+period=512 irq inject 44739: 4885 us
+Convert 512 --- > 32: 714: 4882 us
+period=32 irq inject 44740: 989 us
+... ...
+period=32 irq inject 44842: 974 us
+Convert 32 --- > 512: 715: 100537 us
+period=512 irq inject 44843: 8788 us
+Convert 512 --- > 32: 716: 8789 us
+period=32 irq inject 44844: 972 us
+... ...
+period=32 irq inject 44941: 979 us
+Convert 32 --- > 512: 717: 95677 us
+period=512 irq inject 44942: 13661 us
+Convert 512 --- > 32: 718: 13657 us
+period=32 irq inject 44943: 987 us
+... ...
+Convert 32 --- > 512: 719: 94690 us
+period=512 irq inject 45040: 14643 us
+Convert 512 --- > 32: 720: 14642 us
+period=32 irq inject 45041: 974 us
+... ...
+Convert 32 --- > 512: 721: 88848 us
+period=512 irq inject 45132: 4892 us
+Convert 512 --- > 32: 722: 4931 us
+period=32 irq inject 45133: 964 us
+... ...
+Tue Mar 29 04:39:19 2016
+*irq_num_period_32:835, irq_num_period_512:11 [82], Real time interval is 
+911520 us
+
+For windows 7, it has got 835 IRQs which injected during the period of 32,
+and got 11 IRQs that injected during the period of 512. it updated the 
+wall-clock
+time with one second, because it supposed it has counted
+(835*976.5+11*15625)= 987252.5 us, but the real interval time is 911520 us.
+
+IMHO, we should calculate the next interrupt time based on the time of last
+interrupt injected, and it seems to be more similar with hardware CMOS timer
+in this way.
+Maybe someone can tell me the reason why we calculated the interrupt timer
+in that way, or is it a bug ? ;)
+
+Thanks,
+Hailiang
+

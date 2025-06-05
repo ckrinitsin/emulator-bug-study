@@ -1,0 +1,102 @@
+debug: 0.968
+permissions: 0.965
+performance: 0.948
+semantic: 0.943
+graphic: 0.940
+PID: 0.938
+device: 0.936
+vnc: 0.935
+network: 0.925
+other: 0.921
+KVM: 0.917
+files: 0.890
+boot: 0.876
+socket: 0.875
+performance: 0.800
+KVM: 0.696
+debug: 0.238
+device: 0.097
+other: 0.059
+graphic: 0.058
+files: 0.018
+semantic: 0.006
+PID: 0.005
+socket: 0.004
+network: 0.003
+permissions: 0.002
+boot: 0.002
+vnc: 0.001
+
+[BUG] x86/PAT handling severely crippled AMD-V SVM KVM performance
+
+Hi, I maintain an out-of-tree 3D APIs pass-through QEMU device models at
+https://github.com/kjliew/qemu-3dfx
+that provide 3D acceleration for legacy
+32-bit Windows guests (Win98SE, WinME, Win2k and WinXP) with the focus on
+playing old legacy games from 1996-2003. It currently supports the now-defunct
+3Dfx propriety API called Glide and an alternative OpenGL pass-through based on
+MESA implementation.
+
+The basic concept of both implementations create memory-mapped virtual
+interfaces consist of host/guest shared memory with guest-push model instead of
+a more common host-pull model for typical QEMU device model implementation.
+Guest uses shared memory as FIFOs for drawing commands and data to bulk up the
+operations until serialization event that flushes the FIFOs into host. This
+achieves extremely good performance since virtual CPUs are fast with hardware
+acceleration (Intel VT/AMD-V) and reduces the overhead of frequent VMEXITs to
+service the device emulation. Both implementations work on Windows 10 with WHPX
+and HAXM accelerators as well as KVM in Linux.
+
+On Windows 10, QEMU WHPX implementation does not sync MSR_IA32_PAT during
+host/guest states sync. There is no visibility into the closed-source WHPX on
+how things are managed behind the scene, but from measuring performance figures
+I can conclude that it didn't handle the MSR_IA32_PAT correctly for both Intel
+and AMD. Call this fair enough, if you will, it didn't flag any concerns, in
+fact games such as Quake2 and Quake3 were still within playable frame rate of
+40~60FPS on Win2k/XP guest. Until the same games were run on Win98/ME guest and
+the frame rate blew off the roof (300~500FPS) on the same CPU and GPU. In fact,
+the later seemed to be more inlined with runnng the games bare-metal with vsync
+off.
+
+On Linux (at the time of writing kernel 5.6.7/Mesa 20.0), the difference
+prevailed. Intel CPUs (and it so happened that I was on laptop with Intel GPU),
+the VMX-based kvm_intel got it right while SVM-based kvm_amd did not.
+To put this in simple exaggeration, an aging Core i3-4010U/HD Graphics 4400
+(Haswell GT2) exhibited an insane performance in Quake2/Quake3 timedemos that
+totally crushed more recent AMD Ryzen 2500U APU/Vega 8 Graphics and AMD
+FX8300/NVIDIA GT730 on desktop. Simply unbelievable!
+
+It turned out that there was something to do with AMD-V NPT. By loading kvm_amd
+with npt=0, AMD Ryzen APU and FX8300 regained a huge performance leap. However,
+AMD NPT issue with KVM was supposedly fixed in 2017 kernel commits. NPT=0 would
+actually incur performance loss for VM due to intervention required by
+hypervisors to maintain the shadow page tables.  Finally, I was able to find the
+pointer that pointed to MSR_IA32_PAT register. By updating the MSR_IA32_PAT to
+0x0606xxxx0606xxxxULL, AMD CPUs now regain their rightful performance without
+taking the hit of NPT=0 for Linux KVM. Taking the same solution into Windows,
+both Intel and AMD CPUs no longer require Win98/ME guest to unleash the full
+performance potentials and performance figures based on games measured on WHPX
+were not very far behind Linux KVM.
+
+So I guess the problem lies in host/guest shared memory regions mapped as
+uncacheable from virtual CPU perspective. As virtual CPUs now completely execute
+in hardware context with x86 hardware virtualiztion extensions, the cacheability
+of memory types would severely impact the performance on guests. WHPX didn't
+handle it for both Intel EPT and AMD NPT, but KVM seems to do it right for Intel
+EPT. I don't have the correct fix for QEMU. But what I can do for my 3D APIs
+pass-through device models is to implement host-side hooks to reprogram and
+restore MSR_IA32_PAT upon activation/deactivation of the 3D APIs. Perhaps there
+is also a better solution of having the proper kernel drivers for virtual
+interfaces to manage the memory types of host/guest shared memory in kernel
+space, but to do that and the needs of Microsoft tools/DDKs, I will just forget
+it. The guest stubs uses the same kernel drivers included in 3Dfx drivers for
+memory mapping and the virtual interfaces remain driver-less from Windows OS
+perspective. Considering the current state of halting progress for QEMU native
+virgil3D to support Windows OS, I am just being pragmatic. I understand that
+QEMU virgil3D will eventually bring 3D acceleration for Windows guests, but I do
+not expect anything to support legacy 32-bit Windows OSes which have out-grown
+their commercial usefulness.
+
+Regards,
+KJ Liew
+
