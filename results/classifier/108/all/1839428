@@ -1,0 +1,176 @@
+other: 0.958
+vnc: 0.946
+semantic: 0.945
+device: 0.943
+performance: 0.937
+debug: 0.932
+socket: 0.932
+boot: 0.930
+permissions: 0.928
+graphic: 0.926
+PID: 0.922
+network: 0.921
+KVM: 0.921
+files: 0.909
+
+ qemu core dumped when repeat "system_reset" multiple times during guest boot
+
+commit 864ab314f1d924129d06ac7b571f105a2b76a4b2 (HEAD, tag: v4.1.0-rc4, origin/master, origin/HEAD, master)
+Test arch:x86 and power
+
+Steps:
+1.Boot up guest with command
+power cmdline:
+/usr/libexec/backup/qemu-kvm \
+ -smp 8 \
+ -m 4096 \
+ -nodefaults \
+ -device virtio-blk-pci,id=image1,drive=drive_image1,bootindex=1,bus=pci.0,addr=0x7 \
+ -drive file=rhel77-ppc64le-virtio.qcow2,if=none,id=drive_image1,format=qcow2,cache=none \
+ -chardev stdio,mux=on,id=serial_id_serial0,server,nowait,signal=off \
+ -device spapr-vty,id=serial111,chardev=serial_id_serial0 \
+ -mon chardev=serial_id_serial0,mode=readline \
+x86 cmdline:
+/usr/libexec/qemu-kvm \
+ -m 4096 -smp 8 \
+ -boot menu=on \
+ -device virtio-blk-pci,id=image1,drive=drive_image1\
+ -drive file=rhel77-64-virtio.qcow2,if=none,id=drive_image1,format=qcow2,cache=none \
+ -vga std \
+ -vnc :9 \
+ -nographic \
+ -device virtio-net-pci,netdev=net0,id=nic0,mac=52:54:00:c4:e7:84 \
+ -netdev tap,id=net0,script=/etc/qemu-ifup,downscript=/etc/qemu-ifdown,vhost=on \
+
+2.when guest start to boot up kernel(when no output infomation),run hmp command "system_reset"
+
+
+Result:
+
+Sometimes,qemu core dumped with error as following:
+system_reset
+(qemu) qemu-system-ppc64: /root/qemu/hw/virtio/virtio.c:225: vring_get_region_caches: Assertion `caches != NULL' failed.
+b.sh: line 11: 73679 Aborted                 (core dumped) /usr/local/bin/qemu-system-ppc64 -enable-kvm -smp 8 -m 4096 -nodefaults -device virtio-blk-pci,id=image1,drive=drive_image1,bootindex=1,bus=pci.0,addr=0x7 -drive file=rhel77-ppc64le-virtio.qcow2,if=none,id=drive_image1,format=qcow2,cache=none -chardev stdio,mux=on,id=serial_id_serial0,server,nowait,signal=off -device spapr-vty,id=serial111,chardev=serial_id_serial0 -mon chardev=serial_id_serial0,mode=readline
+
+Upstream qemu-v3.1.0 pass
+Upstream qemu-v3.1.1 pass
+Upstream qemu-v4.0.0 fail
+Upstream qemu-v4.0.0-rc0 fail
+
+So the problem occurs due to patch between qemu-v3.1.1 to qemu-v4.0.0-rc0.
+
+This issue is very hard to reproduce.
+
+It sometimes crashes, so I could mark few commits 'bad' while bisecting, but since it is not reliable, I'm not sure a commit is 'good' when there is no crash.
+
+For now after hours of testing I could reduce Xujun Ma's range to qemu-v3.1.0..1d31f1872b:
+
+commit 1d31f1872b337e4acac5bf6b3c2a45b66e43b494 (refs/bisect/bad)
+Merge: 20b084c4b1 88c869198a
+Author: Peter Maydell <email address hidden>
+Date:   Mon Mar 4 11:04:31 2019 +0000
+
+    Merge remote-tracking branch 'remotes/mst/tags/for_upstream' into staging
+    
+    pci, pc, virtio: fixes, cleanups, tests
+    
+    Lots of work on tests: BiosTablesTest UEFI app,
+    vhost-user testing for non-Linux hosts.
+    Misc cleanups and fixes all over the place
+    
+    Signed-off-by: Michael S. Tsirkin <email address hidden>
+    
+    * remotes/mst/tags/for_upstream: (26 commits)
+      pci: Sanity test minimum downstream LNKSTA
+      hw/smbios: fix offset of type 3 sku field
+      pci: Move NVIDIA vendor id to the rest of ids
+      virtio-balloon: Safely handle BALLOON_PAGE_SIZE < host page size
+      virtio-balloon: Use ram_block_discard_range() instead of raw madvise()
+      virtio-balloon: Rework ballon_page() interface
+      virtio-balloon: Corrections to address verification
+      virtio-balloon: Remove unnecessary MADV_WILLNEED on deflate
+      i386/kvm: ignore masked irqs when update msi routes
+      contrib/vhost-user-blk: fix the compilation issue
+      Revert "contrib/vhost-user-blk: fix the compilation issue"
+      pc-dimm: use same mechanism for [get|set]_addr
+      tests/data: introduce "uefi-boot-images" with the "bios-tables-test" ISOs
+      tests/uefi-test-tools: add build scripts
+      tests: introduce "uefi-test-tools" with the BiosTablesTest UEFI app
+      roms: build the EfiRom utility from the roms/edk2 submodule
+      roms: add the edk2 project as a git submodule
+      vhost-user-test: create a temporary directory per TestServer
+      vhost-user-test: small changes to init_hugepagefs
+      vhost-user-test: create a main loop per TestServer
+      ...
+
+I found the commit that introduced this regression.
+
+commit 57830a499f7c815bb0cb325c94a3d8c910d13cfa (HEAD)
+Author: Denis Plotnikov <email address hidden>
+Date:   Fri Feb 15 16:03:25 2019 +0300
+
+    block: don't set the same context
+
+    Adds a fast path on aio context setting preventing
+    unnecessary context setting routine.
+    Also, it prevents issues with cyclic walk of child
+    bds-es appeared because of registering aio walking
+    notifiers:
+
+    Call stack:
+
+    0  __GI_raise
+    1  __GI_abort
+    2  __assert_fail_base
+    3  __GI___assert_fail
+    4  bdrv_detach_aio_context (bs=0x55f54d65c000)      <<<
+    5  bdrv_detach_aio_context (bs=0x55f54fc8a800)
+    6  bdrv_set_aio_context (bs=0x55f54fc8a800, ...)
+    7  block_job_attached_aio_context
+    8  bdrv_attach_aio_context (bs=0x55f54d65c000, ...) <<<
+    9  bdrv_set_aio_context (bs=0x55f54d65c000)
+    10 blk_set_aio_context
+    11 virtio_blk_data_plane_stop
+    12 virtio_bus_stop_ioeventfd
+    13 virtio_vmstate_change
+    14 vm_state_notify (running=0, state=RUN_STATE_SHUTDOWN)
+    15 do_vm_stop (state=RUN_STATE_SHUTDOWN, send_stop=true)
+    16 vm_stop (state=RUN_STATE_SHUTDOWN)
+    17 main_loop_should_exit
+    18 main_loop
+    19 main
+
+    This can happen because of "new" context attachment to VM disk bds.
+    When attaching a new context the corresponding aio context handler is
+    called for each of aio_notifiers registered on the VM disk bds context.
+    Among those handlers, there is the block_job_attached_aio_context handler
+    which sets a new aio context for the block job bds. When doing so,
+    the old context is detached from all the block job bds children and one of
+    them is the VM disk bds, serving as backing store for the blockjob bds,
+    although the VM disk bds is actually the initializer of that process.
+    Since the VM disk bds is protected with walking_aio_notifiers flag
+    from double processing in recursive calls, the assert fires.
+
+    Signed-off-by: Denis Plotnikov <email address hidden>
+    Signed-off-by: Kevin Wolf <email address hidden>
+
+diff --git a/block.c b/block.c
+index 4ad0e90d7e..0c12632661 100644
+--- a/block.c
++++ b/block.c
+@@ -5265,6 +5265,10 @@ void bdrv_set_aio_context(BlockDriverState *bs, AioContext *new_context)
+ {
+     AioContext *ctx = bdrv_get_aio_context(bs);
+
++    if (ctx == new_context) {
++        return;
++    }
++
+     aio_disable_external(ctx);
+     bdrv_parent_drained_begin(bs, NULL, false);
+     bdrv_drain(bs); /* ensure there are no in-flight requests */
+
+
+Please check if this commit has solved the issue:
+https://git.qemu.org/?p=qemu.git;a=commit;h=ebb6ff25cd888a52a64a9adc3692541c6d1d9a42
+

@@ -1,0 +1,232 @@
+debug: 0.958
+graphic: 0.937
+performance: 0.923
+semantic: 0.918
+socket: 0.916
+permissions: 0.908
+device: 0.906
+KVM: 0.903
+other: 0.899
+vnc: 0.897
+network: 0.891
+files: 0.890
+PID: 0.885
+boot: 0.840
+
+SIGILL during DPDK e1000e device initialization - VMOVD instruction fails in QEMU
+Description of problem:
+I think it's a QEMU issue, but it could be rather a DPDK issue.
+When using DPDK with QEMU's e1000e device, the initialization fails with SIGILL (Illegal Instruction) during the LED initialization phase. The issue occurs specifically with the e1000e device and not with other network devices.
+
+Output from GDB:
+```
+Starting DPDK initialization...
+EAL: Detected CPU lcores: 4
+EAL: Detected NUMA nodes: 1
+EAL: Auto-detected process type: PRIMARY
+EAL: Detected shared linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'PA'
+EAL: VFIO support initialized
+EAL: Using IOMMU type 1 (Type 1)
+EAL: Ignore mapping IO port bar(2)
+EAL: Probe PCI driver: net_e1000_em (8086:10d3) device: 0000:01:00.0 (socket -1)
+
+Thread 1 "hello" received signal SIGILL, Illegal instruction.
+0x00007ffff1d4f63e in e1000_id_led_init_generic ()
+   from /usr/local/lib/x86_64-linux-gnu/dpdk/pmds-24.0/librte_net_e1000.so.24.0
+
+1: x/i $pc
+=> 0x7ffff1d4f63e <e1000_id_led_init_generic+94>:	vmovd  0xe00(%rax),%xmm0
+```
+
+PCI device information:
+```
+01:00.0 Ethernet controller: Intel Corporation 82574L Gigabit Network Connection
+    Subsystem: Intel Corporation 82574L Gigabit Network Connection
+    Physical Slot: 0
+    Control: I/O+ Mem+ BusMaster- SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR+ FastB2B- DisINTx-
+    Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+    Interrupt: pin A routed to IRQ 22
+    IOMMU group: 6
+    Region 0: Memory at fe840000 (32-bit, non-prefetchable) [size=128K]
+    Region 1: Memory at fe860000 (32-bit, non-prefetchable) [size=128K]
+    Region 2: I/O ports at c000 [size=32]
+    Region 3: Memory at fe880000 (32-bit, non-prefetchable) [size=16K]
+    Expansion ROM at fe800000 [disabled] [size=256K]
+```
+
+GDB Analysis:
+The crash occurs during LED initialization when attempting to execute a VMOVD instruction. The register RAX contains value 0x1 at the time of crash, which appears incorrect as it should contain the base address of the device's memory-mapped region (around 0xfe840000 based on PCI info).
+
+Both host and guest have AVX/AVX2 support
+- The issue appears to be related to memory mapping or address translation
+- The SIGILL occurs consistently at the same point during device initialization
+- This issue only occurs with e1000e device; other network devices work correctly
+
+Please let me know if you need any additional information.
+Additional information:
+Test program:
+```c
+#include <rte_eal.h>
+#include <rte_debug.h>
+#include <rte_lcore.h>
+#include <rte_memory.h>
+#include <rte_log.h>
+#include <rte_dev.h>
+#include <rte_bus.h>
+#include <rte_ethdev.h>
+#include <rte_kvargs.h>
+
+// Callback function for memory segment walking
+static int dump_memseg(const struct rte_memseg_list *msl, 
+                      const struct rte_memseg *ms, void *arg) {
+    size_t *total_mem = arg;
+    *total_mem += ms->len;
+    return 0;
+}
+
+static void print_device_info(uint16_t port_id) {
+    struct rte_eth_dev_info dev_info;
+    int ret = rte_eth_dev_info_get(port_id, &dev_info);
+    if (ret != 0) {
+        printf("Error getting device info for port %u: %s\n", 
+               port_id, rte_strerror(-ret));
+        return;
+    }
+
+    printf("\nDevice Info for Port %u:\n", port_id);
+    printf("  Driver name: %s\n", dev_info.driver_name);
+    
+    // Get device capabilities
+    printf("  Capabilities:\n");
+    printf("    Maximum RX queues: %u\n", dev_info.max_rx_queues);
+    printf("    Maximum TX queues: %u\n", dev_info.max_tx_queues);
+    printf("    Maximum MTU: %u\n", dev_info.max_mtu);
+    printf("    Minimum RX buffers: %u\n", dev_info.min_rx_bufsize);
+    printf("    Maximum RX descriptors: %u\n", dev_info.rx_desc_lim.nb_max);
+    printf("    Maximum TX descriptors: %u\n", dev_info.tx_desc_lim.nb_max);
+
+    // Get and print link status
+    struct rte_eth_link link;
+    ret = rte_eth_link_get_nowait(port_id, &link);
+    if (ret < 0) {
+        printf("  Link status: unknown\n");
+    } else {
+        printf("  Link status: %s\n", link.link_status ? "up" : "down");
+        if (link.link_status) {
+            printf("    Speed: %u Mbps\n", link.link_speed);
+            printf("    Duplex: %s\n", 
+                   link.link_duplex == RTE_ETH_LINK_FULL_DUPLEX ? 
+                   "full" : "half");
+        }
+    }
+    
+    // Get and print MAC address
+    struct rte_ether_addr mac_addr;
+    ret = rte_eth_macaddr_get(port_id, &mac_addr);
+    if (ret < 0) {
+        printf("  MAC address: unknown\n");
+    } else {
+        printf("  MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",
+               mac_addr.addr_bytes[0], mac_addr.addr_bytes[1],
+               mac_addr.addr_bytes[2], mac_addr.addr_bytes[3],
+               mac_addr.addr_bytes[4], mac_addr.addr_bytes[5]);
+    }
+
+    // Get statistics
+    struct rte_eth_stats stats;
+    ret = rte_eth_stats_get(port_id, &stats);
+    if (ret == 0) {
+        printf("  Statistics:\n");
+        printf("    RX packets: %" PRIu64 "\n", stats.ipackets);
+        printf("    TX packets: %" PRIu64 "\n", stats.opackets);
+        printf("    RX bytes: %" PRIu64 "\n", stats.ibytes);
+        printf("    TX bytes: %" PRIu64 "\n", stats.obytes);
+        printf("    RX errors: %" PRIu64 "\n", stats.ierrors);
+        printf("    TX errors: %" PRIu64 "\n", stats.oerrors);
+    }
+}
+
+// Print runtime configurations
+void print_runtime_config(void) {
+    // Core and NUMA information
+    printf("\n=== CPU and Memory Configuration ===\n");
+    printf("Main lcore ID: %u\n", rte_get_main_lcore());
+    printf("Number of available lcores: %u\n", rte_lcore_count());
+    
+    // Print available lcores and their status
+    printf("\nLcore status:\n");
+    unsigned int lcore_id;
+    RTE_LCORE_FOREACH(lcore_id) {
+        printf("  Lcore %u - Role: %s, Socket: %d\n", 
+               lcore_id,
+               lcore_id == rte_get_main_lcore() ? "Main" : "Worker",
+               rte_lcore_to_socket_id(lcore_id));
+    }
+    
+    // Memory and NUMA information
+    printf("\n=== Memory Configuration ===\n");
+    printf("Number of NUMA nodes: %u\n", rte_socket_count());
+    printf("IOVA mode: %s\n", rte_eal_iova_mode() == RTE_IOVA_PA ? "PA" : "VA");
+    
+    // Service and Process information
+    printf("\n=== Process Information ===\n");
+    printf("Process type: %s\n", 
+           rte_eal_process_type() == RTE_PROC_PRIMARY ? "Primary" :
+           rte_eal_process_type() == RTE_PROC_SECONDARY ? "Secondary" : "Invalid");
+    
+    // Runtime options
+    printf("\n=== Runtime Options ===\n");
+    printf("Current log level: %d\n", rte_log_get_global_level());
+    
+    // Memory allocation policy
+    printf("Hugepage info: %s\n", 
+           rte_eal_has_hugepages() ? "Using hugepages" : "Not using hugepages");
+    
+    // Memory segments info
+    printf("\n=== Memory Segments ===\n");
+    size_t total_memory = 0;
+    
+    // Walk through all memory segments
+    int ret = rte_memseg_walk(dump_memseg, &total_memory);
+    if (ret < 0) {
+        printf("Failed to walk memory segments\n");
+    } else {
+        printf("Total memory: %zu MB\n", total_memory >> 20);
+    }
+}
+
+int main(int argc, char **argv) {
+    printf("Starting DPDK initialization...\n");
+
+    // Set log level to debug
+    rte_log_set_global_level(RTE_LOG_DEBUG);
+
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0) {
+        rte_panic("Cannot init EAL: %s\n", rte_strerror(-ret));
+    }
+    printf("EAL initialization successful\n");
+
+    // Get number of available ports
+    uint16_t nb_ports = rte_eth_dev_count_avail();
+    printf("\nNumber of available ethernet ports: %u\n", nb_ports);
+
+    // Print info for each port
+    uint16_t port_id;
+    RTE_ETH_FOREACH_DEV(port_id) {
+        print_device_info(port_id);
+    }
+
+    printf("\nProceeding with runtime configuration...\n");
+    print_runtime_config();
+
+    printf("\nCleaning up...\n");
+    rte_eal_cleanup();
+    return 0;
+}
+```
+Compile command: `gcc -o hello hello.c $(pkg-config --cflags libdpdk) $(pkg-config --libs libdpdk) -DRTE_LOG_LEVEL=RTE_LOG_DEBUG`
+
+Launch command: `sudo gdb --args ./hello -l 0 -n 1 --proc-type=auto -m 256 --iova-mode=pa --log-level=8 --match-allocations -a 0000:01:00.0`

@@ -1,0 +1,67 @@
+graphic: 0.664
+semantic: 0.650
+device: 0.625
+performance: 0.596
+socket: 0.581
+other: 0.580
+PID: 0.578
+debug: 0.535
+permissions: 0.526
+vnc: 0.488
+network: 0.484
+files: 0.446
+boot: 0.417
+KVM: 0.335
+
+watchpoints might not properly stop execution at the right address
+
+This bug has been tested with the latest development tree (19b599f7664b2ebfd0f405fb79c14dd241557452).
+
+I am using qemu-system-i386 with the gdbserver stub. I set a watchpoint on some address. When the watchpoint is hit, it will be reported by gdb, but it might happen that eip points to the wrong address (execution has not properly stopped when the watchpoint was hit).
+
+The setup I used to reproduce it is quite complex, but I believe I have found the cause of the bug, so I will describe that.
+
+The check_watchpoint() function sets cflags_next_tb in order to force the execution of only one instruction, and then exits the current tb. It then expects to be called again after that one instruction is executed, the watchpoint is hit and it is reported to gdb.
+
+The problem is that another interrupt might have been generated around the same time as the watchpoint. If the interrupt changes eip and execution goes on in another address, the value of cflags_next_tb will be spoiled. When we come back from the interrupt to the address where the watchpoint is hit, it is possible that a tb with multiple instructions is been executed, and therefore eip points to the wrong address, ahead of where it should be.
+
+In my case, the order is as follows:
+* i8259 generates an IRQ
+  - cpu->interrupt_request contains both CPU_INTERRUPT_TGT_EXT_1 and CPU_INTERRUPT_HARD
+* cpu_handle_interrupt() -> x86_cpu_exec_interrupt() is called
+  - it deals with CPU_INTERRUPT_TGT_EXT_1
+  - execution continues
+* I am exactly at the instruction where the watchpoint is hit.
+  - check_watchpoint() is called and cflags_next_tb is set to force the execution of only one instruction.
+  - execution breaks out of the loop with siglongjmp()
+* cpu_handle_interrupt() -> x86_cpu_exec_interrupt() is called
+  - it deals with the IRQ. eip is changed and cflags_next_tb is spoiled
+  - execution continues at the IRQ
+
+[...]
+* The kernel finishes dealing with the IRQ
+
+* I am back at the instruction where the watchpoint is hit.
+  - A tb is created and executed with two instructions instead of one
+  - eip is now ahead of the instruction that hit the watchpoint
+* cpu_handle_interrupt() is called
+  - it deals with CPU_INTERRUPT_DEBUG
+  - the watchpoint is reported by gdb, but with the wrong eip.
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+I can follow the logic here and agree there's a bug.
+
+It would be nice if there were a reproducer, to verify
+that the bug is actually fixed, but I can make a stab
+at it without.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'invalid' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/245
+
+

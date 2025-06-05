@@ -1,0 +1,81 @@
+semantic: 0.851
+graphic: 0.837
+permissions: 0.833
+KVM: 0.826
+device: 0.821
+performance: 0.798
+vnc: 0.794
+other: 0.784
+debug: 0.781
+PID: 0.746
+files: 0.699
+boot: 0.693
+network: 0.670
+socket: 0.480
+
+"DMAR: DRHD: handling fault status reg 2" with vfio on kernel 6.13.11-200.fc41.x86_64, works with 6.13.9-200.fc41.x86_64
+Description of problem:
+Since kernel 6.13.11-200.fc41.x86_64, I cannot use VFIO to pass an NVIDIA GeForce GTX 1070 card to a Windows guest. The same setup works just fine in 6.13.9-200.fc41.x86_64. The issue symptoms are the same regardless if I use kernel command line arguments to isolate cpus or not.
+
+Symptoms:
+- qemu logs show:
+```
+2025-05-07T09:59:49.957891Z qemu-system-x86_64: vfio: Cannot reset device 0000:36:00.1, no available reset mechanism.
+2025-05-07T09:59:49.958444Z qemu-system-x86_64: vfio: Cannot reset device 0000:36:00.0, no available reset mechanism.
+2025-05-07T09:59:49.959119Z qemu-system-x86_64: vfio: Cannot reset device 0000:36:00.1, no available reset mechanism.
+2025-05-07T09:59:49.959635Z qemu-system-x86_64: vfio: Cannot reset device 0000:36:00.0, no available reset mechanism.
+```
+- in dmesg I see:
+```
+kernel: DMAR: DRHD: handling fault status reg 2
+kernel: DMAR: [INTR-REMAP] Request device [36:00.0] fault index 0x50 [fault reason 0x22] Present field in the IRTE entry is clear
+```
+- the VM hangs at boot (please see the notes below (*)).
+Steps to reproduce:
+Boot the same libvirt domain in kernel 6.13.9-200.fc41.x86_64 (works) and any other more recent kernel (>= 6.13.11-200.fc41.x86_64).
+Additional information:
+(*) Note that in a working kernel, the boot process is in any case finicky, and it shows these phases:
+1. tianocore logo shows, and one single cpu is fully utilized by the guest
+2. slowly, the loader find the Windows bootloader, and prints a message that it is loading and running it
+3. some time passes, while cpus seem idle
+4. finally the spinning wheel of the Windows bootloader appears
+
+Phase 1-3 can take anywhere from 0 to 60 seconds, in an apparently random manner.
+
+When running on the faulty kernels, it seems that the virtual machine gets stuck in phase 1, and I must use `virsh destroy` to interrupt it.
+
+lspci output:
+```
+-[0000:00]-+-00.0  Intel Corporation Tiger Lake-UP3/H35 4 cores Host Bridge/DRAM Registers
+           +-02.0  Intel Corporation TigerLake-LP GT2 [Iris Xe Graphics]
+           +-04.0  Intel Corporation TigerLake-LP Dynamic Tuning Processor Participant
+           +-06.0-[01]----00.0  Samsung Electronics Co Ltd NVMe SSD Controller SM981/PM981/PM983
+           +-07.0-[02-33]--
+           +-0a.0  Intel Corporation Tigerlake Telemetry Aggregator Driver
+           +-0d.0  Intel Corporation Tiger Lake-LP Thunderbolt 4 USB Controller
+           +-0d.2  Intel Corporation Tiger Lake-LP Thunderbolt 4 NHI #0
+           +-14.0  Intel Corporation Tiger Lake-LP USB 3.2 Gen 2x1 xHCI Host Controller
+           +-14.2  Intel Corporation Tiger Lake-LP Shared SRAM
+           +-15.0  Intel Corporation Tiger Lake-LP Serial IO I2C Controller #0
+           +-15.1  Intel Corporation Tiger Lake-LP Serial IO I2C Controller #1
+           +-15.2  Intel Corporation Tiger Lake-LP Serial IO I2C Controller #2
+           +-16.0  Intel Corporation Tiger Lake-LP Management Engine Interface
+           +-1c.0-[34]----00.0  Intel Corporation Wi-Fi 6 AX200
+           +-1c.5-[35]----00.0  Realtek Semiconductor Co., Ltd. RTS522A PCI Express Card Reader
+           +-1d.0-[36]--+-00.0  NVIDIA Corporation GP104 [GeForce GTX 1070]
+           |            \-00.1  NVIDIA Corporation GP104 High Definition Audio Controller
+           +-1f.0  Intel Corporation Tiger Lake-LP LPC Controller
+           +-1f.3  Intel Corporation Tiger Lake-LP Smart Sound Technology Audio Controller
+           +-1f.4  Intel Corporation Tiger Lake-LP SMBus Controller
+           \-1f.5  Intel Corporation Tiger Lake-LP SPI Controller
+```
+
+kernel command line arguments (optimized with cpu isolation):
+```
+intel_pstate=per_cpu_perf_limits rd.driver.blacklist=nouveau modprobe.blacklist=nouveau module_blacklist=nouveau default_hugepagesz=1G hugepagesz=1G hugepages=13 i2c_i801.disable_features=0x10 rd.driver.pre=vfio_pci,vfio,vfio_iommu_type1 vfio-pci.ids=10de:1b81,10de:10f0 modprobe.blacklist=xpad systemd.unit=multi-user.target systemd.wants=bluetooth.service isolcpus=domain,managed_irq,1-3,5-7 rcu_nocbs=1-3,5-7 irqaffinity=0,4 nospectre_v2
+```
+
+kernel command line arguments (without cpu isolation, same symptoms):
+```
+intel_pstate=per_cpu_perf_limits rd.driver.blacklist=nouveau modprobe.blacklist=nouveau module_blacklist=nouveau default_hugepagesz=1G hugepagesz=1G hugepages=13 rd.driver.pre=vfio_pci,vfio,vfio_iommu_type1 vfio-pci.ids=10de:1b81,10de:10f0 modprobe.blacklist=xpad systemd.unit=multi-user.target systemd.wants=bluetooth.service
+```

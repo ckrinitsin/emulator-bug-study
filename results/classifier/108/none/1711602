@@ -1,0 +1,948 @@
+KVM: 0.584
+device: 0.551
+semantic: 0.526
+other: 0.486
+vnc: 0.474
+graphic: 0.468
+network: 0.467
+PID: 0.443
+permissions: 0.410
+performance: 0.366
+debug: 0.353
+files: 0.341
+socket: 0.262
+boot: 0.257
+
+--copy-storage-all failing with qemu 2.10
+
+We fixed an issue around disk locking already in regard to qemu-nbd [1], but there still seem to be issues.
+
+$ virsh migrate --live --copy-storage-all kvmguest-artful-normal qemu+ssh://10.22.69.196/system
+error: internal error: qemu unexpectedly closed the monitor: 2017-08-18T12:10:29.800397Z qemu-system-x86_64: -chardev pty,id=charserial0: char device redirected to /dev/pts/0 (label charserial0)
+2017-08-18T12:10:48.545776Z qemu-system-x86_64: load of migration failed: Input/output error
+
+Source libvirt log for the guest:
+2017-08-18 12:09:08.251+0000: initiating migration
+2017-08-18T12:09:08.809023Z qemu-system-x86_64: Unable to read from socket: Connection reset by peer
+2017-08-18T12:09:08.809481Z qemu-system-x86_64: Unable to read from socket: Connection reset by peer
+
+Target libvirt log for the guest:
+2017-08-18T12:09:08.730911Z qemu-system-x86_64: load of migration failed: Input/output error
+2017-08-18 12:09:09.010+0000: shutting down, reason=crashed
+
+Given the timing it seems that the actual copy now works (it is busy ~10 seconds on my environment which would be the copy).
+Also we don't see the old errors we saw before, but afterwards on the actual take-over it fails.
+
+Dmesg has no related denials as often apparmor is in the mix.
+
+Need to check libvirt logs of source [2] and target [3] in Detail.
+
+[1]: https://lists.gnu.org/archive/html/qemu-devel/2017-08/msg02200.html
+[2]: http://paste.ubuntu.com/25339356/
+[3]: http://paste.ubuntu.com/25339358/
+
+Is anybody but me testing this combo ?
+All else seems to work nice, just this special (and only this) migration setup fails.
+
+--copy-storage-inc also affected.
+
+It seems in the copy storage set of migrations is overall affected.
+
+Note: We do upgrade migration checks from the old version onto the new one with the planned upgrade - that revealed that if the migration source is still at the old level the migration works (even with the 2.10 based one on the target).
+
+
+I reached out to the people involved in the initial fixes which were related to image locking and qemu-nbd. But this might after all be something completely different.
+Yet until we know better it might be wiser to reach out to more people.
+
+=> http://lists.nongnu.org/archive/html/qemu-devel/2017-08/msg03465.html
+
+The source log is virsh, I need to ensure we also have a source libvirtd log ...
+
+Since this is pretty reproducible here on the setup:
+
+- Two systems (actually two lxd containers on one system)
+- Both running Artful with qemu 2.10-rc3 and libvirt 3.6
+- Storage path is not shared but set up equivalent with a manual pre-copy
+- Migration with post copy is failing, no other options set, example:
+  $ virsh migrate --live --copy-storage-all kvmguest-artful-normal qemu+ssh://10.22.69.100/system
+- Same setup works on the qemu versions in Xenial (2.5), Yakkety (2.6), and Zesty (2.8)
+- In fact it seems even a migration from a Zesty qemu (2.8) to the new (2.10) works
+
+To simplify downloading the logs I'm attaching here a full set of:
+- virsh
+- source libvirtd
+- target libvirtd
+
+
+
+
+
+I've seen something in the logs which I want to eliminate from the list of possibilities:
+  "warning: host doesn't support requested feature: CPUID.80000001H:ECX.svm [bit 2]"
+
+We had always a patch I questioned to enable svm capabilitiy for guests in general, it worked all the time but I'd have preferred to be an explicit user opt-in.
+I remember seeing the warning in the past which made me neglect it at first, but maybe the target capability check is now more strict.
+
+I'll drop this change for a test build and run all that again to be sure.
+I doubt that is the reason, but let verifying this particular lead be my task - please be open with other suggestions.
+
+Currently I plan to test with the svm/vmx changes disabled as well as a cross test on ppc64 and s390x which might complete the picture.
+
+The 'host doesn't support requested feature' is probably a red-herring in this case
+The fact it's failing with an IO error but nothing else suggests either:
+  a) it's something closing the socket between the two qemu's
+  b) The I/O error is from storage/NBD
+
+Assuming it fails on precopy, I'd look at the qemu_loadvm_state_section_startfull to watch all the device states load.
+You could also add some debug/tracing in qemu_loadvm_state to see at what point it fails.
+
+Dave
+
+Hi David,
+confirming the red-herring on the cpu feature - I had a build without runnign over the weekend so this was easy to test - and still the migration fails.
+
+I have about 7 seconds from kicking off the migration until the sync seems to pass its first phase and then qemu is exiting (at least that is what libvirt thinks):
+  "closed without SHUTDOWN event; assuming the domain crashed"
+
+Since the qemu "lives" in that time I can try to debug what happens.
+With strace to sniff where things could be I see right before the end:
+     0.000203 recvmsg(27, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="", iov_len=32768}], msg_iovlen=1, msg_controllen=0, msg_flags=MSG_CMSG_CLOEXEC}, MSG_CMSG_CLOEXEC) = 0 <0.000014>
+     0.000049 futex(0xca65dacf4, FUTEX_CMP_REQUEUE_PRIVATE, 1, 2147483647, 0xca4785a80, 20) = 1 <0.000016>
+     0.000038 getpid()                  = 29750 <0.000023>
+     0.000011 tgkill(29750, 29760, SIGUSR1) = 0 <0.000030>
+     0.000012 futex(0xca4785a80, FUTEX_WAKE_PRIVATE, 1) = 1 <0.000048>
+     0.000010 futex(0xca47b46e4, FUTEX_WAIT_PRIVATE, 19, NULL) = 0 <0.002215>
+     0.000032 sendmsg(21, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="{\"timestamp\": {\"seconds\": 1503322067, \"microseconds\": 613178}, \"event\": \"MIGRATION\", \"data\": {\"status\": \"failed\"}}\r\n", iov_len=116}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, 0) = 116 <0.000024>
+     0.000074 write(2, "2017-08-21T13:27:47.613276Z qemu-system-x86_64: load of migration failed: Input/output error\n", 93) = 93 <0.000022>
+     0.000055 close(27)                 = 0 <0.000090>
+
+Now 29750 is the main process/tgid and 29760 is the third process started on the migration.
+It is the one that does the vcpu ioctl's so I assume this is just the one representing the vpu.
+Well gdb should be more useful so looking with that.
+
+As expected by David when I trace on process_incoming_migration_co which prints the "readable" error I see the error pop up on "qemu_loadvm_state"
+It appears as "Thread 4 "CPU 0/KVM" received signal SIGUSR1" and similar which is just the break down of the guest.
+
+
+Diving "into" qemu_loadvm_state reveals that it gets until "cpu_synchronize_all_pre_loadvm".
+In qemu_loadvm_state none of the initial checks fail.
+Then the "ret = vmstate_load_state(f, &vmstate_configuration, &savevm_state, 0);" seems to work fine was well.
+It seems reproducible in "cpu_synchronize_all_pre_loadvm" where the crash happens.
+
+I can catch the incoming qemu easily with:
+$ while ! pid=$(pidof qemu-system-x86_64); do /bin/true; done; gdb --pid ${pid}
+# Then in gdb break on "cpu_synchronize_all_pre_loadvm"
+# And when I step over it I the next thing I see is the "beginning of the end" for the process
+Thread 4 "CPU 0/KVM" received signal SIGUSR1, User defined signal 1.
+[Switching to Thread 0x7f418136e700 (LWP 3887)]
+__lll_lock_wait () at ../sysdeps/unix/sysv/linux/x86_64/lowlevellock.S:135
+
+The guest only has one vcpu, so CPU_FOREACH(cpu) is not much of a loop.
+Looking down that path I tracked it to along:
+cpu_synchronize_all_pre_loadvm -> cpu_synchronize_pre_loadvm -> kvm_cpu_synchronize_pre_loadvm -> do_run_on_cpu
+
+Here it queues the function "do_kvm_cpu_synchronize_pre_loadvm" onto the vcpu.
+That is done via queue_work_on_cpu(cpu, &wi); which in turn uses eventually "qemu_cpu_kick_thread(cpu);"
+That seems to trigger the first SIGUSR1
+
+Following that I get the breakpoint that I set at "do_kvm_cpu_synchronize_pre_loadvm".
+The actual function only sets "cpu->vcpu_dirty = true;" and works.
+
+On the way out from there, there is a "qemu_kvm_wait_io_event" which leads to the next SIGUSR1.
+
+Going on I see another "do_run_on_cpu" with "vapic_do_enable_tpr_reporting" as the function.
+I set a breakpoint on that as well but took a full CPUstate before going on:
+p *cpu
+$4 = {parent_obj = {parent_obj = {class = 0x5ffe7170c0, free = 0x7f62328f15a0 <g_free>, properties = 0x5ffe736e40, ref = 1, 
+      parent = 0x5ffe726160}, id = 0x0, realized = true, pending_deleted_event = false, opts = 0x0, hotplugged = 0, parent_bus = 0x0, gpios = {
+      lh_first = 0x0}, child_bus = {lh_first = 0x0}, num_child_bus = 0, instance_id_alias = -1, alias_required_for_version = 0}, nr_cores = 1, 
+  nr_threads = 1, thread = 0x5ffe803cd0, thread_id = 8498, running = false, has_waiter = false, halt_cond = 0x5ffe803cf0, thread_kicked = true, 
+  created = true, stop = false, stopped = true, unplug = false, crash_occurred = false, exit_request = false, interrupt_request = 4, 
+  singlestep_enabled = 0, icount_budget = 0, icount_extra = 0, jmp_env = {{__jmpbuf = {0, 0, 0, 0, 0, 0, 0, 0}, __mask_was_saved = 0, 
+      __saved_mask = {__val = {0 <repeats 16 times>}}}}, work_mutex = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, 
+        __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, 
+    initialized = true}, queued_work_first = 0x5fffefc990, queued_work_last = 0x5fffefc990, cpu_ases = 0x5ffe803c10, num_ases = 1, 
+  as = 0x5ffe7f9690, memory = 0x5ffe725bd0, env_ptr = 0x5ffe7e44c0, tb_jmp_cache = {0x0 <repeats 4096 times>}, gdb_regs = 0x0, 
+  gdb_num_regs = 57, gdb_num_g_regs = 57, node = {tqe_next = 0x0, tqe_prev = 0x5ffc1783f0 <cpus>}, breakpoints = {tqh_first = 0x0, 
+    tqh_last = 0x5ffe7e4430}, watchpoints = {tqh_first = 0x0, tqh_last = 0x5ffe7e4440}, watchpoint_hit = 0x0, opaque = 0x0, mem_io_pc = 0, 
+  mem_io_vaddr = 0, kvm_fd = 19, kvm_state = 0x5ffe7357a0, kvm_run = 0x7f62374bc000, trace_dstate_delayed = {0}, trace_dstate = {0}, 
+  cpu_index = 0, halted = 1, can_do_io = 1, exception_index = -1, vcpu_dirty = true, throttle_thread_scheduled = false, icount_decr = {u32 = 0, 
+    u16 = {low = 0, high = 0}}, hax_vcpu = 0x0, pending_tlb_flush = 7}
+
+Continuing I hit the "vapic_do_enable_tpr_reporting" with qemu still running.
+
+Things go on, the next candidate for "do_run_on_cpu" is "kvm_apic_put"
+Another SIGUSR1 to get that kicked it seems.
+"kvm_apic_put" breakpoint is reached after that kick.
+
+Next for "do_run_on_cpu"  is "do_kvm_cpu_synchronize_post_init". And that triggered the fourth SIGUSR1. Before I only saw four, hopefully that is the same with so much breakpoints.
+
+Checked the cpu state again:
+1880    static void do_kvm_cpu_synchronize_post_init(CPUState *cpu, run_on_cpu_data arg)
+1881    {
+1882        kvm_arch_put_registers(cpu, KVM_PUT_FULL_STATE);
+1883        cpu->vcpu_dirty = false;
+1884    }
+1885
+(gdb) p cpu
+$5 = (CPUState *) 0x5ffe7dc230
+(gdb) p *cpu
+$6 = {parent_obj = {parent_obj = {class = 0x5ffe7170c0, free = 0x7f62328f15a0 <g_free>, properties = 0x5ffe736e40, ref = 1, 
+      parent = 0x5ffe726160}, id = 0x0, realized = true, pending_deleted_event = false, opts = 0x0, hotplugged = 0, parent_bus = 0x0, gpios = {
+      lh_first = 0x0}, child_bus = {lh_first = 0x0}, num_child_bus = 0, instance_id_alias = -1, alias_required_for_version = 0}, nr_cores = 1, 
+  nr_threads = 1, thread = 0x5ffe803cd0, thread_id = 8498, running = false, has_waiter = false, halt_cond = 0x5ffe803cf0, thread_kicked = false, 
+  created = true, stop = false, stopped = true, unplug = false, crash_occurred = false, exit_request = false, interrupt_request = 4, 
+  singlestep_enabled = 0, icount_budget = 0, icount_extra = 0, jmp_env = {{__jmpbuf = {0, 0, 0, 0, 0, 0, 0, 0}, __mask_was_saved = 0, 
+      __saved_mask = {__val = {0 <repeats 16 times>}}}}, work_mutex = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, 
+        __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, __size = '\000' <repeats 39 times>, __align = 0}, 
+    initialized = true}, queued_work_first = 0x0, queued_work_last = 0x0, cpu_ases = 0x5ffe803c10, num_ases = 1, as = 0x5ffe7f9690, 
+  memory = 0x5ffe725bd0, env_ptr = 0x5ffe7e44c0, tb_jmp_cache = {0x0 <repeats 4096 times>}, gdb_regs = 0x0, gdb_num_regs = 57, 
+  gdb_num_g_regs = 57, node = {tqe_next = 0x0, tqe_prev = 0x5ffc1783f0 <cpus>}, breakpoints = {tqh_first = 0x0, tqh_last = 0x5ffe7e4430}, 
+  watchpoints = {tqh_first = 0x0, tqh_last = 0x5ffe7e4440}, watchpoint_hit = 0x0, opaque = 0x0, mem_io_pc = 0, mem_io_vaddr = 0, kvm_fd = 19, 
+  kvm_state = 0x5ffe7357a0, kvm_run = 0x7f62374bc000, trace_dstate_delayed = {0}, trace_dstate = {0}, cpu_index = 0, halted = 1, can_do_io = 1, 
+  exception_index = -1, vcpu_dirty = true, throttle_thread_scheduled = false, icount_decr = {u32 = 0, u16 = {low = 0, high = 0}}, 
+  hax_vcpu = 0x0, pending_tlb_flush = 7}
+
+And from here stepping into kvm_arch_put_registers:
+kvm_arch_put_registers (cpu=cpu@entry=0x5ffe7dc230, level=level@entry=3) at ./target/i386/kvm.c:2591
+
+That still is the same vcpu as all the time, x86_cpu is optimized out unfortunately as I had no full debug build with -O0.
+
+I see it setting up regs in kvm_arch_put_registers without error (all ret=0) and return to do_kvm_cpu_synchronize_post_init.
+This eventually sets "cpu->vcpu_dirty = false;"
+
+After this seems all good I steped through the "way out" and there came another "qemu_kvm_wait_io_event(cpu);".
+Without considering this being critical I stepped with "n" and qemu was gone with all its threads.
+
+qemu_kvm_cpu_thread_fn (arg=0x5ffe7dc230) at ./cpus.c:1134
+1134        } while (!cpu->unplug || cpu_can_run(cpu));
+(gdb) n
+1127            if (cpu_can_run(cpu)) {
+(gdb) n
+1133            qemu_kvm_wait_io_event(cpu);
+(gdb) n
+[Thread 0x7f6227857700 (LWP 8498) exited]
+
+
+After this I was trying to start closer to the issue, so I put a break on "process_incoming_migration_co" (to skip over much of the initial setup).
+Once that was hit I added "qemu_kvm_cpu_thread_fn" and "qemu_kvm_wait_io_event".
+
+Of course when I try that the other functions do not trigger.
+Maybe it is partially influenced by the debugging itself and/or the timing changes it causes.
+
+I'll check what else I can find with slightly different debugging, but so much as an update for now.
+
+oh yeh you want to tell gdb to ignore SIGUSR1, something like: 
+  handle SIGUSR1 nostop noprint pass
+
+Sure, but initially I wanted to see what is going on overall so I let it pop up.
+
+Started a debugging another session today.
+First I confirmed with
+  (gdb) catch syscall exit exit_group
+That this is the "normal" exit along the error message we knew:
+     migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,                  
+                       MIGRATION_STATUS_FAILED);                              
+     error_report("load of migration failed: %s", strerror(-ret));            
+     qemu_fclose(mis->from_src_file);                                         
+     exit(EXIT_FAILURE);
+
+I found that already the retval of qemu_loadvm_state it -5.
+Every thing else afterwards is cleanup.
+
+Inside qemu_loadvm_state the first 2/3 pass and then that ret=-5 is from "ret = qemu_file_get_error(f);".
+
+Via a watchpoints I found that the error is set by qemu_fill_buffer.
+
+b qemu_loadvm_state
+handle SIGUSR1 nostop noprint pass
+c
+# on the break check and watch the status
+(gdb) p f
+$1 = (QEMUFile *) 0xb9babb3c00
+(gdb) p *f
+$2 = {ops = 0xb9b89880a0 <channel_input_ops>, hooks = 0x0, opaque = 0xb9bbabfe00, bytes_xfer = 0, xfer_limit = 0, pos = 0, buf_index = 0, 
+  buf_size = 0, buf = '\000' <repeats 32767 times>, may_free = {0}, iov = {{iov_base = 0x0, iov_len = 0} <repeats 64 times>}, iovcnt = 0, 
+  last_error = 0}
+
+# ok still no err, set watchpoint
+(gdb) p &(f->last_error)
+$4 = (int *) 0xb9babbc044
+(gdb) watch *(int *) 0xb9babbc044
+Hardware watchpoint 2: *(int *) 0xb9babbc044
+
+# This catches the following
+Thread 1 "qemu-system-x86" hit Hardware watchpoint 2: *(int *) 0xb9babbc044
+
+Old value = 0
+New value = -5
+0x000000b9b82bd0ec in qemu_file_set_error (ret=-5, f=0xb9babb3c00) at ./migration/qemu-file.c:125
+warning: Source file is more recent than executable.
+125             f->last_error = ret;
+(gdb) bt
+#0  0x000000b9b82bd0ec in qemu_file_set_error (ret=-5, f=0xb9babb3c00) at ./migration/qemu-file.c:125
+#1  qemu_fill_buffer (f=0xb9babb3c00) at ./migration/qemu-file.c:299
+#2  0x000000b9b82bdbb1 in qemu_peek_byte (f=0xb9babb3c00, offset=0) at ./migration/qemu-file.c:553
+#3  0x000000b9b82bdc1b in qemu_get_byte (f=f@entry=0xb9babb3c00) at ./migration/qemu-file.c:566
+#4  0x000000b9b82b5853 in qemu_loadvm_state_main (f=f@entry=0xb9babb3c00, mis=0xb9b8a4f700 <mis_current>) at ./migration/savevm.c:1947
+#5  0x000000b9b82b864f in qemu_loadvm_state (f=f@entry=0xb9babb3c00) at ./migration/savevm.c:2032
+#6  0x000000b9b82af5c3 in process_incoming_migration_co (opaque=0xb9babb3c00) at ./migration/migration.c:320
+#7  0x000000b9b83e42a6 in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at ./util/coroutine-ucontext.c:79
+#8  0x00007fbf3702fac0 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#9  0x00007fffe3f9f800 in ?? ()
+#10 0x0000000000000000 in ?? ()
+
+So this is failing I/O that iterates over a channel.
+I was tracking down the len, pending and pos used.
+
+I found that this is not completely broken (like no access or generla I/O error)
+It starts at pos 0 and iterated with varying offsets, but works for quite some time.
+Example:
+
+[...]
+Thread 1 "qemu-system-x86" hit Breakpoint 2, qemu_fill_buffer (f=f@entry=0xd3b66f3c00) at ./migration/qemu-file.c:295
+295         if (len > 0) {
+$11183 = 28728
+$11184 = 4040
+$11185 = {ops = 0xd3b3d740a0 <channel_input_ops>, hooks = 0x0, opaque = 0xd3b75ee490, bytes_xfer = 0, xfer_limit = 0, pos = 107130146, 
+  buf_index = 0, buf_size = 4040, 
+  buf = "\v\327\a\000\021\000\[...]\000"..., 
+  may_free = {0}, iov = {{iov_base = 0x0, iov_len = 0} <repeats 64 times>}, iovcnt = 0, last_error = 0}
+[...]
+
+Well you could see the whole file read passing by one by one buffer
+Yet this isn't particularly fast, so track the one that has len==0
+ (gdb) b ./migration/qemu-file.c:295 if len == 0
+
+And I got it as:
+(gdb) p *f
+$11195 = {ops = 0xd3b3d740a0 <channel_input_ops>, hooks = 0x0, opaque = 0xd3b75ee490, bytes_xfer = 0, xfer_limit = 0, pos = 319638837, 
+  buf_index = 0, buf_size = 0, buf = '\000' <repeats 5504 times>..., may_free = {0}, iov = {{iov_base = 0x0, iov_len = 0} <repeats 64 times>}, 
+  iovcnt = 0, last_error = 0}
+
+Here pending == 0 so buf_size = 0 as well also pos is further down incremented to 319638837.
+
+Checking in detail I found that I had pending=0 and buf_size=0 as well as non aligned pos entried, but they worked.
+So I excluded the buf_size=0/pending=0 as well as the alignment as reasons.
+Maybe it just iterates pos out of the range that is working?
+
+
+(gdb) handle SIGUSR1 nostop noprint pass
+(gdb) b migration/qemu-file.c:295
+(gdb) command
+p f->pos
+c
+end
+
+That showed the pos is ever increasing and fails at an offset it never read before. Yet the absolute number was different.
+$1 = 0
+$2 = 8948
+$3 = 41423
+[...]
+$11359 = 326387440
+$11360 = 326420208 => This was the one failing this time
+
+
+This was a different f->pos than last time, so I wondered if this would change every time.
+With a less interactive gdb config I got in three tries:
+1. 313153311
+2. 313313376
+3. 313571856
+So a different f->pos to fail each time.
+
+Different but rather close.
+I wondered if the reasons I got a higher one when tracing in more detail printing all offsets could be that there still is something copied/synced and only slowly gets available.
+
+I stepped through rather slowly and got to 322429260 this time.
+So slower continuing on the iteration over qemu_fill_buffer makes it fail "later"?
+
+Finally it is surely interesting which channel that actually is- likely the migration socket?
+And yes, ioc->name in qio_channel_read is:
+ $8 = 0x56ab78e5c0 "migration-socket-incoming
+
+So TL;DR summary for now:
+- error triggers in qio_channel_read
+- file is migration-socket-incoming
+- reads work a while, but then fail at high f->pos offsets (slightly different ones each time)
+- slower execution seems to lead to slightly higher offsets that are failing
+- only happens on --copy-storage-* migrations (libvirt/virsh argument)
+
+I don't really know atm where to look deeper - is there a good side channel that I could use to look at what is going on on the migration-socket-incoming - Maybe from the source and target while I block in gdb?
+
+OK, so that looks like a real case of the migration stream failing and getting an IO error; so the question is why:
+  a) Is the source qemu dieing first and closing the socket?
+  b) Is libvirt closing the socket for some reason
+
+
+
+also, you might want to chase it a bit further down, I think we've got:
+
+   qemu-file-channel.c:channel_get_buffer
+     io/channel-socket.c or io/channel-file.c  qio_channel_file_readv
+
+    it would be good to know what the readv/readmsg is actually returning in the case where it's failing.
+
+Dave
+
+I'll track down the actual read and then add debugging the source at the same time (that should be the best way to track the migration socket on both sides).
+This might be slightly tricky since I don't know exactly on which offset but I can surely start over 310*10^6 it seems.
+
+I'll report back once I know more, thanks for your guidance David
+
+Hmm i just tried to reproduce this and hit (on the source):
+
+main_channel_client_handle_migrate_connected: client 0x5607d785f610 connected: 0 seamless 0
+qemu-system-x86_64: /root/qemu/io/channel.c:303: qio_channel_yield: Assertion `!ioc->write_coroutine' failed.
+2017-08-22 10:50:04.888+0000: shutting down, reason=crashed
+
+
+OK, 3rd try and I've hit the same behaviour as Christian.
+
+
+Stack from qemu_fill_buffer to qio_channel_socket_readv
+#0  qio_channel_socket_readv (ioc=<optimized out>, iov=<optimized out>, niov=<optimized out>, fds=0x0, nfds=0x0, errp=0x0)
+    at ./io/channel-socket.c:477
+#1  0x0000001486ec97e2 in qio_channel_read (ioc=ioc@entry=0x148a73a6c0, 
+    buf=buf@entry=\060\nLw", buflen=buflen@entry=28728, errp=errp@entry=0x0) at ./io/channel.c:112
+#2  0x0000001486e005ec in channel_get_buffer (opaque=<optimized out>, 
+    buf=0x1489844c00 "\060\nLw", pos=<optimized out>, size=28728) at ./migration/qemu-file-channel.c:80
+#3  0x0000001486dff095 in qemu_fill_buffer (f=f@entry=0x1489843c00) at ./migration/qemu-file.c:293
+
+I checked that sioc->fd, &msg, sflags) is in fact the socket.
+With e.g. with this fd being 27
+tcp    ESTAB      1405050 0      ::ffff:10.22.69.30:49152                   ::ffff:10.22.69.157:49804                 users:(("qemu-system-x86",pid=29273,fd=27)) ino:3345152 sk:30 <->
+         skmem:(r1420644,rb1495660,t0,tb332800,f668,w0,o0,bl0,d14) ts sack cubic wscale:7,7 rto:200 rtt:0.04/0.02 ato:80 mss:8948 cwnd:10 bytes_received:1981460 segs_out:37 segs_in:247 data_segs_in:231 send 17896.0Mbps lastsnd:254728 lastrcv:250372 lastack:250372 rcv_rtt:0.205 rcv_space:115461 minrtt:0.04
+
+I need to break on the fail of that recvmsg in qio_channel_socket_readv
+# the following does not work due to optimization the ret value is only around later
+b io/channel-socket.c:478 if ret < 0
+But catching it "inside" the if works
+b io/channel-socket.c:479
+
+
+Take the following with a grain of salt, this is very threaded and noisy to debug.
+
+Once I hit it the recmsg returned "-1", that was on f->pos = 311641887
+But at the same time I could confirm (via ss) that the socket itself is still open on source and target of the migration.
+
+-1  is EAGAIN and returns QIO_CHANNEL_ERR_BLOCK
+That seems to arrive in nbd_rwv nbd/common.c:44).
+And led to "qio_channel_yield"
+
+There are a few corouting switches in between so I hope I'm not loosing anything.
+But that first ret<0 actually worked, it seems the yield and retry got it working.
+
+I got back to qemu_fill_buffer iterating further after this.
+This hit ret<0 in qio_channel_socket_readv again at f->pos 311641887.
+
+This time on returning the QIO_CHANNEL_ERR_BLOCK it returned to "./migration/qemu-file-channel.c:81".
+That was interesting as it is different than before.
+After this it seemed to become a death spiral - recmsg returned -1 every time (still on the same offset).
+It passed back through the nbd_rwv which called qio_channel_yield for multiple times.
+
+Then it continued and later on on 321998304 is the last I saw.
+It did no more pass b io/channel-socket.c:479 at all, but then led to the exit.
+
+Hmm, I might have lost myself on the coroutine switches - but it is odd at least.
+Trying to redo less interactive and with a bit more prep ...
+Maybe the results are more reliable then ...
+
+Getting back with more later ...
+
+Only now read comment #27, thanks David for reproducing with me, it is somewhat relieving that you seem to see the same.
+
+(4th try) breakpoint on qemu_file_set_error,  it's bdrv_inactivate_all that's returning the error.
+
+(gdb) list
+1155	    if (inactivate_disks) {
+1156	        /* Inactivate before sending QEMU_VM_EOF so that the
+1157	         * bdrv_invalidate_cache_all() on the other end won't fail. */
+1158	        ret = bdrv_inactivate_all();
+1159	        if (ret) {
+1160	            qemu_file_set_error(f, ret);
+1161	            return ret;
+1162	        }
+1163	    }
+
+
+For me qemu_file_set_error was always called from qemu_fill_buffer, interesting that it seems different for you.
+I'll rerun a few times to ensure it really always is always from qemu_fill_buffer for me.
+
+The difference with the qemu_file_set_error is I'm looking on the source - because what's happening is the source is erroring so closing the socket, and so the error you're seeing on the destination is real - the socket just EOF'd!
+
+repeated the assert in #26:
+Program received signal SIGABRT, Aborted.
+0x00007f02163005f7 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+56	  return INLINE_SYSCALL (tgkill, 3, pid, selftid, sig);
+(gdb) where
+#0  0x00007f02163005f7 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007f0216301ce8 in __GI_abort () at abort.c:90
+#2  0x00007f02162f9566 in __assert_fail_base (fmt=0x7f0216449288 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=assertion@entry=0x560ac0191e93 "!ioc->write_coroutine", file=file@entry=0x560ac0191e66 "/root/qemu/io/channel.c", line=line@entry=303, function=function@entry=0x560ac0191f60 <__PRETTY_FUNCTION__.22239> "qio_channel_yield")
+    at assert.c:92
+#3  0x00007f02162f9612 in __GI___assert_fail (assertion=assertion@entry=0x560ac0191e93 "!ioc->write_coroutine", file=file@entry=0x560ac0191e66 "/root/qemu/io/channel.c", line=line@entry=303, function=function@entry=0x560ac0191f60 <__PRETTY_FUNCTION__.22239> "qio_channel_yield") at assert.c:101
+#4  0x0000560ac0036a08 in qio_channel_yield (ioc=ioc@entry=0x560ac2397c90, condition=condition@entry=G_IO_OUT)
+    at /root/qemu/io/channel.c:303
+#5  0x0000560ac001930e in nbd_rwv (ioc=0x560ac2397c90, iov=<optimized out>, niov=<optimized out>, length=<optimized out>, do_read=do_read@entry=false, errp=errp@entry=0x0) at /root/qemu/nbd/common.c:47
+#6  0x0000560ac0007e24 in nbd_co_send_request (bs=bs@entry=0x560ac30167a0, request=request@entry=0x7f0209afc9a0, qiov=qiov@entry=0x560ac2428d68) at /root/qemu/block/nbd-client.c:154
+#7  0x0000560ac0008244 in nbd_client_co_pwritev (bs=0x560ac30167a0, offset=3414163456, bytes=<optimized out>, qiov=0x560ac2428d68, flags=<optimized out>) at /root/qemu/block/nbd-client.c:260
+#8  0x0000560ac00030e1 in bdrv_driver_pwritev (bs=bs@entry=0x560ac30167a0, offset=offset@entry=3414163456, bytes=bytes@entry=589824, qiov=qiov@entry=0x560ac2428d68, flags=flags@entry=0) at /root/qemu/block/io.c:877
+#9  0x0000560ac0004480 in bdrv_aligned_pwritev (req=req@entry=0x7f0209afcba0, offset=offset@entry=3414163456, bytes=589824, align=align@entry=1, qiov=qiov@entry=0x560ac2428d68, flags=flags@entry=0, child=0x560ac1f0a9b0, child=0x560ac1f0a9b0) at /root/qemu/block/io.c:1382
+#10 0x0000560ac0005258 in bdrv_co_pwritev (child=0x560ac1f0a9b0, offset=offset@entry=3414163456, bytes=<optimized out>, qiov=qiov@entry=0x560ac2428d68, flags=0) at /root/qemu/block/io.c:1633
+#11 0x0000560abffbf564 in raw_co_pwritev (bs=0x560ac22807f0, offset=3414163456, bytes=<optimized out>, qiov=0x560ac2428d68, flags=<optimized out>) at /root/qemu/block/raw-format.c:243
+#12 0x0000560ac00030e1 in bdrv_driver_pwritev (bs=bs@entry=0x560ac22807f0, offset=offset@entry=3414163456, bytes=bytes@entry=589824, qiov=qiov@entry=0x560ac2428d68, flags=flags@entry=0) at /root/qemu/block/io.c:877
+#13 0x0000560ac0004480 in bdrv_aligned_pwritev (req=req@entry=0x7f0209afce70, offset=offset@entry=3414163456, bytes=589824, align=align@entry=1, qiov=qiov@entry=0x560ac2428d68, flags=flags@entry=0, child=0x560ac33c1e70, child=0x560ac33c1e70) at /root/qemu/block/io.c:1382
+#14 0x0000560ac0005258 in bdrv_co_pwritev (child=0x560ac33c1e70, offset=offset@entry=3414163456, bytes=<optimized out>, bytes@entry=589824, qiov=qiov@entry=0x560ac2428d68, flags=0) at /root/qemu/block/io.c:1633
+#15 0x0000560abfff5173 in blk_co_pwritev (blk=0x560ac14f31e0, offset=3414163456, bytes=589824, qiov=0x560ac2428d68, flags=<optimized out>) at /root/qemu/block/block-backend.c:1062
+#16 0x0000560abfff528a in blk_aio_write_entry (opaque=0x560ac2c18f70) at /root/qemu/block/block-backend.c:1253
+#17 0x0000560ac0092cca in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>)
+    at /root/qemu/util/coroutine-ucontext.c:79
+#18 0x00007f0216312110 in __start_context () at /lib64/libc.so.6
+#19 0x00007fff12c4db30 in  ()
+#20 0x0000000000000000 in  ()
+(gdb) 
+
+In 5/5 tries this was on qemu_fill_buffer for my case.
+
+But that was on the receiving side, and what you found is closer to the root cause on the source of the migration.
+I checked on qemu_file_set_error on the source and can confirm your finding that on the source it is from bdrv_inactivate_all.
+
+#0  qemu_file_set_error (f=f@entry=0x6b76b46c00, ret=ret@entry=-1) at ./migration/qemu-file.c:124
+#1  0x0000006b727140cb in qemu_savevm_state_complete_precopy (f=0x6b76b46c00, iterable_only=iterable_only@entry=false, 
+    inactivate_disks=inactivate_disks@entry=true) at ./migration/savevm.c:1160
+#2  0x0000006b7270c84b in migration_completion (start_time=<synthetic pointer>, old_vm_running=<synthetic pointer>, current_active_state=4, 
+    s=0x6b74ef53b0) at ./migration/migration.c:1858
+#3  migration_thread (opaque=0x6b74ef53b0) at ./migration/migration.c:2023
+#4  0x00007f61a740e74a in start_thread (arg=0x7f61467fc700) at pthread_create.c:456
+#5  0x00007f61a714acaf in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+Also as I outlined - what seems ages ago in comment #6 - if the source is a qemu 2.8 the migration works for me which would kind of match assuming the root cause is in the source.
+
+OK, Stefan posted a patch for that assert (see 'nbd-client: avoid spurious qui_channel_yield() re-entry) so now I'm running with the following patch and I'm seeing the bdrv_inactivate return a -1 for 
+drive-virtio-disk0
+Christian: Could you see what your source says with this patch?
+
+diff --git a/block.c b/block.c
+index 3615a68..f9bd689 100644
+--- a/block.c
++++ b/block.c
+@@ -4078,9 +4078,11 @@ static int bdrv_inactivate_recurse(BlockDriverState *bs,
+     BdrvChild *child, *parent;
+     int ret;
+ 
++    fprintf(stderr, "%s: entry for %s\n", __func__, bdrv_get_device_or_node_name(bs));
+     if (!setting_flag && bs->drv->bdrv_inactivate) {
+         ret = bs->drv->bdrv_inactivate(bs);
+         if (ret < 0) {
++            fprintf(stderr, "%s: exit 1(%d) for %s\n", __func__, ret, bdrv_get_device_or_node_name(bs));
+             return ret;
+         }
+     }
+@@ -4094,6 +4096,7 @@ static int bdrv_inactivate_recurse(BlockDriverState *bs,
+             if (parent->role->inactivate) {
+                 ret = parent->role->inactivate(parent);
+                 if (ret < 0) {
++                    fprintf(stderr, "%s: exit 2(%d) for %s\n", __func__, ret, bdrv_get_device_or_node_name(bs));
+                     bs->open_flags &= ~BDRV_O_INACTIVE;
+                     return ret;
+                 }
+@@ -4109,6 +4112,7 @@ static int bdrv_inactivate_recurse(BlockDriverState *bs,
+     QLIST_FOREACH(child, &bs->children, next) {
+         ret = bdrv_inactivate_recurse(child->bs, setting_flag);
+         if (ret < 0) {
++            fprintf(stderr, "%s: exit 3(%d) for %s\n", __func__, ret, bdrv_get_device_or_node_name(bs));
+             return ret;
+         }
+     }
+@@ -4117,6 +4121,7 @@ static int bdrv_inactivate_recurse(BlockDriverState *bs,
+      * driver */
+     bdrv_release_persistent_dirty_bitmaps(bs);
+ 
++    fprintf(stderr, "%s: exit end good for %s\n", __func__,  bdrv_get_device_or_node_name(bs));
+     return 0;
+ }
+ 
+
+
+Building with the attached debug patch ...
+
+I didn't add Stefans patch yet.
+Note: the Mentioned patch is at: Note: http://lists.nongnu.org/archive/html/qemu-devel/2017-08/msg04027.html
+
+With your debug patch applied I get:
+2017-08-22 17:57:04.486+0000: initiating migration
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block145
+bdrv_inactivate_recurse: entry for #block328
+bdrv_inactivate_recurse: entry for #block210
+bdrv_inactivate_recurse: exit end good for #block210
+bdrv_inactivate_recurse: exit end good for #block328
+bdrv_inactivate_recurse: entry for #block082
+bdrv_inactivate_recurse: exit end good for #block082
+bdrv_inactivate_recurse: exit end good for #block145
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block763
+bdrv_inactivate_recurse: entry for #block631
+bdrv_inactivate_recurse: exit end good for #block631
+bdrv_inactivate_recurse: exit end good for #block763
+bdrv_inactivate_recurse: entry for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block544
+bdrv_inactivate_recurse: entry for #block405
+bdrv_inactivate_recurse: exit end good for #block405
+bdrv_inactivate_recurse: exit end good for #block544
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block1086
+bdrv_inactivate_recurse: entry for #block919
+bdrv_inactivate_recurse: exit end good for #block919
+bdrv_inactivate_recurse: exit end good for #block1086
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+bdrv_inactivate_recurse: exit 2(-1) for drive-virtio-disk0
+
+I'm currently building one with Stefans patch applied as well over (my) night, but let me know if there is more that makes sense to try.
+
+With the patch from Stefan and your debug applied source and target I still run into the same issue I'd say.
+Id's are slightly off, but they are different on every try anyway.
+
+Still looks the same for me:
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block184
+bdrv_inactivate_recurse: entry for #block319
+bdrv_inactivate_recurse: entry for #block218
+bdrv_inactivate_recurse: exit end good for #block218
+bdrv_inactivate_recurse: exit end good for #block319
+bdrv_inactivate_recurse: entry for #block092
+bdrv_inactivate_recurse: exit end good for #block092
+bdrv_inactivate_recurse: exit end good for #block184
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block1905
+bdrv_inactivate_recurse: entry for #block1889
+bdrv_inactivate_recurse: exit end good for #block1889
+bdrv_inactivate_recurse: exit end good for #block1905
+bdrv_inactivate_recurse: entry for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block551
+bdrv_inactivate_recurse: entry for #block423
+bdrv_inactivate_recurse: exit end good for #block423
+bdrv_inactivate_recurse: exit end good for #block551
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block2246
+bdrv_inactivate_recurse: entry for #block2106
+bdrv_inactivate_recurse: exit end good for #block2106
+bdrv_inactivate_recurse: exit end good for #block2246
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+bdrv_inactivate_recurse: exit 2(-1) for drive-virtio-disk0
+
+OK, yeh that's the same symptom I saw - it's that final failure that causes bdrv_inactivate_all to return a failure and fail the source migration.
+
+Please see Fam's patch series "[PATCH for-2.10 0/4] block: Fix non-shared storage migration" that fixes this issue.
+
+yes, seems to fix it for me.
+
+Thanks Christian for filing this;  we probably wouldn't have spotted it before the release without it
+(which the test Stefan has just added will hopefully cure!).
+
+Hi Stefan,
+I was part of the report around the series in "[PATCH for-2.10 0/4] block: Fix non-shared storage migration", but this is happening on rc3 which contains this.
+
+AFAIK Fam's series is:
+dd7fdaad iotests: Add non-shared storage migration case 192 (Fam)
+5f7772c4 block-backend: Defer shared_perm tightening migration completion (Fam)
+3dff24f2 nbd: Fix order of bdrv_set_perm and bdrv_invalidate_cache (Kevin)
+80adf54e stubs: Add vm state change handler stubs (Fam)
+
+All these got into v2.10.0-rc3 which these tests are based on already.
+IMHO - This is not complete for qemu 2.10 and a regression since 2.9 (well since 2.8 as I haven't tested 2.9 personally).
+
+Ok, clarified with Stefanha
+It has exactly the same title as a series of 18th August which was related to a similar issue.
+It is about an hour old now on qemu-devel, quoting
+
+"This fixes the issue reported as https://bugs.launchpad.net/bugs/1711602
+
+Fam Zheng (3):
+  block-backend: Refactor inactivate check
+  block-backend: Allow more "can inactivate" cases
+  mirror: Mark target BB as "force allow inactivate"
+
+Stefan Hajnoczi (1):
+  block: Update open_flags after ->inactivate() callback"
+
+
+I'll prep a build with that and test as well
+
+On 08/23/2017 09:55 AM, ChristianEhrhardt wrote:
+> Ok, clarified with Stefanha
+> It has exactly the same title as a series of 18th August which was related to a similar issue.
+> It is about an hour old now on qemu-devel, quoting
+> 
+> "This fixes the issue reported as
+> https://bugs.launchpad.net/bugs/1711602
+> 
+> Fam Zheng (3):
+>   block-backend: Refactor inactivate check
+>   block-backend: Allow more "can inactivate" cases
+>   mirror: Mark target BB as "force allow inactivate"
+> 
+> Stefan Hajnoczi (1):
+>   block: Update open_flags after ->inactivate() callback"
+> 
+> 
+> I'll prep a build with that and test as well
+
+Here's what is brewing for my pull request, although if you can
+successfully test things, I'm happy to add a Tested-by: tag before
+actually sending the pull request:
+
+git fetch  git://repo.or.cz/qemu/ericb.git nbd
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3266
+Virtualization:  qemu.org | libvirt.org
+
+
+
+Hmm,
+it gets further but can still not complete this kind of migration:
+
+$ virsh migrate --live --copy-storage-all kvmguest-artful-normal qemu+ssh://10.22.69.30/system
+
+Source:
+2017-08-23 16:49:23.022+0000: initiating migration
+Unexpected error in bdrv_check_perm() at /build/qemu-VjSgVJ/qemu-2.10~rc3+dfsg/block.c:1574:
+2017-08-23T16:49:23.203181Z qemu-system-x86_64: Block node is read-only
+2017-08-23 16:49:23.762+0000: shutting down, reason=crashed
+
+Target:
+2017-08-23T16:49:23.495478Z qemu-system-x86_64: Failed to load virtio_pci/modern_state:modern_state
+2017-08-23T16:49:23.495505Z qemu-system-x86_64: Failed to load virtio/extra_state:extra_state
+2017-08-23T16:49:23.495510Z qemu-system-x86_64: Failed to load virtio-balloon:virtio
+2017-08-23T16:49:23.495515Z qemu-system-x86_64: error while loading state for instance 0x0 of device '0000:00:06.0/virtio-balloon'
+2017-08-23T16:49:23.496071Z qemu-system-x86_64: load of migration failed: Input/output error
+2017-08-23 16:49:23.797+0000: shutting down, reason=crashed
+
+I was to eager to get this close-to-real so I don't have Davids fprintf's applied anymore - I'll build those and then run it in the debugger, but until then what I can see is that behavior slightly changes (worse).
+It now crashes the guest on the source as well when aborting the migration.
+
+I need to debug to confirm, but it seems it still aborts the migration
+ -> qemu-system-x86_64: load of migration failed: Input/output error
+But then can't fall back to the source and crashes at
+ -> qemu-system-x86_64: Block node is read-only
+
+That was rc3 +:
+- nbd-client-avoid-spurious-qio_channel_yield.patch
+- the four patches mentioned in comment #43
+
+I could also re-base onto master + pacthes or rc4 if there is one soon.
+For now building with Davids debug statements applied again to check if we still abort around that assert.
+
+I need to recheck with that combo - I'd seen that error but only when I'd commented out 'if (!blk->dev && !blk_name(blk)[0]) {'  when debugging earlier.
+
+Looks good here, just retested:
+
+here's teh top of my git:
+
+f89f59fad5119f878aaedf711af90802ddcb99c7 nbd-client: avoid spurious qio_channel_yield() re-entry
+cf26039a2b50f078b4ad90b88eea5bb28971c0d8 block: Update open_flags after ->inactivate() callback
+8ccc527d84ec9a5052cfae19edbc44abb5ac03ae mirror: Mark target BB as "force allow inactivate"
+34c3f17c99a43f261560edbd3da1188dd0c398ab block-backend: Allow more "can inactivate" cases
+952ad9fd9dd43e92016d5bfc0ff93bdeaec13bf9 block-backend: Refactor inactivate check
+1f296733876434118fd766cfef5eb6f29ecab6a8 Update version for v2.10.0-rc3 release
+
+
+just tested current head - 1eed33994e28d4a0437ba6e944bbc3ec5e4a29a0 - seems to work for me.
+
+Yeah seems to be slightly different than the former assert.
+
+2017-08-23 18:41:54.556+0000: initiating migration
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block133
+bdrv_inactivate_recurse: entry for #block329
+bdrv_inactivate_recurse: entry for #block202
+bdrv_inactivate_recurse: exit end good for #block202
+bdrv_inactivate_recurse: exit end good for #block329
+bdrv_inactivate_recurse: entry for #block025
+bdrv_inactivate_recurse: exit end good for #block025
+bdrv_inactivate_recurse: exit end good for #block133
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk0
+bdrv_inactivate_recurse: entry for #block799
+bdrv_inactivate_recurse: entry for #block626
+bdrv_inactivate_recurse: exit end good for #block626
+bdrv_inactivate_recurse: exit end good for #block799
+bdrv_inactivate_recurse: entry for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block570
+bdrv_inactivate_recurse: entry for #block485
+bdrv_inactivate_recurse: exit end good for #block485
+bdrv_inactivate_recurse: exit end good for #block570
+bdrv_inactivate_recurse: exit end good for drive-virtio-disk1
+bdrv_inactivate_recurse: entry for #block1058
+bdrv_inactivate_recurse: entry for #block920
+bdrv_inactivate_recurse: exit end good for #block920
+bdrv_inactivate_recurse: exit end good for #block1058
+bdrv_inactivate_recurse: entry for drive-virtio-disk0
+Unexpected error in bdrv_check_perm() at /build/qemu-0OVYHF/qemu-2.10~rc3+dfsg/block.c:1574:
+2017-08-23T18:41:54.730131Z qemu-system-x86_64: Block node is read-only
+
+Which is:
+1553 /*                                                                               
+1554  * Check whether permissions on this node can be changed in a way that           
+1555  * @cumulative_perms and @cumulative_shared_perms are the new cumulative         
+1556  * permissions of all its parents. This involves checking whether all necessary  
+1557  * permission changes to child nodes can be performed.                           
+1558  *                                                                               
+1559  * A call to this function must always be followed by a call to bdrv_set_perm()  
+1560  * or bdrv_abort_perm_update().                                                  
+1561  */                                                                              
+1562 static int bdrv_check_perm(BlockDriverState *bs, uint64_t cumulative_perms,      
+1563                            uint64_t cumulative_shared_perms,                     
+1564                            GSList *ignore_children, Error **errp)                
+1565 {                                                                                
+1566     BlockDriver *drv = bs->drv;                                                  
+1567     BdrvChild *c;                                                                
+1568     int ret;                                                                     
+1569                                                                                  
+1570     /* Write permissions never work with read-only images */                     
+1571     if ((cumulative_perms & (BLK_PERM_WRITE | BLK_PERM_WRITE_UNCHANGED)) &&      
+1572         !bdrv_is_writable(bs))                                                   
+1573     {                                                                            
+1574         error_setg(errp, "Block node is read-only");                             
+1575         return -EPERM;                                                           
+1576     } 
+
+Adding in debug symbols to see in gdb which device that actually is showed me:
+I don't know what you might need so the full struct:
+
+(gdb) p *bs
+$2 = {open_flags = 2050, read_only = false, encrypted = false, sg = false, probed = false, force_share = false, implicit = true, 
+  drv = 0x1a67219800 <bdrv_mirror_top>, opaque = 0x0, aio_context = 0x1a684ae0d0, aio_notifiers = {lh_first = 0x1a6a4850e0}, 
+  walking_aio_notifiers = false, filename = "/var/lib/uvtool/libvirt/images/kvmguest-artful-normal.qcow", '\000' <repeats 4037 times>, 
+  backing_file = "/var/lib/uvtool/libvirt/images/kvmguest-artful-normal.qcow", '\000' <repeats 4037 times>, 
+  backing_format = "qcow2\000\000\000\000\000\000\000\000\000\000", full_open_options = 0x0, 
+  exact_filename = "/var/lib/uvtool/libvirt/images/kvmguest-artful-normal.qcow", '\000' <repeats 4037 times>, backing = 0x1a6971a4a0, 
+  file = 0x0, bl = {request_alignment = 1, max_pdiscard = 0, pdiscard_alignment = 0, max_pwrite_zeroes = 0, pwrite_zeroes_alignment = 0, 
+    opt_transfer = 0, max_transfer = 0, min_mem_alignment = 512, opt_mem_alignment = 4096, max_iov = 1024}, supported_write_flags = 0, 
+  supported_zero_flags = 0, node_name = "#block814", '\000' <repeats 22 times>, node_list = {tqe_next = 0x1a684b44d0, tqe_prev = 0x1a6b02e0c0}, 
+  bs_list = {tqe_next = 0x1a6a010030, tqe_prev = 0x1a6ab6bc50}, monitor_list = {tqe_next = 0x0, tqe_prev = 0x0}, refcnt = 3, op_blockers = {{
+      lh_first = 0x1a69e18e80}, {lh_first = 0x1a69e18ea0}, {lh_first = 0x1a69e18ec0}, {lh_first = 0x1a69e18ee0}, {lh_first = 0x1a69e18f00}, {
+      lh_first = 0x0}, {lh_first = 0x1a69e18f40}, {lh_first = 0x1a69e18f60}, {lh_first = 0x1a69e18f80}, {lh_first = 0x1a69e18fa0}, {
+      lh_first = 0x1a6989be30}, {lh_first = 0x1a69e18fc0}, {lh_first = 0x1a69e18fe0}, {lh_first = 0x1a69352e90}, {lh_first = 0x1a69352eb0}, {
+      lh_first = 0x1a69352ed0}}, job = 0x1a69e18bf0, inherits_from = 0x0, children = {lh_first = 0x1a6971a4a0}, parents = {
+    lh_first = 0x1a69e18e00}, options = 0x1a69b636a0, explicit_options = 0x1a69e16bb0, detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF, 
+  backing_blocker = 0x1a686e2e00, total_sectors = 16777216, before_write_notifiers = {notifiers = {lh_first = 0x0}}, write_threshold_offset = 0, 
+  write_threshold_notifier = {notify = 0x0, node = {le_next = 0x0, le_prev = 0x0}}, dirty_bitmap_mutex = {lock = {__data = {__lock = 0, 
+        __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}}, 
+      __size = '\000' <repeats 39 times>, __align = 0}, initialized = true}, dirty_bitmaps = {lh_first = 0x0}, wr_highest_offset = {
+    value = 1190584320}, copy_on_read = 0, in_flight = 0, serialising_in_flight = 0, wakeup = false, io_plugged = 0, enable_write_cache = 0, 
+  quiesce_counter = 0, write_gen = 2, reqs_lock = {locked = 0, ctx = 0x0, from_push = {slh_first = 0x0}, to_pop = {slh_first = 0x0}, 
+    handoff = 0, sequence = 0, holder = 0x0}, tracked_requests = {lh_first = 0x0}, flush_queue = {entries = {sqh_first = 0x0, 
+      sqh_last = 0x1a69b63680}}, active_flush_req = false, flushed_gen = 2}
+
+And that effectively is my root disk:
+
+At least the trivial flag in the struct is "read_only = false".
+Also on a FS level it is rw:
+-rw------- 1 root root 717160448 Aug 23 18:50 /var/lib/uvtool/libvirt/images/kvmguest-artful-normal.qcow
+(qemu is running privileged in this setup with UID 0, so no reason to mark that as read only IMHO)
+
+So I checked the full context of the if that leads to the error:
+  (cumulative_perms & (BLK_PERM_WRITE | BLK_PERM_WRITE_UNCHANGED))
+       3  (in my case)  & (    0x2   |  0x4)
+  ok that is a match
+
+So it goes further to
+  !bdrv_is_writable(bs)
+
+Which effectively is:
+  !bdrv_is_read_only(bs) && !(bs->open_flags & BDRV_O_INACTIVE);
+       !bs->read_only       ! (2050        &    0x800)
+         !false                     !(true)
+         true                       false
+
+So the problem is that BDRV_O_INACTIVE is set?
+Sorry I don't see why that is so (maybe too late for today).
+But I hope that helps in understanding the remaining case.
+
+I checked against your coommit list and I didn't have the following yet.
+cf26039a2b50f078b4ad90b88eea5bb28971c0d8 block: Update open_flags after ->inactivate() callback
+I took it now from the PULL 0/6 of Eric that appeared after my last test.
+Building with that now to report once again.
+
+If there is no build hickup that next test should just fit in before I fall asleep.
+Hoping for the best to report a tested by in time if possible.
+
+Yes, with all the series of [1] on top it finally works.
+Saw it already being merged on master.
+Expecting a late rc4 or early release tag and then wrap all it up.
+
+Thanks everybody involved!
+
+[1]: http://lists.nongnu.org/archive/html/qemu-devel/2017-08/msg04513.html
+
+This bug was fixed in the package qemu - 1:2.10~rc4+dfsg-0ubuntu1
+
+---------------
+qemu (1:2.10~rc4+dfsg-0ubuntu1) artful; urgency=medium
+
+  * Merge with Upstream 2.10-rc4; This fixes a migration issue (LP: #1711602);
+    Remaining changes:
+    - qemu-kvm to systemd unit
+      - d/qemu-kvm-init: script for QEMU KVM preparation modules, ksm,
+        hugepages and architecture specifics
+      - d/qemu-kvm.service: systemd unit to call qemu-kvm-init
+      - d/qemu-system-common.install: install systemd unit and helper script
+      - d/qemu-system-common.maintscript: clean old sysv and upstart scripts
+      - d/qemu-system-common.qemu-kvm.default: defaults for
+        /etc/default/qemu-kvm
+      - d/rules: install /etc/default/qemu-kvm
+    - Enable nesting by default
+      - set nested=1 module option on intel. (is default on amd)
+      - re-load kvm_intel.ko if it was loaded without nested=1
+      - d/p/ubuntu/expose-vmx_qemu64cpu.patch: expose nested kvm by default
+        in qemu64 cpu type.
+      - d/p/ubuntu/enable-svm-by-default.patch: Enable nested svm by default
+        in qemu64 on amd
+    - libvirt/qemu user/group support
+      - qemu-system-common.postinst: remove acl placed by udev, and add udevadm
+        trigger.
+      - qemu-system-common.preinst: add kvm group if needed
+    - Distribution specific machine type
+      - d/p/ubuntu/define-ubuntu-machine-types.patch: define distro machine
+        types to ease future live vm migration.
+      - d/qemu-system-x86.NEWS Info on fixed machine type defintions
+    - improved dependencies
+      - Make qemu-system-common depend on qemu-block-extra
+      - Make qemu-utils depend on qemu-block-extra
+      - let qemu-utils recommend sharutils
+    - s390x support
+      - Create qemu-system-s390x package
+      - Include s390-ccw.img firmware
+      - Enable numa support for s390x
+    - ppc64[le] support
+      - d/qemu-system-ppc.links provide usr/bin/qemu-system-ppc64le symlink
+      - Enable seccomp for ppc64el
+      - bump libseccomp-dev dependency, 2.3 is the minimum for ppc64
+    - arch aware kvm wrappers
+    - update VCS-git to match the Artful branch
+    - disable missing x32 architecture
+    - d/rules: or32 is now named or1k (since 4a09d0bb)
+    - d/qemu-system-common.docs: new paths since (ac06724a)
+    - d/qemu-system-common.install: qmp-commands.txt removed, but replaced
+      by qapi-schema.json which is already packaged (since 4d8bb958)
+    - d/p/02_kfreebsd.patch: utimensat is no more optional upstream (Update
+      to Debian patch to match qemu 2.10)
+    - s390x package now builds correctly on all architectures (LP 1710695)
+  * Added changes:
+    - d/qemu-system-common.docs: adapt new path of live-block-operations.rst
+      since 8508eee7
+    - d/qemu-system-common.docs: adapt q35 config paths since 9ca019c1
+    - make nios2/hppa not installed explicitly until further stablized
+    - d/qemu-guest-agent.install: add the new guest agent reference man page
+      qemu-ga-ref
+    - d/qemu-system-common.install: add the now generated qapi/qmp reference
+      along the qapi intro
+    - d/not-installed: ignore further generated (since 56e8bdd4) files in
+      dh_missing that are already provided in other formats qemu-doc,
+      qemu-qmp-ref,qemu-ga-ref
+    - d/p/ubuntu/define-ubuntu-machine-types.patch: update to match new
+      changes in 2.10-rc4
+
+ -- Christian Ehrhardt <email address hidden>  Fri, 25 Aug 2017 07:49:30 +0200
+

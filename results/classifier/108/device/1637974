@@ -1,0 +1,99 @@
+device: 0.940
+permissions: 0.936
+semantic: 0.928
+other: 0.926
+PID: 0.923
+graphic: 0.916
+files: 0.912
+network: 0.887
+performance: 0.881
+vnc: 0.871
+KVM: 0.870
+boot: 0.852
+debug: 0.849
+socket: 0.809
+
+dead code in pl080 functions
+
+pl080 is arm dma controller virtual device.
+source code path: hw/dma/pl080.c
+I find there are two same dead code in pl080_read and pl080_write,
+Here's the code, comments are my opinion:
+=========================
+240 static uint64_t pl080_read(void *opaque, hwaddr offset,
+241                            unsigned size)
+242 {
+243     PL080State *s = (PL080State *)opaque;
+244     uint32_t i;
+245     uint32_t mask;
+246 
+247     if (offset >= 0xfe0 && offset < 0x1000) {
+248         if (s->nchannels == 8) {
+249             return pl080_id[(offset - 0xfe0) >> 2];
+250         } else {
+251             return pl081_id[(offset - 0xfe0) >> 2];
+252         }
+253     }
+254     if (offset >= 0x100 && offset < 0x200) {   //// here offset is limited in 0x100~0x200
+255         i = (offset & 0xe0) >> 5;
+256         if (i >= s->nchannels)
+257             goto bad_offset;
+258         switch (offset >> 2) {                 //// then here, offset>>2 is in range  64~128
+259         case 0: /* SrcAddr */                  //// while the switch case is 0,1,2,3,4,
+260             return s->chan[i].src;             //// so, NONE of the switch case would be selected !
+261         case 1: /* DestAddr */                 //// this switch is A DEAD CODE, it is contradictory with if.
+262             return s->chan[i].dest;
+263         case 2: /* LLI */
+264             return s->chan[i].lli;
+265         case 3: /* Control */
+266             return s->chan[i].ctrl;
+267         case 4: /* Configuration */
+268             return s->chan[i].conf;
+269         default:
+270             goto bad_offset;
+271         }
+272     }
+        .....................................
+=============================================
+
+I guess, switch statement should like this :
+switch((offset-0x100)>>2)
+{
+...
+}
+
+On 31 October 2016 at 10:48, jeyyej <email address hidden> wrote:
+> Public bug reported:
+>
+> pl080 is arm dma controller virtual device.
+> source code path: hw/dma/pl080.c
+> I find there are two same dead code in pl080_read and pl080_write,
+
+> + if this DEADCODE is not the author's original purpose,
+> + Then there must be something in logic goes wrong, pl080 have NEVER works correctly ?
+
+Yes, this code is incorrect. However the only registers
+affected are those that set up the DMA channels, and
+the code for actually doing DMA transfers will assert if
+the guest ever tries to use it (see the hw_error() call in
+pl080_run()), so even if the guest could set up the DMA
+channels it would run into problems later.
+
+This device is only used in the versatilepb board, and
+I don't think Linux attempts to use it for DMA, so nobody's
+ever needed to care that it's actually totally broken
+for anything beyond "shouldn't crash the kernel when it
+tries to probe for and initialize it".
+
+thanks
+-- PMM
+
+
+@Peter Maydell Oh, I see, but would you try to fix this code ?
+
+I have no requirement for a working pl080, since I have no guest code that requires one. If somebody else (you?) wants to send a patch that fixes it, I'm happy to review it.
+
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=156448ab640baaeca18
+

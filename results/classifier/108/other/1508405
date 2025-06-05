@@ -1,0 +1,140 @@
+graphic: 0.891
+KVM: 0.842
+performance: 0.837
+device: 0.835
+vnc: 0.831
+permissions: 0.830
+PID: 0.802
+debug: 0.799
+network: 0.792
+files: 0.787
+semantic: 0.778
+socket: 0.771
+other: 0.753
+boot: 0.677
+
+qemu 2.4.0 with --enable-kvm hangs, takes 100% CPU
+
+When starting qemu-system-x86_64 from version 2.4.0 with --enable-kvm, it hangs and takes 100% CPU. The graphical display (SeaBIOS output) is not initialized.
+
+There have been multiple reports of this issue in the following thread:
+https://bbs.archlinux.org/viewtopic.php?pid=1572405
+
+There is no need to load a certain image, it already hangs with the following command:
+qemu-system-x86_64 --enable-kvm
+
+There are three workarounds:
+- Downgrading the kernel form 4.2.2 to 4.1.6 (according to the forum thread, have not tested this myself)
+- Downgrading qemu to 2.3 (tested personally, works)
+- passing -machine pc-i440fx-2.3 to qemu 2.4 (have not tested this myself, I will try that shortly)
+
+modules kvm and kvm_intel are loaded and rmmod && modprobing them does not change the situation
+
+I have an nvidia card and switching from official binary drivers to nouveau and back does not change the situation.
+
+
+qemu is installed from Arch package. From the PKGBUILD you can see that is is built with the following configuration:
+================================================================
+export ARFLAGS="rv"
+  export CFLAGS+=' -fPIC'
+  ./configure --prefix=/usr --sysconfdir=/etc --audio-drv-list='pa alsa sdl' \
+              --python=/usr/bin/python2 --smbd=/usr/bin/smbd \
+              --enable-docs --libexecdir=/usr/lib/qemu \
+              --disable-gtk --enable-linux-aio --enable-seccomp \
+              --enable-spice --localstatedir=/var \
+              --enable-tpm \
+              --enable-modules --enable-{rbd,glusterfs,libiscsi,curl}
+  make V=99
+================================================================
+
+cpuinfo on my machine (for the first core only):
+
+================================================================
+processor       : 0
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 30
+model name      : Intel(R) Core(TM) i7 CPU       Q 820  @ 1.73GHz
+stepping        : 5
+microcode       : 0x7
+cpu MHz         : 1333.000
+cache size      : 8192 KB
+physical id     : 0
+siblings        : 8
+core id         : 0
+cpu cores       : 4
+apicid          : 0
+initial apicid  : 0
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 11
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc aperfmperf pni dtes64 monitor ds_cpl vmx smx est tm2 ssse3 cx16 xtpr pdcm sse4_1 sse4_2 popcnt lahf_lm ida dtherm tpr_shadow vnmi flexpriority ept vpid
+bugs            :
+bogomips        : 3459.21
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 36 bits physical, 48 bits virtual
+================================================================
+
+Is there more information I can provide you with to help debug this problem?
+
+Thanks,
+
+cptG
+
+Just confirmed: passing -machine pc-i440fx-2.3 to qemu 2.4 works on my machine, too.
+
+I guess I forgot about it before: Kernel version is 4.2.3
+
+OK, I just git-bisected and it found the following commit to probably cause the problem:
+===================== SNIP ========================================
+355023f2010c4df619d88a0dd7012b4b9c74c12c is the first bad commit
+commit 355023f2010c4df619d88a0dd7012b4b9c74c12c
+Author: Paolo Bonzini <email address hidden>
+Date:   Thu Jun 18 18:30:52 2015 +0200
+
+    pc: add SMM property
+    
+    The property can take values on, off or auto.  The default is "off"
+    for KVM and pre-2.4 machines, otherwise "auto" (which makes it
+    available on TCG or on new-enough kernels).
+    
+    Acked-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+:040000 040000 28b1de64871e1baa3aaad155f22f7c44d5fdc94f 77265bdd62664d15d8ad6ef3364aeb284d030486 M      hw
+:040000 040000 8b933a2739a2dccb0b5e28ab3ce20e2bb703780b a8d444cb27fbd54b0b9a7bd9997db355da15763e M      include
+:040000 040000 1acb81aecaf50f2d313b33f2b61a24f7f0bd6f07 726899e7ae70d04dd9acd7000fa1c5dee715da3e M      target-i386
+===================== SNIP ========================================
+
+
+The script I ran after each bisection step:
+
+===================== SNIP ========================================
+make clean
+PREFIX=$PWD/localinstall
+export ARFLAGS="rv"
+  # http://permalink.gmane.org/gmane.comp.emulators.qemu/238740
+  export CFLAGS+=' -fPIC'
+  # gtk gui breaks keymappings at the moment
+  ./configure --prefix=$PREFIX --sysconfdir=/etc --audio-drv-list='pa alsa sdl' \
+              --python=/usr/bin/python2 --smbd=/usr/bin/smbd \
+              --enable-docs --libexecdir=$PREFIX/lib/qemu \
+              --disable-gtk --enable-linux-aio --enable-seccomp \
+              --enable-spice --localstatedir=/var \
+              --enable-tpm \
+              --enable-modules --enable-{rbd,glusterfs,libiscsi,curl}
+  make V=99 -j9 && ./x86_64-softmmu/qemu-system-x86_64 --enable-kvm
+===================== SNIP ========================================
+
+
+Hope this helps!
+
+
+Duh, I should've actually taken a closer look at the commit I found... another workaround for the problem is:
+
+qemu-system-x86_64 --enable-kvm -machine smm=off
+
+though the commit  message seems to state that the default is off for kvm - so that's where the bug is?
+

@@ -1,0 +1,109 @@
+semantic: 0.887
+permissions: 0.875
+device: 0.863
+other: 0.861
+graphic: 0.856
+PID: 0.846
+files: 0.832
+performance: 0.818
+vnc: 0.809
+network: 0.805
+debug: 0.799
+socket: 0.794
+KVM: 0.778
+boot: 0.769
+
+xHCI and event ring handling
+
+I believe that the Event Ring handling in QEMU is not correct.  For example, an Event Ring may have multiple segments.  However, the code in xhci_write_event() (https://git.qemu.org/?p=qemu.git;a=blob;f=hw/usb/hcd-xhci.c;hb=HEAD#l645), starting with line 668, seems to only support a single segment.
+
+Also, QEMU is sending a spurious interrupt after the Guest writes to the ERDP register due to the fact that the address written does not match the current index.  This is because the index is incremented after sending the event.  The xHCI specification states in section 5.5.2.3.3 "When software finishes processing an Event TRB, it will write the address of that Event TRB to the ERDP."
+
+Since xhci_write_event() has already incremented the index pointer (intr->er_ep_idx), the check at line 3098 (https://git.qemu.org/?p=qemu.git;a=blob;f=hw/usb/hcd-xhci.c;hb=HEAD#l3090) no longer is valid.
+
+I have not studied QEMU's code enough yet to offer a patch.  However, this should be a simple fix.
+
+intr->er_ep_idx++;
+if (intr->er_ep_idx >= intr->er_table[intr->er_segment].er_size) {
+  intr->er_ep_idx = 0;
+  intr->er_segment++;
+  if (intr->er_segment >= intr->er_table_size) {
+    intr->er_segment = 0;
+    intr->er_pcs = !intr->er_pcs;
+  }
+}
+
+Being sure to incorporate this new segment member into the above code (possibly as shown) as well as change the lines at 665 to use the new segment member of the structure, and of course in the initialization portion of the event ring.
+
+As for the spurious interrupt at line 3101, a new member will need to be added to the code to keep track of the last inserted ED (TRB) into the Event Ring and then of course checking against this new member, not the now newly incremented member.
+
+I have sent an email to the author listed at the top of the file as well, not sure if this is proper bug reporting etiquette or not.
+
+Thank you.
+
+I failed to note above that the HCSPARAMS2 register does indeed limit the count of segments in the Event Ring.  I guess as long as you never change this value from one (1) you will be okay.  
+
+However, the spurious interrupt stuff still stands as a bug.
+
+Thank you,
+Ben
+
+Please note that the current code reports zero (0)
+
+https://git.qemu.org/?p=qemu.git;a=blob;f=hw/usb/hcd-xhci.c#l2737
+
+Bits 7:4 is this limit and the current code has these bits as zero.
+
+
+My apologizes.  I forgot that it was 2^ERSTMAX.  I really need to get some sleep :-)
+
+qemu behavior matches linux guest driver expectations on erdp writes, I don't think we have a bug there.
+
+And, yes, qemu doesn't support multiple segments and correctly says so in the capabilities registers.
+
+The xHCI specification states that after processing the Event TRB, software is to write the address of that TRB to the xHC_INTERRUPTER_DEQUEUE.  QEMU currently checks this value written and compares it to its own current pointer, which is now incremented to the next available TRB, therefore not matching.  When finding that it does not match, it sends another interrupt.
+
+On receiving this interrupt, software will see this interrupt as a mismatch in cycle bits and simply write the address of the last processed Event TRB to the xHC_INTERRUPTER_DEQUEUE and return again.  QEMU will then again check the address and find again that it is a mismatch, again firing the interrupt.  This causes an infinite loop and will halt the USB.
+
+I do believe this to be in error.
+
+However, it is up to the majority, which seams to be a Linux based majority, so if it works on Linux, if it isn't broken, why fix it.
+
+As for the multiple segments in the Event Ring, this was more of a request than a bug report.  Sorry for the miss representation on that part.
+
+Thank you,
+Ben
+
+The part you're missing is in section 4.9.4.
+
+> System software shall advance the Event Ring Dequeue Pointer by writing the address of the last
+processed Event TRB to the Event Ring Dequeue Pointer (ERDP) register. Note, the “last processed
+Event TRB” includes the case where software detects a Cycle bit mismatch when evaluating an Event
+TRB and the ring is empty.
+
+So the bug is in your code, because it's supposed to check the next TRB, find the cycle bit mismatch, and *that* qualifies as "processing" it, and then it should write *that* address to the ERDP, which is going to equal the actual last valid TRB's address + 1 (modulo wraparound), which is exactly what qemu expects, and what Linux does too.
+
+Hi Hector, guys,
+
+I think I have found my/the error:
+
+xHCI, version 1.0, Page 136:
+"Note: The detection of a Cycle bit mismatch in an Event TRB processed 
+ by software indicates the location of the xHC Event Ring Enqueue Pointer 
+ and that the Event Ring is empty. Software shall write the ERDP with the
+ address of this TRB to indicate that it has processed all Events in the
+ ring."
+
+It does not state to advance the Consumer's internal Dequeue pointer.  
+Just the register is mentioned.
+
+This is my error.  I thought that it implied to advance the Consumer's
+internal Dequeue Pointer as well.  (Implied being the big word here)
+
+Sorry for the bother.  It was my error.  It took me a bit of (re)reading
+and a little more work to find that it was/is indeed my error.
+
+Sorry and thank you for your time,
+Ben
+
+

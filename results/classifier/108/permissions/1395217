@@ -1,0 +1,332 @@
+permissions: 0.931
+semantic: 0.905
+debug: 0.832
+graphic: 0.801
+other: 0.800
+socket: 0.789
+network: 0.781
+device: 0.776
+vnc: 0.719
+performance: 0.719
+PID: 0.704
+KVM: 0.655
+files: 0.632
+boot: 0.588
+
+Networking in qemu 2.0.0 and beyond is not compatible with Open Solaris (Illumos) 5.11
+
+The networking code in qemu in versions 2.0.0 and beyond is non-functional with Solaris/Illumos 5.11 images. 
+
+Building 1.7.1, 2.0.0, 2.0.2, 2.1.2,and 2.2.0rc1with the following standard Slackware config:
+
+# From Slackware build tree . . . 
+./configure \
+  --prefix=/usr \
+  --libdir=/usr/lib64 \
+  --sysconfdir=/etc \
+  --localstatedir=/var \
+  --enable-gtk \
+  --enable-system \
+  --enable-kvm \
+  --disable-debug-info \
+  --enable-virtfs \
+  --enable-sdl \
+  --audio-drv-list=alsa,oss,sdl,esd \
+  --enable-libusb \
+  --disable-vnc \
+  --target-list=x86_64-linux-user,i386-linux-user,x86_64-softmmu,i386-softmmu \
+  --enable-spice \
+  --enable-usb-redir 
+
+
+And attempting to run the same VM image with the following command (or via virt-manager):
+
+macaddress="DE:AD:BE:EF:3F:A4"
+
+qemu-system-x86_64 nex4x -cdrom /dev/cdrom -name "Nex41" -cpu Westmere
+-machine accel=kvm -smp 2 -m 4000 -net nic,macaddr=$macaddress  -net bridge,br=b
+r0 -net dump,file=/usr1/tmp/<FILENAME> -drive file=nex4x_d1 -drive file=nex4x_d2
+ -enable-kvm
+
+Gives success on 1.7.1, and a deaf VM on all subsequent versions. 
+
+Notable in validating my config, is that a Windows 7 image runs cleanly with networking on *all* builds, so my configuration appears to be good - qemu just hates Solaris at this point.
+
+Watching with wireshark (as well as pulling network traces from qemu as noted above) it appears that the notable difference in the two configs is that for some reason, Solaris gets stuck arping for it's own interface on startup, and never really comes on line on the network.  If other hosts attempt to ping the Solaris instance, they can successfully arp the bad VM, but not the other way around.
+
+
+
+
+
+Note that the host system, network config, etc. are identical, qemu is built with an identical config, and started with the same command - the *ONLY* variable is the qemu version.   This is utilizing the bridge-helper binary, but as noted earlier, using virt-manager whether allowing it to define it's on network, or using the existing bridge config on this box, the behaviour is the same, and only Solaris is failing.  
+
+I note also that the failure happens with both the e1000 and the rtl8139 interfaces - this does not appear to be an issue with the drivers, but more a case of how qemu passes traffic to and from the tap device.  Looking at the tap device with wireshark, I can see the external traffic as well as traffic from qemu - it just appears that some does not make it into Solaris.
+
+I also noted discussions several years ago regarding a very similar issue, but do not have a bug number at this point (2010 vintage).  Not certain that that is relevant, but it definitely is similar. 
+
+Host platform is Slackware 14.1, x86_64 . . . cc 4.8.2, kernel 3.10.17 
+
+
+Can you try bisecting between 1.7 and 2.0 with git?
+
+Paolo - I should have some time to do that this week, as well as bone up on git (it's been a bit . . .) 
+
+And thanks for the quick reply!
+
+Bisected merrily away, and this is where it definitively begins to fail . . . To verify, I checked out both commits, and confirmed change in function at this point.  I attempted a revoke of this commit on my clone to test, but too many merge errors to make that a simple task, so that was not done.  
+
+commit ef02ef5f4536dba090b12360a6c862ef0e57e3bc
+Author: Eduardo Habkost <email address hidden>
+Date:   Wed Feb 19 11:58:12 2014 -0300
+
+    target-i386: Enable x2apic by default on KVM
+
+    When on KVM mode, enable x2apic by default on all CPU models.
+
+    Normally we try to keep the CPU model definitions as close as the real
+    CPUs as possible, but x2apic can be emulated by KVM without host CPU
+    support for x2apic, and it improves performance by reducing APIC access
+    overhead. x2apic emulation is available on KVM since 2009 (Linux
+    2.6.32-rc1), there's no reason for not enabling x2apic by default when
+    running KVM.
+
+    Signed-off-by: Eduardo Habkost <email address hidden>
+    Acked-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Andreas FÃ¤rber <email address hidden>
+
+:040000 040000 ebdc1ecd08cb507db62cc465696925a4cde6174f e83d9c32f821714600c48594
+15911910d4b37c0d M      hw
+:040000 040000 9064bc796128ba1380b67a86af9718dcc1022f0d 5cb337c72259b54780856806
+8f56f4abfa628579 M      target-i386
+
+
+This does not appear to be run-time selectable (or I have not found the option yet . . . ) so not quire sure how to verify if backing this out will resolve the issue in later versions.
+
+
+Additional test (I just don't know when to go to bed . . . *sigh* . . . ). 
+
+In a checkout of the 2.1.2 code base, and based on the above failing commit as per bisect, I removed the change in the commit for target-i386/cpu.c of the line: 
+
+[FEAT_1_ECX] = CPUID_EXT_X1APIC,
+
+as added by the errant commit, recompiled, and networking is now working with Illumos in 2.1.2, so this commit is definitely not as innocent as it may appear. 
+
+It is runtime selectable using "-cpu ...,-x2apic" (as indicated by Markus on qemu-devel).
+
+First thing we need to find out is if it fails on the newest CPU model that can be run in enforce mode.
+
+So, assuming you are running on an Intel host CPU, it would be interesting to test those CPU models in this order, until you have one that actually boots:
+
+ -cpu Broadwell,enforce
+ -cpu Haswell,enforce
+ -cpu SandyBridge,enforce
+ -cpu Westmere,enforce
+ -cpu Nehalem,enforce
+ -cpu Penryn,enforce
+ -cpu Conroe,enforce
+
+Testing of:
+  -cpu host
+would be interesting, too.
+
+If the latest CPU model (or -cpu host) have working networking, that means Solaris (or QEMU NIC emulation code) doesn't like to see an old CPU with x2apic enabled. If it doesn't work even using the latest CPU model (and -cpu host), that means Solaris (or QEMU NIC emulation) doesn't like the x2apic implementation of KVM at all (and that could mean a Solaris bug, a QEMU bug, or a KVM x2apic emulation bug).
+
+
+Broadwell - Fails, Host won't support it:
+
+warning: host doesn't support requested feature: CPUID.01H:ECX.fma [bit 12]
+warning: host doesn't support requested feature: CPUID.01H:ECX.movbe [bit 22]
+warning: host doesn't support requested feature: CPUID.07H:EBX.fsgsbase [bit 0]
+warning: host doesn't support requested feature: CPUID.07H:EBX.bmi1 [bit 3]
+warning: host doesn't support requested feature: CPUID.07H:EBX.hle [bit 4]
+warning: host doesn't support requested feature: CPUID.07H:EBX.avx2 [bit 5]
+warning: host doesn't support requested feature: CPUID.07H:EBX.smep [bit 7]
+warning: host doesn't support requested feature: CPUID.07H:EBX.bmi2 [bit 8]
+warning: host doesn't support requested feature: CPUID.07H:EBX.erms [bit 9]
+warning: host doesn't support requested feature: CPUID.07H:EBX.invpcid [bit 10]
+warning: host doesn't support requested feature: CPUID.07H:EBX.rtm [bit 11]
+warning: host doesn't support requested feature: CPUID.07H:EBX.rdseed [bit 18]
+warning: host doesn't support requested feature: CPUID.07H:EBX.adx [bit 19]
+warning: host doesn't support requested feature: CPUID.07H:EBX.smap [bit 20]
+warning: host doesn't support requested feature: CPUID.80000001H:ECX.3dnowprefetch [bit 8]
+qemu-system-x86_64: Host doesn't support requested features
+
+Haswell fails, host won't support it: 
+
+warning: host doesn't support requested feature: CPUID.01H:ECX.fma [bit 12]
+warning: host doesn't support requested feature: CPUID.01H:ECX.movbe [bit 22]
+warning: host doesn't support requested feature: CPUID.07H:EBX.fsgsbase [bit 0]
+warning: host doesn't support requested feature: CPUID.07H:EBX.bmi1 [bit 3]
+warning: host doesn't support requested feature: CPUID.07H:EBX.hle [bit 4]
+warning: host doesn't support requested feature: CPUID.07H:EBX.avx2 [bit 5]
+warning: host doesn't support requested feature: CPUID.07H:EBX.smep [bit 7]
+warning: host doesn't support requested feature: CPUID.07H:EBX.bmi2 [bit 8]
+warning: host doesn't support requested feature: CPUID.07H:EBX.erms [bit 9]
+warning: host doesn't support requested feature: CPUID.07H:EBX.invpcid [bit 10]
+warning: host doesn't support requested feature: CPUID.07H:EBX.rtm [bit 11]
+qemu-system-x86_64: Host doesn't support requested features
+
+
+SandyBridge (this is the test box physical CPU) fails, no errors, networking dead, as per initial problem.
+
+Westmere fails, no networking.
+
+Nehalem fails, no networking
+
+Panryn fails, no networking
+
+Conroe fails, no networking
+
+host fails, no networking
+
+Just to ensure that all else was good, I tested SandyBridge, Westmere, Conroe, and host with "-x2apic" and every one works with x2apic disabled. 
+
+This test box is a laptop, and I am only testing on it since I am away from my primary server (Dell 2950) for the holiday.  Both Intel, but not even close to the same CPU . . . same problem observed on both, although workaround not tested yet on primary. 
+
+
+Test box (for this data) CPU into:
+
+processor       : 0
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 42
+model name      : Intel(R) Core(TM) i5-2520M CPU @ 2.50GHz
+stepping        : 7
+microcode       : 0x25
+cpu MHz         : 1200.000
+cache size      : 3072 KB
+physical id     : 0
+siblings        : 4
+core id         : 0
+cpu cores       : 2
+apicid          : 0
+initial apicid  : 0
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 13
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov 
+pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx rdtscp lm c
+onstant_tsc arch_perfmon pebs bts nopl xtopology nonstop_tsc aperfmperf eagerfpu
+ pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 cx16 xtpr pdcm pcid s
+se4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx lahf_lm ida arat epb
+ xsaveopt pln pts dtherm tpr_shadow vnmi flexpriority ept vpid
+bogomips        : 4984.29
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 36 bits physical, 48 bits virtual
+power management:
+
+(Repeats for 4 cores)
+
+
+
+
+Primary system:
+
+processor       : 0
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 15
+model name      : Intel(R) Xeon(R) CPU           E5345  @ 2.33GHz
+stepping        : 7
+microcode       : 0x6b
+cpu MHz         : 2000.000
+cache size      : 4096 KB
+physical id     : 0
+siblings        : 4
+core id         : 0
+cpu cores       : 4
+apicid          : 0
+initial apicid  : 0
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 10
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov 
+pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx lm constant
+_tsc arch_perfmon pebs bts rep_good nopl aperfmperf pni dtes64 monitor ds_cpl vm
+x est tm2 ssse3 cx16 xtpr pdcm dca lahf_lm dtherm tpr_shadow
+bogomips        : 4655.23
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 36 bits physical, 48 bits virtual
+power management:
+
+(Repeats for 8 cores)
+
+
+Note that this Illumos image is certified/runs cleanly on Intel hardware from the last 5 years when natively on it.  I doubt that it is a kernel problem with Illumos with regard to the actual CPU architecture.  Older releases that are OpenSolaris based also see the problem.  
+
+Generally speaking, I don't think that an issue of this nature has ever been seen with this OS image on any Intel or AMD CPU ever tested . . . so unless there is something in Illumos that is only triggered by qemu, I find it hard to imagine it being an Illumos bug, but then again, it's not like oddities like this never happen . . .
+
+And thanks for all the quick attention! If nothing else, it got me to a point whereby I can work around the problem, and not be stuck on older builds that virt-manager hates . . . .
+
+(Wow . . . that last was incredibly redundant . . . staying up most of the night working on this has apparently left me a bit stupid this morning/afternoon . . . sorry!)
+
+
+So, if it breaks even with -cpu SandyBridge and -cpu host, it is likely to be a KVM or QEMU bug. Thanks for the testing!
+
+Much appreciated!  Please let me know if there is anything else I can do to help this bug progress . . . . 
+
+- Tim
+
+FWIW there's some other hits on this:
+
+Fedora bug: https://bugzilla.redhat.com/show_bug.cgi?id=1040500
+Openstack mailing list: http://lists.openstack.org/pipermail/openstack-dev/2014-December/053478.html
+
+Hello to all, I confirm this bug in qemu. 
+
+12 different Linux versions/distributions and 1 Windows 7 VM  are running fine without any networking issue. 
+Solaris 5.11 Version 11.2 can be installed (text version) and is running but network is broken.
+
+DHCPOFFER will not be received by Solaris 5.11 VM's (RX not working)  for Automatic profile.
+If DefaultFixed profile is online there is the same behavior. 
+Arp table on Solaris containes the own entry which is completed.
+If I ping another host, the IP will be added but no MAC, which indicates that also no ARP package will be received.  
+
+I could NOT get it working with disabled x2apic (tested with different CPU types).
+Is there something additional which has to be changed?
+
+qemu version is 2.0.0+dfsg-2ubuntu1.10 @ ubuntu 14.04.2 LTS, Kernel 3.13.0-49-generic.
+
+
+
+See also bug #638955
+
+See the following bug report for a working Solaris 10 KVM guest configuration:
+https://bugzilla.redhat.com/show_bug.cgi?id=1262093
+
+#17 
+I have the same situtaion 
+when I use cpu line as "-cpu qemu64,-x2apic" the network still doesn't work.
+maybe there is another way to remove x2apic,but I don't get it.
+for the arp ,as you say ,there is not MAC.
+Have you solve the problem ?
+
+
+host: ubuntu 14.04    
+qemu  img:openindiana 5.11
+
+
+any one have a right way ?
+
+I fixed this by adding the configuration in the xml configuration file:
+  <cpu mode='custom' match='exact'>
+    <model fallback='allow'>SandyBridge</model>
+    <feature policy='disable' name='x2apic'/>
+  </cpu>
+
+See also attachement (https://bugzilla.redhat.com/attachment.cgi?id=1072357) of bug https://bugzilla.redhat.com/show_bug.cgi?id=1262093.
+
+Note that I tested with Solaris 10, not openindiana 5.11
+
+On Fedora, I had to use this command to edit the VM config file:
+virsh edit <put_here_name_of_your_vm>
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

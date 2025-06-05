@@ -1,0 +1,310 @@
+permissions: 0.626
+semantic: 0.560
+other: 0.556
+graphic: 0.541
+debug: 0.511
+vnc: 0.463
+device: 0.455
+PID: 0.449
+performance: 0.436
+KVM: 0.411
+socket: 0.391
+network: 0.365
+boot: 0.344
+files: 0.213
+
+Qemu after v5.0.0 breaks macos guests
+
+The Debian Sid 5.0-6 qemu-kvm package can no longer get further than the Clover bootloader whereas 5.0-6 and earlier worked fine.
+
+So I built qemu master from github and it has the same problem, whereas git tag v5.0.0 (or 4.2.1) does not, so something between v5.0.0 release and the last few days has caused the problem.
+
+Here's my qemu script, pretty standard macOS-Simple-KVM setup on a Xeon host:
+
+qemu-system-x86_64 \
+    -enable-kvm \
+    -m 4G \
+    -machine q35,accel=kvm \
+    -smp 4,sockets=1,cores=2,threads=2 \
+    -cpu 
+Penryn,vendor=GenuineIntel,kvm=on,+sse3,+sse4.2,+aes,+xsave,+avx,+xsaveopt,+xsavec,+xgetbv1,+avx2,+bmi2,+smep,+bmi1,+fma,+movbe,+invtsc 
+\
+    -device 
+isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc" 
+\
+    -smbios type=2 \
+    -drive if=pflash,format=raw,readonly,file="/tmp/OVMF_CODE.fd" \
+    -drive if=pflash,format=raw,file="/tmp/macos_catalina_VARS.fd" \
+    -vga qxl \
+    -device ich9-ahci,id=sata \
+    -drive id=ESP,if=none,format=raw,file=/tmp/ESP.img \
+    -device ide-hd,bus=sata.2,drive=ESP \
+    -drive id=InstallMedia,format=raw,if=none,file=/tmp/BaseSystem.img \
+    -device ide-hd,bus=sata.3,drive=InstallMedia \
+    -drive id=SystemDisk,if=none,format=raw,file=/tmp/macos_catalina.img \
+    -device ide-hd,bus=sata.4,drive=SystemDisk \
+    -usb -device usb-kbd -device usb-mouse
+
+Perhaps something has changed in Penryn support recently, as that's required for macos?
+
+See also https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=964247
+
+Also on a related note, kernel 5.6/5.7 (on Debian) hard crashes the host when I try GPU passthrough on macos, whereas Ubuntu20/Win10 work fine - as does 5.5 kernel.
+
+See also https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=961676
+
+Is this not the place to report qemu bugs?
+
+qemu console screenshot, this is as far as it gets after clover: https://i.imgur.com/HWY96Kq.png
+
+same result with or without usb/pci passthrough, qxl/vnc, git master HEAD or debian 5.0-6
+
+Indeed it is, but bear in mind it was QEMU 5.1 release feature freeze this week so most developers are busy rebasing and fixing up bugs from the resulting merge.
+
+Given that you have already built QEMU from source, what would help enormously is if you can do a "git bisect" between the v5.0.0 tag (working) and your current master (not working) and provide the output of "git bisect log" in this bug report. By identifying the individual commit that broke your test case, it is much easier for developers to understand the issue and propose a fix.
+
+
+ATB,
+
+Mark.
+
+
+Thanks Mark, what an interesting exercise that was - and sorry, didn't know 5.1 was due.
+
+So the git bisect revealed this:
+
+$ git bisect good
+5d971f9e672507210e77d020d89e0e89165c8fc9 is the first bad commit
+commit 5d971f9e672507210e77d020d89e0e89165c8fc9
+Author: Michael S. Tsirkin <email address hidden>
+Date:   Wed Jun 10 09:47:49 2020 -0400
+
+    memory: Revert "memory: accept mismatching sizes in memory_region_access_valid"
+    
+    Memory API documentation documents valid .min_access_size and .max_access_size
+    fields and explains that any access outside these boundaries is blocked.
+    
+    This is what devices seem to assume.
+    
+    However this is not what the implementation does: it simply
+    ignores the boundaries unless there's an "accepts" callback.
+    
+    Naturally, this breaks a bunch of devices.
+    
+    Revert to the documented behaviour.
+    
+    Devices that want to allow any access can just drop the valid field,
+    or add the impl field to have accesses converted to appropriate
+    length.
+    
+    Cc: <email address hidden>
+    Reviewed-by: Richard Henderson <email address hidden>
+    Fixes: CVE-2020-13754
+    Fixes: https://bugzilla.redhat.com/show_bug.cgi?id=1842363
+    Fixes: a014ed07bd5a ("memory: accept mismatching sizes in memory_region_access_valid")
+    Signed-off-by: Michael S. Tsirkin <email address hidden>
+    Message-Id: <email address hidden>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+ memory.c | 29 +++++++++--------------------
+ 1 file changed, 9 insertions(+), 20 deletions(-)
+
+
+Woohoo! Simply reverting that one commit 5d971f9e672507210e77d020d89e0e89165c8fc9 from today's master gets me running again.
+
+Not sure where that leaves us though....?
+
+that's an interesting observation. Thank you for finding this one. It'd be much faster to find one of about 10 debian patches which affects this but full qemu bisect works too, ofcourse.
+
+Simon, I can't reach you by email, your mailserver apparently malfunctioning, - I sent you instructions about how and what to do, but all my emails returned back - connections to your mailserver times out from a few of networks I have access to.
+
+This commit breaking macos guest is interesting, perhaps we should try to fix that for 5.1.. :)
+
+the debian patch is:
+
+revert-memory-accept-mismatching-sizes-in-memory_region_access_valid-CVE-2020-13754.patch
+
+i'm currently building a deb package without it.
+
+mailserver has a geoip block and doesn't use ipv6, synapticconsulting at gmail dot com should work.
+
+
+yup, building debian 5.0-6 package minus that single patch gives me working macos catalina again.
+
+now just got to figure out why any kernel newer than 5.5 crashes the host when using pci passthrough - i don't fancy bisecting a whole kernel!
+
+Thanks for the bisection, that's really helpful - that particular patch fixes the way in which memory region access sizes are treated as valid. The obvious device to look at here is isa-apple-smc since I suspect that has less CI coverage.
+
+Looking at the access sizes of all 3 MemoryRegions within hw/misc/applesmc.c I think these would now reject all non-byte accesses - does the following patch help at all?
+
+
+diff --git a/hw/misc/applesmc.c b/hw/misc/applesmc.c
+index 1c4addb201..7ca89e5e86 100644
+--- a/hw/misc/applesmc.c
++++ b/hw/misc/applesmc.c
+@@ -288,7 +288,7 @@ static const MemoryRegionOps applesmc_data_io_ops = {
+     .endianness = DEVICE_NATIVE_ENDIAN,
+     .impl = {
+         .min_access_size = 1,
+-        .max_access_size = 1,
++        .max_access_size = 4,
+     },
+ };
+ 
+@@ -298,7 +298,7 @@ static const MemoryRegionOps applesmc_cmd_io_ops = {
+     .endianness = DEVICE_NATIVE_ENDIAN,
+     .impl = {
+         .min_access_size = 1,
+-        .max_access_size = 1,
++        .max_access_size = 4,
+     },
+ };
+ 
+@@ -308,7 +308,7 @@ static const MemoryRegionOps applesmc_err_io_ops = {
+     .endianness = DEVICE_NATIVE_ENDIAN,
+     .impl = {
+         .min_access_size = 1,
+-        .max_access_size = 1,
++        .max_access_size = 4,
+     },
+ };
+ 
+
+ATB,
+
+Mark.
+
+Hi Mark, no that doesn't work sorry, same error.
+
+No worries - I didn't spot that those memory regions were implemented as single-byte registers which means the access size won't matter anyway.
+
+I had a quick look at your command line again and the only other obvious thing I spotted was that a 64-bit access to the q35 "blackhole" region might also be affected by this change in logic. Does the diff below help at all?
+
+
+diff --git a/hw/pci-host/q35.c b/hw/pci-host/q35.c
+index b67cb9c29f..e703979488 100644
+--- a/hw/pci-host/q35.c
++++ b/hw/pci-host/q35.c
+@@ -281,8 +281,6 @@ static const MemoryRegionOps blackhole_ops = {
+     .read = blackhole_read,
+     .write = blackhole_write,
+     .endianness = DEVICE_NATIVE_ENDIAN,
+-    .valid.min_access_size = 1,
+-    .valid.max_access_size = 4,
+     .impl.min_access_size = 4,
+     .impl.max_access_size = 4,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+
+
+ATB,
+
+Mark.
+
+
+No that doesn't make any difference either, nor does combining the two patches :-(
+
+In that case please disregard those patches. Can you try this diff below which will log any invalid accesses and see if anything appears on stderr?
+
+
+diff --git a/memory.c b/memory.c
+index 9200b20130..5d1a6d4477 100644
+--- a/memory.c
++++ b/memory.c
+@@ -1354,10 +1354,12 @@ bool memory_region_access_valid(MemoryRegion *mr,
+ {
+     if (mr->ops->valid.accepts
+         && !mr->ops->valid.accepts(mr->opaque, addr, size, is_write, attrs)) {
++        fprintf(stderr, "invalid accepts: %s  addr %"PRIx64 " size: %d\n", mr->name, addr, size);
+         return false;
+     }
+ 
+     if (!mr->ops->valid.unaligned && (addr & (size - 1))) {
++        fprintf(stderr, "invalid aligned: %s  addr %"PRIx64 " size: %d\n", mr->name, addr, size);
+         return false;
+     }
+ 
+@@ -1368,6 +1370,7 @@ bool memory_region_access_valid(MemoryRegion *mr,
+ 
+     if (size > mr->ops->valid.max_access_size
+         || size < mr->ops->valid.min_access_size) {
++        fprintf(stderr, "invalid size: %s  addr %"PRIx64 " size: %d\n", mr->name, addr, size);
+         return false;
+     }
+     return true;
+
+
+
+ATB,
+
+Mark.
+
+
+i get this over and over (and only this):
+
+invalid size: acpi-tmr addr 0 size: 2
+
+which seems to reside in hw/acpi/core.c
+
+on a hunch, i applied this, and now macos boots (as 2 from acpi-tmr fits in the 1-4 range):
+
+diff --git a/hw/acpi/core.c b/hw/acpi/core.c
+index f6d9ec4f13..05ff29b9d7 100644
+--- a/hw/acpi/core.c
++++ b/hw/acpi/core.c
+@@ -527,7 +527,7 @@ static void acpi_pm_tmr_write(void *opaque, hwaddr addr, uint64_t val,
+ static const MemoryRegionOps acpi_pm_tmr_ops = {
+     .read = acpi_pm_tmr_read,
+     .write = acpi_pm_tmr_write,
+-    .valid.min_access_size = 4,
++    .valid.min_access_size = 1,
+     .valid.max_access_size = 4,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+
+
+all i get on stderr with my patch is:
+
+invalid accepts: (null)  addr fe03601c size: 4
+
+
+Great work Simon! I'm not an ACPI expert but that certainly seems a plausible solution - I'll have to defer the final review to someone else though.
+
+The quickest way to get this reviewed is to follow the procedure at https://wiki.qemu.org/Contribute/SubmitAPatch which is basically send a "git format-patch" email to the qemu-devel mailing list. Adding as CC the appropriate maintainers shown by running "./scripts/get_maintainer.pl /path/to/my.patch" as indicated in Section 2.1 "CC the relevant maintainer" will help ensure it gets the attention of the right people.
+
+
+ATB,
+
+Mark.
+
+
+urgh, that was complicated, think i got it right!
+
+need to look for "[PATCH] Allow acpi-tmr size=2" to show up in qemu-devel
+
+I think we should add debugging patch by Mark to qemu too, — I suspect there will be more cases like this, since this check were turned off for a few years.  Maybe not as printf's but as logging, I dunno, but the info it collects is really a must-have.
+
+Hi Simon,
+
+Just in case you're not getting emails to the git@ email address on the patch, there has been more follow up and discussion on the qemu-devel@ list:
+
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg04006.html
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg04621.html
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg04637.html
+
+
+ATB,
+
+Mark.
+
+
+Hi Mark,
+
+Yes I am getting the emails from qemu-devel thanks (seems pretty slow though - the website is faster) I replied to a couple but its over my head mostly now!
+
+I didn't notice Michael had done a v2 patch for 5.1, that's fine with me.
+
+I wonder if we can get the debian 5.0 package updated with a patch, or if we have to wait for 5.1 to be packaged with the fix already included from upstream?
+
+Patch has been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=dba04c3488c4699f5
+

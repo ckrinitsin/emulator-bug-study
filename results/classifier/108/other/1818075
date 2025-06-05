@@ -1,0 +1,135 @@
+graphic: 0.906
+debug: 0.898
+other: 0.877
+permissions: 0.866
+performance: 0.860
+device: 0.848
+KVM: 0.820
+files: 0.816
+vnc: 0.809
+network: 0.800
+semantic: 0.791
+PID: 0.787
+socket: 0.778
+boot: 0.655
+
+qemu x86 TCG doesn't support AVX insns
+
+I'm trying to execute code that has been built with -march=skylake -mtune=generic -mavx2 under qemu-user x86-64 with -cpu Skylake-Client. However this code just hangs at 100% CPU.
+
+Adding input tracing shows that it is likely hanging when dealing with an AVX instruction:
+
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.fma [bit 12]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.pcid [bit 17]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.x2apic [bit 21]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.tsc-deadline [bit 24]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.avx [bit 28]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.f16c [bit 29]
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.rdrand [bit 30]
+warning: TCG doesn't support requested feature: CPUID.07H:EBX.hle [bit 4]
+warning: TCG doesn't support requested feature: CPUID.07H:EBX.avx2 [bit 5]
+warning: TCG doesn't support requested feature: CPUID.07H:EBX.invpcid [bit 10]
+warning: TCG doesn't support requested feature: CPUID.07H:EBX.rtm [bit 11]
+warning: TCG doesn't support requested feature: CPUID.07H:EBX.rdseed [bit 18]
+warning: TCG doesn't support requested feature: CPUID.80000001H:ECX.3dnowprefetch [bit 8]
+warning: TCG doesn't support requested feature: CPUID.0DH:EAX.xsavec [bit 1]
+
+IN:
+0x4000b4ef3b:  c5 fb 5c ca              vsubsd   %xmm2, %xmm0, %xmm1
+0x4000b4ef3f:  c4 e1 fb 2c d1           vcvttsd2si %xmm1, %rdx
+0x4000b4ef44:  4c 31 e2                 xorq     %r12, %rdx
+0x4000b4ef47:  48 85 d2                 testq    %rdx, %rdx
+0x4000b4ef4a:  79 9e                    jns      0x4000b4eeea
+
+[ hangs ]
+
+Attaching a gdb produces this stacktrace:
+
+(gdb) bt
+#0  canonicalize (status=0x55a20ff67a88, parm=0x55a20bb807e0 <float64_params>, part=...)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/fpu/softfloat.c:350
+#1  float64_unpack_canonical (s=0x55a20ff67a88, f=0)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/fpu/softfloat.c:547
+#2  float64_sub (a=0, b=4890909195324358656, status=0x55a20ff67a88)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/fpu/softfloat.c:776
+#3  0x000055a20baa1949 in helper_subsd (env=<optimized out>, d=0x55a20ff67ad8, s=<optimized out>)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/target/i386/ops_sse.h:623
+#4  0x000055a20cfcfea8 in static_code_gen_buffer ()
+#5  0x000055a20ba3f764 in cpu_tb_exec (itb=<optimized out>, cpu=0x55a20cea2180 <static_code_gen_buffer+15684720>)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/accel/tcg/cpu-exec.c:171
+#6  cpu_loop_exec_tb (tb_exit=<synthetic pointer>, last_tb=<synthetic pointer>, tb=<optimized out>,
+    cpu=0x55a20cea2180 <static_code_gen_buffer+15684720>)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/accel/tcg/cpu-exec.c:615
+#7  cpu_exec (cpu=cpu@entry=0x55a20ff5f4d0)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/accel/tcg/cpu-exec.c:725
+#8  0x000055a20ba6d728 in cpu_loop (env=0x55a20ff67780)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/linux-user/x86_64/../i386/cpu_loop.c:93
+#9  0x000055a20ba049ff in main (argc=<optimized out>, argv=0x7ffc58572868, envp=<optimized out>)
+    at /data/poky-tmp/master/work/x86_64-linux/qemu-native/3.1.0-r0/qemu-3.1.0/linux-user/main.c:819
+
+<pm215>	my guess is we're doing something unhelpful with the AVX insn, and so the guest code which is checking the result and using it as its loop condition for the jns is just looping forever
+
+<rburton> in_asm log just stopped with this as the last line
+<rburton> 0x4000b4ef4a:  79 9e                    jns      0x4000b4eeea
+
+
+Further debugging on IRC reveals that QEMU itself is not hanging, but the guest code is looping infinitely, because QEMU doesn't implement the AVX instruction set and isn't generating an undefined-instruction exception either. So the %rdx output from the AVX insn is wrong and the guest code never exits the loop (whose condition depends on %rdx).
+
+We should ideally:
+ * make the x86 decoder properly handle insns that don't exist for the CPU being emulated (not too difficult, but doesn't actually help in running this test program)
+ * implement AVX (a fair chunk of effort; it is being proposed as a GSoC project for this summer)
+
+
+If I may be so free:
+
+It seems that QEMU has stopped emphasizing the EMU part of the name, and is too much focused on virtualization.
+
+My interest is at running legacy operating systems, and as such, they must run on foreign CPU platforms. m68 on intel, intel on ARM, etc.
+Time doesn't stand still, and reliance on KVM and similar x86-on-x86 tricks, which allow the delegation of certain CPU features to the host CPU is going to not work going forward.
+
+If the rumored transition of Apple to ARM is going to take place, people will want to e.g. emulate for testing or legacy purposes a variety of operating systems, incl. earlier versions of MacOS.
+
+Testing that scenario, i.e. macOS on an ARM board with the lowest possible CPU capable of running modern macOS, results in these problems (and of course utter failure achieving the goal):
+
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.01H:ECX.fma [bit 12]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.01H:ECX.avx [bit 28]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.07H:EBX.avx2 [bit 5]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.80000007H:EDX.invtsc [bit 8]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID.0DH:EAX.xsavec [bit 1]
+
+And this is emulating a lowly Penryn CPU with the required CPU flags for macOS:
+-cpu Penryn,vendor=GenuineIntel,+sse3,+sse4.2,+aes,+xsave,+avx,+xsaveopt,+xsavec,+xgetbv1,+avx2,+bmi2,+smep,+bmi1,+fma,+movbe,+invtsc
+
+Attempting to emulate a more feature laden intel CPU results in even more issues.
+
+I would propose that no CPU should be considered supported unless it can be fully handled by TCG on a non-native host. KVM, native-on-native etc. are nice to have, but peripheral to qEMUlation when it boils down to it.
+
+We do care about emulation; but as always with open source software projects, the parts that get more care and attention are the parts that people are either paid to work on or are personally interested in. x86 guest emulation in particular is not very well maintained (though it is better than some targets), because mostly people are happy to use x86 hardware, and adding support for emulation of large new architectural features like AVX is a lot of work. If you would like to help improve x86 guest emulation, you are welcome to submit patches to fix bugs or add new features. Merely saying "X should be better and you should somehow magically find three months worth of developer time to make it so" doesn't really do anything to move the situation forwards.
+
+
+QEMU, like most open source projects, relies on contributors who have motivation, skills and available time to work on implementing particular features. They naturally tend to focus on features that result in the greatest benefit to their own use cases. Thus simply declaring that an open source project, must support something won't magically make it happen.
+
+IOW, the lack of coverage of newer x86 instructions is largely a reflection of the relative priorities of the current pool of contributors and where/what they feel are the best places/features to spend their time on.
+
+If any person does want to work on improving x86 TCG though, the project would happily receive patches, and existing contributors can offer guidance & advice along the way to help get to a successful outcome.
+
+
+Of course it’s open source, I get that. When I say „xyz should be done“ then in the sense of „2+2 should be 4“ not in the sense of „you must implement xyz right now“ ;)
+
+Nonetheless, if you run e.g. on an ARM platform the command 
+
+qemu-system-x86_64 -cpu help
+
+then it shouldn’t list a slew of CPUs as „available“ that clearly aren’t working.
+
+It should then list fully implemented CPUs separately from partially implemented CPUs (if listing them at all), and if it does list incomplete implementations, it should indicate what’s missing.
+It’s just a horrible user experience, if based on such output, one spends significant time trying to get some emulation running, only to then discover from runtime error messages, that an „available“ CPU isn’t actually available.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/164
+
+

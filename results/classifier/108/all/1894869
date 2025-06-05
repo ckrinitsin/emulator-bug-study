@@ -1,0 +1,162 @@
+other: 0.989
+network: 0.988
+semantic: 0.987
+debug: 0.983
+files: 0.983
+device: 0.981
+socket: 0.980
+graphic: 0.980
+permissions: 0.978
+vnc: 0.977
+performance: 0.969
+PID: 0.967
+KVM: 0.963
+boot: 0.954
+
+Chelsio T4 has old MSIX PBA offset bug
+
+There exists a bug with Chelsio NICs T4 that causes the following error:
+
+kvm: -device vfio-pci,host=0000:83:00.7,id=hostpci1.7,bus=pci.0,addr=0x11.7: vfio 0000:83:00.7: hardware reports invalid configuration, MSIX PBA outside of specified BAR
+
+I was working with a downstream Proxmox developer to try to fix this issue, and they provided me with the following change to make from line 1484 of hw/vfio/pci.c:
+
+static void vfio_msix_early_setup(VFIOPCIDevice *vdev, Error **errp)
+          * is 0x1000, so we hard code that here.
+          */
+         if (vdev->vendor_id == PCI_VENDOR_ID_CHELSIO &&
+-            (vdev->device_id & 0xff00) == 0x5800) {
++            ((vdev->device_id & 0xff00) == 0x5800 ||
++             (vdev->device_id & 0xff00) == 0x1425)) {
+             msix->pba_offset = 0x1000;
+         } else if (vdev->msix_relo == OFF_AUTOPCIBAR_OFF) {
+             error_setg(errp, "hardware reports invalid configuration, "
+
+However, I found that this did not fix the issue, so the bug appears to work differently than the one that was present on the T5 NICs which has already been patched. I have attached the output of my lspci -nnkvv
+
+
+
+There are no BAR resources for this device:
+
+83:00.7 Ethernet controller [0200]: Chelsio Communications Inc Device [1425:0000]
+	Subsystem: Chelsio Communications Inc Device [1425:0000]
+	Physical Slot: 818
+	Control: I/O- Mem- BusMaster- SpecCycle- MemWINV- VGASnoop- ParErr+ Stepping- SERR+ FastB2B- DisINTx-
+	Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+	NUMA node: 1
+
+Note the lack of any regions here.
+
+	Capabilities: [40] Power Management version 3
+		Flags: PMEClk- DSI+ D1- D2- AuxCurrent=0mA PME(D0-,D1-,D2-,D3hot-,D3cold-)
+		Status: D3 NoSoftRst- PME-Enable- DSel=0 DScale=0 PME-
+	Capabilities: [48] MSI: Enable- Count=1/32 Maskable+ 64bit+
+		Address: 0000000000000000  Data: 0000
+		Masking: 00000000  Pending: 00000000
+	Capabilities: [60] MSI-X: Enable- Count=32 Masked-
+		Vector table: BAR=4 offset=00000000
+		PBA: BAR=4 offset=00001000
+
+There is no BAR4 for either the vector table or the PBA, the device is broken.  Maybe check dmesg for resource allocation errors.  Note that a device ID of 0000 is also reported for this device.  Does this device provide any useful function in the host outside of vfio?
+
+PS, this can never be true:
+
++ (vdev->device_id & 0xff00) == 0x1425))
+
+The lower byte would always be 00.  It's the wrong fix anyway, BAR4 is still missing.
+
+There exists a bug with Chelsio NICs that causes the following error:
+
+kvm: -device vfio-pci,host=0000:83:00.7,id=hostpci1.7,bus=pci.0,addr=0x11.7: vfio 0000:83:00.7: hardware reports invalid configuration, MSIX PBA outside of specified BAR
+
+This bug was fixed in later versions of Qemu, and is caused by vendor misconfigurations of their MSIX PBA. I know a catchall fix was implemented in recent versions of Qemu, as well as patches applied to hotfix it in earlier versions. I encountered this bug using a Chelsio T4 device, and I believe the patches are for T5 and newer.
+
+Here is an email chain that has a patch for this situation:
+https://patchwork.ozlabs.org/project<email address hidden>/
+
+I'd appreciate it if anyone could tell me what the best course of action to fix it on my system would be. I assume the solution is to either build Qemu with this patch applied, or update the version of Qemu in my Proxmox installation, but I do not know which is the better route to go.
+
+The patch you mention is already included in our QEMU builds, but as you correctly said it's only implemented for T5 devices.
+
+You'd have to go about patching your QEMU yourself if you want this to work, or message the upstream QEMU maintainers to include a fix (or even better: provide them with the fix :) ).
+
+In any case, a full 'lspci -nnkvv' output for your device (and any virtual functions thereof) would help.
+
+I've attached a QEMU patch for you to try, it has "0xNNNN" instead of the actual device ID of your T4, so change that before applying the patch. No liability of this working at all, here be dragons and if it breaks everything you're on your own, but I believe it's simple enough to work, provided the hardware quirk is the same on T4 as on T5.
+
+You can find our QEMU downstream at https://git.proxmox.com/?p=pve-qemu.git;a=summary, if you put it in debian/patches/pve and mention the file in debian/patches/series you should be able to build a pve-qemu against it. Check out our developer documentation (https://pve.proxmox.com/wiki/Developer_Documentation) as well.
+
+Created attachment 614
+experimental T4 patch, change 0xNNNN to device id
+
+Created attachment 615
+Full output of lspci -nnkvv
+
+Created attachment 616
+Output of lspci -nnkvv with Chelsio devices only
+
+Thank you so much for your reply! I have attached the lspci you requested. I think the most recent version of qemu actually has a fix for all devices that give this error, as there were reports of some HBA cards also causing it. I would like to try applying your patch, however for several days now my builds of pve-qemu have been getting stopped by a missing dependency called libproxmox-backup-qemu0-dev. I have seen other people on the forums mention that it exists in the repository, but every time I git clone pve-qemu.git and attempt to build I get the same error. I thought it would be taken care of by mk-build-deps, but even that gets stopped by the same missing dependency. Apt install isn't able to find it either. Would you be able to tell me where I can find this dependency?
+
+You need to configure our PBS repository to get the library:
+
+# echo "deb http://download.proxmox.com/debian/pbs buster pbstest" >> /etc/apt/sources.list.d/pbs.list
+# apt update
+# apt install libproxmox-backup-qemu0-dev
+
+> I think the most recent version of qemu actually has a fix for all devices that give this error, as there were reports of some HBA cards also causing it.
+
+Hm, not sure about that, the patch I added is against our 5.1 build from the repo. That said, 5.1 is newer than what's currently rolled out, so you can also try just building the repo version without any patches and see if that fixes it. That would be nice, since 5.1 will be rolled out soon-ish anyway :)
+
+I managed to get the package installed. Apparently my sources.list was set to jessie instead of buster. Fixing this allowed me to download that package, however make still fails, but with new errors. Progress! I'll attach the errors, but I understand if helping me fix this is outside of what you're willing to help me with.
+As a side note, the machine that I am configuring this on is not deployed, does not have a deadline for deployment, and has no data stored on it at all. As such, I'm willing to make just about any changes to it that you think might help, or that you may want to test.
+
+Created attachment 618
+New errors
+
+Hm, it appears your linker isn't finding the library. Try installing the 'libproxmox-backup-qemu0' package as well, that should have been a dependency of the -dev package though... Make sure /usr/lib/libproxmox_backup_qemu.so.0 exists. If you use "make deb" it also might be necessary to run the build as root.
+
+I ran into problems building it with the patch applied. I know how to correct those errors, but I decided to check if I could build without the patches and found that the build fails for other reasons, too. I have attached the new errors. I have attached the new output.
+
+Just so that I understand it correctly, does the value that PCI_VENDOR_ID_CHELSIO stores equal 1425? Since I have two of the same Chelsio NIC installed, would that mean that I have to insert both 8100 and 8300 as my device IDs for my two cards in the patch, and have it evaluate whether they are equal to the value at vdev->device_id for the if statement the same way you did? Or should I just be bale to do it with a single device ID?
+
+Created attachment 620
+New errors given by make after installing libproxmox-backup-qemu0
+
+There's no relevant error in the output you posted? You should have two files 'pve-qemu-kvm_5.1.0-1_amd64.deb' and 'pve-qemu-kvm-dbg_5.1.0-1_amd64.deb' in the repository root now, which you can install with 'apt install ./*.deb' or similar. If not, you might need a 'make clean' before the 'make deb'.
+
+> Just so that I understand it correctly, does the value that
+> PCI_VENDOR_ID_CHELSIO stores equal 1425? Since I have two of the same
+> Chelsio NIC installed, would that mean that I have to insert both 8100 and
+> 8300 as my device IDs for my two cards in the patch, and have it evaluate
+> whether they are equal to the value at vdev->device_id for the if statement
+> the same way you did? Or should I just be bale to do it with a single device
+> ID?
+
+# rg "PCI_VENDOR_ID_CHELSIO"
+  include/hw/pci/pci_ids.h
+  219:#define PCI_VENDOR_ID_CHELSIO            0x1425
+
+Yes.
+
+And also yes, if you need two different device IDs you need to add more clauses to the 'or', e.g.:
+
+    ((vdev->device_id & 0xff00) == 0x5800 ||
+    (vdev->device_id & 0xff00) == 0x8100) ||
+    (vdev->device_id & 0xff00) == 0x8300)) {
+
+Yes, you were right, I thought the warnings being set to evaluate as errors would stop the build, but I completely missed where it said it built the .deb packages. I got it built and installed this time, but I still get the same error when I attempt to boot a vm with the Chelsio cards. I have started a bug report with the upstream qemu devs.
+
+Yeah, I figured out that the logic behind that patch was failed and corrected it to get the same error again already. Just to clarify, it is two of the same card giving the same error. I ran dmesg --level=err, but got no output. In the full output of dmesg, though, I noticed that there are some problems with the nics, but I don't know enough about this to know if there's anything I can do about it. I included dmesg output here. I don't believe the nics are giving the host any functionality since I added the driver for them to the blacklist, so it shouldn't even be getting loaded by it. In case it's useful, I'm not sure if SR-IOV is enabled on these cards or not, though I'm trying to use PCI passthrough for my VMs.
+
+I don't understand the purpose of function 7 on these cards, the class code indicates an Ethernet device, but without any BARs, I very much doubt that the functions provide any useful service.  Config space is invalid for the function as QEMU identifies, the referenced BAR resource for the MSI-X vector table and PBA is invalid.  Without proving that the function provides an actual netdev interface in the host, I don't see any value to adding a quirk to work around the invalid MSI-X capability.  The solution is to simply not assign this function to a VM.
+
+SR-IOV is not enable on these cards.  Perhaps enabling SR-IOV would provide the additional NICs you're trying to assign.
+
+I was able to boot a VM with just the functions of the device with the ethernet controller function ID added as PCI devices. Something I noticed while adding in those devices though is that all of the others have a description associated with them in Proxmox, but the one that's causing the boot to fail doesn't. I attached a picture of the menu, 81:00.7 has no functions associated with it. So it seems like it just doesn't have any function at all? Unless it benefits QEMU to know whether turning SR-IOV on for these cards fixes the problem, I don't think I'm going to go through the process of turning  it on, since the process looks terrible. Thank you for your help.
+
+The device ID on function 7 is 0x0000 which is typically not valid, there's no entry for it in the PCI IDs database.  Someone from Chelsio would need to explain why it's even exposed, but there doesn't seem to be any value in quirking it since it provides no useful function.
+
+https://bugs.launchpad.net/qemu/+bug/1894869
+
+Here's the discussion with the upstream devs. The problem ended up being on Chelsio's part as either the .7 funciton fo these cards should not have even been exposed to the OS in the first place, or SR-IOV is necessary to actually correct the parameters of this function. Unfortunately, it looks like SR-IOV is no longer possible to enable on these cards. Thank you for your help.
+

@@ -1,0 +1,749 @@
+other: 0.664
+graphic: 0.601
+performance: 0.498
+boot: 0.497
+device: 0.488
+semantic: 0.481
+network: 0.475
+KVM: 0.469
+vnc: 0.463
+debug: 0.457
+files: 0.423
+permissions: 0.420
+socket: 0.380
+PID: 0.367
+
+Assertion failed with USB pass through with XHCI controller
+
+Starting qemu 2.8.0 with XHCI controller and host device passed through results in an assertion failure:
+
+qemu-system-x86_64: hw/usb/core.c:623: usb_packet_cleanup: Assertion `!usb_packet_is_inflight(p)' failed.
+
+Can be reproduced with the following command (passing through a Lenovo keyboard):
+
+qemu-system-x86_64 -usb  -device nec-usb-xhci,id=usb -device usb-host,vendorid=0x04b3,productid=0x3025,id=hostdev0,bus=usb.0,port=1
+
+If nec-usb-xhci is changed to usb-ehci, qemu tries to boot without assertion failures. 
+
+
+Can be reproduced with the latest master (commit dbe2b65) and v2.8.0.
+
+Bisected the issue to following commit:
+first bad commit: [94b037f2a451b3dc855f9f2c346e5049a361bd55] xhci: use linked list for transfers
+
+
+Backtrace from commit dbe2b65:
+
+#0  0x00007f2eb4657227 in __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:55
+        resultvar = 0
+        pid = 3453
+        selftid = 3453
+#1  0x00007f2eb465867a in __GI_abort () at abort.c:89
+        save_stage = 2
+        act = {__sigaction_handler = {sa_handler = 0x4, sa_sigaction = 0x4}, sa_mask = {__val = {140734740550528, 93876690035339, 
+              140734740550624, 48833659808, 0, 0, 0, 21474836480, 140734740550792, 139838573009553, 140734740550560, 139838573043008, 
+              139838573024160, 93876666665872, 139838702616576, 139838573024160}}, sa_flags = 1528954938, 
+          sa_restorer = 0x55615b2202c0 <__PRETTY_FUNCTION__.38612>}
+        sigs = {__val = {32, 0 <repeats 15 times>}}
+#2  0x00007f2eb46502cd in __assert_fail_base (fmt=0x7f2eb47893a0 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", 
+    assertion=assertion@entry=0x55615b22003a "!usb_packet_is_inflight(p)", file=file@entry=0x55615b21fdf0 "hw/usb/core.c", line=line@entry=619, 
+    function=function@entry=0x55615b2202c0 <__PRETTY_FUNCTION__.38612> "usb_packet_cleanup") at assert.c:92
+        str = 0x55615cfdf510 ""
+        total = 4096
+#3  0x00007f2eb4650382 in __GI___assert_fail (assertion=0x55615b22003a "!usb_packet_is_inflight(p)", file=0x55615b21fdf0 "hw/usb/core.c", 
+    line=619, function=0x55615b2202c0 <__PRETTY_FUNCTION__.38612> "usb_packet_cleanup") at assert.c:101
+No locals.
+#4  0x000055615afc385e in usb_packet_cleanup ()
+No symbol table info available.
+#5  0x000055615afda555 in xhci_ep_free_xfer ()
+No symbol table info available.
+#6  0x000055615afdc156 in xhci_kick_epctx ()
+No symbol table info available.
+#7  0x000055615afda099 in xhci_ep_kick_timer ()
+No symbol table info available.
+#8  0x000055615b08ceee in timerlist_run_timers ()
+No symbol table info available.
+#9  0x000055615b08cf36 in qemu_clock_run_timers ()
+No symbol table info available.
+#10 0x000055615b08d2df in qemu_clock_run_all_timers ()
+No symbol table info available.
+#11 0x000055615b08be40 in main_loop_wait ()
+No symbol table info available.
+#12 0x000055615ae3870f in main_loop ()
+No symbol table info available.
+#13 0x000055615ae4027b in main ()
+
+This behaviour was introduced by commit:
+
+94b037f2a451b3dc855f9f2c346e5049a361bd55
+xhci: use linked list for transfers
+
+However, QEMU does not crash yet, but linux' xhci_hcd reports errors like "ERROR Transfer event TRB DMA...". The following commit
+
+5612564ea9cf5b9636438a1b58ae9a2ab6ca16ae
+xhci: drop XHCITransfer->xhci
+
+finally makes QEMU crash on the assertion check.
+
+I tried to dig into the code, but I'm not an expert in usb stuff so I don't understand it. usb_packet_is_inflight checks if USBPacket.state is USB_PACKET_QUEUED or USB_PACKET_ASYNC. I suppose that somewhere in the code changed by 94b037f2 finished usb transfers do not have the packet state changed.
+
+  Hi,
+
+> qemu-system-x86_64: hw/usb/core.c:623: usb_packet_cleanup: Assertion
+> `!usb_packet_is_inflight(p)' failed.
+
+We are trying to free a in-flight transfer.  Hmm.
+
+> Bisected the issue to following commit:
+> first bad commit: [94b037f2a451b3dc855f9f2c346e5049a361bd55] xhci: use linked list for transfers
+
+Ok.
+
+> #5  0x000055615afda555 in xhci_ep_free_xfer ()
+> No symbol table info available.
+> #6  0x000055615afdc156 in xhci_kick_epctx ()
+> No symbol table info available.
+
+Can you rebuild with debug into and try again?
+
+There are multiple xhci_ep_free_xfer() callsites in xhci_kick_epctx()
+and it would be useful to know which one is it.
+
+thanks,
+  Gerd
+
+
+Hi,
+
+using qemu commit f634151b02ce5c80605383894f1f63f2c12e0033
+configured with --python=/usr/bin/python2 --target-list=x86_64-softmmu --audio-drv-list="oss alsa sdl pa" --enable-debug
+running with -m 1024 -drive if=pflash,file=ovmf-arch.bin,format=raw -drive file=arch.raw,format=raw,if=virtio -device nec-usb-xhci,id=xhci -device usb-host,bus=xhci.0,vendorid=0x046d,productid=0x0a4d
+
+I get:
+(gdb) bt full
+#0  0x00007fffdccb304f in raise () at /usr/lib/libc.so.6
+#1  0x00007fffdccb447a in abort () at /usr/lib/libc.so.6
+#2  0x00007fffdccabea7 in __assert_fail_base () at /usr/lib/libc.so.6
+#3  0x00007fffdccabf52 in  () at /usr/lib/libc.so.6
+#4  0x0000555555a8ab6e in usb_packet_cleanup (p=0x7fff5c125c18) at hw/usb/core.c:619
+        __PRETTY_FUNCTION__ = "usb_packet_cleanup"
+#5  0x0000555555aa8d97 in xhci_ep_free_xfer (xfer=0x7fff5c125c10) at hw/usb/hcd-xhci.c:1465
+#6  0x0000555555aaa9a8 in xhci_kick_epctx (epctx=0x7fff5c0205d0, streamid=0) at hw/usb/hcd-xhci.c:2201
+        xfer = 0x7fff5c125c10
+        xhci = 0x7fff76538010
+        stctx = 0x7fffffffd960
+        xfer = 0x2ffffd920
+        ring = 0x5555562aeed0 <timers_state+16>
+        ep = 0x0
+        mfindex = 113160
+        length = 1434054766
+        i = 32767
+        __PRETTY_FUNCTION__ = "xhci_kick_epctx"
+#7  0x0000555555aa88d9 in xhci_ep_kick_timer (opaque=0x7fff5c0205d0) at hw/usb/hcd-xhci.c:1363
+        epctx = 0x7fff5c0205d0
+#8  0x0000555555b6217f in timerlist_run_timers (timer_list=0x5555567a25a0) at qemu-timer.c:540
+        ts = 0x7fff5cb8f210
+        current_time = 31951197002
+        progress = false
+        cb = 0x555555aa88b4 <xhci_ep_kick_timer>
+        opaque = 0x7fff5c0205d0
+#9  0x0000555555b621cb in qemu_clock_run_timers (type=QEMU_CLOCK_VIRTUAL) at qemu-timer.c:551
+#10 0x0000555555b62564 in qemu_clock_run_all_timers () at qemu-timer.c:665
+        progress = false
+        type = QEMU_CLOCK_VIRTUAL
+#11 0x0000555555b610be in main_loop_wait (nonblocking=0) at main-loop.c:516
+        ret = 0
+        timeout = 1000
+        timeout_ns = 289955
+#12 0x00005555558f0b97 in main_loop () at vl.c:1966
+        nonblocking = false
+        last_io = 0
+#13 0x00005555558f847c in main (argc=11, argv=0x7fffffffde18, envp=0x7fffffffde78) at vl.c:4685
+        i = 0
+        snapshot = 0
+        linux_boot = 0
+        initrd_filename = 0x0
+        kernel_filename = 0x0
+        kernel_cmdline = 0x555555c8ecb6 ""
+        boot_order = 0x555555c7c5b5 "cad"
+        boot_once = 0x0
+        ds = 0x555557777de0
+        cyls = 0
+        heads = 0
+        secs = 0
+        translation = 0
+        hda_opts = 0x0
+        opts = 0x0
+        machine_opts = 0x5555567a2480
+        icount_opts = 0x0
+        olist = 0x0
+        optind = 11
+        optarg = 0x7fffffffe296 "usb-host,bus=xhci.0,vendorid=0x046d,productid=0x0a4d"
+        loadvm = 0x0
+        machine_class = 0x55555676bef0
+        cpu_model = 0x0
+        vga_model = 0x555555c7cece "std"
+        qtest_chrdev = 0x0
+        qtest_log = 0x0
+        pid_file = 0x0
+        incoming = 0x0
+        defconfig = true
+        userconfig = true
+        nographic = false
+        display_type = DT_GTK
+        display_remote = 0
+        log_mask = 0x0
+        log_file = 0x0
+        trace_file = 0x0
+        maxram_size = 1073741824
+        ram_slots = 0
+        vmstate_dump_file = 0x0
+        main_loop_err = 0x0
+        err = 0x0
+        list_data_dirs = false
+        __func__ = "main"
+
+Hope this helps.
+
+I examined xhci_kick_epctx (frame 6) and looked into xfer and xfer->packet, maybe this helps:
+
+(gdb) bt
+#0  0x00007fffdccb304f in raise () at /usr/lib/libc.so.6
+#1  0x00007fffdccb447a in abort () at /usr/lib/libc.so.6
+#2  0x00007fffdccabea7 in __assert_fail_base () at /usr/lib/libc.so.6
+#3  0x00007fffdccabf52 in  () at /usr/lib/libc.so.6
+#4  0x0000555555a8ab6e in usb_packet_cleanup (p=0x7fff5c3bcd88) at hw/usb/core.c:619
+#5  0x0000555555aa8d97 in xhci_ep_free_xfer (xfer=0x7fff5c3bcd80) at hw/usb/hcd-xhci.c:1465
+#6  0x0000555555aaa9a8 in xhci_kick_epctx (epctx=0x7fff5c745290, streamid=0) at hw/usb/hcd-xhci.c:2201
+#7  0x0000555555aa88d9 in xhci_ep_kick_timer (opaque=0x7fff5c745290) at hw/usb/hcd-xhci.c:1363
+#8  0x0000555555b6217f in timerlist_run_timers (timer_list=0x5555567a25a0) at qemu-timer.c:540
+#9  0x0000555555b621cb in qemu_clock_run_timers (type=QEMU_CLOCK_VIRTUAL) at qemu-timer.c:551
+#10 0x0000555555b62564 in qemu_clock_run_all_timers () at qemu-timer.c:665
+#11 0x0000555555b610be in main_loop_wait (nonblocking=0) at main-loop.c:516
+#12 0x00005555558f0b97 in main_loop () at vl.c:1966
+#13 0x00005555558f847c in main (argc=11, argv=0x7fffffffde18, envp=0x7fffffffde78) at vl.c:4685
+(gdb) f 6
+#6  0x0000555555aaa9a8 in xhci_kick_epctx (epctx=0x7fff5c745290, streamid=0) at hw/usb/hcd-xhci.c:2201
+2201            xhci_ep_free_xfer(epctx->retry);
+(gdb) info local
+xfer = 0x7fff5c3bcd80
+xhci = 0x7fff76538010
+stctx = 0x7fffffffd960
+xfer = 0x2ffffd920
+ring = 0x5555562aeed0 <timers_state+16>
+ep = 0x0
+mfindex = 126425
+length = 1434054766
+i = 32767
+__PRETTY_FUNCTION__ = "xhci_kick_epctx"
+(gdb) print xfer
+$1 = (XHCITransfer *) 0x7fff5c3bcd80
+(gdb) print *xfer
+$2 = {epctx = 0x7fff5c745290, packet = {pid = 105, id = 1028964352, ep = 0x555558342660, stream = 0, iov = {iov = 0x7fff5c138960, niov = 1, nalloc = 1, size = 5}, parameter = 0, short_not_ok = false, int_req = true, status = -6, actual_length = 0, state = USB_PACKET_ASYNC, combined = 0x0, queue = {tqe_next = 0x0, tqe_prev = 0x555558342678}, combined_entry = {tqe_next = 0x0, tqe_prev = 0x0}}, sgl = {sg = 0x5555586401e0, nsg = 1, nalloc = 1, size = 5, dev = 0x7fff76538010, as = 0x7fff76538220}, running_async = true, running_retry = false, complete = false, int_req = true, iso_pkts = 0, streamid = 0, in_xfer = true, iso_xfer = false, timed_xfer = false, trb_count = 1, trbs = 0x7fff5c025690, status = CC_INVALID, pkts = 0, pktsize = 0, cur_pkt = 0, mfindex_kick = 126424, next = {tqe_next = 0x0, tqe_prev = 0x0}}
+(gdb) print xfer->packet
+$3 = {pid = 105, id = 1028964352, ep = 0x555558342660, stream = 0, iov = {iov = 0x7fff5c138960, niov = 1, nalloc = 1, size = 5}, parameter = 0, short_not_ok = false, int_req = true, status = -6, actual_length = 0, state = USB_PACKET_ASYNC, combined = 0x0, queue = {tqe_next = 0x0, tqe_prev = 0x555558342678}, combined_entry = {tqe_next = 0x0, tqe_prev = 0x0}}
+
+  Hi,
+
+> #6  0x0000555555aaa9a8 in xhci_kick_epctx (epctx=0x7fff5c0205d0, streamid=0) at hw/usb/hcd-xhci.c:2201
+
+Ok, suspected already it will be there.
+
+thanks,
+  Gerd
+
+
+On Mi, 2017-01-11 at 16:35 +0000, Fabian Lesniak wrote:
+> I examined xhci_kick_epctx (frame 6) and looked into xfer and
+> xfer->packet, maybe this helps:
+
+> (gdb) print *xfer
+> $2 = {epctx = 0x7fff5c745290, packet = {pid = 105, id = 1028964352, ep
+> = 0x555558342660, stream = 0, iov = {iov = 0x7fff5c138960, niov = 1,
+> nalloc = 1, size = 5}, parameter = 0, short_not_ok = false, int_req =
+> true, status = -6, actual_length = 0, state = USB_PACKET_ASYNC,
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^
+Yep, packed still being processed at that point.
+
+
+Most callsites check already, one was missed.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 4acf0c6..e961564 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2198,7 +2198,9 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             xhci_complete_packet(xfer);
+         }
+         assert(!xfer->running_retry);
+-        xhci_ep_free_xfer(epctx->retry);
++        if (xfer->complete) {
++            xhci_ep_free_xfer(epctx->retry);
++        }
+         epctx->retry = NULL;
+     }
+ 
+-- 
+1.8.3.1
+
+
+
+This patch fixes passing through a keyboard for me. I tried a Logitech K120 (046d:c31c).
+
+After that, I tried my real-world use case being a standard USB sound card (046d:0a4d). This does not crash the machine anymore, but linux reports:
+
+xhci_hcd 0000:00:03.0: ERROR Transfer event TRB DMA ptr not part of current TD ep_index 1 comp_code 1
+
+multiple times when trying to use the sound card. I get no sound and my media player freezes.
+
+Before commit 94b037f2a451b3dc855f9f2c346e5049a361bd55 this sound card worked without any errors.
+
+Make clear that this isn't guaranteed to actually complete the transfer,
+the usb packet can still be in flight after calling that function.
+
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index dd429dc..4e2807e 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -1897,7 +1897,7 @@ static int xhci_setup_packet(XHCITransfer *xfer)
+     return 0;
+ }
+ 
+-static int xhci_complete_packet(XHCITransfer *xfer)
++static int xhci_try_complete_packet(XHCITransfer *xfer)
+ {
+     if (xfer->packet.status == USB_RET_ASYNC) {
+         trace_usb_xhci_xfer_async(xfer);
+@@ -2002,7 +2002,7 @@ static int xhci_fire_ctl_transfer(XHCIState *xhci, XHCITransfer *xfer)
+ 
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+ 
+-    xhci_complete_packet(xfer);
++    xhci_try_complete_packet(xfer);
+     if (!xfer->running_async && !xfer->running_retry) {
+         xhci_kick_epctx(xfer->epctx, 0);
+     }
+@@ -2106,7 +2106,7 @@ static int xhci_submit(XHCIState *xhci, XHCITransfer *xfer, XHCIEPContext *epctx
+     }
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+ 
+-    xhci_complete_packet(xfer);
++    xhci_try_complete_packet(xfer);
+     if (!xfer->running_async && !xfer->running_retry) {
+         xhci_kick_epctx(xfer->epctx, xfer->streamid);
+     }
+@@ -2185,7 +2185,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             }
+             usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+             assert(xfer->packet.status != USB_RET_NAK);
+-            xhci_complete_packet(xfer);
++            xhci_try_complete_packet(xfer);
+         } else {
+             /* retry nak'ed transfer */
+             if (xhci_setup_packet(xfer) < 0) {
+@@ -2195,7 +2195,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             if (xfer->packet.status == USB_RET_NAK) {
+                 return;
+             }
+-            xhci_complete_packet(xfer);
++            xhci_try_complete_packet(xfer);
+         }
+         assert(!xfer->running_retry);
+         if (xfer->complete) {
+@@ -3492,7 +3492,7 @@ static void xhci_complete(USBPort *port, USBPacket *packet)
+         xhci_ep_nuke_one_xfer(xfer, 0);
+         return;
+     }
+-    xhci_complete_packet(xfer);
++    xhci_try_complete_packet(xfer);
+     xhci_kick_epctx(xfer->epctx, xfer->streamid);
+     if (xfer->complete) {
+         xhci_ep_free_xfer(xfer);
+-- 
+1.8.3.1
+
+
+
+  Hi,
+
+Commit 94b037f2a451b3dc855f9f2c346e5049a361bd55 caused some regressions,
+partly plain bugs in that commit, partly it seems to have uncovered
+other issues lurking in the xhci code.  This series fixes the isses
+which poped up so far.
+
+cheers,
+  Gerd
+
+Gerd Hoffmann (4):
+  xhci: only free completed transfers
+  xhci: rename xhci_complete_packet to xhci_try_complete_packet
+  xhci: don't kick in xhci_submit and xhci_fire_ctl_transfer
+  xhci: guard xhci_kick_epctx against recursive calls
+
+ hw/usb/hcd-xhci.c | 32 +++++++++++++++++---------------
+ 1 file changed, 17 insertions(+), 15 deletions(-)
+
+-- 
+1.8.3.1
+
+
+
+Track xhci_kick_epctx processing being active in a variable.  Check the
+variable before calling xhci_kick_epctx from xhci_kick_ep.  Add an
+assert to make sure we don't call recursively into xhci_kick_epctx.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 899a410..12cac89 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -390,6 +390,7 @@ struct XHCIEPContext {
+     dma_addr_t pctx;
+     unsigned int max_psize;
+     uint32_t state;
++    uint32_t kick_active;
+ 
+     /* streams */
+     unsigned int max_pstreams;
+@@ -2131,6 +2132,9 @@ static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
+         return;
+     }
+ 
++    if (!epctx->kick_active) {
++        return;
++    }
+     xhci_kick_epctx(epctx, streamid);
+ }
+ 
+@@ -2155,6 +2159,9 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+         return;
+     }
+ 
++    assert(!epctx->kick_active);
++    epctx->kick_active++;
++
+     if (epctx->retry) {
+         XHCITransfer *xfer = epctx->retry;
+ 
+@@ -2253,6 +2260,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             break;
+         }
+     }
++    epctx->kick_active--;
+ 
+     ep = xhci_epid_to_usbep(epctx);
+     if (ep) {
+-- 
+1.8.3.1
+
+
+
+xhci_submit and xhci_fire_ctl_transfer are is called from
+xhci_kick_epctx processing loop only, so there is no need to call
+xhci_kick_epctx make sure processing continues.  Also eecursive calls
+into xhci_kick_epctx can cause trouble.
+
+Drop the xhci_kick_epctx calls.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 4e2807e..899a410 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2001,11 +2001,7 @@ static int xhci_fire_ctl_transfer(XHCIState *xhci, XHCITransfer *xfer)
+     xfer->packet.parameter = trb_setup->parameter;
+ 
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+-
+     xhci_try_complete_packet(xfer);
+-    if (!xfer->running_async && !xfer->running_retry) {
+-        xhci_kick_epctx(xfer->epctx, 0);
+-    }
+     return 0;
+ }
+ 
+@@ -2105,11 +2101,7 @@ static int xhci_submit(XHCIState *xhci, XHCITransfer *xfer, XHCIEPContext *epctx
+         return -1;
+     }
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+-
+     xhci_try_complete_packet(xfer);
+-    if (!xfer->running_async && !xfer->running_retry) {
+-        xhci_kick_epctx(xfer->epctx, xfer->streamid);
+-    }
+     return 0;
+ }
+ 
+-- 
+1.8.3.1
+
+
+
+Most callsites check already, one was missed.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index e0b5169..dd429dc 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2198,7 +2198,9 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             xhci_complete_packet(xfer);
+         }
+         assert(!xfer->running_retry);
+-        xhci_ep_free_xfer(epctx->retry);
++        if (xfer->complete) {
++            xhci_ep_free_xfer(epctx->retry);
++        }
+         epctx->retry = NULL;
+     }
+ 
+-- 
+1.8.3.1
+
+
+
+Track xhci_kick_epctx processing being active in a variable.  Check the
+variable before calling xhci_kick_epctx from xhci_kick_ep.  Add an
+assert to make sure we don't call recursively into xhci_kick_epctx.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Message-id: <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 899a410..df75907 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -390,6 +390,7 @@ struct XHCIEPContext {
+     dma_addr_t pctx;
+     unsigned int max_psize;
+     uint32_t state;
++    uint32_t kick_active;
+ 
+     /* streams */
+     unsigned int max_pstreams;
+@@ -2131,6 +2132,9 @@ static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
+         return;
+     }
+ 
++    if (epctx->kick_active) {
++        return;
++    }
+     xhci_kick_epctx(epctx, streamid);
+ }
+ 
+@@ -2146,6 +2150,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+     int i;
+ 
+     trace_usb_xhci_ep_kick(epctx->slotid, epctx->epid, streamid);
++    assert(!epctx->kick_active);
+ 
+     /* If the device has been detached, but the guest has not noticed this
+        yet the 2 above checks will succeed, but we must NOT continue */
+@@ -2217,6 +2222,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+     }
+     assert(ring->dequeue != 0);
+ 
++    epctx->kick_active++;
+     while (1) {
+         length = xhci_ring_chain_length(xhci, ring);
+         if (length <= 0) {
+@@ -2253,6 +2259,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             break;
+         }
+     }
++    epctx->kick_active--;
+ 
+     ep = xhci_epid_to_usbep(epctx);
+     if (ep) {
+-- 
+1.8.3.1
+
+
+
+These patches solve my problems. All three devices I tested using xhci work correctly now.
+
+Most callsites check already, one was missed.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Message-id: <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index f810678..6a1d3dc 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2198,7 +2198,9 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             xhci_complete_packet(xfer);
+         }
+         assert(!xfer->running_retry);
+-        xhci_ep_free_xfer(epctx->retry);
++        if (xfer->complete) {
++            xhci_ep_free_xfer(epctx->retry);
++        }
+         epctx->retry = NULL;
+     }
+ 
+-- 
+1.8.3.1
+
+
+
+xhci_submit and xhci_fire_ctl_transfer are is called from
+xhci_kick_epctx processing loop only, so there is no need to call
+xhci_kick_epctx make sure processing continues.  Also eecursive calls
+into xhci_kick_epctx can cause trouble.
+
+Drop the xhci_kick_epctx calls.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Message-id: <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 8 --------
+ 1 file changed, 8 deletions(-)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index 7e863d3..f89d8da 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -2001,11 +2001,7 @@ static int xhci_fire_ctl_transfer(XHCIState *xhci, XHCITransfer *xfer)
+     xfer->packet.parameter = trb_setup->parameter;
+ 
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+-
+     xhci_try_complete_packet(xfer);
+-    if (!xfer->running_async && !xfer->running_retry) {
+-        xhci_kick_epctx(xfer->epctx, 0);
+-    }
+     return 0;
+ }
+ 
+@@ -2105,11 +2101,7 @@ static int xhci_submit(XHCIState *xhci, XHCITransfer *xfer, XHCIEPContext *epctx
+         return -1;
+     }
+     usb_handle_packet(xfer->packet.ep->dev, &xfer->packet);
+-
+     xhci_try_complete_packet(xfer);
+-    if (!xfer->running_async && !xfer->running_retry) {
+-        xhci_kick_epctx(xfer->epctx, xfer->streamid);
+-    }
+     return 0;
+ }
+ 
+-- 
+1.8.3.1
+
+
+
+Track xhci_kick_epctx processing being active in a variable.  Check the
+variable before calling xhci_kick_epctx from xhci_kick_ep.  Add an
+assert to make sure we don't call recursively into xhci_kick_epctx.
+
+Cc: <email address hidden>
+Fixes: 94b037f2a451b3dc855f9f2c346e5049a361bd55
+Reported-by: Fabian Lesniak <email address hidden>
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Message-id: <email address hidden>
+Message-id: <email address hidden>
+---
+ hw/usb/hcd-xhci.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/hw/usb/hcd-xhci.c b/hw/usb/hcd-xhci.c
+index f89d8da..1878dad 100644
+--- a/hw/usb/hcd-xhci.c
++++ b/hw/usb/hcd-xhci.c
+@@ -390,6 +390,7 @@ struct XHCIEPContext {
+     dma_addr_t pctx;
+     unsigned int max_psize;
+     uint32_t state;
++    uint32_t kick_active;
+ 
+     /* streams */
+     unsigned int max_pstreams;
+@@ -2131,6 +2132,9 @@ static void xhci_kick_ep(XHCIState *xhci, unsigned int slotid,
+         return;
+     }
+ 
++    if (epctx->kick_active) {
++        return;
++    }
+     xhci_kick_epctx(epctx, streamid);
+ }
+ 
+@@ -2146,6 +2150,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+     int i;
+ 
+     trace_usb_xhci_ep_kick(epctx->slotid, epctx->epid, streamid);
++    assert(!epctx->kick_active);
+ 
+     /* If the device has been detached, but the guest has not noticed this
+        yet the 2 above checks will succeed, but we must NOT continue */
+@@ -2217,6 +2222,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+     }
+     assert(ring->dequeue != 0);
+ 
++    epctx->kick_active++;
+     while (1) {
+         length = xhci_ring_chain_length(xhci, ring);
+         if (length <= 0) {
+@@ -2253,6 +2259,7 @@ static void xhci_kick_epctx(XHCIEPContext *epctx, unsigned int streamid)
+             break;
+         }
+     }
++    epctx->kick_active--;
+ 
+     ep = xhci_epid_to_usbep(epctx);
+     if (ep) {
+-- 
+1.8.3.1
+
+
+

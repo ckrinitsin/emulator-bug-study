@@ -1,0 +1,543 @@
+graphic: 0.919
+semantic: 0.913
+performance: 0.912
+debug: 0.907
+device: 0.896
+socket: 0.890
+vnc: 0.884
+boot: 0.884
+permissions: 0.883
+other: 0.873
+network: 0.863
+KVM: 0.857
+PID: 0.856
+files: 0.763
+
+Intermittent QEMU segfaults on x86_64 with TCG accelerator
+Description of problem:
+Recently(-ish) in our upstream systemd CI we started seeing an uptrend of QEMU segfaults when running our integration tests. This was first observed in CentOS Stream 9 runs, but was later followed by Fedora Rawhide and Ubuntu Noble, once they picked up the QEMU 8.x branch. I filed a RHEL-only ticked first (before we started seeing it on other distros as well), so I'll share the same information here as well.
+
+This seems to happen only with TCG - in the CentOS CI infrastructure, where this was first observed, we run two jobs - one on a baremetal, that runs the test VMs with KVM, and one already on VMs that runs the same jobs using TCG; only the TCG job suffer from this issue. The same goes for the Fedora Rawhide and Ubuntu Noble jobs - they also use TCG.
+
+I managed to get a stack trace from one of the segmentation faults on CentOS Stream 9:
+```gdb
+[coredumpctl_collect] Collecting coredumps for '/usr/libexec/qemu-kvm'
+           PID: 1154719 (qemu-system-x86)
+           UID: 0 (root)
+           GID: 0 (root)
+        Signal: 11 (SEGV)
+     Timestamp: Thu 2024-02-01 21:50:04 UTC (1min 23s ago)
+  Command Line: /bin/qemu-system-x86_64 -smp 8 -net none -m 768M -nographic -kernel /boot/vmlinuz-5.14.0-412.el9.x86_64 -drive format=raw,cache=unsafe,file=/var/tmp/systemd-test-TEST-63-PATH_1/default.img -device virtio-rng-pci,max-bytes=1024,period=1000 -cpu max -initrd /var/tmp/ci-initramfs-5.14.0-412.el9.x86_64.img -append $'root=LABEL=systemd_boot rw raid=noautodetect rd.luks=0 loglevel=2 init=/usr/lib/systemd/systemd console=ttyS0 SYSTEMD_UNIT_PATH=/usr/lib/systemd/tests/testdata/testsuite-63.units:/usr/lib/systemd/tests/testdata/units: systemd.unit=testsuite.target systemd.wants=testsuite-63.service noresume oops=panic panic=1 softlockup_panic=1 systemd.wants=end.service enforcing=0 watchdog_thresh=60 workqueue.watchdog_thresh=120'
+    Executable: /usr/libexec/qemu-kvm
+ Control Group: /user.slice/user-0.slice/session-1.scope
+          Unit: session-1.scope
+         Slice: user-0.slice
+       Session: 1
+     Owner UID: 0 (root)
+       Boot ID: 011f8fd0783c464184955c281ce2c1b7
+    Machine ID: af8d424897a0479fa2fc0e5afcff3198
+      Hostname: n27-39-6.pool.ci.centos.org
+       Storage: /var/lib/systemd/coredump/core.qemu-system-x86.0.011f8fd0783c464184955c281ce2c1b7.1154719.1706824204000000.zst (present)
+  Size on Disk: 124.7M
+       Message: Process 1154719 (qemu-system-x86) of user 0 dumped core.
+                
+                Stack trace of thread 1154728:
+                #0  0x0000557669385a13 address_space_translate_for_iotlb (qemu-kvm + 0x73ba13)
+                #1  0x00005576693d149f tlb_set_page_full (qemu-kvm + 0x78749f)
+                #2  0x0000557669248a18 x86_cpu_tlb_fill (qemu-kvm + 0x5fea18)
+                #3  0x00005576693db519 mmu_lookup1 (qemu-kvm + 0x791519)
+                #4  0x00005576693db31b mmu_lookup.llvm.5973256065011438912 (qemu-kvm + 0x79131b)
+                #5  0x00005576693d3173 do_ld4_mmu.llvm.5973256065011438912 (qemu-kvm + 0x789173)
+                #6  0x00005576692d44cf do_interrupt_all (qemu-kvm + 0x68a4cf)
+                #7  0x000055766924f605 x86_cpu_exec_interrupt (qemu-kvm + 0x605605)
+                #8  0x00005576693bdc25 cpu_exec_loop (qemu-kvm + 0x773c25)
+                #9  0x00005576693bcee1 cpu_exec_setjmp (qemu-kvm + 0x772ee1)
+                #10 0x00005576693bcd64 cpu_exec (qemu-kvm + 0x772d64)
+                #11 0x00007fe0c5e4011c mttcg_cpu_thread_fn (accel-tcg-x86_64.so + 0x411c)
+                #12 0x0000557669662ada qemu_thread_start.llvm.13264588188580115644 (qemu-kvm + 0xa18ada)
+                #13 0x00007fe0c68a1912 start_thread (libc.so.6 + 0xa1912)
+                #14 0x00007fe0c683f450 __clone3 (libc.so.6 + 0x3f450)
+                
+                Stack trace of thread 1154721:
+                #0  0x00007fe0c69159e5 clock_nanosleep@GLIBC_2.2.5 (libc.so.6 + 0x1159e5)
+                #1  0x00007fe0c691a597 __nanosleep (libc.so.6 + 0x11a597)
+                #2  0x00007fe0c6b70c87 g_usleep (libglib-2.0.so.0 + 0x7ec87)
+                #3  0x0000557669670c18 call_rcu_thread (qemu-kvm + 0xa26c18)
+                #4  0x0000557669662ada qemu_thread_start.llvm.13264588188580115644 (qemu-kvm + 0xa18ada)
+                #5  0x00007fe0c68a1912 start_thread (libc.so.6 + 0xa1912)
+                #6  0x00007fe0c683f450 __clone3 (libc.so.6 + 0x3f450)
+                
+                Stack trace of thread 1154727:
+                #0  0x00007fe0c689e4aa __futex_abstimed_wait_common (libc.so.6 + 0x9e4aa)
+                #1  0x00007fe0c68a0cb0 pthread_cond_wait@@GLIBC_2.3.2 (libc.so.6 + 0xa0cb0)
+                #2  0x00005576696620c6 qemu_cond_wait_impl (qemu-kvm + 0xa180c6)
+                #3  0x000055766919425b qemu_wait_io_event (qemu-kvm + 0x54a25b)
+                #4  0x00007fe0c5e40180 mttcg_cpu_thread_fn (accel-tcg-x86_64.so + 0x4180)
+                #5  0x0000557669662ada qemu_thread_start.llvm.13264588188580115644 (qemu-kvm + 0xa18ada)
+                #6  0x00007fe0c68a1912 start_thread (libc.so.6 + 0xa1912)
+                #7  0x00007fe0c683f450 __clone3 (libc.so.6 + 0x3f450)
+                
+                Stack trace of thread 1154719:
+                #0  0x00007fe0c689e670 __GI___lll_lock_wait (libc.so.6 + 0x9e670)
+                #1  0x00007fe0c68a4d02 __pthread_mutex_lock@GLIBC_2.2.5 (libc.so.6 + 0xa4d02)
+                #2  0x0000557669661b76 qemu_mutex_lock_impl (qemu-kvm + 0xa17b76)
+                #3  0x000055766967c937 main_loop_wait (qemu-kvm + 0xa32937)
+                #4  0x00005576691a30c7 qemu_main_loop (qemu-kvm + 0x5590c7)
+                #5  0x0000557668fe3cca qemu_default_main (qemu-kvm + 0x399cca)
+                #6  0x00007fe0c683feb0 __libc_start_call_main (libc.so.6 + 0x3feb0)
+                #7  0x00007fe0c683ff60 __libc_start_main@@GLIBC_2.34 (libc.so.6 + 0x3ff60)
+                #8  0x0000557668fe33e5 _start (qemu-kvm + 0x3993e5)
+                
+                Stack trace of thread 1154725:
+                #0  0x00007fe0c689e670 __GI___lll_lock_wait (libc.so.6 + 0x9e670)
+                #1  0x00007fe0c68a4d02 __pthread_mutex_lock@GLIBC_2.2.5 (libc.so.6 + 0xa4d02)
+                #2  0x0000557669661b76 qemu_mutex_lock_impl (qemu-kvm + 0xa17b76)
+                #3  0x00005576693dc514 do_st_mmio_leN.llvm.5973256065011438912 (qemu-kvm + 0x792514)
+                #4  0x00005576693d3d22 do_st4_mmu.llvm.5973256065011438912 (qemu-kvm + 0x789d22)
+                #5  0x00007fe07cbfe35b n/a (n/a + 0x0)
+                ELF object binary architecture: AMD x86-64
+
+
+[coredumpctl_collect] Trying to run gdb with 'set print pretty on\nbt full' for '/usr/libexec/qemu-kvm'
+GNU gdb (GDB) Red Hat Enterprise Linux 10.2-13.el9
+Copyright (C) 2021 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+Type "show copying" and "show warranty" for details.
+This GDB was configured as "x86_64-redhat-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+    <http://www.gnu.org/software/gdb/documentation/>.
+
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+/root/.gdbinit:1: Error in sourced command file:
+No symbol table is loaded.  Use the "file" command.
+Reading symbols from /usr/libexec/qemu-kvm...
+Downloading separate debug info for /usr/libexec/qemu-kvm...
+Reading symbols from /root/.cache/debuginfod_client/6fdfad7763b68956a31a335edd490cef23088a9a/debuginfo...
+Downloading separate debug info for /root/.cache/debuginfod_client/6fdfad7763b68956a31a335edd490cef23088a9a/debuginfo...
+[New LWP 1154728]
+[New LWP 1154721]
+[New LWP 1154727]
+[New LWP 1154719]
+[New LWP 1154725]
+[New LWP 1154729]
+[New LWP 1154726]
+[New LWP 1154723]
+[New LWP 1154730]
+[New LWP 1154724]
+[New LWP 1154722]
+Downloading separate debug info for /lib64/libpixman-1.so.0...
+Downloading separate debug info for /lib64/libcapstone.so.4...
+Downloading separate debug info for /root/.cache/debuginfod_client/fabd9508a8df77430d74e376fc1853545deaa9a4/debuginfo...
+Downloading separate debug info for /lib64/libgnutls.so.30...
+Downloading separate debug info for /root/.cache/debuginfod_client/3ca805ea0a9583fc8272d443181745507c6c1391/debuginfo...
+Downloading separate debug info for /lib64/libpng16.so.16...
+Downloading separate debug info for /lib64/libz.so.1...
+Downloading separate debug info for /lib64/libsasl2.so.3...
+Downloading separate debug info for /root/.cache/debuginfod_client/d5669a4356bbdf6b9dba9d25fe4674098af42f8d/debuginfo...
+Downloading separate debug info for /lib64/libsnappy.so.1...
+Downloading separate debug info for /lib64/liblzo2.so.2...
+Downloading separate debug info for /lib64/libpmem.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/571e30ee251154a37d94e8c45def4e0b40fdaa92/debuginfo...
+Downloading separate debug info for /lib64/libseccomp.so.2...
+Downloading separate debug info for /lib64/libfdt.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/31a56e0009a8824c7a09267c8205034c91cb4095/debuginfo...
+Downloading separate debug info for /lib64/libnuma.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/e78797386b6fc540350223e432c3bfee6034d2e1/debuginfo...
+Downloading separate debug info for /lib64/libgio-2.0.so.0...
+Downloading separate debug info for /root/.cache/debuginfod_client/56c6122b97d5e4dd5fdf68756bdc02058ce02bbf/debuginfo...
+Downloading separate debug info for /lib64/libgobject-2.0.so.0...
+Downloading separate debug info for /lib64/libglib-2.0.so.0...
+Downloading separate debug info for /lib64/librdmacm.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/7714785fff3ebddc1077a3fad30fffa35283766f/debuginfo...
+Downloading separate debug info for /lib64/libibverbs.so.1...
+Downloading separate debug info for /lib64/libslirp.so.0...
+Downloading separate debug info for /lib64/liburing.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/8f52f15e8dff019c877c3c25083ef4a459429b99/debuginfo...
+Downloading separate debug info for /lib64/libgmodule-2.0.so.0...
+Downloading separate debug info for /lib64/libaio.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/9b75d21282f8e17ddfa06aff78dae4f8dcce4106/debuginfo...
+Downloading separate debug info for /lib64/libm.so.6...
+Downloading separate debug info for /lib64/libresolv.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/8a914905acea217452c928c2e200afceb83341c5/debuginfo...
+Downloading separate debug info for /lib64/libgcc_s.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/ef4c928f1372ad155fea761f0e840ecd264fb153/debuginfo...
+Downloading separate debug info for /lib64/libc.so.6...
+Downloading separate debug info for /lib64/libp11-kit.so.0...
+Downloading separate debug info for /root/.cache/debuginfod_client/b935d795aaf6f8cbc392c922b6c97a4c8db44c41/debuginfo...
+Downloading separate debug info for /lib64/libidn2.so.0...
+Downloading separate debug info for /root/.cache/debuginfod_client/958c50fc94ecb196b24f3619762e7ec3f28a5b40/debuginfo...
+Downloading separate debug info for /lib64/libunistring.so.2...
+Downloading separate debug info for /lib64/libtasn1.so.6...
+Downloading separate debug info for /lib64/libnettle.so.8...
+Downloading separate debug info for /root/.cache/debuginfod_client/0dd622456d9a5330679490d3bd9d812582d9f9d3/debuginfo...
+Downloading separate debug info for /lib64/libhogweed.so.6...
+Downloading separate debug info for /lib64/libcrypt.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/6ce4e5eb200e61d07398af52f8bcb316cf8466e0/debuginfo...
+Downloading separate debug info for /lib64/libgssapi_krb5.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/5ce5f00c8b502e99ab96853950db60f97a710b28/debuginfo...
+Downloading separate debug info for /lib64/libkrb5.so.3...
+Downloading separate debug info for /lib64/libk5crypto.so.3...
+Downloading separate debug info for /lib64/libcom_err.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/2313e22f074e5b67e97bb22e01a722cc727512b1/debuginfo...
+Downloading separate debug info for /lib64/libstdc++.so.6...
+Downloading separate debug info for /lib64/libndctl.so.6...
+Downloading separate debug info for /root/.cache/debuginfod_client/e2e24fd2c7061434b2a0cc849cdcd2854a4a0557/debuginfo...
+Downloading separate debug info for /lib64/libdaxctl.so.1...
+Downloading separate debug info for /lib64/libmount.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/98bababfe2b3d1d0ca128831439521f2b5b7aa95/debuginfo...
+Downloading separate debug info for /lib64/libselinux.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/bdc4adbb0901b548f448d6f0d92b49c352e3b9f6/debuginfo...
+Downloading separate debug info for /lib64/libffi.so.8...
+Downloading separate debug info for /lib64/libpcre.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/cffb947bcc416dca3cd249cdb0a1c6f614549c30/debuginfo...
+Downloading separate debug info for /lib64/libnl-3.so.200...
+Downloading separate debug info for /root/.cache/debuginfod_client/22262a5a1956360f9f4c1daa89e592b1be03cd14/debuginfo...
+Downloading separate debug info for /lib64/libnl-route-3.so.200...
+Downloading separate debug info for /lib64/libkrb5support.so.0...
+Downloading separate debug info for /lib64/libkeyutils.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/5f6459dcec3e266d994b8d4e5b23507c4c0df11e/debuginfo...
+Downloading separate debug info for /lib64/libcrypto.so.3...
+Downloading separate debug info for /root/.cache/debuginfod_client/fb8a738ffca8bdbe3172c842ee9d56f969516473/debuginfo...
+Downloading separate debug info for /lib64/libuuid.so.1...
+Downloading separate debug info for /lib64/libkmod.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/9057cef69769e25914be12563e5d821aef1bd9cb/debuginfo...
+Downloading separate debug info for /lib64/libblkid.so.1...
+Downloading separate debug info for /lib64/libpcre2-8.so.0...
+Downloading separate debug info for /root/.cache/debuginfod_client/10357f8fa75891b03cd08344d56efa49ad9d607f/debuginfo...
+Downloading separate debug info for /lib64/libcap.so.2...
+Downloading separate debug info for /root/.cache/debuginfod_client/94e5c930fa02b381df948b2d2909d96da9f31407/debuginfo...
+Downloading separate debug info for /lib64/libzstd.so.1...
+Downloading separate debug info for /root/.cache/debuginfod_client/f0c68ad1b3f8941857af47c6887736d835317ccc/debuginfo...
+Downloading separate debug info for /lib64/liblzma.so.5...
+Downloading separate debug info for /usr/libexec/../lib64/qemu-kvm/accel-tcg-x86_64.so...
+Downloading separate debug info for /root/systemd/system-supplied DSO at 0x7ffd4cb6b000...
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+Core was generated by `/bin/qemu-system-x86_64 -smp 8 -net none -m 768M -nographic -kernel /boot/vmlin'.
+Program terminated with signal SIGSEGV, Segmentation fault.
+#0  memory_region_get_iommu (mr=0x418c0fdb85f05d8b)
+    at /usr/src/debug/qemu-kvm-8.2.0-2.el9.x86_64/include/exec/memory.h:1715
+Downloading source file /usr/src/debug/qemu-kvm-8.2.0-2.el9.x86_64/include/exec/memory.h...
+1715	    if (mr->alias) {
+[Current thread is 1 (Thread 0x7fe033fff640 (LWP 1154728))]
+(gdb) (gdb) #0  memory_region_get_iommu (mr=0x418c0fdb85f05d8b)
+    at /usr/src/debug/qemu-kvm-8.2.0-2.el9.x86_64/include/exec/memory.h:1715
+        addr = 18446603473123421792
+        d = 0x7fe03c135150
+        section = 0x7fe03c621e70
+        imrc = <optimized out>
+        iommu_idx = <optimized out>
+        iotlb = {
+          target_as = <optimized out>,
+          iova = <optimized out>,
+          translated_addr = <optimized out>,
+          addr_mask = <optimized out>,
+          perm = <optimized out>
+        }
+#1  address_space_translate_for_iotlb
+    (cpu=0x55766c32c480, asidx=<optimized out>, orig_addr=472023040, xlat=0x7fe048df9ea0, plen=0x7fe048df9e98, attrs=..., prot=0x7fe048df9e94)
+    at ../system/physmem.c:688
+        addr = 18446603473123421792
+        d = 0x7fe03c135150
+        section = 0x7fe03c621e70
+        imrc = <optimized out>
+        iommu_idx = <optimized out>
+        iotlb = {
+          target_as = <optimized out>,
+          iova = <optimized out>,
+          translated_addr = <optimized out>,
+          addr_mask = <optimized out>,
+          perm = <optimized out>
+        }
+#2  0x00005576693d149f in tlb_set_page_full
+    (cpu=0x55766c32c480, mmu_idx=<optimized out>, addr=18446741874686296064, full=0x7fe048df9ed8) at ../accel/tcg/cputlb.c:1140
+        sz = 4096
+        addr_page = 18446741874686296064
+        paddr_page = 472023040
+        prot = 1
+        asidx = -536727968
+        xlat = 18599936
+        section = <optimized out>
+        read_flags = <optimized out>
+        is_romd = <optimized out>
+        addend = <optimized out>
+        write_flags = <optimized out>
+        iotlb = <optimized out>
+        wp_flags = <optimized out>
+        index = <optimized out>
+        te = <optimized out>
+        tn = {
+          {
+            addr_read = <optimized out>,
+            addr_write = <optimized out>,
+            addr_code = <optimized out>,
+            addend = <optimized out>
+          },
+          addr_idx = {<optimized out>, <optimized out>, <optimized out>, <optimized out>}
+        }
+#3  0x0000557669248a18 in tlb_set_page_with_attrs
+    (cpu=0x55766c32c480, addr=18446741874686296064, paddr=<optimized out>, attrs=..., prot=<optimized out>, mmu_idx=0, size=<optimized out>)
+    at ../accel/tcg/cputlb.c:1290
+        out = {
+          paddr = 472027056,
+          prot = 1,
+          page_size = 4096
+        }
+        err = {
+          exception_index = 472064000,
+          error_code = 0,
+          cr2 = 13915309287368685568,
+          stage2 = (unknown: 0x1c232b28)
+        }
+        env = <optimized out>
+#4  x86_cpu_tlb_fill
+    (cs=0x55766c32c480, addr=<optimized out>, size=<optimized out>, access_type=MMU_DATA_LOAD, mmu_idx=0, probe=<optimized out>, retaddr=0)
+    at ../target/i386/tcg/sysemu/excp_helper.c:610
+        out = {
+          paddr = 472027056,
+          prot = 1,
+          page_size = 4096
+        }
+        err = {
+          exception_index = 472064000,
+          error_code = 0,
+          cr2 = 13915309287368685568,
+          stage2 = (unknown: 0x1c232b28)
+        }
+        env = <optimized out>
+#5  0x00005576693db519 in tlb_fill
+    (addr=18446741874686300080, size=-2047844981, access_type=MMU_DATA_LOAD, mmu_idx=0, retaddr=0, cpu=<optimized out>) at ../accel/tcg/cputlb.c:1315
+        ok = <optimized out>
+        addr = 18446741874686300080
+        index = <optimized out>
+        entry = 0x7fe028017080
+        tlb_addr = <optimized out>
+        maybe_resized = false
+        full = <optimized out>
+        flags = <optimized out>
+#6  mmu_lookup1
+    (cpu=<optimized out>, data=0x7fe048df9f00, mmu_idx=0, access_type=MMU_DATA_LOAD, ra=0) at ../accel/tcg/cputlb.c:1713
+        addr = 18446741874686300080
+        index = <optimized out>
+        entry = 0x7fe028017080
+        tlb_addr = <optimized out>
+        maybe_resized = false
+        full = <optimized out>
+        flags = <optimized out>
+#7  0x00005576693db31b in mmu_lookup
+    (cpu=0x55766c32c480, addr=18446741874686300080, oi=<optimized out>, ra=0, type=MMU_DATA_LOAD, l=0x7fe048df9f00) at ../accel/tcg/cputlb.c:1803
+        a_bits = <optimized out>
+        flags = <optimized out>
+#8  0x00005576693d3173 in do_ld4_mmu
+    (cpu=0x7fe03c135150, addr=18446603473123421792, oi=2247122315, ra=140601056453952, access_type=MMU_DATA_LOAD) at ../accel/tcg/cputlb.c:2416
+        l = {
+          page = {{
+              full = 0x1c232000,
+              haddr = 0xc0700000000,
+              addr = 18446741874686300080,
+              flags = 88995840,
+              size = 4
+            }, {
+              full = 0x7fe033fff458,
+              haddr = 0xc11d1c12054df800,
+              addr = 18446741874686296064,
+              flags = 88995840,
+              size = 0
+            }},
+          memop = MO_32,
+          mmu_idx = 0
+        }
+        crosspage = <optimized out>
+        ret = <optimized out>
+#9  0x00005576692d44cf in cpu_ldl_mmu
+    (env=0x55766c32ec30, addr=18446741874686300080, oi=2247122315, ra=0)
+    at ../accel/tcg/ldst_common.c.inc:158
+        oi = 2247122315
+        has_error_code = <optimized out>
+        old_eip = 18446744072005078059
+        dt = 0x55766c32edc0
+        ptr = 18446741874686300080
+        e1 = <optimized out>
+        e2 = <optimized out>
+        e3 = <optimized out>
+        type = <optimized out>
+        dpl = <optimized out>
+        cpl = <optimized out>
+        selector = <optimized out>
+        offset = <optimized out>
+        ist = <optimized out>
+        new_stack = <optimized out>
+        esp = <optimized out>
+        ss = <optimized out>
+        count = 0
+        env = 0x55766c32ec30
+#10 cpu_ldl_le_mmuidx_ra
+    (env=0x55766c32ec30, addr=18446741874686300080, mmu_idx=<optimized out>, ra=0) at ../accel/tcg/ldst_common.c.inc:294
+        oi = 2247122315
+        has_error_code = <optimized out>
+        old_eip = 18446744072005078059
+        dt = 0x55766c32edc0
+        ptr = 18446741874686300080
+        e1 = <optimized out>
+        e2 = <optimized out>
+        e3 = <optimized out>
+        type = <optimized out>
+        dpl = <optimized out>
+        cpl = <optimized out>
+        selector = <optimized out>
+        offset = <optimized out>
+        ist = <optimized out>
+        new_stack = <optimized out>
+        esp = <optimized out>
+        ss = <optimized out>
+        count = 0
+        env = 0x55766c32ec30
+#11 do_interrupt64
+    (env=0x55766c32ec30, intno=251, is_int=0, error_code=0, next_eip=<optimized out>, is_hw=<optimized out>) at ../target/i386/tcg/seg_helper.c:889
+        has_error_code = <optimized out>
+        old_eip = 18446744072005078059
+        dt = 0x55766c32edc0
+        ptr = 18446741874686300080
+        e1 = <optimized out>
+        e2 = <optimized out>
+        e3 = <optimized out>
+        type = <optimized out>
+        dpl = <optimized out>
+        cpl = <optimized out>
+        selector = <optimized out>
+        offset = <optimized out>
+        ist = <optimized out>
+        new_stack = <optimized out>
+        esp = <optimized out>
+        ss = <optimized out>
+        count = 0
+        env = 0x55766c32ec30
+#12 do_interrupt_all
+    (cpu=0x55766c32c480, intno=251, is_int=0, error_code=0, next_eip=<optimized out>, is_hw=<optimized out>) at ../target/i386/tcg/seg_helper.c:1130
+        count = 0
+        env = 0x55766c32ec30
+#13 0x000055766924f605 in do_interrupt_x86_hardirq
+    (env=<optimized out>, intno=<optimized out>, is_hw=<optimized out>)
+    at ../target/i386/tcg/seg_helper.c:1162
+        cpu = 0x55766c32c480
+        env = <optimized out>
+        intno = <optimized out>
+#14 0x000055766924f605 in x86_cpu_exec_interrupt ()
+#15 0x00005576693bdc25 in cpu_handle_interrupt
+    (cpu=0x55766c32c480, last_tb=<optimized out>)
+    at ../accel/tcg/cpu-exec.c:865
+        cc = <optimized out>
+        interrupt_request = 2
+        last_tb = <optimized out>
+        tb_exit = <optimized out>
+        ret = <optimized out>
+#16 cpu_exec_loop (cpu=0x55766c32c480, sc=0x7fe048df9fb0)
+    at ../accel/tcg/cpu-exec.c:974
+        last_tb = <optimized out>
+        tb_exit = <optimized out>
+        ret = <optimized out>
+#17 0x00005576693bcee1 in cpu_exec_setjmp
+    (cpu=0x55766c32c480, sc=0x7fe048df9fb0) at ../accel/tcg/cpu-exec.c:1058
+#18 0x00005576693bcd64 in cpu_exec (cpu=0x55766c32c480)
+    at ../accel/tcg/cpu-exec.c:1084
+        sc = {
+          diff_clk = 0,
+          last_cpu_icount = 0,
+          realtime_clock = 0
+        }
+        ret = <optimized out>
+#19 0x00007fe0c5e4011c in tcg_cpus_exec (cpu=0x55766c32c480)
+    at ../accel/tcg/tcg-accel-ops.c:76
+        ret = <optimized out>
+        r = <optimized out>
+        force_rcu = {
+          notifier = {
+            notify = 0x7fe0c5e40250 <mttcg_force_rcu>,
+            node = {
+              le_next = 0x0,
+              le_prev = 0x7fe033fff478
+            }
+          },
+          cpu = 0x55766c32c480
+        }
+#20 mttcg_cpu_thread_fn (arg=0x55766c32c480)
+    at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+        r = <optimized out>
+        force_rcu = {
+          notifier = {
+            notify = 0x7fe0c5e40250 <mttcg_force_rcu>,
+            node = {
+              le_next = 0x0,
+              le_prev = 0x7fe033fff478
+            }
+          },
+          cpu = 0x55766c32c480
+        }
+#21 0x0000557669662ada in qemu_thread_start (args=0x55766c3a1870)
+    at ../util/qemu-thread-posix.c:541
+        __clframe = {
+          __cancel_routine = <optimized out>,
+          __cancel_arg = 0x0,
+          __do_it = 1,
+          __cancel_type = <synthetic pointer>
+        }
+        qemu_thread_args = 0x55766c3a1870
+        start_routine = 0x7fe0c5e40000 <mttcg_cpu_thread_fn>
+        arg = 0x55766c32c480
+        r = <optimized out>
+#22 0x00007fe0c68a1912 in start_thread (arg=<optimized out>)
+    at pthread_create.c:443
+        ret = <optimized out>
+        pd = <optimized out>
+        unwind_buf = {
+          cancel_jmp_buf = {{
+              jmp_buf = {140725889877392, 270352123062618637, 140600921814592, 0, 140603380340288, 0, -288199396121933299, -287677566653593075},
+              mask_was_saved = 0
+            }},
+          priv = {
+            pad = {0x0, 0x0, 0x0, 0x0},
+            data = {
+              prev = 0x0,
+              cleanup = 0x0,
+              canceltype = 0
+            }
+          }
+        }
+        not_first_call = <optimized out>
+#23 0x00007fe0c683f450 in clone3 ()
+    at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```
+
+Also, a couple runs failed with:
+```
++ /usr/libexec/qemu-kvm -smp 8 -net none -m 768M -nographic -kernel /boot/vmlinuz-5.14.0-427.el9.x86_64 -drive format=raw,cache=unsafe,file=/var/tmp/systemd-test.7FKAS9/basic.img -device virtio-rng-pci,max-bytes=1024,period=1000 -cpu Nehalem -initrd /var/tmp/ci-sanity-initramfs-5.14.0-390.el9.x86_64.img -append 'root=LABEL=systemd_boot rw raid=noautodetect rd.luks=0 loglevel=2 init=/usr/lib/systemd/systemd console=ttyS0 SYSTEMD_UNIT_PATH=/usr/lib/systemd/tests/testdata/testsuite-01.units:/usr/lib/systemd/tests/testdata/units: systemd.unit=testsuite.target systemd.wants=testsuite-01.service oops=panic panic=1 softlockup_panic=1 systemd.wants=end.service debug systemd.log_level=debug rd.systemd.log_target=console systemd.default_standard_output=journal+console systemd.unified_cgroup_hierarchy=1 systemd.legacy_systemd_cgroup_controller=0
+'
+Could not access KVM kernel module: No such file or directory
+qemu-kvm: failed to initialize kvm: No such file or directory
+qemu-kvm: falling back to tcg
+qemu-kvm: warning: Machine type 'pc-i440fx-rhel7.6.0' is deprecated: machine types for previous major releases are deprecated
+c[?7l[2J[0mSeaBIOS (version 1.16.3-2.el9)
+Booting from ROM...
+early console in setup codae
+Probing EDD (edd=off to disable)... oc[?7l[2J[0mk
+[    0.000000] Linux version 5.14.0-427.el9.x86_64 (mockbuild@x86-05.stream.rdu2.redhat.com) (gcc (GCC) 11.4.1 20231218 (Red Hat 11.4.1-3), GNU ld version 2.35.2-42.el9) #1 SMP PREEMPT_DYNAMIC Fri Feb 23 04:45:07 UTC 2024
+...
+[    2.152522] pci 0000:00:02.0: reg 0x30: [mem 0xfebe0000-0xfebeffff pref]
+[    2.153914] pci 0000:00:02.0: Video device with shadowed ROM at [mem 0x000c0000-0x000dffff]
+[    2.156615] pci 0000:00:03.0: [1af4:1005] type 00 class 0x00ff00
+[    2.159388] pci 0000:00:03.0: reg 0x10: [io  0xc000-0xc01f]
+qemu-kvm: ../system/memory.c:2424: void *memory_region_get_ram_ptr(MemoryRegion *): Assertion `mr->ram_block' failed.
+/bin/qemu-system-x86_64: line 4: 137172 Aborted                 (core dumped) "/usr/libexec/qemu-kvm" "$@"
+```
+
+I'm not sure if the two issues are related, or if the assertion is something completely different.
+Steps to reproduce:
+I, unfortunately, don't have any concrete steps to reproduce the issue, it happens randomly throughout CI runs. However, when needed, I can reproduce the issue in some reliable-ish manner by running the integration tests in a loop (the issue manifests itself usually in a couple of hours in this case).
+Additional information:
+

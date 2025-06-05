@@ -1,0 +1,59 @@
+performance: 0.956
+device: 0.922
+graphic: 0.910
+debug: 0.852
+boot: 0.829
+semantic: 0.793
+other: 0.771
+vnc: 0.756
+PID: 0.754
+permissions: 0.745
+files: 0.722
+socket: 0.674
+KVM: 0.629
+network: 0.509
+
+qemu-system-arm: unable to use LPAE
+Description of problem:
+Failed to run qemu: qemu-system-arm: Addressing limited to 32 bits,
+but memory exceeds it by 1073741824 bytes
+Steps to reproduce:
+1. ./configure --target-list=arm-softmmu
+2. make
+3.
+./qemu-system-arm \
+-machine virt,highmem=on \
+-cpu cortex-a15 -smp 4 \
+-m 4096 \
+-kernel ./zImage \
+-drive id=disk0,file=./rootfs.ext4,if=none,format=raw \
+-object rng-random,filename=/dev/urandom,id=rng0 \
+-device virtio-rng-pci,rng=rng0 \
+-device virtio-blk-device,drive=disk0 \
+-device virtio-gpu-pci \
+-serial mon:stdio -serial null \
+-nographic \
+-append 'root=/dev/vda rw mem=4096M ip=dhcp console=ttyAMA0 console=hvc0'
+Additional information:
+We set physical address bits to 40 if ARM_FEATURE_LPAE is enabled. But ARM_FEATURE_V7VE also implies ARM_FEATURE_LPAE as set later in arm_cpu_realizefn.
+
+We should add condition for ARM_FEATURE_V7VE, otherwise we would not be able to use highmem larger than 3GB even though we have enabled highmem, since we would fail and return right from machvirt_init. 
+
+I have already made a patch to fix this issue.
+https://gitlab.com/realhezhe/qemu/-/commit/4dad8167c1c1a7695af88d8929e8d7f6399177de
+`hw/arm/virt.c`
+```c
+        if (object_property_get_bool(cpuobj, "aarch64", NULL)) {
+            pa_bits = arm_pamax(armcpu);
+        } else if (arm_feature(&armcpu->env, ARM_FEATURE_LPAE)) {
+        } else if (arm_feature(&armcpu->env, ARM_FEATURE_LPAE)
+                || arm_feature(&armcpu->env, ARM_FEATURE_V7VE)) {
+            /* v7 with LPAE */
+            pa_bits = 40;
+        } else {
+```
+
+After applying the patch, I can make sure that the pa_bits has already been set to 40, but qemu hangs later. By bisecting I found if the following commit is reverted qemu can boot up successfully..
+39a1fd2528 ("target/arm: Fix handling of LPAE block descriptors")
+
+It can't be quickly determined what's going on here at my side. Maybe the author can help give some hints. Thanks.

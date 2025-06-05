@@ -1,0 +1,454 @@
+other: 0.960
+network: 0.953
+performance: 0.946
+graphic: 0.943
+debug: 0.940
+permissions: 0.936
+semantic: 0.931
+PID: 0.918
+vnc: 0.913
+socket: 0.910
+device: 0.897
+files: 0.866
+boot: 0.864
+KVM: 0.863
+
+Bad interaction between tb flushing & gdb stub
+
+I have been working on a series of patches for ARM big-endian system mode support, using QEMU as a bare-metal simulator for the GDB test suite. At some point I realised that these tests were not running reliably on the QEMU master branch, even without my patches applied. (I.e., in little-endian mode.)
+
+Running QEMU under GDB in the test harness via Valgrind, using something akin to:
+
+(gdb) target remote | valgrind --tool=memcheck qemu-arm-system [...]
+
+leads to intermittent (and quite hard-to-reproduce) segfaults in QEMU of the form:
+
+==52333== Process terminating with default action of signal 11 (SIGSEGV)
+==52333==  Access not within mapped region at address 0x24
+==52333==    at 0x1D55F2: tb_page_remove (translate-all.c:1026)
+==52333==    by 0x1D58B4: tb_phys_invalidate (translate-all.c:1119)
+==52333==    by 0x1D63AA: tb_invalidate_phys_page_range (translate-all.c:1519)
+==52333==    by 0x1D66D7: tb_invalidate_phys_addr (translate-all.c:1714)
+==52333==    by 0x1CBA7F: breakpoint_invalidate (exec.c:704)
+==52333==    by 0x1CC01F: cpu_breakpoint_remove_by_ref (exec.c:869)
+==52333==    by 0x1CBF97: cpu_breakpoint_remove (exec.c:857)
+==52333==    by 0x218FAA: gdb_breakpoint_remove (gdbstub.c:717)
+==52333==    by 0x219E35: gdb_handle_packet (gdbstub.c:1035)
+==52333==    by 0x21AF62: gdb_read_byte (gdbstub.c:1459)
+==52333==    by 0x21B096: gdb_chr_receive (gdbstub.c:1672)
+==52333==    by 0x3AF2BC: qemu_chr_be_write_impl (qemu-char.c:419)
+
+These crashes didn't happen on a 2.6-era QEMU, so I bisected and discovered the commit 3359baad36889b83df40b637ed993a4b816c4906 ("tcg: Make tb_flush() thread safe") appears to be the thing that triggers this intermittent failure. Reverting the patch on the branch tip makes the crashes go away.
+
+Unfortunately I don't currently have a way to trigger the segfaults outside of Mentor Graphics's test infrastructure, which I can't share.
+
+Does anyone know a reason that this might be happening, or suggestions of how I might further debug this? Maybe a missed tb flush in the gdb stub code, somewhere?
+
+Thanks!
+
+Julian
+
+(FAOD, the crashes happen without Valgrind too, and the above backtrace may be a red herring.)
+
+On 6 December 2016 at 11:39, Julian Brown <email address hidden> wrote:
+> Running QEMU under GDB in the test harness via Valgrind, using something
+> akin to:
+>
+> (gdb) target remote | valgrind --tool=memcheck qemu-arm-system [...]
+>
+> leads to intermittent (and quite hard-to-reproduce) segfaults in QEMU of
+> the form:
+>
+> ==52333== Process terminating with default action of signal 11 (SIGSEGV)
+> ==52333==  Access not within mapped region at address 0x24
+> ==52333==    at 0x1D55F2: tb_page_remove (translate-all.c:1026)
+> ==52333==    by 0x1D58B4: tb_phys_invalidate (translate-all.c:1119)
+> ==52333==    by 0x1D63AA: tb_invalidate_phys_page_range (translate-all.c:1519)
+> ==52333==    by 0x1D66D7: tb_invalidate_phys_addr (translate-all.c:1714)
+> ==52333==    by 0x1CBA7F: breakpoint_invalidate (exec.c:704)
+> ==52333==    by 0x1CC01F: cpu_breakpoint_remove_by_ref (exec.c:869)
+> ==52333==    by 0x1CBF97: cpu_breakpoint_remove (exec.c:857)
+> ==52333==    by 0x218FAA: gdb_breakpoint_remove (gdbstub.c:717)
+> ==52333==    by 0x219E35: gdb_handle_packet (gdbstub.c:1035)
+> ==52333==    by 0x21AF62: gdb_read_byte (gdbstub.c:1459)
+> ==52333==    by 0x21B096: gdb_chr_receive (gdbstub.c:1672)
+> ==52333==    by 0x3AF2BC: qemu_chr_be_write_impl (qemu-char.c:419)
+>
+> These crashes didn't happen on a 2.6-era QEMU, so I bisected and
+> discovered the commit 3359baad36889b83df40b637ed993a4b816c4906 ("tcg:
+> Make tb_flush() thread safe") appears to be the thing that triggers this
+> intermittent failure. Reverting the patch on the branch tip makes the
+> crashes go away.
+
+I saw something similar the other day as well, not involving valgrind,
+just a simple gdb connected to the gdbstub.
+
+thanks
+-- PMM
+
+
+On 6 December 2016 at 12:34, Peter Maydell <email address hidden> wrote:
+> I saw something similar the other day as well, not involving valgrind,
+> just a simple gdb connected to the gdbstub.
+
+http://people.linaro.org/~peter.maydell/gdbstub-bug.tgz
+is a repro case for this (with an aarch64 kernel guest).
+Segfaults every time when the guest hits the breakpoint.
+
+thanks
+-- PMM
+
+
+A bug (1647683) was reported showing a crash when removing
+breakpoints. The reproducer was bisected to 3359baad when tb_flush was
+finally made thread safe. While in MTTCG the locking in
+breakpoint_invalidate should have prevented any problems currently
+tb_lock() is a NOP for system emulation.
+
+On top of it all the invalidation code was special-cased between user
+and system emulation which was ugly. As we now have a safe tb_flush()
+we might as well use that when breakpoints and added and removed. This
+is the same thing we do for single-stepping and as this is during
+debugging it isn't a major performance concern.
+
+Reported-by: Julian Brown
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ exec.c | 31 ++++---------------------------
+ 1 file changed, 4 insertions(+), 27 deletions(-)
+
+diff --git a/exec.c b/exec.c
+index 3d867f1..e991221 100644
+--- a/exec.c
++++ b/exec.c
+@@ -685,29 +685,6 @@ void cpu_exec_realizefn(CPUState *cpu, Error **errp)
+ }
+ 
+ #if defined(CONFIG_USER_ONLY)
+-static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+-{
+-    mmap_lock();
+-    tb_lock();
+-    tb_invalidate_phys_page_range(pc, pc + 1, 0);
+-    tb_unlock();
+-    mmap_unlock();
+-}
+-#else
+-static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+-{
+-    MemTxAttrs attrs;
+-    hwaddr phys = cpu_get_phys_page_attrs_debug(cpu, pc, &attrs);
+-    int asidx = cpu_asidx_from_attrs(cpu, attrs);
+-    if (phys != -1) {
+-        /* Locks grabbed by tb_invalidate_phys_addr */
+-        tb_invalidate_phys_addr(cpu->cpu_ases[asidx].as,
+-                                phys | (pc & ~TARGET_PAGE_MASK));
+-    }
+-}
+-#endif
+-
+-#if defined(CONFIG_USER_ONLY)
+ void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
+ 
+ {
+@@ -839,7 +816,7 @@ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
+         QTAILQ_INSERT_TAIL(&cpu->breakpoints, bp, entry);
+     }
+ 
+-    breakpoint_invalidate(cpu, pc);
++    tb_flush(cpu);
+ 
+     if (breakpoint) {
+         *breakpoint = bp;
+@@ -855,6 +832,7 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+     QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+         if (bp->pc == pc && bp->flags == flags) {
+             cpu_breakpoint_remove_by_ref(cpu, bp);
++            tb_flush(cpu);
+             return 0;
+         }
+     }
+@@ -865,9 +843,6 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+ void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *breakpoint)
+ {
+     QTAILQ_REMOVE(&cpu->breakpoints, breakpoint, entry);
+-
+-    breakpoint_invalidate(cpu, breakpoint->pc);
+-
+     g_free(breakpoint);
+ }
+ 
+@@ -881,6 +856,8 @@ void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
+             cpu_breakpoint_remove_by_ref(cpu, bp);
+         }
+     }
++
++    tb_flush(cpu);
+ }
+ 
+ /* enable or disable single step mode. EXCP_DEBUG is returned by the
+-- 
+2.10.2
+
+
+
+
+Julian Brown <email address hidden> writes:
+
+> (FAOD, the crashes happen without Valgrind too, and the above backtrace
+> may be a red herring.)
+
+I've sent a patch that should fix this. Could you please test?
+
+--
+Alex Bennée
+
+
+On 6 December 2016 at 14:51, Alex Bennée <email address hidden> wrote:
+> A bug (1647683) was reported showing a crash when removing
+> breakpoints. The reproducer was bisected to 3359baad when tb_flush was
+> finally made thread safe. While in MTTCG the locking in
+> breakpoint_invalidate should have prevented any problems currently
+> tb_lock() is a NOP for system emulation.
+>
+> On top of it all the invalidation code was special-cased between user
+> and system emulation which was ugly. As we now have a safe tb_flush()
+> we might as well use that when breakpoints and added and removed. This
+> is the same thing we do for single-stepping and as this is during
+> debugging it isn't a major performance concern.
+>
+> Reported-by: Julian Brown
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+>  exec.c | 31 ++++---------------------------
+>  1 file changed, 4 insertions(+), 27 deletions(-)
+>
+> diff --git a/exec.c b/exec.c
+> index 3d867f1..e991221 100644
+> --- a/exec.c
+> +++ b/exec.c
+> @@ -685,29 +685,6 @@ void cpu_exec_realizefn(CPUState *cpu, Error **errp)
+>  }
+>
+>  #if defined(CONFIG_USER_ONLY)
+> -static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+> -{
+> -    mmap_lock();
+> -    tb_lock();
+> -    tb_invalidate_phys_page_range(pc, pc + 1, 0);
+> -    tb_unlock();
+> -    mmap_unlock();
+> -}
+> -#else
+> -static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+> -{
+> -    MemTxAttrs attrs;
+> -    hwaddr phys = cpu_get_phys_page_attrs_debug(cpu, pc, &attrs);
+> -    int asidx = cpu_asidx_from_attrs(cpu, attrs);
+> -    if (phys != -1) {
+> -        /* Locks grabbed by tb_invalidate_phys_addr */
+> -        tb_invalidate_phys_addr(cpu->cpu_ases[asidx].as,
+> -                                phys | (pc & ~TARGET_PAGE_MASK));
+> -    }
+> -}
+> -#endif
+> -
+> -#if defined(CONFIG_USER_ONLY)
+>  void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
+>
+>  {
+> @@ -839,7 +816,7 @@ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
+>          QTAILQ_INSERT_TAIL(&cpu->breakpoints, bp, entry);
+>      }
+>
+> -    breakpoint_invalidate(cpu, pc);
+> +    tb_flush(cpu);
+>
+>      if (breakpoint) {
+>          *breakpoint = bp;
+> @@ -855,6 +832,7 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+>      QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+>          if (bp->pc == pc && bp->flags == flags) {
+>              cpu_breakpoint_remove_by_ref(cpu, bp);
+> +            tb_flush(cpu);
+>              return 0;
+>          }
+>      }
+> @@ -865,9 +843,6 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+>  void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *breakpoint)
+>  {
+>      QTAILQ_REMOVE(&cpu->breakpoints, breakpoint, entry);
+> -
+> -    breakpoint_invalidate(cpu, breakpoint->pc);
+> -
+>      g_free(breakpoint);
+>  }
+>
+> @@ -881,6 +856,8 @@ void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
+>              cpu_breakpoint_remove_by_ref(cpu, bp);
+>          }
+>      }
+> +
+> +    tb_flush(cpu);
+>  }
+>
+>  /* enable or disable single step mode. EXCP_DEBUG is returned by the
+
+I think this is the wrong direction. We only need to invalidate
+the TBs for the specific location the breakpoint is at.
+Even if we for the moment want to apply a big hammer of doing
+a full tb flush on breakpoint to fix this issue for this release,
+we shouldn't drop the indirection through breakpoint_invalidate(),
+because then we can't go back to invalidating just the parts we need
+easily later.
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On 6 December 2016 at 14:51, Alex Bennée <email address hidden> wrote:
+>> A bug (1647683) was reported showing a crash when removing
+>> breakpoints. The reproducer was bisected to 3359baad when tb_flush was
+>> finally made thread safe. While in MTTCG the locking in
+>> breakpoint_invalidate should have prevented any problems currently
+>> tb_lock() is a NOP for system emulation.
+>>
+>> On top of it all the invalidation code was special-cased between user
+>> and system emulation which was ugly. As we now have a safe tb_flush()
+>> we might as well use that when breakpoints and added and removed. This
+>> is the same thing we do for single-stepping and as this is during
+>> debugging it isn't a major performance concern.
+>>
+>> Reported-by: Julian Brown
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> ---
+>>  exec.c | 31 ++++---------------------------
+>>  1 file changed, 4 insertions(+), 27 deletions(-)
+>>
+>> diff --git a/exec.c b/exec.c
+>> index 3d867f1..e991221 100644
+>> --- a/exec.c
+>> +++ b/exec.c
+>> @@ -685,29 +685,6 @@ void cpu_exec_realizefn(CPUState *cpu, Error **errp)
+>>  }
+>>
+>>  #if defined(CONFIG_USER_ONLY)
+>> -static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+>> -{
+>> -    mmap_lock();
+>> -    tb_lock();
+>> -    tb_invalidate_phys_page_range(pc, pc + 1, 0);
+>> -    tb_unlock();
+>> -    mmap_unlock();
+>> -}
+>> -#else
+>> -static void breakpoint_invalidate(CPUState *cpu, target_ulong pc)
+>> -{
+>> -    MemTxAttrs attrs;
+>> -    hwaddr phys = cpu_get_phys_page_attrs_debug(cpu, pc, &attrs);
+>> -    int asidx = cpu_asidx_from_attrs(cpu, attrs);
+>> -    if (phys != -1) {
+>> -        /* Locks grabbed by tb_invalidate_phys_addr */
+>> -        tb_invalidate_phys_addr(cpu->cpu_ases[asidx].as,
+>> -                                phys | (pc & ~TARGET_PAGE_MASK));
+>> -    }
+>> -}
+>> -#endif
+>> -
+>> -#if defined(CONFIG_USER_ONLY)
+>>  void cpu_watchpoint_remove_all(CPUState *cpu, int mask)
+>>
+>>  {
+>> @@ -839,7 +816,7 @@ int cpu_breakpoint_insert(CPUState *cpu, vaddr pc, int flags,
+>>          QTAILQ_INSERT_TAIL(&cpu->breakpoints, bp, entry);
+>>      }
+>>
+>> -    breakpoint_invalidate(cpu, pc);
+>> +    tb_flush(cpu);
+>>
+>>      if (breakpoint) {
+>>          *breakpoint = bp;
+>> @@ -855,6 +832,7 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+>>      QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
+>>          if (bp->pc == pc && bp->flags == flags) {
+>>              cpu_breakpoint_remove_by_ref(cpu, bp);
+>> +            tb_flush(cpu);
+>>              return 0;
+>>          }
+>>      }
+>> @@ -865,9 +843,6 @@ int cpu_breakpoint_remove(CPUState *cpu, vaddr pc, int flags)
+>>  void cpu_breakpoint_remove_by_ref(CPUState *cpu, CPUBreakpoint *breakpoint)
+>>  {
+>>      QTAILQ_REMOVE(&cpu->breakpoints, breakpoint, entry);
+>> -
+>> -    breakpoint_invalidate(cpu, breakpoint->pc);
+>> -
+>>      g_free(breakpoint);
+>>  }
+>>
+>> @@ -881,6 +856,8 @@ void cpu_breakpoint_remove_all(CPUState *cpu, int mask)
+>>              cpu_breakpoint_remove_by_ref(cpu, bp);
+>>          }
+>>      }
+>> +
+>> +    tb_flush(cpu);
+>>  }
+>>
+>>  /* enable or disable single step mode. EXCP_DEBUG is returned by the
+>
+> I think this is the wrong direction. We only need to invalidate
+> the TBs for the specific location the breakpoint is at.
+> Even if we for the moment want to apply a big hammer of doing
+> a full tb flush on breakpoint to fix this issue for this release,
+> we shouldn't drop the indirection through breakpoint_invalidate(),
+> because then we can't go back to invalidating just the parts we need
+> easily later.
+
+Why would we? It's not like fresh code generation is particularly slow,
+especially in a debugging situation when you've just stopped the
+machine.
+
+The self-modifying-code paths make more sense to be partial in their
+invalidations although I've never really measured quite how pathalogical
+running a JIT inside QEMU is.
+
+--
+Alex Bennée
+
+
+I'm testing the patch now, thank you! I'll report back on how it goes.
+
+The patch works for me! Thank you!
+
+On 6 December 2016 at 15:14, Alex Bennée <email address hidden> wrote:
+> Peter Maydell <email address hidden> writes:
+>> I think this is the wrong direction. We only need to invalidate
+>> the TBs for the specific location the breakpoint is at.
+>> Even if we for the moment want to apply a big hammer of doing
+>> a full tb flush on breakpoint to fix this issue for this release,
+>> we shouldn't drop the indirection through breakpoint_invalidate(),
+>> because then we can't go back to invalidating just the parts we need
+>> easily later.
+>
+> Why would we? It's not like fresh code generation is particularly slow,
+> especially in a debugging situation when you've just stopped the
+> machine.
+
+Because a wholescale tb_flush() is a "this is probably wrong"
+flag, and a great way to hide bugs. It also makes the gdbstub
+more invasive than it strictly has to be.
+
+We have less than 10 calls to tb_flush() in the whole system
+and I think they could all use examination to see whether
+they're really correct.
+
+thanks
+-- PMM
+
+
+Fix had been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=a9353fe897ca2687e5b338
+

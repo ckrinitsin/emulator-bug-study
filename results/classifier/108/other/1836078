@@ -1,0 +1,252 @@
+permissions: 0.900
+other: 0.860
+semantic: 0.835
+graphic: 0.815
+debug: 0.787
+device: 0.784
+performance: 0.783
+PID: 0.757
+socket: 0.712
+network: 0.678
+vnc: 0.672
+boot: 0.663
+files: 0.645
+KVM: 0.626
+
+Regressions on arm-linux-gnueabihf target with some GCC tests
+
+Hi,
+
+After trying qemu master:
+commit 474f3938d79ab36b9231c9ad3b5a9314c2aeacde
+Merge: 68d7ff0 14f5d87
+Author: Peter Maydell <email address hidden>
+Date: Fri Jun 21 15:40:50 2019 +0100
+
+even with the fix for https://bugs.launchpad.net/qemu/+bug/1834496,
+I've noticed several regressions compared to qemu-3.1 when running the GCC testsuite.
+I'm attaching a tarball containing several GCC tests (binaries), needed shared libs, and a short script to run all the tests.
+
+All tests used to pass w/o error, but with a recent qemu, all of them make qemu crash.
+
+This was noticed with GCC master configured with
+--target arm-none-linux-gnueabihf
+--with-cpu cortex-a57
+--with-fpu crypto-neon-fp-armv8
+
+Thanks
+
+
+
+I bisected the failure for all but the IEEE6 test to:
+
+commit 602f6e42cfbfe9278be34e9b91d2ceb695837e02
+Author: Peter Maydell <email address hidden>
+Date:   Thu Feb 28 10:55:16 2019 +0000
+
+    target/arm: Use MVFR1 feature bits to gate A32/T32 FP16 instructions
+
+    Instead of gating the A32/T32 FP16 conversion instructions on
+    the ARM_FEATURE_VFP_FP16 flag, switch to our new approach of
+    looking at ID register bits. In this case MVFR1 fields FPHP
+    and SIMDHP indicate the presence of these insns.
+
+    This change doesn't alter behaviour for any of our CPUs.
+
+    Signed-off-by: Peter Maydell <email address hidden>
+    Reviewed-by: Richard Henderson <email address hidden>
+    Message-id: <email address hidden>
+
+
+The IEEE6 test comes down to:
+
+commit a15945d98d3a3390c3da344d1b47218e91e49d8b
+Author: Peter Maydell <email address hidden>
+Date:   Tue Feb 5 16:52:42 2019 +0000
+
+    target/arm: Make FPSCR/FPCR trapped-exception bits RAZ/WI
+
+    The {IOE, DZE, OFE, UFE, IXE, IDE} bits in the FPSCR/FPCR are for
+    enabling trapped IEEE floating point exceptions (where IEEE exception
+    conditions cause a CPU exception rather than updating the FPSR status
+    bits). QEMU doesn't implement this (and nor does the hardware we're
+    modelling), but for implementations which don't implement trapped
+    exception handling these control bits are supposed to be RAZ/WI.
+    This allows guest code to test for whether the feature is present
+    by trying to write to the bit and checking whether it sticks.
+
+    QEMU is incorrectly making these bits read as written. Make them
+    RAZ/WI as the architecture requires.
+
+    In particular this was causing problems for the NetBSD automatic
+    test suite.
+
+    Reported-by: Martin Husemann <email address hidden>
+    Signed-off-by: Peter Maydell <email address hidden>
+    Reviewed-by: Richard Henderson <email address hidden>
+    Message-id: <email address hidden>
+
+
+
+In the ieee6 test case it is attempting to write OFE, bit [10] which:
+
+    This bit is RW only if the implementation supports the trapping of floating-point exceptions. In an implementation that does not support floating-point exception trapping, this bit is RAZ/WI.
+
+    When this bit is RW, it applies only to floating-point operations. Advanced SIMD operations always use untrapped floating-point exception handling in AArch32 state
+
+This might be a broken test.
+
+When we converted to using feature bits in 602f6e42cfbf we missed out
+the fact (dp && arm_dc_feature(s, ARM_FEATURE_V8)) was supported for
+-cpu max configurations. This caused a regression in the GCC test
+suite. Fix this by setting the appropriate FP16 bits in mvfr1.FPHP.
+
+Fixes: https://bugs.launchpad.net/qemu/+bug/1836078
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ target/arm/cpu.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index e75a64a25a..0a0a202fe3 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2452,6 +2452,10 @@ static void arm_max_initfn(Object *obj)
+             t = FIELD_DP32(t, ID_ISAR6, SPECRES, 1);
+             cpu->isar.id_isar6 = t;
+ 
++            t = cpu->isar.mvfr1;
++            t = FIELD_DP32(t, MVFR1, FPHP, 2);     /* v8.2 FP16 */
++            cpu->isar.mvfr1 = t;
++
+             t = cpu->isar.mvfr2;
+             t = FIELD_DP32(t, MVFR2, SIMDMISC, 3); /* SIMD MaxNum */
+             t = FIELD_DP32(t, MVFR2, FPMISC, 4);   /* FP MaxNum */
+-- 
+2.20.1
+
+
+
+
+Richard Henderson <email address hidden> writes:
+
+> On 7/10/19 7:24 PM, Alex Bennée wrote:
+>> When we converted to using feature bits in 602f6e42cfbf we missed out
+>> the fact (dp && arm_dc_feature(s, ARM_FEATURE_V8)) was supported for
+>> -cpu max configurations. This caused a regression in the GCC test
+>> suite. Fix this by setting the appropriate FP16 bits in mvfr1.FPHP.
+>>
+>> Fixes: https://bugs.launchpad.net/qemu/+bug/1836078
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> ---
+>>  target/arm/cpu.c | 4 ++++
+>>  1 file changed, 4 insertions(+)
+>>
+>> diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+>> index e75a64a25a..0a0a202fe3 100644
+>> --- a/target/arm/cpu.c
+>> +++ b/target/arm/cpu.c
+>> @@ -2452,6 +2452,10 @@ static void arm_max_initfn(Object *obj)
+>>              t = FIELD_DP32(t, ID_ISAR6, SPECRES, 1);
+>>              cpu->isar.id_isar6 = t;
+>>
+>> +            t = cpu->isar.mvfr1;
+>> +            t = FIELD_DP32(t, MVFR1, FPHP, 2);     /* v8.2 FP16 */
+>
+> The comment is wrong.  This is not full v8.2 FP16 support (which would be value
+> 3, plus a change to SIMDHP), but v8.0 support for double<->half
+> conversions.
+
+Good catch - will fix in v2.
+>
+> Otherwise,
+> Reviewed-by: Richard Henderson <email address hidden>
+>
+>
+> r~
+
+
+--
+Alex Bennée
+
+
+When we converted to using feature bits in 602f6e42cfbf we missed out
+the fact (dp && arm_dc_feature(s, ARM_FEATURE_V8)) was supported for
+-cpu max configurations. This caused a regression in the GCC test
+suite. Fix this by setting the appropriate bits in mvfr1.FPHP to
+report ARMv8-A with FP support (but not ARMv8.2-FP16).
+
+Fixes: https://bugs.launchpad.net/qemu/+bug/1836078
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Richard Henderson <email address hidden>
+---
+ target/arm/cpu.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index e75a64a25a..ad164a773b 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2452,6 +2452,10 @@ static void arm_max_initfn(Object *obj)
+             t = FIELD_DP32(t, ID_ISAR6, SPECRES, 1);
+             cpu->isar.id_isar6 = t;
+ 
++            t = cpu->isar.mvfr1;
++            t = FIELD_DP32(t, MVFR1, FPHP, 2);     /* v8.0 FP support */
++            cpu->isar.mvfr1 = t;
++
+             t = cpu->isar.mvfr2;
+             t = FIELD_DP32(t, MVFR2, SIMDMISC, 3); /* SIMD MaxNum */
+             t = FIELD_DP32(t, MVFR2, FPMISC, 4);   /* FP MaxNum */
+-- 
+2.20.1
+
+
+
+On Thu, 11 Jul 2019 at 11:37, Alex Bennée <email address hidden> wrote:
+>
+> When we converted to using feature bits in 602f6e42cfbf we missed out
+> the fact (dp && arm_dc_feature(s, ARM_FEATURE_V8)) was supported for
+> -cpu max configurations. This caused a regression in the GCC test
+> suite. Fix this by setting the appropriate bits in mvfr1.FPHP to
+> report ARMv8-A with FP support (but not ARMv8.2-FP16).
+>
+> Fixes: https://bugs.launchpad.net/qemu/+bug/1836078
+> Signed-off-by: Alex Bennée <email address hidden>
+> Reviewed-by: Richard Henderson <email address hidden>
+> ---
+>  target/arm/cpu.c | 4 ++++
+>  1 file changed, 4 insertions(+)
+>
+> diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+> index e75a64a25a..ad164a773b 100644
+> --- a/target/arm/cpu.c
+> +++ b/target/arm/cpu.c
+> @@ -2452,6 +2452,10 @@ static void arm_max_initfn(Object *obj)
+>              t = FIELD_DP32(t, ID_ISAR6, SPECRES, 1);
+>              cpu->isar.id_isar6 = t;
+>
+> +            t = cpu->isar.mvfr1;
+> +            t = FIELD_DP32(t, MVFR1, FPHP, 2);     /* v8.0 FP support */
+> +            cpu->isar.mvfr1 = t;
+> +
+>              t = cpu->isar.mvfr2;
+>              t = FIELD_DP32(t, MVFR2, SIMDMISC, 3); /* SIMD MaxNum */
+>              t = FIELD_DP32(t, MVFR2, FPMISC, 4);   /* FP MaxNum */
+> --
+> 2.20.1
+
+
+
+Applied to target-arm.next, thanks.
+
+-- PMM
+
+
+I confirm this patch fixes the problem I reported.
+Thanks!
+
+I think the ieee6 test is due to a broken runtime: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=78314
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=45b1a243b81a7c9ae562
+

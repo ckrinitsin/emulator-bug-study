@@ -1,0 +1,166 @@
+semantic: 0.912
+PID: 0.907
+graphic: 0.905
+permissions: 0.904
+debug: 0.902
+other: 0.876
+performance: 0.854
+device: 0.841
+network: 0.838
+files: 0.824
+KVM: 0.813
+vnc: 0.806
+boot: 0.801
+socket: 0.794
+
+linux-user/i386: Segfault when mixing threads and signals
+
+Given the following C program, qemu-i386 will surely and certainly segfault when executing it.
+The problem is only noticeable if the program is statically linked to musl's libc and, as written
+in the title, it only manifests when targeting i386.
+
+Removing the pthread calls or the second raise() makes it not segfault.
+
+The crash is in some part of the TCG-generated code, right when it tries to perform a
+%gs-relative access.
+
+If you want a quick way of cross-compiling this binary:
+
+* Download a copy of the Zig compiler from https://ziglang.org/download/
+* Compile it with
+  `zig cc -target i386-linux-musl <C-FILE> -o <OUT>`
+
+```
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+
+void sig_func(int sig)
+{
+    write(1, "hi!\n", strlen("hi!\n"));
+}
+
+void func(void *p) { }
+
+typedef void *(*F)(void *);
+
+int main()
+{
+    pthread_t tid;
+
+    struct sigaction action;
+    action.sa_flags = 0;
+    action.sa_handler = sig_func;
+
+    if (sigaction(SIGUSR1, &action, NULL) == -1) {
+        return 1;
+    }
+
+    // This works.
+    raise(SIGUSR1);
+
+    pthread_create(&tid, NULL, (F)func, NULL);
+    pthread_join(tid, NULL);
+
+    // This makes qemu segfault.
+    raise(SIGUSR1);
+}
+```
+
+
+
+I finally understand where the problem is.
+
+Qemu's user-mode emulation maps guest threads to native ones by spawning a new native one
+and running a forked copy of the CPUX86State in parallel with the main thread.
+
+This works fine for pretty much every architecture but i386 where the GDT/LDT comes into
+play: the two descriptor tables are shared among all the threads, mimicking the real hw
+behaviour, but since no host task-switching is being performed the TLS entry in the GDT
+become stale.
+
+Raising a signal makes Qemu reload the GS segment from the GDT, that's why removing that
+line makes the problem disappear.
+
+The problem is also confined to musl libc because of an interesting implementation choice.
+Once a thread dies Glibc adds the now unused stack to a queue in order to reuse it later,
+while musl frees it right away when it's not needed anymore and, as a consequence, makes
+Qemu segfault.
+
+As luck has it, after spending too much time debugging this, I found somebody else already
+stumbled across this problem and wrote a patch. 
+
+https://<email address hidden>/mbox
+
+Too bad the patch flew under the radar...
+
+Le 16/12/2020 à 09:59, The Lemon Man a écrit :
+> I finally understand where the problem is.
+> 
+> Qemu's user-mode emulation maps guest threads to native ones by spawning a new native one
+> and running a forked copy of the CPUX86State in parallel with the main thread.
+> 
+> This works fine for pretty much every architecture but i386 where the GDT/LDT comes into
+> play: the two descriptor tables are shared among all the threads, mimicking the real hw
+> behaviour, but since no host task-switching is being performed the TLS entry in the GDT
+> become stale.
+> 
+> Raising a signal makes Qemu reload the GS segment from the GDT, that's why removing that
+> line makes the problem disappear.
+> 
+> The problem is also confined to musl libc because of an interesting implementation choice.
+> Once a thread dies Glibc adds the now unused stack to a queue in order to reuse it later,
+> while musl frees it right away when it's not needed anymore and, as a consequence, makes
+> Qemu segfault.
+> 
+> As luck has it, after spending too much time debugging this, I found somebody else already
+> stumbled across this problem and wrote a patch. 
+> 
+> https://<email address hidden>/mbox
+> 
+> Too bad the patch flew under the radar...
+> 
+
+Could you add a Reviewed-by and/or a tested by to the patch on the ML?
+
+Thanks,
+Laurent
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

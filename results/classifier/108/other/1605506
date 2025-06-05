@@ -1,0 +1,174 @@
+other: 0.962
+vnc: 0.958
+KVM: 0.950
+debug: 0.942
+permissions: 0.935
+graphic: 0.923
+device: 0.921
+semantic: 0.917
+performance: 0.916
+PID: 0.912
+files: 0.908
+socket: 0.900
+network: 0.889
+boot: 0.884
+
+qemu driver_mirror error "Operation not permitted"
+
+I use libvirtd to call qemu drive_mirror return error message "Operation not permitted", But directly run qemu and call drive_mirror is OK;
+when drive_mirror target is logic device return error message "Operation not permitted",But the file is OK;
+
+Operating Environment：
+OS:ubuntu 14.04
+kernel:3.16.0-28-generic
+libvirt-bin version: 1.2.2-0ubuntu13.1.17
+qemu:2.5.0 or 2.6.0
+run vm user: root
+（retry in redhat7.2 have the same problem！）
+
+Here is my running process:
+libvirtd call
+prepare libvirt xml   libvirt.xml
+<?xml version="1.0"?><domain type="kvm">
+    <name>i-745F35DC</name>
+    <memory>65536</memory>
+    <vcpu>1</vcpu>
+    <cpu mode="host-model"><model fallback="allow"/><topology sockets="1" threads="1" cores="1"/></cpu>
+    <os><type>hvm</type><boot dev="cdrom"/><boot dev="hd"/></os>
+    <features><acpi/><apic/><pae/></features>
+    <on_poweroff>destroy</on_poweroff>
+    <on_reboot>restart</on_reboot>
+    <on_crash>destroy</on_crash>
+    <devices>
+        <emulator>/usr/local/qemu-2.5.0-20160720/bin/qemu-system-x86_64</emulator>
+        <graphics type="vnc" passwd="" autoport="yes" keymap="en-us" listen="0.0.0.0"/>
+        <disk type="file" device="disk">
+            <driver name="qemu" type="raw" cache="none"/>
+            <source file="/tmp/image.raw"/>
+            <target dev="hda" bus="ide"/>
+            <serial>bc-system</serial>
+        </disk>
+    </devices>
+    <clock offset="localtime"/>
+</domain>
+
+virsh create libvirt.xml
+root@test:/opt/run/instance/i-745F35DC# virsh list
+ Id    Name                           State
+----------------------------------------------------
+ 2     i-745F35DC                     running
+call drive_mirror:
+virsh qemu-monitor-command --hmp i-745F35DC 'drive_mirror -n -f drive-ide0-0-0 /dev/vg_bc_local/test raw'
+Could not open '/dev/vg_bc_local/test': Operation not permitted
+
+directly run qemu and call drive_mirror:
+/usr/local/qemu-2.5.0-20160720/bin/qemu-system-x86_64 -hda /tmp/image.raw -m 64 --enable-kvm -vnc :51 -monitor stdio
+QEMU 2.5.0 monitor - type 'help' for more information
+(qemu) info block
+ide0-hd0 (#block135): /tmp/image.raw (raw)
+    Cache mode:       writeback
+(qemu) drive_mirror -n -f ide0-hd0 /dev/vg_bc_local/test raw
+(qemu) info block-jobs
+Type mirror, device ide0-hd0: Completed 41126400 of 41126400 bytes, speed limit 0 bytes/s
+(qemu) block_job_cancel ide0-hd0
+(qemu) info block-jobs
+No active jobs
+
+It is OK!!!
+
+
+Here is my debugging process:
+Recompile qemu-2.5.0 to  enable debug
+../configure --prefix=/usr/local/qemu-2.5.0-20160720 --enable-trace-backend=simple --enable-werror --disable-xen --disable-virtfs --enable-kvm --enable-seccomp --enable-docs --enable-debug-tcg --enable-vnc-sasl --enable-linux-aio --enable-lzo --enable-snappy --enable-usb-redir --enable-vnc-png --disable-vnc-jpeg --enable-uuid --disable-vhost-scsi --enable-rbd --block-drv-rw-whitelist=qcow2,raw,file,host_device,blkdebug,nbd,iscsi,rbd,cdp --block-drv-ro-whitelist=vmdk,vhdx,vpc --target-list=x86_64-softmmu CFLAGS=-O0
+
+Use libvirtd to Re-run VM and debug by gdb
+VM process info:
+root      7804     1  0 10:45 ?        00:00:10 /usr/local/qemu-2.5.0-20160720/bin/qemu-system-x86_64 -name i-745F35DC -S -machine pc-i440fx-2.5,accel=kvm,usb=off -cpu Westmere,+invpcid,+erms,+bmi2,+smep,+avx2,+bmi1,+fsgsbase,+abm,+rdtscp,+pdpe1gb,+rdrand,+f16c,+avx,+osxsave,+xsave,+tsc-deadline,+movbe,+pcid,+pdcm,+xtpr,+fma,+tm2,+est,+vmx,+ds_cpl,+monitor,+dtes64,+pclmuldq,+pbe,+tm,+ht,+ss,+acpi,+ds,+vme -m 64 -realtime mlock=off -smp 1,sockets=1,cores=1,threads=1 -uuid ef55dfa6-b82e-488d-a7fc-4c882f8091ab -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/i-745F35DC.monitor,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=localtime -no-shutdown -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -drive file=/tmp/image.raw,if=none,id=drive-ide0-0-0,format=raw,serial=bc-system,cache=none -device ide-hd,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0,bootindex=2 -vnc 0.0.0.0:0,password -k en-us -device cirrus-vga,id=video0,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3
+
+gdb -p  7804
+set breakpoint
+(gdb) i b
+Num     Type           Disp Enb Address            What
+1       breakpoint     keep y   0x00007f51d9e92cb1 in qmp_drive_mirror at /opt/qemu/qemu-2.5.0/blockdev.c:3310
+2       breakpoint     keep y   0x00007f51da1252f2 in raw_open_common at /opt/qemu/qemu-2.5.0/block/raw-posix.c:457
+3       breakpoint     keep y   0x00007f51da12500f in raw_parse_flags at /opt/qemu/qemu-2.5.0/block/raw-posix.c:358
+(gdb)
+
+call drive_mirror and debug:
+
+(gdb)
+raw_open_common (bs=0x7f4b27259ab0, options=0x7f4b27480290, bdrv_flags=24674, open_flags=0, errp=0x7fff4a19f548)
+    at /opt/qemu/qemu-2.5.0/block/raw-posix.c:484
+484        s->fd = -1;
+(gdb) n
+485        fd = qemu_open(filename, s->open_flags, 0644);
+(gdb) s
+qemu_open (name=0x7f4b2642b5c0 "/dev/vg_bc_local/test", flags=2) at /opt/qemu/qemu-2.5.0/util/osdep.c:177
+177        int mode = 0;
+(gdb) n
+183        if (strstart(name, "/dev/fdset/", &fdset_id_str)) {
+(gdb)
+214        if (flags & O_CREAT) {
+(gdb)
+223    char arg[1000] = {0};
+(gdb)
+227        ret = open(name, flags , mode);
+(gdb) p name
+$1 = 0x7f4b2642b5c0 "/dev/vg_bc_local/test"
+(gdb) p flags
+$2 = 2
+(gdb) p mode
+$3 = 0
+(gdb) n
+(gdb) p ret
+$4 = -1
+
+get system erroron is :Operation not permitted  
+!!!!!!!!!!!!!!
+
+
+Re-run VM Directly  and debug by gdb
+/usr/local/qemu-2.5.0-20160720/bin/qemu-system-x86_64 -hda /tmp/image.raw -m 64 --enable-kvm -vnc :51 -monitor stdio
+(qemu) info block
+ide0-hd0 (#block135): /tmp/image.raw (raw)
+    Cache mode:       writeback
+(qemu) drive_mirror -n -f ide0-hd0 /dev/vg_bc_local/test raw
+
+gdb debug:
+(gdb) i b
+Num     Type           Disp Enb Address            What
+1       breakpoint     keep y   0x00007f51d9e92cb1 in qmp_drive_mirror at /opt/qemu/qemu-2.5.0/blockdev.c:3310
+2       breakpoint     keep y   0x00007f51da1252f2 in raw_open_common at /opt/qemu/qemu-2.5.0/block/raw-posix.c:457
+3       breakpoint     keep y   0x00007f51da12500f in raw_parse_flags at /opt/qemu/qemu-2.5.0/block/raw-posix.c:358
+(gdb)
+raw_open_common (bs=0x7f51dc15d350, options=0x7f51dc083110, bdrv_flags=24642, open_flags=0, errp=0x7fff5aaa9738)
+    at /opt/qemu/qemu-2.5.0/block/raw-posix.c:484
+484        s->fd = -1;
+(gdb) n
+485        fd = qemu_open(filename, s->open_flags, 0644);
+(gdb) s
+qemu_open (name=0x7f51dca09230 "/dev/vg_bc_local/test", flags=2) at /opt/qemu/qemu-2.5.0/util/osdep.c:177
+177        int mode = 0;
+(gdb) n
+183        if (strstart(name, "/dev/fdset/", &fdset_id_str)) {
+(gdb)
+214        if (flags & O_CREAT) {
+(gdb)
+223    char arg[1000] = {0};
+(gdb)
+227        ret = open(name, flags , mode);
+(gdb) p name
+$1 = 0x7f51dca09230 "/dev/vg_bc_local/test"
+(gdb) p flags
+$2 = 2
+(gdb) p mode
+$3 = 0
+(gdb) n
+(gdb) p ret
+$4 = 16
+(gdb)
+
+Do you have SELinux or AppArmor or something similar enabled?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,94 @@
+other: 0.859
+debug: 0.839
+permissions: 0.834
+device: 0.833
+performance: 0.807
+network: 0.805
+graphic: 0.803
+boot: 0.791
+PID: 0.782
+semantic: 0.775
+vnc: 0.767
+socket: 0.744
+KVM: 0.740
+files: 0.721
+
+QEMU Windows COM port setup dialog always invoked and fails if none is available (USB or virtual serial port hardware)
+Description of problem:
+The Windows backend serial port in `chardev/char-win.c` always calls `CommConfigDialog()`. This should display a COM port configuration dialog which does (and can) not persist the COM port settings. If the COM port does not support this action (see https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-commconfigdialoga) then the function fails.
+Steps to reproduce:
+1. Currently not possible with QEMU releases as QEMU does not recognize extended COM port specifications like `\\.\COM19` or `\\.\CNCA0`
+Additional information:
+See https://support.microsoft.com/en-gb/topic/howto-specify-serial-ports-larger-than-com9-db9078a5-b7b6-bf00-240f-f749ebfd913e for details on COM port filenames.
+
+I have a patch which 'fixes' this problem by setting the nominated COM port to defaults of `115200,8,N,0` which seems perfectly sensible in 2024. Please contact me for more details. A git diff shown below (with extensive error reporting)
+
+N.B. Markodown will destroy formatting!
+
+```
+diff --git a/chardev/char-win.c b/chardev/char-win.c
+index d4fb44c4dc..a05896ffe9 100644
+--- a/chardev/char-win.c
++++ b/chardev/char-win.c
+@@ -96,12 +96,24 @@ int win_chr_serial_init(Chardev *chr, const char *filename, Error **errp)
+     s->file = CreateFile(filename, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                       OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0);
+     if (s->file == INVALID_HANDLE_VALUE) {
++        {
++            char buffer[1024] = { 0 };
++            DWORD dw = GetLastError();
++            sprintf_s(buffer, 1024, "%s(%d) Error: %d 0x%x %s\r\n", __FILE__, __LINE__, dw, dw, filename);
++            OutputDebugString(buffer);
++        }
+         error_setg_win32(errp, GetLastError(), "Failed CreateFile");
+         s->file = NULL;
+         goto fail;
+     }
+
+     if (!SetupComm(s->file, NRECVBUF, NSENDBUF)) {
++        {
++            char buffer[1024] = { 0 };
++            DWORD dw = GetLastError();
++            sprintf_s(buffer, 1024, "%s(%d) Error: %d 0x%x %s\r\n", __FILE__, __LINE__, dw, dw, filename);
++            OutputDebugString(buffer);
++        }
+         error_setg(errp, "Failed SetupComm");
+         goto fail;
+     }
+@@ -110,9 +122,31 @@ int win_chr_serial_init(Chardev *chr, const char *filename, Error **errp)
+     size = sizeof(COMMCONFIG);
+     GetDefaultCommConfig(filename, &comcfg, &size);
+     comcfg.dcb.DCBlength = sizeof(DCB);
+-    CommConfigDialog(filename, NULL, &comcfg);
+-
++#if 1
++    // JME hardwire. There seems to be no mechanism to simply specify serial port options
++    comcfg.dcb.BaudRate = 115200;
++    comcfg.dcb.Parity = NOPARITY;
++    comcfg.dcb.StopBits = ONESTOPBIT;
++    comcfg.dcb.ByteSize = 8;
++#else
++    {
++        BOOL ret = CommConfigDialog(filename, NULL, &comcfg);
++        if (!ret)
++        {
++            char buffer[1024] = { 0 };
++            DWORD dw = GetLastError();
++            sprintf_s(buffer, 1024, "%s(%d) Error: %d 0x%x %s\r\n", __FILE__, __LINE__, dw, dw, filename);
++            OutputDebugString(buffer);
++        }
++    }
++#endif
+     if (!SetCommState(s->file, &comcfg.dcb)) {
++        {
++            char buffer[1024]={0};
++            DWORD dw = GetLastError();
++            sprintf_s(buffer,1024,"%s(%d) Error: %d 0x%x %s\r\n",__FILE__,__LINE__,dw,dw, filename);
++            OutputDebugString(buffer);
++        }
+         error_setg(errp, "Failed SetCommState");
+         goto fail;
+     }
+```
+
+/label ~"kind::Bug"

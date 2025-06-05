@@ -1,0 +1,103 @@
+permissions: 0.836
+graphic: 0.800
+semantic: 0.746
+debug: 0.716
+other: 0.658
+device: 0.642
+PID: 0.616
+performance: 0.566
+files: 0.494
+boot: 0.441
+network: 0.370
+socket: 0.369
+vnc: 0.364
+KVM: 0.357
+
+qemu-ppc (user) incorrectly converts float(nan)->double(non-nan)
+
+Noticed on qemu-3.1.0 on GHC test suite where float32 comparisons didn't work on NaNs.
+Here is the minimal reproducer:
+
+```c
+// cat a.c
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+
+int main() {
+    volatile float f1 = NAN;
+    volatile float f2 = NAN;
+    printf ("f1 (%e, %#x) >= f2 (%e, %#x): %s\n",
+        f1, *(volatile uint32_t*)&f1,
+        f2, *(volatile uint32_t*)&f2,
+        (f1 >= f2) ? "True"
+                   : "False");
+    volatile double d = f1;
+    printf ("d (%e, %#llx)\n",
+        d, *(volatile uint64_t*)&d);
+}
+```
+
+```
+# incorrect execution:
+$ powerpc-unknown-linux-gnu-gcc -O2 a.c -o a -static && qemu-ppc ./a 
+f1 (5.104236e+38, 0x7fc00000) >= f2 (5.104236e+38, 0x7fc00000): True
+d (5.104236e+38, 0x47f8000000000000)
+
+# correct execution
+$ scp a timberdoodle.ppc64.dev.gentoo.org:~/;  ssh timberdoodle.ppc64.dev.gentoo.org ./a
+f1 (nan, 0x7fc00000) >= f2 (nan, 0x7fc00000): False
+d (nan, 0x7ff8000000000000)
+```
+
+Note: qemu-ppc handled float32 extension as it was not a NaN (exp=111..1111) but a normalized number.
+
+
+
+The bug is in the same area as https://bugs.launchpad.net/qemu/+bug/1821444 but in another branch of 'uint64_t helper_todouble(uint32_t arg=0x1)'.
+
+We also hit this regression when testing CompCert for e5500 with qemu 3.1.0.
+
+The minimal example
+> #include <stdio.h>
+> #include <math.h>
+>  
+> union C { float f; unsigned long l; };
+> int main (void) {
+>     union C c;
+>     c.f = NAN;
+>     printf("Float: %f\n  Hex: 0x%x\n", c.f, c.l);
+>     printf("The above float is %s NAN\n", c.f == NAN ? "==" : "!=");                                                      
+>     return 0;
+> }
+
+does not exhibit the error with GCC 6.3.0, since that statically optimizes the c.f == NAN to always be false. But CompCert doesn't do this optimization and thus triggers the regression in the float compare.
+
+With qemu 3.0.0 the example outputs (whether built with compcert or gcc):
+> Float: nan
+>   Hex: 0x7fc00000
+> The above float is != NAN
+
+The example works well with qemu 3.0.0 and we stumbled over this with qemu 3.1.0; both build from the released source tarballs. My native system is a x86_64 GNU/Linux (openSUSE Tumbleweed with Kernel 4.20.13-1-default).
+
+Output with qemu 3.1.0 and built with GCC:
+> $ ./qemu-ppc64abi32-3.1.0 bug25310.gcc.elf 
+> Float: 510423550381407695195061911147652317184.000000
+>   Hex: 0x7fc00000
+> The above float is != NAN
+
+qemu 3.1.0 and example built with CompCert:
+> $ ./qemu-ppc64abi32-3.1.0 bug25310.ccomp.elf 
+> Float: 510423550381407695195061911147652317184.000000
+>   Hex: 0x7fc00000
+> The above float is == NAN
+
+I attached example binaries (statically built):
+> $ ../../compcert_internal_ppc/bin/ccomp --version
+> The CompCert C verified compiler, Release: 18.10i, Build: 4503984, Tag: auto/2019/02/11/1924
+> $ ../../compcert_internal_ppc/bin/ccomp -target e5500-linux -g -static bug25310.c -o bug25310.ccomp.elf 
+> 
+> $ ../../compcert_internal_ppc/gcc/bin/powerpc-unknown-linux-gnu-gcc --version
+> powerpc-unknown-linux-gnu-gcc (crosstool-NG crosstool-ng-1.23.0) 6.3.0
+> $ ../../compcert_internal_ppc/gcc/bin/powerpc-unknown-linux-gnu-gcc bug25310.c -g -static -O0 -o bug25310.gcc.elf -mcpu=e5500
+

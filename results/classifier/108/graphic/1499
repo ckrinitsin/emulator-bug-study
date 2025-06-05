@@ -1,0 +1,105 @@
+graphic: 0.957
+other: 0.943
+semantic: 0.941
+performance: 0.936
+debug: 0.934
+socket: 0.921
+vnc: 0.919
+PID: 0.912
+network: 0.910
+KVM: 0.905
+device: 0.901
+permissions: 0.885
+boot: 0.881
+files: 0.815
+
+qemu-system-arm doesn't honour CPACR.ASEDIS, D32DIS
+Description of problem:
+We used differential testing to compared the instruction consistency (ARMv7) between QEMU and raspberry pi 2B in system level and some inconsistency in SIMD instruction was detected.
+
+We compiled the kernel with options `-mcpu=cortex-a7 -march=armv7ve -mfloat-abi=hard -mfpu=vfpv4 `. Some SIMD instructions are considered as **undefined** instructions in raspi2b, but run successfully in the QEMU. 
+
+We checked that the CPACR.ASEDIS=1, which disables Advanced SIMD functionality, according to ARMv7-a manual B4.1.40.  The manual says "All instruction encodings identified in the Alphabetical list of instructions on page A8-300 as being Advanced SIMD instructions, but that are not VFPv3 or VFPv4
+instructions, are UNDEFINED when accessed from PL1 and PL0 modes."
+
+Tested instruction samples are shown as follows:
+
+- VMAX_int_T1A1_A 11110010010010110000011010100100 0xf24b06a4
+- VMUL_scalar_A1_A 11110010101001001100100 001000011 0xf2a4c843
+- VADD_int_T1A1_A 11110010000111111010100000001100 0xf21fa80c
+
+...
+
+Some checks of the SIMD instructions may be needed before the execution of the instructions in function ` do_3same` etc. in target/arm/translate-neon.c.
+Steps to reproduce:
+1. Compile a kernel module to run the test instruction in PL1.
+2. Hook a undefined handler in kernel module to catch the undefined instructions. A kernel module template we used to test is as follows
+
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <asm/traps.h> 
+
+MODULE_LICENSE("GPL");
+#pragma GCC optimize ("O0")
+// instr is undefined instruction value
+static int undef_instr_handler(struct pt_regs *regs, u32 instr)
+{
+    printk(KERN_INFO "get undefined instruction\n");
+    // Just skip over to the next instruction.
+    regs->ARM_pc += 4;
+    return 0; // All fine!
+}
+
+static struct undef_hook uh = {
+    .instr_mask  = 0x0, // any instruction
+    .instr_val   = 0x0, // any instruction
+    .cpsr_mask = 0x0, // any pstate
+    .cpsr_val  = 0x0, // any pstate
+    .fn          = undef_instr_handler
+};
+int init_module(void) {
+    // Lookup wanted symbols.
+    register_undef_hook(&uh);
+    __asm__ __volatile__("push {R0-R12}");
+    __asm__ __volatile__(
+      ".global inialize_location\n"
+      "inialize_location:\n"
+      "mov r0, %[reg_init]        \n"
+      "mov r1, %[reg_init]        \n"
+      "mov r2, %[reg_init]        \n"
+      "mov r3, %[reg_init]        \n"
+      "mov r4, %[reg_init]        \n"
+      "mov r5, %[reg_init]        \n"
+      "mov r6, %[reg_init]        \n"
+      "mov r7, %[reg_init]        \n"
+      "mov r8, %[reg_init]        \n"
+      "mov r9, %[reg_init]        \n"
+      "mov r10, %[reg_init]       \n"
+      "mov r11, %[reg_init]       \n"
+      "mov r12, %[reg_init]       \n"
+      :
+      : [reg_init] "n"(0)
+    );
+  // =======TODO=======
+  // replace nop with test instruction
+   __asm__ __volatile__(
+      ".global inst_location\n"
+      "inst_location:\n"
+      "nop\n" 
+    );
+    // kgdb_breakpoint();
+    __asm__ __volatile__(
+      ".global finish_location\n"
+      "finish_location:\n"
+    );
+    __asm__ __volatile__("pop {R0-R12}");
+    return 0;
+}
+
+void cleanup_module(void) {
+    unregister_undef_hook(&uh);
+}
+```
+Additional information:
+

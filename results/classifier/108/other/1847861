@@ -1,0 +1,71 @@
+other: 0.824
+KVM: 0.809
+permissions: 0.806
+graphic: 0.802
+vnc: 0.800
+debug: 0.793
+files: 0.777
+boot: 0.753
+semantic: 0.749
+performance: 0.738
+device: 0.725
+socket: 0.722
+network: 0.719
+PID: 0.711
+
+Guest stuttering under high disk IO (virtio)
+
+Performing io intensive tasks on virtualized Windows causes the system to visually stutter. I can often reproduce the problem by running fio on windows:
+
+fio --randrepeat=1 --ioengine=windowsaio --direct=1 --gtod_reduce=1 --name=test --filename=\\.\PhysicalDrive0 --bs=4k --iodepth=128 --size=4G --readwrite=randread
+
+While the fio command is running, moving the mouse pointer will be be laggy. The stuttering does not appear with iodepth <= 32 . The stuttering also manifests while playing games, the music and video pauses for a fraction of second in a playable but disturbing way.
+
+Here are my system specs:
+
+Host OS: archlinux
+Guest OS: Windows 10 Enterprise
+qemu version: qemu-git 8:v4.1.0.r1378.g98b2e3c9ab-1 (from AUR, compiled with -march=native)
+CPU: AMD Ryzen Threadripper 1900X 8-Core Processor
+Huge Pages: vm.nr_hugepages=4128
+Disk: nvme type=raw, io=threads bus=virtio
+GPU (passthrough): Radeon RX 570
+
+Here are some fio test results on my windows guest:
+
+[size=512M,iodepth=1 -> min=30k,avg=31k,stddev=508]
+[size=2G,iodepth=8 -> min=203k,avg=207k,stddev=2.3k]
+[size=2G,iodepth=16 -> min=320k,avg=330k,stddev=4.3k]
+[size=4G,iodepth=32 -> min=300k,avg=310k,stddev=4.8k]
+[size=4G,iodepth=64 -> min=278k,avg=366k,stddev=68.6k] -> STUTTER
+[size=4G,iodepth=64 -> min=358k,avg=428k,stddev=52.6k] -> STUTTER
+[size=4G,iodepth=128 -> min=92k,avg=217k,stddev=185k] -> STUTTER
+[size=4G,iodepth=128 -> min=241k,avg=257k,stddev=14k] -> same config as above, but no stuttering
+
+The min and avg values are the bandwidth values reported in KB/s by fio. You can see that, when the stuttering occurs, the stardard deviation is high and the minimum bandwidth is way below the average.
+
+You can find my libvirt XML attached. Here is the full qemu command (taken from the ps output):
+
+/usr/bin/qemu-system-x86_64 -name guest=win10,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-7-win10/master-key.aes -machine pc-q35-3.1,accel=kvm,usb=off,vmport=off,dump-guest-core=off -cpu host,topoext=on,hv-time,hv-relaxed,hv-vapic,hv-spinlocks=0x1fff -drive file=/usr/share/ovmf/x64/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/var/lib/libvirt/qemu/nvram/win10_VARS.fd,if=pflash,format=raw,unit=1 -m 8192 -overcommit mem-lock=off -smp 16,sockets=1,cores=8,threads=2 -object iothread,id=iothread1 -mem-prealloc -mem-path /dev/hugepages/libvirt/qemu/7-win10 -numa node,nodeid=0,cpus=0-7,mem=4096 -numa node,nodeid=1,cpus=8-15,mem=4096 -uuid d1c03f35-3846-4b76-a139-b798b497b95c -display none -no-user-config -nodefaults -chardev socket,id=charmonitor,fd=34,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=localtime,driftfix=slew -global kvm-pit.lost_tick_policy=delay -no-hpet -no-shutdown -global ICH9-LPC.disable_s3=1 -global ICH9-LPC.disable_s4=1 -boot strict=on -device pcie-root-port,port=0x10,chassis=1,id=pci.1,bus=pcie.0,multifunction=on,addr=0x2 -device pcie-root-port,port=0x11,chassis=2,id=pci.2,bus=pcie.0,addr=0x2.0x1 -device pcie-root-port,port=0x12,chassis=3,id=pci.3,bus=pcie.0,addr=0x2.0x2 -device pcie-root-port,port=0x13,chassis=4,id=pci.4,bus=pcie.0,addr=0x2.0x3 -device pcie-root-port,port=0x14,chassis=5,id=pci.5,bus=pcie.0,addr=0x2.0x4 -device pcie-root-port,port=0x15,chassis=6,id=pci.6,bus=pcie.0,addr=0x2.0x5 -device pcie-root-port,port=0x16,chassis=7,id=pci.7,bus=pcie.0,addr=0x2.0x6 -device pcie-root-port,port=0x17,chassis=8,id=pci.8,bus=pcie.0,addr=0x2.0x7 -device pcie-root-port,port=0x18,chassis=9,id=pci.9,bus=pcie.0,multifunction=on,addr=0x3 -device pcie-root-port,port=0x19,chassis=10,id=pci.10,bus=pcie.0,addr=0x3.0x1 -device pcie-pci-bridge,id=pci.11,bus=pci.3,addr=0x0 -device qemu-xhci,p2=15,p3=15,id=usb,bus=pci.2,addr=0x0 -device lsi,id=scsi0,bus=pci.11,addr=0x1 -drive file=/dev/nvme0n1p3,format=raw,if=none,id=drive-virtio-disk0,cache=none,aio=threads -device virtio-blk-pci,scsi=off,bus=pci.8,addr=0x0,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on -drive if=none,id=drive-sata0-0-0,readonly=on -device ide-cd,bus=ide.0,drive=drive-sata0-0-0,id=sata0-0-0 -netdev tap,fd=37,id=hostnet0,vhost=on,vhostfd=38 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=52:54:00:7c:10:fc,bus=pci.1,addr=0x0 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -chardev spicevmc,id=charredir0,name=usbredir -device usb-redir,chardev=charredir0,id=redir0,bus=usb.0,port=2 -chardev spicevmc,id=charredir1,name=usbredir -device usb-redir,chardev=charredir1,id=redir1,bus=usb.0,port=3 -device vfio-pci,host=41:00.0,id=hostdev0,bus=pci.4,addr=0x0 -device vfio-pci,host=41:00.1,id=hostdev1,bus=pci.5,addr=0x0 -device virtio-balloon-pci,id=balloon0,bus=pci.6,addr=0x0 -object input-linux,id=mouse1,evdev=/dev/input/by-path/pci-0000:42:00.3-usb-0:3:1.0-event-mouse -object input-linux,id=kbd1,evdev=/dev/input/by-path/pci-0000:42:00.3-usb-0:4:1.0-event-kbd,grab_all=on,repeat=on -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny -msg timestamp=on
+
+Additional note: the performance of fio in the linux host is about 2x the one on the guest:
+
+fio --randrepeat=1 --ioengine=libaio --direct=1 --gtod_reduce=1 --name=test --filename=/dev/nvme0n1 --bs=4k --iodepth=64 --size=512M --readwrite=randread
+
+read: IOPS=279k, BW=1092MiB/s (1145MB/s)(512MiB/469msec)
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

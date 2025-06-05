@@ -1,0 +1,75 @@
+graphic: 0.681
+permissions: 0.620
+other: 0.606
+semantic: 0.517
+debug: 0.483
+device: 0.474
+vnc: 0.457
+PID: 0.440
+performance: 0.420
+boot: 0.379
+network: 0.370
+KVM: 0.365
+socket: 0.291
+files: 0.284
+
+VLLDM/VLSTM trigger UsageFault in the Secure Mode
+
+The VLLDM/VLSTM instructions trigger UsageFault when they are supposed to behave as NOP.
+
+Version: 
+$ qemu-system-arm --version                                                                               QEMU emulator version 2.11.93
+
+VLLDM and VLSTM are instructions newly added to ARMv8-M Mainline Profile. Although they are FP instructions and the FP support of the M profile is not implemented by QEMU, the Armv8-M Architecture Reference Manual specifies that they should behave as NOP even in this case:
+
+C2.4.268 VLLDM:
+
+> If the Floating-point Extension is not implemented, this instruction is available in Secure state, but behaves as a NOP.
+
+C2.4.269 VLSTM:
+
+> If the Floating-point Extension is not implemented, this instruction is available in Secure state, but behaves as a NOP.
+
+VLLDM and VLSTM are generated automatically by the compiler to save and restore the floating point registers (in a lazy manner) during a Non-Secure function call. An example is shown below:
+
+10000064 <__gnu_cmse_nonsecure_call>:
+10000064:       e92d 4fe0       stmdb   sp!, {r5, r6, r7, r8, r9, sl, fp, lr}
+10000068:       4627            mov     r7, r4
+1000006a:       46a0            mov     r8, r4
+1000006c:       46a1            mov     r9, r4
+1000006e:       46a2            mov     sl, r4
+10000070:       46a3            mov     fp, r4
+10000072:       46a4            mov     ip, r4
+10000074:       b0a2            sub     sp, #136        ; 0x88
+10000076:       ec2d 0a00       vlstm   sp
+1000007a:       f384 8800       msr     CPSR_f, r4
+1000007e:       4625            mov     r5, r4
+10000080:       4626            mov     r6, r4
+10000082:       47a4            blxns   r4
+10000084:       ec3d 0a00       vlldm   sp
+10000088:       b022            add     sp, #136        ; 0x88
+1000008a:       e8bd 8fe0       ldmia.w sp!, {r5, r6, r7, r8, r9, sl, fp, pc}
+
+Yes, you're right -- I hadn't noticed this wrinkle of the architecture. I'll put this on my todo list -- it should be straightforward.
+
+Do you have a convenient test binary that I could use as a test case?
+
+
+I attached a ZIP file containing a set of binary images that reproduces the problem.
+
+Secure.elf and NonSecure.elf contain codes that run in the Secure/Non-Secure mode, respectively. They must be loaded simultaneously by using the generic loader:
+
+    $ qemu-system-arm -device loader,file=Secure.elf -kernel NonSecure.elf -machine mps2-an505 -nographic -s -cpu cortex-m33
+
+The problematic instructions are located in 0x10000064 <__gnu_cmse_nonsecure_call> of Secure.elf. The program runs successfully and outputs some message via UART0 if they are replaced with NOPs, as shown below:
+
+    $ qemu-system-arm -device loader,file=Secure-patched.elf -kernel NonSecure.elf -machine mps2-an505 -nographic -s -cpu cortex-m33
+    I'm running in the Non-Secure mode.
+
+
+Submitted this patch for review which should fix this bug:
+https://patchwork.ozlabs.org/patch/907959/
+
+
+Fix now in master as commit b1e5336a9899016c53d59 (and cc stable), so should be in 3.0 and 2.12.1.
+

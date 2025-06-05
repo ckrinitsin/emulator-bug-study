@@ -1,0 +1,57 @@
+other: 0.896
+debug: 0.879
+semantic: 0.879
+device: 0.803
+performance: 0.774
+permissions: 0.742
+socket: 0.727
+graphic: 0.717
+vnc: 0.716
+PID: 0.690
+files: 0.670
+network: 0.649
+boot: 0.580
+KVM: 0.528
+
+2.6.0: vvfat driver generates bad FAT entries
+
+The vvfat driver sometimes generates entries about which file system checking utilities generate complaints.
+
+For example, dosfsck will complain that the volume label entry has non-zero size. ScanDisk from Windows 9x complains about invalid dot (".") and dot-dot ("..") entries in directories and also about invalid long file name entries. MS-DOS ScanDisk also often manages to find "lost clusters" on the drive.
+
+Tangentially: qemu-img convert fat:test test.img doesn't seem to work -- it generates an 504MiB of zero bytes and hangs. qemu-img map fat:test generates an assertion failure. Having qemu-img working might have helped with debugging the above issue.
+
+
+
+Please send your patch to the qemu-devel (and qemu-block) mailing list. See http://qemu-project.org/Contribute/SubmitAPatch for details on how to submit a patch. Thanks!
+
+I noticed another bug in vvfat disk image generation. Applying the patch I attached earlier made testing easier. I'm less sure what the actual problem is.
+
+Steps to reproduce (you'll need to have cpio, md5sum and GNU GRUB 2.x installed):
+0. Apply the patch and build qemu-img.
+1. Create a directory, cd into it and unpack the attached cpio file.
+2. Run: qemu-img convert fat:. ../xxx.img
+3. Run: for fname in $(grub-fstest ../xxx.img ls '(loop0,msdos1)/'); do grub-fstest ../xxx.img cat "(loop0,msdos1)/$fname" | md5sum | sed -e "s,-,$fname,"; done | md5sum -c
+4. Observe how almost all checksum tests fail.
+
+Alternatively, the image can be tested inside a virtual machine. You probably get the idea.
+
+(File names and data have been changed for the sake of anonymity and better compressibility)
+
+The original issue turned out to be trivial. The dot and dot-dot entries need to be the two very first entries in a non-root directory table; however, readdir() does not guarantee that "." and ".." will be the first items returned. When I patched read_directory() to generate "." and ".." entries first (and also ensured that volume label entry is generated with zero size), ScanDisk stopped complaining.
+
+The latter issue is also easy. The FAT16 file system cannot hold more than 512 entries in its root directory table. The vvfat driver does not recognise this limit and tries to squeeze more entries into the table than is normally possible. FAT-reading software doesn't seem to appreciate it. The driver should emit a warning and refuse to generate a FAT image altogether. (I have actually thought of a way to do it anyway, but it will not work everywhere.)
+
+Thanks for looking into this, Felix. If you think that your fix to read_directory() is ready for inclusion, please do send the patch to both the qemu-devel and qemu-block mailing lists as Thomas suggested. As each patch should address a single point, this can be done even while the second problem isn't fully solved yet.
+
+I agree that erroring out when trying to open a vvfat image on a directory with too many entries is probably the best option. Instead of thinking of ways to do it anyway, I'd rather suggest to look into fixing/fully implementing FAT32 support. There are a few scary comments in the code, so I suppose it might not yet be as stable as you'd want it to be, but it shouldn't have the root directory limit anyway.
+
+I believe commits f82d92bb028a1d674bab4ccc7e6cde6c04956230 and 6817efea3a0d1bf87be815970cdb014c5a64b628 have fixed this particular bug; although I've since noticed the vvfat driver remains quite fragile, especially FAT32 and writing support. I've got some patches for it of my own, which I might submit someday (they aren't quite ready yet).
+
+Also, after some testing, it turns one can simply grow the fixed-size root directory table above 512 entries, and it doesn't seem to actually cause any problems after all; although I haven't tested any extreme cases or obscure implementations. Shrinking it (entry-wise) should be fine in any case: 1440 KiB floppy disks typically allow 224 root directory entries, which is 14 clusters = 14 sectors.
+
+
+Another patch has apparently been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=f80256b7eebfbe20683
+I assume we can close this ticket now as fixed?
+

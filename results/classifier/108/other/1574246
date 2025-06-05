@@ -1,0 +1,95 @@
+KVM: 0.830
+debug: 0.825
+semantic: 0.804
+vnc: 0.783
+graphic: 0.781
+socket: 0.768
+other: 0.764
+device: 0.764
+performance: 0.763
+permissions: 0.737
+PID: 0.737
+boot: 0.725
+files: 0.715
+network: 0.698
+
+Drunken keyboard in go32v2 programs
+
+QEMU 2.5.0, SeaBIOS 1.9.1; I've been noticing this bug for quite a while, though.
+
+Steps to reproduce:
+
+# Create a VM image, install DOS in it (doesn't matter which) and launch it.
+# Launch a "bare DOS" DPMI host (not an operating system) in it; I tested with CWSDPMI and HDPMI32.
+# Run a go32v2 program which reads keyboard input (say, the Lua interpreter: <http://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/distributions/1.1/repos/devel/lua.zip>; the Free Pascal IDE will also do; on the other hand, DOS/4GW programs seem unaffected).
+# Quickly type in something random (e.g. alternate between hitting "p" and "q"), then optionally move the cursor left and right.
+# Observe how some keystrokes are missed, and some are caught twice.
+
+The issue does NOT arise:
+* on bare metal DOS,
+* in VirtualBox,
+* in Bochs with stock Plex86 BIOS,
+* in Bochs with SeaBIOS,
+* in DOSEMU,
+* in DOSBox,
+* in QEMU when the DPMI host is Windows 3.11/9x
+so at this point I'm reasonably sure that it's the fault of either QEMU or SeaBIOS, and probably the former. The issue arises regardless of whether KVM is enabled.
+
+I compiled the latest git snapshot (tag: v2.6.0-rc4, calling itself 2.5.94; with GTK frontend) and could only half-reproduce the bug; keys do not longer "jam", but arrow keys are still captured twice. I woudn't make much of that difference; this bug seems very timing-sensitive. It could be that the GTK frontend adds sufficient latency to the interface to avoid triggering it.
+
+I enabled some debugging switches and recompiled both QEMU and the latest git snapshot of SeaBIOS (1.9.0-127; commit c8e105a4d5e52e8e7539ab1f2cd07ebe0ae9033a). This is what I got when running programs affected by this bug:
+
+(key press)
+[qemu   ] ps2_queue(0xe0)
+[qemu   ] ps2_queue(0x4d)
+(IRQ1)
+[qemu   ] KBD: kbd: read data=0xe0 ← (***)
+[seabios] handle_09
+[qemu   ] KBD: kbd: read status=0x1d
+[qemu   ] KBD: kbd: read data=0x4d
+[seabios] i8042_command cmd=ae
+[seabios] i8042_wait_write
+[qemu   ] KBD: kbd: read status=0x1c
+[qemu   ] KBD: kbd: write cmd=0xae
+(IRQ1)
+[qemu   ] KBD: kbd: read data=0x4d ← (***)
+[seabios] handle_09
+[qemu   ] KBD: kbd: read status=0x1c
+[qemu   ] KBD: kbd: read data=0x4d
+[seabios] i8042_command cmd=ae
+[seabios] i8042_wait_write
+[qemu   ] KBD: kbd: read status=0x1c
+[qemu   ] KBD: kbd: write cmd=0xae
+
+Reads marked (***) do not appear when running unaffected programs. So it appears something is making reads from the keyboard controller before SeaBIOS has a chance to put scancodes in the ring buffer. And indeed: DJGPP libc installs a custom IRQ1 handler which does it to detect whether it should raise SIGINT in response to Ctrl+C; it can be found in the file src/libc/go32/exceptn.S in the djcrx package[1]. Free Pascal incorporates this handler into its RTL with almost no changes; it's found in rtl/go32v2/exceptn.as[2]. I also noticed I can reproduce this bug with Borland Pascal 7; lo and behold, the Turbo Vision library does something similar.
+
+SeaBIOS gets extra confused when I send some mouse events to QEMU (grab the mouse, move it around, ungrab); it reacts with a "ps2 keyboard irq but found mouse data?!" message and refuses to put keys in the ring buffer until the queue of mouse events becomes empty.
+
+That's the culprit, I think. It also explains why the bug doesn't appear under Windows; because port 0x60 reads from DPMI are simulated, they don't correspond to actual port 0x60 reads in the guest. I don't know what the fix ought be; documentation about the i8042 that I found is unclear about what real hardware does in this case.
+
+If I'm reading the code correctly, DOSEMU[3] (also the DOSEMU2 fork[4]), DOSBox[5], Bochs[6] and VirtualBox[7] keep one value to be read from 0x60 at until the next interrupt, avoiding the issue.
+
+[1] <http://www.delorie.com/bin/cvsweb.cgi/djgpp/src/libc/go32/exceptn.S?rev=1.7>; function ___djgpp_kbd_hdlr
+[2] <http://svn.freepascal.org/cgi-bin/viewvc.cgi/trunk/rtl/go32v2/exceptn.as?revision=8210&view=co>; function ___djgpp_kbd_hdlr
+[3] <https://sourceforge.net/p/dosemu/code/ci/8897222f8830e0bd2769935f611a0e5c3271bcb9/tree/src/plugin/kbd_unicode/serv_8042.c>
+[4] <https://github.com/stsp/dosemu2/blob/69419c7a5430f0109f9df45b179d9b223b075550/src/plugin/kbd_unicode/serv_8042.c>
+[5] <https://sourceforge.net/p/dosbox/code-0/3961/tree/dosbox/trunk/src/ints/bios_keyboard.cpp>
+[6] <https://sourceforge.net/p/bochs/code/12853/tree/trunk/bochs/iodev/keyboard.cc>
+[7] <https://www.virtualbox.org/browser/vbox/trunk/src/VBox/Devices/Input/DevPS2.cpp?rev=60404>
+
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

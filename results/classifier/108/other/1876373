@@ -1,0 +1,91 @@
+debug: 0.895
+permissions: 0.861
+device: 0.842
+graphic: 0.829
+performance: 0.829
+PID: 0.821
+other: 0.818
+semantic: 0.785
+vnc: 0.774
+files: 0.747
+network: 0.726
+boot: 0.710
+socket: 0.677
+KVM: 0.640
+
+segfault mremap 4096
+
+a qemu-hosted process segfaults when the program calls mremap to shrink the size of a buffer to 4096 that was allocated with mmap. See below for a C program to reproduce this issue.  I was able to compile this program for both i386 and 32-bit arm, and use qemu-i386 and qemu-arm to reproduce the segfault.  If I run the i386 program natively on my x86_64 system, no segfault occurs.  Also note that if I change the mremap size to something else such as 12288, no segfault occurs.  I also confirmed using qemu's -singlestep debug option that the segfault occurs during the mremap syscall.
+
+If you save the source below to mremapbug.c, the following should reproduce the issue given you have gcc-multilib:
+
+gcc -m32 mremapbug.c
+# works
+./a.out
+# segfault
+qemu-i386 a.out
+
+If you can also compile to arm, the same thing happens when running "qemu-arm a.out".  I also tried compiling natively and running "qemu-x86_64 a.out" but no segfault in that case, not sure if it's because it is 64-bits or if it was because it was my native target.
+
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/mman.h>
+
+int main(int argc, char *argv[])
+{
+  const size_t initial_size = 8192;
+
+  printf("calling mmap, size=%llu\n", (unsigned long long)initial_size);
+  void *mmap_ptr = mmap(NULL, initial_size,
+                   PROT_READ | PROT_WRITE ,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1, 0);
+  printf("mmap returned  : %p\n", mmap_ptr);
+  if (mmap_ptr == MAP_FAILED) {
+    perror("mmap");
+    exit(1);
+  }
+
+  const size_t new_size = 4096;
+  printf("calling mremap, size=%llu\n", (unsigned long long)new_size);
+  void *remap_ptr = mremap(mmap_ptr, initial_size, new_size, 0);
+  printf("mremap returned: %p\n", remap_ptr);
+  if (remap_ptr != mmap_ptr) {
+    perror("mreamap");
+    exit(1);
+  }
+  printf("Success: pointers match\n");
+}
+
+
+This issue was found while I was pushing code that calls "mremap" to the Zig compiler repository, it's CI testing uses qemu-i386 and qemu-arm to run tests for non-native hosts.  I've filed an issue in that repository as well with details on how to reproduce this issue with the Zig compiler as well: https://github.com/ziglang/zig/issues/5245
+
+Thanks to @LemonBoy for finding this:
+
+It looks like this issue my be caused by this chunk of code in linux-user/mmap.c
+
+        if (prot == 0) {
+            host_addr = mremap(g2h(old_addr), old_size, new_size, flags);
+            if (host_addr != MAP_FAILED && reserved_va && old_size > new_size) {
+                mmap_reserve(old_addr + old_size, new_size - old_size);
+            }
+        } else {
+            errno = ENOMEM;
+            host_addr = MAP_FAILED;
+        }
+
+if new_size is less than old_size (which is the case in my example program) then we'll get an integer underflow which would cause a very large value passed to mmap_reserve
+
+I've submitted a patch, this is my first qemu patch so sorry if I didn't format it correctly: https://lists.gnu.org/archive/html/qemu-trivial/2020-05/msg00000.html
+
+FYI, first patch in the previous comment was wrong.  This new patch is the correct one: https://lists.gnu.org/archive/html/qemu-devel/2020-05/msg00183.html
+
+
+Fix has been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=257a7e212d5e518ac5
+
+Patch has been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=257a7e212d5e518ac53b
+

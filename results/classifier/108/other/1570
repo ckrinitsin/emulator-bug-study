@@ -1,0 +1,78 @@
+debug: 0.807
+KVM: 0.794
+other: 0.772
+vnc: 0.758
+boot: 0.744
+permissions: 0.735
+device: 0.718
+graphic: 0.716
+PID: 0.662
+socket: 0.630
+network: 0.626
+files: 0.607
+semantic: 0.593
+performance: 0.586
+
+Incorrect memory handling when booting redox
+Description of problem:
+During the boot of redox, I regularly get one of two errors when reading the HPET at base address `0xfed00000`:
+- Incorrect translation from virtual address `0xffff8000fed00108` to random physical addresses, e.g. `0xfec00108`
+- Invalid read at addr 0x0, size 8, region 'hpet', reason: invalid size (min:4 max:4)
+Steps to reproduce:
+1. Build the server version of the redox OS as per [the instructions](https://doc.redox-os.org/book/ch02-05-building-redox.html).
+2. Run the qemu command line with multiple CPUs. The more CPUs the easier it is to reproduce.
+3. The problem will manifest itself as a divide by zero error. See the corresponding [redox bug report](https://gitlab.redox-os.org/redox-os/kernel/-/issues/116).
+Additional information:
+The best evidence I have is a debug line I added to qemu before [the memory_region_dispatch_read line](https://gitlab.com/qemu-project/qemu/-/blob/master/accel/tcg/cputlb.c#L1375):
+
+```
+if ((mr_offset & 0x1ff) == 0x108)  fprintf(stderr, "cputlb io_readx cpu %d addr=%llx mr_offset=%llx mr=%p mr->addr=%llx\n", current_cpu->cpu_index, addr,  mr_offset, mr, mr->addr);
+r = memory_region_dispatch_read(mr, mr_offset, &val, op, full->attrs);
+```
+
+That logs:
+
+```
+cputlb io_readx cpu 0 addr=ffff8000fed00108 mr_offset=108 mr=0x7fefb60d5720 mr->addr=fec00000
+```
+
+The expected physical address is `0xfed00000` instead of `0xfec00000`.
+
+A more extensive log is this one:
+```
+55027@1680283224.671665:memory_region_ops_read cpu 5 mr 0x7f9950890130 addr 0xfed000f0 value 0x949707cc size 4 name 'hpet'      <- ok
+55027@1680283224.671681:memory_region_ops_read cpu 5 mr 0x7f9950890130 addr 0xfed000f4 value 0x0 size 4 name 'hpet'             <- ok
+tlb_set_page_full: vaddr=0000000000474000 paddr=0x000000000536f000 prot=5 idx=1
+...
+tlb_flush_by_mmuidx_async_work: mmu_idx:0xffff
+tlb_flush_by_mmuidx_async_work: mmu_idx:0xffff
+tlb_flush_by_mmuidx_async_work: mmu_idx:0xffff
+tlb_flush_by_mmuidx_async_work: mmu_idx:0xffff
+...
+55027@1680283224.671951:memory_region_ops_read cpu 5 mr 0x7f9950882930 addr 0xfec00108 value 0x0 size 4 name 'ioapic'           <- wrong
+55027@1680283224.671958:memory_region_ops_read cpu 5 mr 0x7f9950882930 addr 0xfec0010c value 0x0 size 4 name 'ioapic'
+55027@1680283224.671967:memory_region_ops_write cpu 2 mr 0x7f994d808d30 addr 0xcf8 value 0x8000fa80 size 4 name 'pci-conf-idx'
+55027@1680283224.671986:memory_region_ops_read cpu 2 mr 0x7f994d808e40 addr 0xcfc value 0x80a805 size 4 name 'pci-conf-data'
+55027@1680283224.672001:memory_region_ops_read cpu 5 mr 0x7f9950882930 addr 0xfec00000 value 0x0 size 4 name 'ioapic'           <- wrong
+55027@1680283224.672010:memory_region_ops_read cpu 5 mr 0x7f9950882930 addr 0xfec00004 value 0x0 size 4 name 'ioapic'
+```
+
+Some observations
+- ~I seem to be the only one having this issue. Perhaps because I am the only one developing on MacOS. Maybe it's because I'm running an older intel mac.~. I managed to reproduce this on a Asus vivobook running linux
+- The redox OS [reads the HPET](https://gitlab.redox-os.org/redox-os/kernel/-/blob/master/src/arch/x86_64/time.rs#L11) at addresses `0xf4`, `0x108`, `0x00` in that order. If I change the order to `0x00`, `0xf4`, `0x108`, the problem goes away.
+- Even if I work around the problem by changing the order of the reads, the OS still randomly crashes. This could be related, but I can only speculate on that right now.
+- Increasing qemu debug logging tends to push the problem to the 4vs8 size problem instead of the incorrect address one. The more logging, the more difficult it is to reproduce.
+- I tried to bisect the issue and found I could only reproduce it after qemu version 5.2. However, the mac build broke during this process so I could not find the causal commit. Between 5.1 and 5.2 the performance is greatly increased though and I suspect whatever changed there caused the issue.
+- I can't reproduce the problem with -smp 1
+- I have seen qemu segfault occasionally, but I didn't look further into it and I don't know if it's related to this issue.
+- I have attempted to rule out a bug in redox. I am fairly certain nothing strange is going on there, but I can't say for sure.
+- When I trigger the incorrect address bug, I mostly get  a base address of `0xfec00000` which is the IO APIC. However, I do occasionally see other addresses too
+- `info tlb` at the time of the fault shows
+   ```
+   ffff8000fd3e6000: 00000000fd3e6000 X--DA---W
+   ffff8000fd3e7000: 00000000fd3e7000 X--DA---W
+   ffff8000fed00000: 00000000fed00000 X--DAC--W
+   ffff8000fee00000: 00000000fee00000 X--DA---W
+   fffffd8000000000: 0000000001e32000 XG-DA---W
+   fffffd8000001000: 0000000001e36000 XG-DA---W
+   ```

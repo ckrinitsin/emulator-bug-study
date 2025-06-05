@@ -1,0 +1,64 @@
+vnc: 0.920
+socket: 0.895
+graphic: 0.768
+network: 0.731
+device: 0.633
+performance: 0.625
+semantic: 0.609
+other: 0.544
+PID: 0.512
+files: 0.487
+permissions: 0.447
+boot: 0.396
+debug: 0.288
+KVM: 0.191
+
+VNC unix-domain socket unlink()ed prematurely
+
+With qemu 3.0.0 (I don't believe this happened with previous
+versions), if I tell it `-vnc unix:/path/to/vnc.sock`, qemu will
+unlink() that file when the first client disconnects, meaning that
+once I disconnect, I can't ever reconnect without restarting the VM.
+
+A stupid testcase demonstrating the issue:
+
+In terminal A:
+
+    $ qemu-system-x86_64 -vnc unix:$PWD/vnc.sock
+
+In terminal B:
+
+    $ ls vnc.sock
+    vnc.sock
+    $ socat STDIO UNIX-CONNECT:vnc.sock <<<''
+    RFB 003.008
+    $ ls vnc.sock
+    ls: cannot access 'vnc.sock': No such file or directory
+
+I have determined that the offending unlink() call is the one in
+io/channel-socket.c:qio_channel_socket_close().  That call was first
+introduced in commit d66f78e1eaa832f73c771d9df1b606fe75d52a50, which
+first appeared in version 3.0.0.
+
+This type of premature unlink() does not happen on monitor.sock with
+`-monitor unix:/path/to/monitor.sock,server,nowait`.
+
+I am not familiar enough with the QIO subsystem to suggest a fix that
+fixes VNC, but preserves the QMP fix targeted in the offending commit.
+
+This is still a problem with 3.1.0.
+
+Added Daniel to the bug.
+
+It only affects VNC, not chardevs because the chardevs fail to call qio_channel_close() and just rely on finalize() cleaning up the open socket. To fix this we just need to made the code conditional on it being a listener socket
+
+  if (qio_channel_has_feature(ioc, QIO_CHANNEL_FEATURE_LISTEN)) {
+   ...
+  }
+
+Patch proposed at
+
+https://lists.gnu.org/archive/html/qemu-devel/2019-01/msg02774.html
+
+Fix merged to git master  https://git.qemu.org/?p=qemu.git;a=commit;h=feff02089113839d233e40a9bd7134241de12d1d
+

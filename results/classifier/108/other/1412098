@@ -1,0 +1,116 @@
+graphic: 0.878
+KVM: 0.854
+other: 0.845
+permissions: 0.838
+device: 0.835
+performance: 0.820
+socket: 0.818
+debug: 0.806
+semantic: 0.792
+network: 0.792
+vnc: 0.776
+PID: 0.749
+files: 0.748
+boot: 0.745
+
+qemu crashes when ctrl-alt-u is pressed
+
+Qemu version: 2.2.0 release, compiled from source
+Host OS: Windows 7 Ultimate x64
+Guest OS: not applicable, crash occurs even without OS and occurs with all OSs
+Executable: qemu-system-i386.exe or qemu-system-i386w.exe
+
+To reproduce:
+Start qemu-system-i386 or qemu-system-i386w without any options. Press CTRL-ALT-U, which is supposed to rescale the window. Instead, qemu just crashes.
+
+Compilation:
+Qemu 2.2.0 release compiled from sources under MinGW on the host.
+Configure options used:
+'../qemu-2.2.0/configure' '--python=C:/Python27/python' '--prefix=/mingw/build/qemu-2.2.0-bin' '--target-list=i386-softmmu'
+
+
+
+I did a git bisect, and the offending commit appears to be this one:
+
+author	Gerd Hoffmann <email address hidden>	
+Wed, 18 Jun 2014 09:03:15 +0000 (11:03 +0200)
+committer	Gerd Hoffmann <email address hidden>	
+Fri, 5 Sep 2014 11:27:11 +0000 (13:27 +0200)
+commit	30f1e661b640de58ba1e8178f7f2290179a7e01c
+tree	dc373a0d374386bc793e67a9e185dbc5ecdfc8f1	tree | snapshot
+parent	56bd9ea1a37395012adecca8b9c4762da15b01e7	commit | diff
+console: stop using PixelFormat
+
+With this patch the qemu console core stops using PixelFormat and pixman
+format codes side-by-side, pixman format code is the primary way to
+specify the DisplaySurface format:
+
+ * DisplaySurface stops carrying a PixelFormat field.
+ * qemu_create_displaysurface_from() expects a pixman format now.
+
+Functions to convert PixelFormat to pixman_format_code_t (and back)
+exist for those who still use PixelFormat.   As PixelFormat allows
+easy access to masks and shifts it will probably continue to exist.
+
+[ xenfb added by Benjamin Herrenschmidt ]
+
+Signed-off-by: Gerd Hoffmann <email address hidden>
+
+A build from the current master attached in gdb reveals
+
+Program received signal SIGSEGV, Segmentation fault.
+sdl_switch (dcl=0x7f4db26e4b20, new_surface=new_surface@entry=0x0) at ui/sdl.c:128
+128         PixelFormat pf = qemu_pixelformat_from_pixman(new_surface->format);
+(gdb) bt
+#0  sdl_switch (dcl=0x7f4db26e4b20, new_surface=new_surface@entry=0x0) at ui/sdl.c:128
+#1  0x00007f4dafdff9c4 in handle_keydown (ev=0x7fff1598ef60) at ui/sdl.c:552
+#2  sdl_refresh (dcl=0x7f4db26e4b20) at ui/sdl.c:799
+#3  0x00007f4dafdf33b2 in dpy_refresh (s=0x7f4db2792b40) at ui/console.c:1473
+#4  gui_update (opaque=0x7f4db2792b40) at ui/console.c:196
+#5  0x00007f4dafe30179 in timerlist_run_timers (timer_list=0x7f4db1dd4900) at qemu-timer.c:502
+#6  0x00007f4dafe30414 in qemu_clock_run_timers (type=<optimized out>) at qemu-timer.c:513
+#7  qemu_clock_run_all_timers () at qemu-timer.c:621
+#8  0x00007f4dafe2ebac in main_loop_wait (nonblocking=<optimized out>) at main-loop.c:500
+#9  0x00007f4dafb8fe66 in main_loop () at vl.c:1794
+#10 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4353
+(gdb) p new_surface
+$1 = (DisplaySurface *) 0x0
+
+
+
+Actually in any version this can never work, as you call
+
+   sdl_switch(dcl,NULL);
+
+in ui/sdl.c:552. So the dereferncing statement
+
+   new_surface->format
+
+must SEGFAULT.
+
+The obvious patch is very simple, of course, as just the statement below line 128 asks if(new_surface). So pf should be initialized after this check:
+
+diff --git a/ui/sdl.c b/ui/sdl.c
+index 138ca73..c4fa1f6 100644
+--- a/ui/sdl.c
++++ b/ui/sdl.c
+@@ -125,12 +125,13 @@ static void do_sdl_resize(int width, int height, int bpp)
+ static void sdl_switch(DisplayChangeListener *dcl,
+                        DisplaySurface *new_surface)
+ {
+-    PixelFormat pf = qemu_pixelformat_from_pixman(new_surface->format);
++    PixelFormat pf;
+
+     /* temporary hack: allows to call sdl_switch to handle scaling changes */
+     if (new_surface) {
+         surface = new_surface;
+     }
++    pf = qemu_pixelformat_from_pixman(surface->format);
+
+     if (!scaling_active) {
+         do_sdl_resize(surface_width(surface), surface_height(surface), 0);
+
+
+
+Ingo Krabbe's suggested change fixes the issue for me.
+

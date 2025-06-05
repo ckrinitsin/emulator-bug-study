@@ -1,0 +1,186 @@
+graphic: 0.945
+permissions: 0.941
+network: 0.941
+device: 0.936
+other: 0.926
+performance: 0.918
+PID: 0.917
+debug: 0.912
+files: 0.908
+socket: 0.895
+semantic: 0.884
+boot: 0.872
+KVM: 0.785
+vnc: 0.785
+
+ARM cpu emulation regression on QEMU 4.2.0
+
+[*] Summary
+
+Latest QEMU has an ARM CPU emulation regression.
+Regression is reproducible by building any C# project with .NET Core SDK 3.1.300 on Debian 10 armhf.
+
+Affected releases: QEMU 4.2.0, 5.0.0
+Not affected releases: QEMU 4.1.0, QEMU 4.1.1
+
+
+[*] Detail
+
+qemu-system-arm fails to run .NET Core SDK 3.1 on Debian 10 armhf.
+
+I occasionally test my C# projects on the virtual armhf/arm64 system emulated by QEMU.
+MSBuild, a build engine of the .NET Core SDK, crashes on QEMU 4.2.0 or later.
+The crash only happens when MSBuild tries to do any JIT compiling (dotnet build / dotnet test).
+
+I attached MSBuild crash logs. MSBuild always crashes with SEHException, which means it tried to call C binary from .NET binary.
+
+The issue affects QEMU 4.2.0 and 5.0.0.
+QEMU 4.1.0, 4.1.1, and real Raspberry Pi 2 machine is not affected by this issue, and .NET Core SDK works completely fine.
+Thus, I think an ARM CPU regression happened between QEMU 4.1.1 ~ QEMU 4.2.0.
+
+
+[*] Environment
+
+[Host OS]
+Distribution: Linux Mint 19.3 amd64
+CPU: AMD Ryzen 5 3600
+Kernel: Ubuntu 5.3.0-51-generic
+
+[QEMU Arguments]
+qemu-system-arm \
+    -smp 3 -M virt -m 4096 \
+    -kernel vmlinuz-4.19.0-9-armmp-lpae \
+    -initrd initrd.img-4.19.0-9-armmp-lpae \
+    -append "root=/dev/vda2" \
+    -drive if=none,file=debian_arm.qcow2,format=qcow2,id=hd \
+    -device virtio-blk-device,drive=hd \
+    -netdev user,id=mynet,hostfwd=tcp::<PORT>-:22 \
+    -device virtio-net-device,netdev=mynet \
+    -device virtio-rng-device\
+
+[QEMU Guest OS]
+Distribution: Debian 10 Buster armhf
+Kernel: Debian 4.19.0-9-armmp-lpae
+.NET Core SDK: 3.1.300
+
+[Raspberry Pi 2]
+Distribution: Raspberry Pi OS Buster armhf (20200527)
+
+[Tested C# Projects]
+This is a list of C# projects I have tested on QEMU and RPI2. 
+- https://github.com/ied206/Joveler.DynLoader
+- https://github.com/ied206/Joveler.Compression
+- https://github.com/ied206/ManagedWimLib
+
+
+
+I have tested 4.2.0 release candidate versions to pinpoint which commit caused the regression.
+
+- 4.2.0-rc2: Same with 4.2.0, dotnet command crashes with SEHException.
+- 4.2.0-rc0, 4.2.0-rc1: Launching dotnet command with any argument crashes with illegal hardware instruction message.
+
+$ dotnet build
+[1]    658 illegal hardware instruction  dotnet build
+$ dotnet --version
+[1]    689 illegal hardware instruction  dotnet --version
+
+So the issue is affected by some commits pushed between 4.1.0 ~ 4.2.0-rc0 and 4.2.0-rc1 ~ 4.2.0-rc2 period.
+
+Could you try current head of git as well please, just in case it's a bug we've already fixed since 5.0? Thanks!
+
+
+I pinpointed the exact commits which affected the regression.
+
+[QEMU 4.2.0-rc0 : illegal hardware instruction]
+- Introduced in commit af28822
+https://github.com/qemu/qemu/commit/af2882289951e58363d714afd16f80050685fa29
+The commit affected LDREX/STREX translation, and broke dotnet command from .NET Core SDK.
+
+[QEMU 4.2.0-rc2 : .NET SEHException]
+- Introduced in commit 655b026
+https://github.com/qemu/qemu/commit/655b02646dc175dc10666459b0a1e4346fc8d46a
+The commit fixes STREX a bit. As a result, dotnet command is now executable except JIT compiling. 
+
+
+I also tested lastest HEAD from the master, and it still has the SEHException regression.
+(Tested commit is 66234fee9c2d37bfbc523aa8d0ae5300a14cc10e)
+
+
+Dear Peter Maydell (@pmaydell), is there any update on this bug?
+
+No, sorry. There would be a lot of effort required to track down exactly what goes wrong with the MS JIT engine...
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/271
+
+
+Hi all,
+
+I'm sure this patch will prevent the assertion failure due to the
+inconsistent ep and pid (UBS_TOKEN_SETUP) (
+https://lists.gnu.org/archive/html/qemu-devel/2021-06/msg07179.html).
+
+For UHCI (https://gitlab.com/qemu-project/qemu/-/issues/119) and OHCI (
+https://gitlab.com/qemu-project/qemu/-/issues/303), this patch may be
+right.
+
+For EHCI, I found another way to trigger this assertion even with my patch
+because ehci_get_pid() returns 0 if qtd->token.QTD_TOKEN_PID is not
+valid[0]. In this case, the patch cannot capture it because pid is zero[2].
+This case is specific to EHCI as far as I know. It seems we want to drop
+the operation if ehci_get_pid() returns 0.
+
+```static int ehci_get_pid(EHCIqtd *qtd)
+{
+    switch (get_field(qtd->token, QTD_TOKEN_PID)) {
+    case 0:
+        return USB_TOKEN_OUT;
+    case 1:
+        return USB_TOKEN_IN;
+    case 2:
+        return USB_TOKEN_SETUP;
+    default:
+        fprintf(stderr, "bad token\n"); //
+---------------------------------------------> [0]
+        return 0;
+    }
+}
+
+static int ehci_execute(EHCIPacket *p, const char *action)
+{
+    p->pid = ehci_get_pid(&p->qtd); //
+--------------------------------------------> [1]
+    p->queue->last_pid = p->pid;
+    endp = get_field(p->queue->qh.epchar, QH_EPCHAR_EP);
+    ep = usb_ep_get(p->queue->dev, p->pid/*=0*/, endp); //
+-----------------------> [2]
+```
+
+A qtest sequence is like
+```
+writel 0x1011b000 0x10124000
+writel 0x10124004 0x358cbd80
+writel 0x10124018 0x9e4bba36
+writel 0x10124014 0x10139000
+writel 0xfebd5020 0x1c4a5135
+writel 0x10139008 0x3d5c4b84
+clock_step 0xb17b0
+writel 0xfebd5064 0x5f919911
+clock_step 0xa9229
+writel 0xfebd5064 0x5431e207
+writel 0xfebd5038 0x1b2034b5
+writel 0x1b2034a0 0x10100000
+writel 0x10100000 0x10109000
+writel 0x10109000 0x1011b000
+clock_step 0xa9229
+```
+
+Best,
+Qiang
+
+

@@ -1,0 +1,95 @@
+permissions: 0.874
+socket: 0.849
+semantic: 0.821
+other: 0.818
+performance: 0.810
+graphic: 0.788
+debug: 0.772
+device: 0.767
+PID: 0.754
+boot: 0.726
+vnc: 0.717
+files: 0.693
+KVM: 0.662
+network: 0.575
+
+qemu-system-arm and qemu-system-aarch64 QMP hangs after kernel boots
+
+After booting a Linux kernel on both arm and aarch64, the QMP sockets gets unresponsive. Initially, this was thought to be limited to "quit" commands, but it reproduced with others (such as in this
+reproducer).  This is a partial log output:
+    
+   >>> {'execute': 'qmp_capabilities'}
+   <<< {'return': {}}
+   Booting Linux on physical CPU 0x0000000000 [0x410fd034]
+   Linux version 4.18.16-300.fc29.aarch64 (<email address hidden>) (gcc version 8.2.1 20180801 (Red Hat 8.2.1-2) (GCC)) #1 SMP Sat Oct 20 23:12:22 UTC 2018
+   ...
+   Policy zone: DMA32
+   Kernel command line: printk.time=0 console=ttyAMA0
+   >>> {'execute': 'stop'}
+   <<< {'timestamp': {'seconds': 1558370331, 'microseconds': 470173}, 'event': 'STOP'}
+   <<< {'return': {}}
+   >>> {'execute': 'cont'}
+   <<< {'timestamp': {'seconds': 1558370331, 'microseconds': 470849}, 'event': 'RESUME'}
+   <<< {'return': {}}
+   >>> {'execute': 'stop'}
+    
+Sometimes it takes just the first "stop" command.  Overall, I was able to reproduce 100% of times when applied on top of 6d8e75d41c58892ccc5d4ad61c4da476684c1c83.
+
+The reproducer test can be seen/fetched at:
+ - https://github.com/clebergnu/qemu/commit/c778e28c24030c4a36548b714293b319f4bf18df
+
+And test results from Travis CI can be seen at:
+ - https://travis-ci.org/clebergnu/qemu/jobs/534915669
+
+For convenience purposes, here's qemu-system-aarch64 launching and hanging on the first "stop":
+ - https://travis-ci.org/clebergnu/qemu/jobs/534915669#L3615
+ - https://travis-ci.org/clebergnu/qemu/jobs/534915669#L3645
+
+And here's qemu-system-arm hanging the very same way:
+ - https://travis-ci.org/clebergnu/qemu/jobs/534915669#L3780
+ - https://travis-ci.org/clebergnu/qemu/jobs/534915669#L3800
+
+I have an update on this.  Eric and myself attempted to zero in the
+exact cause.  A few things we discovered:
+
+ 1) It has nothing to do with having a kernel running
+ 2) It has to do with having a chardev that is a server socket.  This
+    test produces command line arguments such as:
+
+   -chardev socket,id=console,path=<path>.sock,server,nowait \
+   -serial chardev:console
+
+ 3) It doesn't seem to have a connection to the test infrastructure code
+    (python/qemu/qmp/*), as a I made a number of experiments which
+    yielded no differences in behavior.
+
+So, the reproducer given at:
+
+ https://github.com/clebergnu/qemu/commit/c778e28c24030c4a36548b714293b319f4bf18df
+
+Continues to be be valid (and continues to be limited to arm and aarch64).
+Now, after a number of experiments, the following was found to be a 100%
+reproducible *workaround*:
+
+ https://github.com/clebergnu/qemu/commit/e1713f3b91972ad57c089f276c54db3f3fa63423
+
+That basically shutdowns the *console* socket before proceeding with further QMP
+interaction.  The effectiveness of the workaround can be seen here:
+
+ aarch64 command line:
+  - https://travis-ci.org/clebergnu/qemu/jobs/535459499#L3633
+ aarch64 QMP interaction:
+  - https://travis-ci.org/clebergnu/qemu/jobs/535459499#L3663
+
+ arm command line:
+  - https://travis-ci.org/clebergnu/qemu/jobs/535459499#L3747
+ arm QMP interaction:
+  - https://travis-ci.org/clebergnu/qemu/jobs/535459499#L3767
+
+I hope this provides a few more hints into the real issue.
+
+
+A patch for this bug has been merged here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=085809670201c6d3a33e3
+... can we close this ticket now?
+

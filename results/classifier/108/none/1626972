@@ -1,0 +1,3871 @@
+KVM: 0.571
+vnc: 0.495
+other: 0.474
+device: 0.260
+permissions: 0.248
+network: 0.230
+PID: 0.229
+debug: 0.228
+semantic: 0.216
+graphic: 0.214
+boot: 0.210
+performance: 0.201
+socket: 0.200
+files: 0.147
+
+QEMU memfd_create fallback mechanism change for security drivers
+
+And, when libvirt starts using apparmor, and creating apparmor profiles for every virtual machine created in the compute nodes, mitaka qemu (2.5 - and upstream also) uses a fallback mechanism for creating shared memory for live-migrations. This fall back mechanism, on kernels 3.13 - that don't have memfd_create() system-call, try to create files on /tmp/ directory and fails.. causing live-migration not to work.
+
+Trusty with kernel 3.13 + Mitaka with qemu 2.5 + apparmor capability = can't live migrate.
+
+From qemu 2.5, logic is on :
+
+void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals, int *fd)
+{
+    if (memfd_create)... ### only works with HWE kernels
+
+    else ### 3.13 kernels, gets blocked by apparmor
+       tmpdir = g_get_tmp_dir
+       ...
+       mfd = mkstemp(fname)
+}
+
+And you can see the errors:
+
+From the host trying to send the virtual machine:
+
+2016-08-15 16:36:26.160 1974 ERROR nova.virt.libvirt.driver [req-0cac612b-8d53-4610-b773-d07ad6bacb91 691a581cfa7046278380ce82b1c38ddd 133ebc3585c041aebaead8c062cd6511 - - -] [instance: 2afa1131-bc8c-43d2-9c4a-962c1bf7723e] Migration operation has aborted
+2016-08-15 16:36:26.248 1974 ERROR nova.virt.libvirt.driver [req-0cac612b-8d53-4610-b773-d07ad6bacb91 691a581cfa7046278380ce82b1c38ddd 133ebc3585c041aebaead8c062cd6511 - - -] [instance: 2afa1131-bc8c-43d2-9c4a-962c1bf7723e] Live Migration failure: internal error: unable to execute QEMU command 'migrate': Migration disabled: failed to allocate shared memory
+
+From the host trying to receive the virtual machine:
+
+Aug 15 16:36:19 tkcompute01 kernel: [ 1194.356794] type=1400 audit(1471289779.791:72): apparmor="STATUS" operation="profile_load" profile="unconfined" name="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" pid=12565 comm="apparmor_parser"
+Aug 15 16:36:19 tkcompute01 kernel: [ 1194.357048] type=1400 audit(1471289779.791:73): apparmor="STATUS" operation="profile_load" profile="unconfined" name="qemu_bridge_helper" pid=12565 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.877027] type=1400 audit(1471289780.311:74): apparmor="STATUS" operation="profile_replace" profile="unconfined" name="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" pid=12613 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.904407] type=1400 audit(1471289780.343:75): apparmor="STATUS" operation="profile_replace" profile="unconfined" name="qemu_bridge_helper" pid=12613 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.973064] type=1400 audit(1471289780.407:76): apparmor="DENIED" operation="mknod" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/tmp/memfd-tNpKSj" pid=12625 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=107 ouid=107
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.979871] type=1400 audit(1471289780.411:77): apparmor="DENIED" operation="open" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/tmp/" pid=12625 comm="qemu-system-x86" requested_mask="r" denied_mask="r" fsuid=107 ouid=0
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.979881] type=1400 audit(1471289780.411:78): apparmor="DENIED" operation="open" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/var/tmp/" pid=12625 comm="qemu-system-x86" requested_mask="r" denied_mask="r" fsuid=107 ouid=0
+
+When leaving libvirt without apparmor capabilities (thus not confining virtual machines on compute nodes, the live migration works as expected, so, clearly, apparmor is stepping into the live migration). I'm sure that virtual machines have to be confined and that this isn't the desired behaviour...
+
+Related: https://bugs.launchpad.net/nova/+bug/1613423
+
+I came up with this patch for QEMU:
+
+http://paste.ubuntu.com/23217056/
+
+I'm finishing libvirt patch so I can propose upstream QEMU already sure that libvirt will benefit from this change. Right after I'll propose libvirt upstream patch (changing vert-aa-helper logic).
+
+And later: 
+
+Improved it a little bit: http://paste.ubuntu.com/23217333/
+
+And fixed it:
+
+http://paste.ubuntu.com/23219599/
+(Probable the version to be suggested to upstream)
+
+Fixed it according to checkpatch.pl as stated in http://wiki.qemu.org/Contribute/SubmitAPatch.
+
+http://paste.ubuntu.com/23220104/
+
+Will submit to mailing list after testing everything.
+
+Commit: 35f9b6ef3acc9d0546c395a566b04e63ca84e302 added a fallback
+mechanism for systems not supporting memfd_create syscall (started
+being supported since 3.17).
+
+Backporting memfd_create might not be accepted for distros relying
+on older kernels. Nowadays there is no way for security driver
+to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+
+It is more appropriate to include UUID and/or VM names in the
+temporary filename, allowing security driver rules to be applied
+while maintaining the required unpredictability with mkstemp.
+
+This change will allow libvirt to know exact memfd file to be created
+for vhost log AND to create appropriate security rules to allow access
+per instance (instead of a opened rule like <tmpdir>/memfd-*).
+
+Example of apparmor deny messages with this change:
+
+Per VM UUID (preferred, generated automatically by libvirt):
+
+kernel: [26632.154856] type=1400 audit(1474945148.633:78): apparmor=
+"DENIED" operation="mknod" profile="libvirt-0b96011f-0dc0-44a3-92c3-
+196de2efab6d" name="/tmp/memfd-0b96011f-0dc0-44a3-92c3-196de2efab6d-
+qeHrBV" pid=75161 comm="qemu-system-x86" requested_mask="c" denied_
+mask="c" fsuid=107 ouid=107
+
+Per VM name (if no UUID is specified):
+
+kernel: [26447.505653] type=1400 audit(1474944963.985:72): apparmor=
+"DENIED" operation="mknod" profile="libvirt-00000000-0000-0000-0000-
+000000000000" name="/tmp/memfd-instance-teste-osYpHh" pid=74648
+comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=107
+ouid=107
+
+Signed-off-by: Rafael David Tinoco <email address hidden>
+---
+ util/memfd.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/util/memfd.c b/util/memfd.c
+index 4571d1a..4b715ac 100644
+--- a/util/memfd.c
++++ b/util/memfd.c
+@@ -30,6 +30,9 @@
+ #include <glib/gprintf.h>
+ 
+ #include "qemu/memfd.h"
++#include "qmp-commands.h"
++#include "qemu-common.h"
++#include "sysemu/sysemu.h"
+ 
+ #ifdef CONFIG_MEMFD
+ #include <sys/memfd.h>
+@@ -94,11 +97,32 @@ void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals,
+             return NULL;
+         }
+     } else {
++        int ret = 0;
+         const char *tmpdir = g_get_tmp_dir();
++        UuidInfo *uinfo;
++        NameInfo *ninfo;
+         gchar *fname;
+ 
+-        fname = g_strdup_printf("%s/memfd-XXXXXX", tmpdir);
++        uinfo = qmp_query_uuid(NULL);
++
++        ret = strcmp(uinfo->UUID, UUID_NONE);
++        if (ret == 0) {
++            ninfo = qmp_query_name(NULL);
++            if (ninfo->has_name) {
++                fname = g_strdup_printf("%s/memfd-%s-XXXXXX", tmpdir,
++                                        ninfo->name);
++            } else {
++                fname = g_strdup_printf("%s/memfd-XXXXXX", tmpdir);
++            }
++            qapi_free_NameInfo(ninfo);
++        } else {
++            fname = g_strdup_printf("%s/memfd-%s-XXXXXX", tmpdir,
++                                    uinfo->UUID);
++        }
++
+         mfd = mkstemp(fname);
++
++        qapi_free_UuidInfo(uinfo);
+         unlink(fname);
+         g_free(fname);
+ 
+-- 
+2.9.3
+
+
+
+Commit: 35f9b6ef3acc9d0546c395a566b04e63ca84e302 added a fallback
+mechanism for systems not supporting memfd_create syscall (started
+being supported since 3.17).
+
+Backporting memfd_create might not be accepted for distros relying
+on older kernels. Nowadays there is no way for security driver
+to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+
+It is more appropriate to include UUID and/or VM names in the
+temporary filename, allowing security driver rules to be applied
+while maintaining the required unpredictability with mkstemp.
+
+This change will allow libvirt to know exact memfd file to be created
+for vhost log AND to create appropriate security rules to allow access
+per instance (instead of a opened rule like <tmpdir>/memfd-*).
+
+Example of apparmor deny messages with this change:
+
+Per VM UUID (preferred, generated automatically by libvirt):
+
+kernel: [26632.154856] type=1400 audit(1474945148.633:78): apparmor=
+"DENIED" operation="mknod" profile="libvirt-0b96011f-0dc0-44a3-92c3-
+196de2efab6d" name="/tmp/memfd-0b96011f-0dc0-44a3-92c3-196de2efab6d-
+qeHrBV" pid=75161 comm="qemu-system-x86" requested_mask="c" denied_
+mask="c" fsuid=107 ouid=107
+
+Per VM name (if no UUID is specified):
+
+kernel: [26447.505653] type=1400 audit(1474944963.985:72): apparmor=
+"DENIED" operation="mknod" profile="libvirt-00000000-0000-0000-0000-
+000000000000" name="/tmp/memfd-instance-teste-osYpHh" pid=74648
+comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=107
+ouid=107
+
+Signed-off-by: Rafael David Tinoco <email address hidden>
+---
+ util/memfd.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/util/memfd.c b/util/memfd.c
+index 4571d1a..4b715ac 100644
+--- a/util/memfd.c
++++ b/util/memfd.c
+@@ -30,6 +30,9 @@
+ #include <glib/gprintf.h>
+ 
+ #include "qemu/memfd.h"
++#include "qmp-commands.h"
++#include "qemu-common.h"
++#include "sysemu/sysemu.h"
+ 
+ #ifdef CONFIG_MEMFD
+ #include <sys/memfd.h>
+@@ -94,11 +97,32 @@ void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals,
+             return NULL;
+         }
+     } else {
++        int ret = 0;
+         const char *tmpdir = g_get_tmp_dir();
++        UuidInfo *uinfo;
++        NameInfo *ninfo;
+         gchar *fname;
+ 
+-        fname = g_strdup_printf("%s/memfd-XXXXXX", tmpdir);
++        uinfo = qmp_query_uuid(NULL);
++
++        ret = strcmp(uinfo->UUID, UUID_NONE);
++        if (ret == 0) {
++            ninfo = qmp_query_name(NULL);
++            if (ninfo->has_name) {
++                fname = g_strdup_printf("%s/memfd-%s-XXXXXX", tmpdir,
++                                        ninfo->name);
++            } else {
++                fname = g_strdup_printf("%s/memfd-XXXXXX", tmpdir);
++            }
++            qapi_free_NameInfo(ninfo);
++        } else {
++            fname = g_strdup_printf("%s/memfd-%s-XXXXXX", tmpdir,
++                                    uinfo->UUID);
++        }
++
+         mfd = mkstemp(fname);
++
++        qapi_free_UuidInfo(uinfo);
+         unlink(fname);
+         g_free(fname);
+ 
+-- 
+2.9.3
+
+
+
+I'll follow to see if patch was accepted upstream:
+
+https://lists.gnu.org/archive/html/qemu-devel/2016-09/msg06191.html
+https://<email address hidden>/msg400892.html
+
+On Tue, Sep 27, 2016 at 03:06:21AM +0000, Rafael David Tinoco wrote:
+> Commit: 35f9b6ef3acc9d0546c395a566b04e63ca84e302 added a fallback
+> mechanism for systems not supporting memfd_create syscall (started
+> being supported since 3.17).
+
+This is really dubious code in general and IMHO should just
+be reverted.
+
+We have a golden rule that any time QEMU needs to be able to
+create a file on disk, then the path should be explicitly
+provided as a command line argument so that mgmt apps can
+control the location used.
+
+> Backporting memfd_create might not be accepted for distros relying
+> on older kernels. Nowadays there is no way for security driver
+> to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> 
+> It is more appropriate to include UUID and/or VM names in the
+> temporary filename, allowing security driver rules to be applied
+> while maintaining the required unpredictability with mkstemp.
+
+We should not have QEMU creating unpredictabile filenames in the
+first place - any filenames should be determined by libvirt
+explicitly.
+
+> This change will allow libvirt to know exact memfd file to be created
+> for vhost log AND to create appropriate security rules to allow access
+> per instance (instead of a opened rule like <tmpdir>/memfd-*).
+
+Even with this change it is bad - we don't want driver backends
+creating arbitrary files in the shared /tmp directory.
+
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://autobuild.org       -o-         http://search.cpan.org/~danberr/ :|
+|: http://entangle-photo.org       -o-       http://live.gnome.org/gtk-vnc :|
+
+
+
+> On Sep 27, 2016, at 05:36, Daniel P. Berrange <email address hidden> wrote:
+> 
+> On Tue, Sep 27, 2016 at 03:06:21AM +0000, Rafael David Tinoco wrote:
+>> Commit: 35f9b6ef3acc9d0546c395a566b04e63ca84e302 added a fallback
+>> mechanism for systems not supporting memfd_create syscall (started
+>> being supported since 3.17).
+> 
+> This is really dubious code in general and IMHO should just
+> be reverted.
+
+There are numerous people relying on older kernels in openstack 
+deployments - sometimes with specific drivers (ovswitch, dpdk, 
+infiniband) holding kernel upgrades - but still in need of upgrading 
+userland (e.g. newer releases). Having a fallback mechanism seems 
+appropriate for those cases.
+
+> 
+> We have a golden rule that any time QEMU needs to be able to
+> create a file on disk, then the path should be explicitly
+> provided as a command line argument so that mgmt apps can
+> control the location used.
+> 
+>> Backporting memfd_create might not be accepted for distros relying
+>> on older kernels. Nowadays there is no way for security driver
+>> to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+>> 
+>> It is more appropriate to include UUID and/or VM names in the
+>> temporary filename, allowing security driver rules to be applied
+>> while maintaining the required unpredictability with mkstemp.
+> 
+> We should not have QEMU creating unpredictabile filenames in the
+> first place - any filenames should be determined by libvirt
+> explicitly.
+
+Note that the filename, per se, is not as important as other files, 
+since qemu won't provide it for being accessed by external programs, and,
+deletes the file, while keeping the descriptor, right after its creation
+(due to its nature, that is probably why it was created in /tmp).
+
+Having libvirt to define a filename that would not be used for recent
+kernels (> 3.17) and would exist for a fraction of second doesn't seem
+right to me. 
+
+> 
+>> This change will allow libvirt to know exact memfd file to be created
+>> for vhost log AND to create appropriate security rules to allow access
+>> per instance (instead of a opened rule like <tmpdir>/memfd-*).
+> 
+> Even with this change it is bad - we don't want driver backends
+> creating arbitrary files in the shared /tmp directory.
+
+On the other hand, if we are creating a tmp file, like I said, I see 
+benefit on having unpredictability (mkstemp), but providing predictable
+parts to allow security driver to apply rules per instance basis 
+(/tmp/memfd-UUID*, /tmp/memfd-VMname*). 
+
+Looking forward to a decision so I can backport correct behaviour
+(with or without memfd file).  
+
+Thank you!
+
+Best Regards,
+Rafael
+
+
+
+Hello!
+
+> On Sep 27, 2016, at 08:13, Marc-André Lureau <email address hidden> wrote:
+> 
+>> Note that the filename, per se, is not as important as other files,
+>> since qemu won't provide it for being accessed by external programs, and,
+>> deletes the file, while keeping the descriptor, right after its creation
+>> (due to its nature, that is probably why it was created in /tmp).
+>> 
+>> Having libvirt to define a filename that would not be used for recent
+>> kernels (> 3.17) and would exist for a fraction of second doesn't seem
+>> right to me.
+>> 
+> 
+> There are other parts of qemu that rely on creating temporary files, and this seems to lack a bit of uniformity. Would it make sense to define a place where qemu could create those? Or setting TMPDIR should help too. Could libvirt set a per-vm TMPDIR with appropriate security rules?
+
+You got a point. With a per-vm TMPDIR we don't have to care about filenames in future for the security driver, while still securing them per-instance base. I'll come back to you! 
+
+Thank you!
+
+On Tue, Sep 27, 2016 at 11:01:10AM -0000, Rafael David Tinoco wrote:
+> > On Sep 27, 2016, at 05:36, Daniel P. Berrange <email address hidden> wrote:
+> > 
+> > On Tue, Sep 27, 2016 at 03:06:21AM +0000, Rafael David Tinoco wrote:
+> >> Commit: 35f9b6ef3acc9d0546c395a566b04e63ca84e302 added a fallback
+> >> mechanism for systems not supporting memfd_create syscall (started
+> >> being supported since 3.17).
+> > 
+> > This is really dubious code in general and IMHO should just
+> > be reverted.
+> 
+> There are numerous people relying on older kernels in openstack 
+> deployments - sometimes with specific drivers (ovswitch, dpdk, 
+> infiniband) holding kernel upgrades - but still in need of upgrading 
+> userland (e.g. newer releases). Having a fallback mechanism seems 
+> appropriate for those cases.
+
+I'm not against some kind of fallback - just about the way it
+silently creates files in /tmp.
+
+> 
+> Note that the filename, per se, is not as important as other files, 
+> since qemu won't provide it for being accessed by external programs, and,
+> deletes the file, while keeping the descriptor, right after its creation
+> (due to its nature, that is probably why it was created in /tmp).
+
+If it doesn't shared with other processes, and is deleted immediately,
+why does the file need to be on disk at all ?
+
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://autobuild.org       -o-         http://search.cpan.org/~danberr/ :|
+|: http://entangle-photo.org       -o-       http://live.gnome.org/gtk-vnc :|
+
+
+On Tue, Sep 27, 2016 at 07:13:55AM -0400, Marc-André Lureau wrote:
+> Hi
+> 
+> ----- Original Message -----
+> > 
+> > > On Sep 27, 2016, at 05:36, Daniel P. Berrange <email address hidden> wrote:
+> > > 
+> > > On Tue, Sep 27, 2016 at 03:06:21AM +0000, Rafael David Tinoco wrote:
+> > > We should not have QEMU creating unpredictabile filenames in the
+> > > first place - any filenames should be determined by libvirt
+> > > explicitly.
+> > 
+> > Note that the filename, per se, is not as important as other files,
+> > since qemu won't provide it for being accessed by external programs, and,
+> > deletes the file, while keeping the descriptor, right after its creation
+> > (due to its nature, that is probably why it was created in /tmp).
+> > 
+> > Having libvirt to define a filename that would not be used for recent
+> > kernels (> 3.17) and would exist for a fraction of second doesn't seem
+> > right to me.
+> > 
+> 
+> There are other parts of qemu that rely on creating temporary files, and
+> this seems to lack a bit of uniformity. Would it make sense to define a
+> place where qemu could create those? Or setting TMPDIR should help too.
+> Could libvirt set a per-vm TMPDIR with appropriate security rules?
+
+The other places that use mkstemp are block for snapshot=on, which
+libvirt does not support as we want control over the filename. This
+needs fixing by allowing a filename to be given. The qemu sockets code
+uses it for auto-creating a UNIX domain socket path, but again libvirt
+doesn't support that usage. The exec.c file uses it, but that honours
+an explicit directory path provided on the command line. So this memfd
+code really is the first place which is causing a real
+
+Just setting TMPDIR per VM doesn't magically solve all these cases as
+it isn't reasonable to assume that all these files should be in the
+same location. Certainly block snapshot file will be somewhere different
+from others, due to its size.
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://autobuild.org       -o-         http://search.cpan.org/~danberr/ :|
+|: http://entangle-photo.org       -o-       http://live.gnome.org/gtk-vnc :|
+
+
+Sorry, I was only able to come back to this today.
+
+> On Sep 27, 2016, at 09:18, Daniel Berrange <email address hidden> wrote:
+> 
+>> There are numerous people relying on older kernels in openstack 
+>> deployments - sometimes with specific drivers (ovswitch, dpdk, 
+>> infiniband) holding kernel upgrades - but still in need of upgrading 
+>> userland (e.g. newer releases). Having a fallback mechanism seems 
+>> appropriate for those cases.
+> 
+> I'm not against some kind of fallback - just about the way it
+> silently creates files in /tmp.
+> 
+
+That is why memfd_create is used here I suppose: To allow anonymous-backed-pages to have a descriptor and to be sealed. When falling back this mechanism I don't see any other way other than creating a temporary file. Of course one way would be something like:
+
+http://paste.ubuntu.com/23270379/
+
+But this is pretty much the same, just solving the "where to place the temporary file" (non configurable for this usage). 
+
+>> 
+>> Note that the filename, per se, is not as important as other files, 
+>> since qemu won't provide it for being accessed by external programs, and,
+>> deletes the file, while keeping the descriptor, right after its creation
+>> (due to its nature, that is probably why it was created in /tmp).
+> 
+> If it doesn't shared with other processes, and is deleted immediately,
+> why does the file need to be on disk at all ?
+
+Well, it unlinks the file but the references are still there while the descriptor isn't closed by this process, or by the one that receives the descriptor (that is why is the "unlink" so early). 
+
+If you check vhost_dev_log_resize(), it gets *possible* new vhost log (if a new size is given) and informs the vhost dev driver about the new log base (vhost_ops->vhost_set_log_base). 
+
+For vhost_user, this means that the file descriptors for vhost logs are likely going to be passed to vhost backend (fds[] in vhost_user_set_log_base). This is just one example, not sure about others. 
+
+Probably the best approach here, like what Marc-André said, is to create some sort of TMPDIR, set by libvirt perhaps ?
+
+> 
+> Regards,
+> Daniel
+
+
+
+Hello Marc, 
+
+> On Sep 27, 2016, at 08:13, Marc-André Lureau <email address hidden> wrote:
+> 
+>>> On Tue, Sep 27, 2016 at 03:06:21AM +0000, Rafael David Tinoco wrote:
+>>> We should not have QEMU creating unpredictabile filenames in the
+>>> first place - any filenames should be determined by libvirt
+>>> explicitly.
+>> 
+>> Note that the filename, per se, is not as important as other files,
+>> since qemu won't provide it for being accessed by external programs, and,
+>> deletes the file, while keeping the descriptor, right after its creation
+>> (due to its nature, that is probably why it was created in /tmp).
+>> 
+>> Having libvirt to define a filename that would not be used for recent
+>> kernels (> 3.17) and would exist for a fraction of second doesn't seem
+>> right to me.
+>> 
+> 
+> There are other parts of qemu that rely on creating temporary files, and this seems to lack a bit of uniformity. Would it make sense to define a place where qemu could create those? Or setting TMPDIR should help too. Could libvirt set a per-vm TMPDIR with appropriate security rules?
+
+Best move I can see. Only problem is that if we do that, we would have to create a fallback mechanism for when TMPDIR is not set. It would go back to /tmp ? 
+
+In my particular case (for 1 vhost log file):
+
+-netdev tap,fd=26,id=hostnet0,vhost=on,vhostfd=28 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=fa:16:3e:5c:10:f2,bus=pci.0,addr=0x3
+
+I could have something similar to:
+
+-netdev tap,fd=26,id=hostnet0,vhost=on,vhostfd=28 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=fa:16:3e:5c:10:f2,bus=pci.0,addr=0x3,vhostpath=/var/lib/XXXX/YYYY/ 
+
+and put mkstemp() files (one per vhost device) in there. 
+
+Even so, what to do when "vhostpath" is not informed ? 
+
+I'm worried that, right now there are security drivers either blocking the live migration entirely or allowing all instances to be able to read /tmp/memfd-XXXX. 
+
+Don't you think we could push the first patch until we come up with a better approach for the tmp (and default tmp) files & directories ? The patch is not worse than what was committed already. 
+
+Tks
+
+Rafael
+
+
+
+
+On Mon, Oct 03, 2016 at 03:41:10PM -0000, Rafael David Tinoco wrote:
+> Sorry, I was only able to come back to this today.
+> 
+> > On Sep 27, 2016, at 09:18, Daniel Berrange <email address hidden> wrote:
+> > 
+> >> There are numerous people relying on older kernels in openstack 
+> >> deployments - sometimes with specific drivers (ovswitch, dpdk, 
+> >> infiniband) holding kernel upgrades - but still in need of upgrading 
+> >> userland (e.g. newer releases). Having a fallback mechanism seems 
+> >> appropriate for those cases.
+> > 
+> > I'm not against some kind of fallback - just about the way it
+> > silently creates files in /tmp.
+> > 
+> 
+> That is why memfd_create is used here I suppose: To allow anonymous-
+> backed-pages to have a descriptor and to be sealed. When falling back
+> this mechanism I don't see any other way other than creating a temporary
+> file. Of course one way would be something like:
+> 
+> http://paste.ubuntu.com/23270379/
+> 
+> But this is pretty much the same, just solving the "where to place the
+> temporary file" (non configurable for this usage).
+> 
+> >> 
+> >> Note that the filename, per se, is not as important as other files, 
+> >> since qemu won't provide it for being accessed by external programs, and,
+> >> deletes the file, while keeping the descriptor, right after its creation
+> >> (due to its nature, that is probably why it was created in /tmp).
+> > 
+> > If it doesn't shared with other processes, and is deleted immediately,
+> > why does the file need to be on disk at all ?
+> 
+> Well, it unlinks the file but the references are still there while the
+> descriptor isn't closed by this process, or by the one that receives the
+> descriptor (that is why is the "unlink" so early).
+> 
+> If you check vhost_dev_log_resize(), it gets *possible* new vhost log
+> (if a new size is given) and informs the vhost dev driver about the new
+> log base (vhost_ops->vhost_set_log_base).
+> 
+> For vhost_user, this means that the file descriptors for vhost logs are
+> likely going to be passed to vhost backend (fds[] in
+> vhost_user_set_log_base). This is just one example, not sure about
+> others.
+>
+> Probably the best approach here, like what Marc-André said, is to create
+> some sort of TMPDIR, set by libvirt perhaps ?
+
+So you're saying that the file descriptor here is actually getting
+passed to a different process for it to use ?
+
+If so that means we definitely do not want this in TMPDIR. If we
+create a generic file in TMPDIR, then its going to have a generic
+security label. That means that the other process we're giving the
+FD to is going to have to be granted permission to access this FD
+and we certainly don't want to grant permission for it to access
+any of QEMU's other FDs. So for the SELinux integration, we'll
+need this FD to be in a specific directory, so that we can setup
+policy such that the file created gets given a specific SELinux
+label. We can then grant the other process access to only that
+particular file, and not anything else of QEMU's.
+
+This makes me wonder about the memfd_create() code path too - we'll
+again not want that external process to be granted access to arbitrary
+FDs of QEMU's and I'm not sure of a way to get the memfd  FD to have
+a specific label. So I think it is possible that when using libvirt
+we'll want the ability to tell QEMU to *always* use an explicit file
+in a path libvirt specifies, and never use memfd even if available.
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/ :|
+
+
+Hello Daniel,
+
+> On Oct 03, 2016, at 14:55, Daniel P. Berrange <email address hidden> wrote:
+> 
+>> Well, it unlinks the file but the references are still there while the
+>> descriptor isn't closed by this process, or by the one that receives the
+>> descriptor (that is why is the "unlink" so early).
+>> 
+>> If you check vhost_dev_log_resize(), it gets *possible* new vhost log
+>> (if a new size is given) and informs the vhost dev driver about the new
+>> log base (vhost_ops->vhost_set_log_base).
+>> 
+>> For vhost_user, this means that the file descriptors for vhost logs are
+>> likely going to be passed to vhost backend (fds[] in
+>> vhost_user_set_log_base). This is just one example, not sure about
+>> others.
+>> 
+>> Probably the best approach here, like what Marc-André said, is to create
+>> some sort of TMPDIR, set by libvirt perhaps ?
+> 
+> So you're saying that the file descriptor here is actually getting
+> passed to a different process for it to use ?
+> 
+> If so that means we definitely do not want this in TMPDIR. If we
+> create a generic file in TMPDIR, then its going to have a generic
+> security label. That means that the other process we're giving the
+> FD to is going to have to be granted permission to access this FD
+> and we certainly don't want to grant permission for it to access
+> any of QEMU's other FDs. So for the SELinux integration, we'll
+> need this FD to be in a specific directory, so that we can setup
+> policy such that the file created gets given a specific SELinux
+> label. We can then grant the other process access to only that
+> particular file, and not anything else of QEMU's.
+> 
+> This makes me wonder about the memfd_create() code path too - we'll
+> again not want that external process to be granted access to arbitrary
+> FDs of QEMU's and I'm not sure of a way to get the memfd  FD to have
+> a specific label. So I think it is possible that when using libvirt
+> we'll want the ability to tell QEMU to *always* use an explicit file
+> in a path libvirt specifies, and never use memfd even if available.
+
+Check this execution path:
+
+(vhost_vsock_device_realize)
+  vhost_dev_init
+  vhost_commit
+  |- vhost_get_log_size
+  |...
+  |- vhost_dev_log_resize
+
+(vhost_dev_log_resize):
+  vhost_log_get -> here if the size is bigger, a new log is created
+  dev->vhost_ops->vhost_set_log_base() -> kernel or user vhost driver
+  vhost_log_put()
+
+----
+
+So, 
+
+* In case of the kernel mode, this is just a:
+
+vhost in kernel mode = vhost_kernel_set_log_base
+return vhost_kernel_call(dev, VHOST_SET_LOG_BASE, &base);
+
+which makes an ioctl to dev->opaque file descriptor to set a new vhost log base.
+
+* But in the case of user mode:
+
+vhost in user mode = vhost_user_set_log_base
+
+which gets the log file descriptor (log->fd) and gives to vhost_user_write. vhost_user_write will do a qemu_chr_fe_set_msgfds passing the log file descriptors for the backend vhost driver (CharDriverState). 
+
+If I'm reading this right.. if the backend driver is:
+
+static int tcp_set_msgfds(CharDriverState *chr, int *fds, int num)
+
+it would check for:
+
+!qio_channel_has_feature(s->ioc, QIO_CHANNEL_FEATURE_FD_PASS)) {
+
+and configure s->write_msgfds. This would be sent in:
+
+static int tcp_chr_write(CharDriverState *chr, const uint8_t *buf, int len)
+
+with "io_channel_send_full" + "qio_channel_writev_full + io_writev from QIOChannelClass. 
+
+----
+
+https://www.berrange.com/posts/2016/08/16/
+
+This, from your blog, probably confirms this behaviour:
+
+"The migration code supports a number of different protocols besides just “tcp:“. In particular it allows an “fd:” protocol to tell QEMU to use a passed-in file descriptor, and an “exec:” protocol to tell QEMU to launch an external command to tunnel the connection. It is desirable to be able to use TLS with these protocols too, but when using TLS the client QEMU needs to know the hostname of the target QEMU in order to correctly validate the x509 certificate it receives. Thus, a second “tls-hostname” parameter was added to allow QEMU to be informed of the hostname to use for x509 certificate validation when using a non-tcp migration protocol. This can be set on the source QEMU prior to starting the migration using the “migrate_set_str_parameter” monitor command"
+
+=) 
+
+Yes, definitely. Check this:
+
+/**
+ * @qemu_chr_fe_set_msgfds:
+ *
+ * For backends capable of fd passing, set an array of fds to be passed with
+ * the next send operation.
+ * A subsequent call to this function before calling a write function will
+ * result in overwriting the fd array with the new value without being send.
+ * Upon writing the message the fd array is freed.
+ *
+ * Returns: -1 if fd passing isn't supported.
+ */
+int qemu_chr_fe_set_msgfds(CharDriverState *s, int *fds, int num);
+
+----
+
+So, at least for vhost_dev_log_resize, this "interface" is being implemented:
+
+vhost_user_set_log_base -> VhostUserMsg = VHOST_USER_SET_LOG_BASE
+
+vhost_user_write(with the VHOST_USER_GET_LOG_BASE message):
+
+- configures the file descriptors(... , fds, fd_num)
+  qemu_chr_fe_set_msgfds
+
+- writes them down the char driver
+  qemu_chr_fe_write_all
+
+> On Oct 03, 2016, at 15:46, Rafael David Tinoco <email address hidden> wrote:
+> 
+>> So you're saying that the file descriptor here is actually getting
+>> passed to a different process for it to use ?
+
+
+
+On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+> Yes, definitely. Check this:
+
+[snip]
+
+So in that case, I think we must add ability to specify an explicit path
+that apps can use *regardles* of whether memfd support exists or not.
+
+> > On Oct 03, 2016, at 15:46, Rafael David Tinoco <email address hidden> wrote:
+> > 
+> >> So you're saying that the file descriptor here is actually getting
+> >> passed to a different process for it to use ?
+> 
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/ :|
+
+
+Let me work on it. I'll get back soon. 
+
+Tks Daniel.
+
+> On Oct 04, 2016, at 05:36, Daniel P. Berrange <email address hidden> wrote:
+> 
+> On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+>> Yes, definitely. Check this:
+> 
+> [snip]
+> 
+> So in that case, I think we must add ability to specify an explicit path
+> that apps can use *regardles* of whether memfd support exists or not.
+> 
+>>> On Oct 03, 2016, at 15:46, Rafael David Tinoco <email address hidden> wrote:
+>>> 
+>>>> So you're saying that the file descriptor here is actually getting
+>>>> passed to a different process for it to use ?
+
+
+
+Hi Rafael, Daniel,
+
+On Tue, Oct 4, 2016 at 4:22 PM Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> Let me work on it. I'll get back soon.
+>
+>
+thanks for working on it, before that I have a few questions:
+
+Tks Daniel.
+>
+> > On Oct 04, 2016, at 05:36, Daniel P. Berrange <email address hidden>
+> wrote:
+> >
+> > On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+> >> Yes, definitely. Check this:
+> >
+> > [snip]
+> >
+> > So in that case, I think we must add ability to specify an explicit path
+> > that apps can use *regardles* of whether memfd support exists or not.
+>
+
+How will this path be used? Is it going to be global to qemu for various
+use (kinda like $TMP), or per-device, or for memfd fallback only? Should
+the path pre-exist? (I suppose, if not, qemu should clean it up when
+leaving)
+
+>
+> >>> On Oct 03, 2016, at 15:46, Rafael David Tinoco <
+> <email address hidden>> wrote:
+> >>>
+> >>>> So you're saying that the file descriptor here is actually getting
+> >>>> passed to a different process for it to use ?
+>
+>
+> --
+Marc-André Lureau
+
+
+On Tue, Oct 04, 2016 at 12:39:17PM +0000, Marc-André Lureau wrote:
+> Hi Rafael, Daniel,
+> 
+> On Tue, Oct 4, 2016 at 4:22 PM Rafael David Tinoco <
+> <email address hidden>> wrote:
+> 
+> > Let me work on it. I'll get back soon.
+> >
+> >
+> thanks for working on it, before that I have a few questions:
+> 
+> Tks Daniel.
+> >
+> > > On Oct 04, 2016, at 05:36, Daniel P. Berrange <email address hidden>
+> > wrote:
+> > >
+> > > On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+> > >> Yes, definitely. Check this:
+> > >
+> > > [snip]
+> > >
+> > > So in that case, I think we must add ability to specify an explicit path
+> > > that apps can use *regardles* of whether memfd support exists or not.
+> >
+> 
+> How will this path be used? Is it going to be global to qemu for various
+> use (kinda like $TMP), or per-device, or for memfd fallback only? Should
+> the path pre-exist? (I suppose, if not, qemu should clean it up when
+> leaving)
+
+I'd expect it to be an option set against the vhost user backend, since
+that's the thing using this.
+
+If other things have similar usage needs wrt memfd in future, they would
+also need similar path config option.
+
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/ :|
+
+
+Hi
+
+On Tue, Oct 4, 2016 at 4:42 PM Daniel P. Berrange <email address hidden>
+wrote:
+
+> On Tue, Oct 04, 2016 at 12:39:17PM +0000, Marc-André Lureau wrote:
+> > Hi Rafael, Daniel,
+> >
+> > On Tue, Oct 4, 2016 at 4:22 PM Rafael David Tinoco <
+> > <email address hidden>> wrote:
+> >
+> > > Let me work on it. I'll get back soon.
+> > >
+> > >
+> > thanks for working on it, before that I have a few questions:
+> >
+> > Tks Daniel.
+> > >
+> > > > On Oct 04, 2016, at 05:36, Daniel P. Berrange <email address hidden>
+> > > wrote:
+> > > >
+> > > > On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+> > > >> Yes, definitely. Check this:
+> > > >
+> > > > [snip]
+> > > >
+> > > > So in that case, I think we must add ability to specify an explicit
+> path
+> > > > that apps can use *regardles* of whether memfd support exists or not.
+> > >
+> >
+> > How will this path be used? Is it going to be global to qemu for various
+> > use (kinda like $TMP), or per-device, or for memfd fallback only? Should
+> > the path pre-exist? (I suppose, if not, qemu should clean it up when
+> > leaving)
+>
+> I'd expect it to be an option set against the vhost user backend, since
+> that's the thing using this.
+>
+> If other things have similar usage needs wrt memfd in future, they would
+> also need similar path config option.
+>
+
+The log may be shared if there are several vhost-user (stored in
+vhost_log_shm global), so I think it makes more sense to have a global
+config path for it, or you may end up duplicating that information per
+vhost backend and having files in either of the specified paths.
+
+
+>
+>
+> Regards,
+> Daniel
+> --
+> |: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/
+> :|
+> |: http://libvirt.org              -o-             http://virt-manager.org
+> :|
+> |: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/
+> :|
+>
+-- 
+Marc-André Lureau
+
+
+On Tue, Oct 04, 2016 at 01:10:17PM +0000, Marc-André Lureau wrote:
+> Hi
+> 
+> On Tue, Oct 4, 2016 at 4:42 PM Daniel P. Berrange <email address hidden>
+> wrote:
+> 
+> > On Tue, Oct 04, 2016 at 12:39:17PM +0000, Marc-André Lureau wrote:
+> > > Hi Rafael, Daniel,
+> > >
+> > > On Tue, Oct 4, 2016 at 4:22 PM Rafael David Tinoco <
+> > > <email address hidden>> wrote:
+> > >
+> > > > Let me work on it. I'll get back soon.
+> > > >
+> > > >
+> > > thanks for working on it, before that I have a few questions:
+> > >
+> > > Tks Daniel.
+> > > >
+> > > > > On Oct 04, 2016, at 05:36, Daniel P. Berrange <email address hidden>
+> > > > wrote:
+> > > > >
+> > > > > On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco wrote:
+> > > > >> Yes, definitely. Check this:
+> > > > >
+> > > > > [snip]
+> > > > >
+> > > > > So in that case, I think we must add ability to specify an explicit
+> > path
+> > > > > that apps can use *regardles* of whether memfd support exists or not.
+> > > >
+> > >
+> > > How will this path be used? Is it going to be global to qemu for various
+> > > use (kinda like $TMP), or per-device, or for memfd fallback only? Should
+> > > the path pre-exist? (I suppose, if not, qemu should clean it up when
+> > > leaving)
+> >
+> > I'd expect it to be an option set against the vhost user backend, since
+> > that's the thing using this.
+> >
+> > If other things have similar usage needs wrt memfd in future, they would
+> > also need similar path config option.
+> >
+> 
+> The log may be shared if there are several vhost-user (stored in
+> vhost_log_shm global), so I think it makes more sense to have a global
+> config path for it, or you may end up duplicating that information per
+> vhost backend and having files in either of the specified paths.
+
+Hmm, is there a reason why it is shared? That seems to make an assumption
+that all vhost-user backends would be managed by the same external process.
+While that may be the common case today, it doesn't feel like a reasonable
+assumption to make long term. IOW it feels wiser to have it set per-NIC
+unless I'm missing something important that means it must be shared ?
+
+Regards,
+Daniel
+-- 
+|: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/ :|
+|: http://libvirt.org              -o-             http://virt-manager.org :|
+|: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/ :|
+
+
+
+> On Oct 04, 2016, at 10:10, Marc-André Lureau <email address hidden> wrote:
+> 
+> > How will this path be used? Is it going to be global to qemu for various
+> > use (kinda like $TMP), or per-device, or for memfd fallback only? Should
+> > the path pre-exist? (I suppose, if not, qemu should clean it up when
+> > leaving)
+> 
+> I'd expect it to be an option set against the vhost user backend, since
+> that's the thing using this.
+> 
+> If other things have similar usage needs wrt memfd in future, they would
+> also need similar path config option.
+
+I was going for that approach. I could have something similar to:
+
+-netdev tap,fd=26,id=hostnet0,vhost=on,vhostfd=28 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=fa:16:3e:5c:10:f2,bus=pci.0,addr=0x3,vhostpath=/var/lib/XXXX/YYYY/ 
+
+> The log may be shared if there are several vhost-user (stored in vhost_log_shm global), so I think it makes more sense to have a global config path for it, or you may end up duplicating that information per vhost backend and having files in either of the specified paths.
+
+But, yes, indeed the vhost_log_shm makes that approach tricky. If sharing the same log file with multiple vhost backend. Besides, tools like openstack would put all the vhost log files in the same place at the end. 
+
+Having a global config path, forced to be specified, orelse the vhost log isn't created, like when it fails nowadays. This seems to be the right approach. 
+
+True. 
+
+What about having a single config parameter as a place to put all vhost logs for all drives for a single instance ? Remove the memfd implementation with all the memfd shared_memory option ? Replace it with a open+unlink+ftruncate+mmap approach only.
+
+This way every device would get its own log file and vhost-user backends would be able to get its file descriptors. (and, of course, allow the security drivers to do their jobs). 
+
+>> On Oct 04, 2016, at 10:25, Daniel P. Berrange <email address hidden> wrote:
+>> 
+>> Hmm, is there a reason why it is shared? That seems to make an assumption
+>> that all vhost-user backends would be managed by the same external process.
+>> While that may be the common case today, it doesn't feel like a reasonable
+>> assumption to make long term. IOW it feels wiser to have it set per-NIC
+>> unless I'm missing something important that means it must be shared ?
+> 
+
+
+
+Hi
+
+On Tue, Oct 4, 2016 at 5:25 PM Daniel P. Berrange <email address hidden>
+wrote:
+
+> On Tue, Oct 04, 2016 at 01:10:17PM +0000, Marc-André Lureau wrote:
+> > Hi
+> >
+> > On Tue, Oct 4, 2016 at 4:42 PM Daniel P. Berrange <email address hidden>
+> > wrote:
+> >
+> > > On Tue, Oct 04, 2016 at 12:39:17PM +0000, Marc-André Lureau wrote:
+> > > > Hi Rafael, Daniel,
+> > > >
+> > > > On Tue, Oct 4, 2016 at 4:22 PM Rafael David Tinoco <
+> > > > <email address hidden>> wrote:
+> > > >
+> > > > > Let me work on it. I'll get back soon.
+> > > > >
+> > > > >
+> > > > thanks for working on it, before that I have a few questions:
+> > > >
+> > > > Tks Daniel.
+> > > > >
+> > > > > > On Oct 04, 2016, at 05:36, Daniel P. Berrange <
+> <email address hidden>>
+> > > > > wrote:
+> > > > > >
+> > > > > > On Mon, Oct 03, 2016 at 04:15:55PM -0300, Rafael David Tinoco
+> wrote:
+> > > > > >> Yes, definitely. Check this:
+> > > > > >
+> > > > > > [snip]
+> > > > > >
+> > > > > > So in that case, I think we must add ability to specify an
+> explicit
+> > > path
+> > > > > > that apps can use *regardles* of whether memfd support exists or
+> not.
+> > > > >
+> > > >
+> > > > How will this path be used? Is it going to be global to qemu for
+> various
+> > > > use (kinda like $TMP), or per-device, or for memfd fallback only?
+> Should
+> > > > the path pre-exist? (I suppose, if not, qemu should clean it up when
+> > > > leaving)
+> > >
+> > > I'd expect it to be an option set against the vhost user backend, since
+> > > that's the thing using this.
+> > >
+> > > If other things have similar usage needs wrt memfd in future, they
+> would
+> > > also need similar path config option.
+> > >
+> >
+> > The log may be shared if there are several vhost-user (stored in
+> > vhost_log_shm global), so I think it makes more sense to have a global
+> > config path for it, or you may end up duplicating that information per
+> > vhost backend and having files in either of the specified paths.
+>
+> Hmm, is there a reason why it is shared? That seems to make an assumption
+> that all vhost-user backends would be managed by the same external process.
+> While that may be the common case today, it doesn't feel like a reasonable
+> assumption to make long term. IOW it feels wiser to have it set per-NIC
+> unless I'm missing something important that means it must be shared ?
+>
+>
+It's a shared log, just like they share the same ram. Duplicating the log
+would mostly make migration more difficult to handle and increase a bit
+memory usage.
+
+
+> Regards,
+> Daniel
+> --
+> |: http://berrange.com      -o-    http://www.flickr.com/photos/dberrange/
+> :|
+> |: http://libvirt.org              -o-             http://virt-manager.org
+> :|
+> |: http://entangle-photo.org       -o-    http://search.cpan.org/~danberr/
+> :|
+>
+-- 
+Marc-André Lureau
+
+
+On Tue, Oct 4, 2016 at 5:34 PM Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> True.
+>
+> What about having a single config parameter as a place to put all vhost
+> logs for all drives for a single instance ? Remove the memfd implementation
+> with all the memfd shared_memory option ? Replace it with a
+> open+unlink+ftruncate+mmap approach only.
+>
+>
+I fail to see your point, memfd is superior to open+unlink and has other
+advantages with sealing etc.
+
+Regarding shared log, see my previous reply to Daniel.
+
+This way every device would get its own log file and vhost-user backends
+> would be able to get its file descriptors. (and, of course, allow the
+> security drivers to do their jobs).
+>
+> >> On Oct 04, 2016, at 10:25, Daniel P. Berrange <email address hidden>
+> wrote:
+> >>
+> >> Hmm, is there a reason why it is shared? That seems to make an
+> assumption
+> >> that all vhost-user backends would be managed by the same external
+> process.
+> >> While that may be the common case today, it doesn't feel like a
+> reasonable
+> >> assumption to make long term. IOW it feels wiser to have it set per-NIC
+> >> unless I'm missing something important that means it must be shared ?
+> >
+>
+> --
+Marc-André Lureau
+
+
+
+> On Oct 04, 2016, at 10:50, Marc-André Lureau <email address hidden> wrote:
+> 
+> What about having a single config parameter as a place to put all vhost logs for all drives for a single instance ? Remove the memfd implementation with all the memfd shared_memory option ? Replace it with a open+unlink+ftruncate+mmap approach only.
+> 
+> 
+> I fail to see your point, memfd is superior to open+unlink and has other advantages with sealing etc.
+
+I was just summarising needs based on previous statement from Daniel:
+
+> This makes me wonder about the memfd_create() code path too - we'll
+> again not want that external process to be granted access to arbitrary
+> FDs of QEMU's and I'm not sure of a way to get the memfd  FD to have
+> a specific label. So I think it is possible that when using libvirt
+> we'll want the ability to tell QEMU to *always* use an explicit file
+> in a path libvirt specifies, and never use memfd even if available.
+> 
+> Regards,
+> Daniel
+
+
+Hello Again, finally I could get back to this, and..
+ 
+I was finishing a patch creating the open+truncate+mmap+unlink mechanism on files specified by "vhostlog" parameter of tap devices. Patch is done, problem is that... looks like the "memfd" is only used for shared logs AND vhost-net (used for tap devices) doesn't use it. 
+
+In the following...
+
+(scenario 1)
+
+Linux kvm01 4.8.0-22-generic #24-Ubuntu SMP Sat Oct 8 09:15:00 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux
+
+with:
+-netdev tap,id=net0,vhost=on
+-device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:20:c5:42,bus=pci.0,addr=0x3
+
+## kvm01
+
+$ ./instance.sh
+qemu_memfd_check
+qemu_memfd_alloc: enter
+qemu_memfd_alloc: memfd_create with no sealing
+qemu_memfd_alloc: memfd_create worked, truncating...
+qemu_memfd_alloc: mmaping
+qemu_memfd_free: enter
+qemu_memfd_check: ok
+vhost_dev_start: enter
+vhost_log_get: enter
+vhost_log_alloc: enter
+vhost_log_alloc: local
+vhost_log_get: not shared
+vhost_log_put: enter
+vhost_log_put: enter
+vhost_log_put: local free
+
+(qemu) migrate -d tcp:kvm02:4444
+(qemu) info migrate
+capabilities: xbzrle: off rdma-pin-all: off auto-converge: off zero-blocks: off compres
+Migration status: completed
+total time: 14586 milliseconds
+downtime: 10 milliseconds
+setup: 20 milliseconds
+transferred ram: 377224 kbytes
+throughput: 212.02 mbps
+remaining ram: 0 kbytes
+total ram: 4001544 kbytes
+duplicate: 908879 pages
+skipped: 0 pages
+normal: 92129 pages
+normal bytes: 368516 kbytes
+dirty sync count: 4
+
+## kvm02
+
+$ ./instance.sh
+qemu_memfd_check
+qemu_memfd_alloc: enter
+qemu_memfd_alloc: memfd_create with no sealing
+qemu_memfd_alloc: memfd_create worked, truncating...
+qemu_memfd_alloc: mmaping
+qemu_memfd_free: enter
+qemu_memfd_check: ok
+vhost_dev_start: enter
+
+(scenario 2)
+
+Linux kvm01 3.13.0-99-generic #146-Ubuntu SMP Wed Oct 12 20:56:26 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux
+
+with:
+-netdev tap,id=net0,vhost=on
+-device virtio-net-pci,netdev=net0,id=net0,mac=52:54:00:20:c5:42,bus=pci.0,addr=0x3
+
+## kvm01
+
+$ ./instance.sh
+qemu_memfd_check
+qemu_memfd_alloc: enter
+qemu_memfd_alloc: memfd_create with no sealing
+qemu_memfd_alloc: memfd_create failed #2
+qemu_memfd_alloc: fallback
+qemu_memfd_alloc: fname = /tmp/memfd-XXXXXX
+qemu_memfd_alloc: fallback truncating
+qemu_memfd_alloc: mmaping
+qemu_memfd_free
+qemu_memfd_check: ok
+vhost_dev_start: enter
+vhost_log_get: enter
+vhost_log_alloc: enter
+vhost_log_alloc: local
+vhost_log_get: not shared
+vhost_log_put: enter
+vhost_log_put: enter
+vhost_log_put: local free
+
+(qemu) migrate -d tcp:kvm02:4444
+(qemu) info migrate
+capabilities: xbzrle: off rdma-pin-all: off auto-converge: off zero-blocks: off compres
+Migration status: completed
+total time: 15400 milliseconds
+downtime: 9 milliseconds
+setup: 5 milliseconds
+transferred ram: 375812 kbytes
+throughput: 199.99 mbps
+remaining ram: 0 kbytes
+total ram: 4001544 kbytes
+duplicate: 909186 pages
+skipped: 0 pages
+normal: 91776 pages
+normal bytes: 367104 kbytes
+dirty sync count: 3
+
+## kvm02
+
+$ ./instance.sh
+qemu_memfd_check
+qemu_memfd_alloc: enter
+qemu_memfd_alloc: memfd_create with no sealing
+qemu_memfd_alloc: memfd_create failed #2
+qemu_memfd_alloc: fallback
+qemu_memfd_alloc: fname = /tmp/memfd-XXXXXX
+qemu_memfd_alloc: fallback truncating
+qemu_memfd_alloc: mmaping
+qemu_memfd_free
+qemu_memfd_check: ok
+vhost_dev_start: enter
+
+For kvm01, we have 2 parts:
+
+(1) From "-netdev tap,id=net0,vhost=on":
+  - net_init_clients()
+  - net_init_client()
+  - net_client_init()
+  - net_client_init1()
+  - net_client_init_fun() .. net_init_tap() in my case
+  - net_init_tap_one()
+  - vhost_net_init()
+  - vhost_dev_init()
+  - migration checks (host feature, memfd functional test)
+
+(2) From "-device virtio-net-pci,netdev=net0...":
+  - virtio_pci_device_plugged()
+  - virtio_pci_modern_regions_init()
+  - virtio_pci_common_write()
+  - virtio_set_status()
+  - virtio_net_set_status()
+  - virtio_net_vhost_status()
+  - vhost_net_start()
+  - vhost_net_start_one()
+  - vhost_dev_start()
+  - does the log allocation logic
+
+It looks like "vhost_requires_shm_log" isn't defined by my underlaying VHOST driver (vhost-net in my case). It seems that vhost-user defines it (from VhostOps user_ops).
+
+Judging by the outputs above, looks like vhost_dev_log_is_shared is returning false, making (2) - vhost_dev_start - to use a different log allocation (malloc) than the one that was tested for allowing migrations at (1) - vhost_dev_init.
+
+Question: Why to check for "memfd" when its not sure - yet - if a shared descriptor and memory pointer is going to be needed for the migration to happen ? Do you want me to change that ? If memfd fails, but, the guest in question is using regular "malloc" for vhost log, we are marking it unable to live migrate by mistake. I could check for vhost_requires_shm_log pointer during vhost_dev_init (coming from tap).
+
+Also, if possible, I would like comments about a draft:
+
+https://pastebin.canonical.com/168579/
+(please disregard printfs and minor problems)
+
+OBS: I'm basically removing fallback mechanism from memfd, creating a generic qemu_mmap_XXX implementation, adding a vhostlog parameter in tap cmdline AND changing the decision on what to use: if vhostlog is present in cmdline, qemu_mmap_XXX on vhostlog is used. If it is a directory, a random file is created inside it. If it is a file, the file is used. If no vhostlog is given (default while libvirt isn't changed), it tries first to use memfd (all newer kernels), and, if not possible, it tries to fallback using the qemu_mmap mechanism on "tmp" directory creating random files. 
+
+PS: Remember that this is because selinux/apparmor labelling on tmp files (and because file descriptors can be passed away, like we discussed before). 
+
+If that is okay I'll provide a patch asap. Let me know if you prefer something else.
+
+Thank you,
+Rafael
+
+> On Oct 04, 2016, at 12:29, Rafael David Tinoco <email address hidden> wrote:
+> 
+> 
+>> On Oct 04, 2016, at 10:50, Marc-André Lureau <email address hidden> wrote:
+>> 
+>> What about having a single config parameter as a place to put all vhost logs for all drives for a single instance ? Remove the memfd implementation with all the memfd shared_memory option ? Replace it with a open+unlink+ftruncate+mmap approach only.
+>> 
+>> 
+>> I fail to see your point, memfd is superior to open+unlink and has other advantages with sealing etc.
+> 
+> I was just summarising needs based on previous statement from Daniel:
+> 
+>> This makes me wonder about the memfd_create() code path too - we'll
+>> again not want that external process to be granted access to arbitrary
+>> FDs of QEMU's and I'm not sure of a way to get the memfd  FD to have
+>> a specific label. So I think it is possible that when using libvirt
+>> we'll want the ability to tell QEMU to *always* use an explicit file
+>> in a path libvirt specifies, and never use memfd even if available.
+>> 
+>> Regards,
+>> Daniel
+
+
+
+The correct (and draft) one:
+http://pastebin.ubuntu.com/23357210/
+
+Im passing vhostlog parameter as "hdev->log_filename" so it can be accessed from net_init_tap()-> functions AND from vhost_dev_start()-> functions. This way I don't have to change function prototypes anymore.
+
+> On Oct 21, 2016, at 01:03, Rafael David Tinoco <email address hidden> wrote:
+> 
+> Also, if possible, I would like comments about a draft:
+> 
+> https://pastebin.canonical.com/168579/
+> (please disregard printfs and minor problems)
+
+
+
+Hi
+
+On Fri, Oct 21, 2016 at 6:03 AM Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> Judging by the outputs above, looks like vhost_dev_log_is_shared is
+> returning false, making (2) - vhost_dev_start - to use a different log
+> allocation (malloc) than the one that was tested for allowing migrations at
+> (1) - vhost_dev_init.
+>
+>
+correct
+
+
+> Question: Why to check for "memfd" when its not sure - yet - if a shared
+> descriptor and memory pointer is going to be needed for the migration to
+> happen ? Do you want me to
+
+
+It's done early enough to disable migration.
+
+
+> change that ? If memfd fails, but, the guest in question is using regular
+> "malloc" for vhost log, we are marking it unable to live migrate by
+> mistake. I could check for vhost_requires_shm_log pointer during
+> vhost_dev_init (coming from tap).
+>
+>
+Right, it should be done only if vhost_dev_log_is_shared is true. Patch
+welcome
+
+
+> Also, if possible, I would like comments about a draft:
+>
+> https://pastebin.canonical.com/168579/
+> (please disregard printfs and minor problems)
+>
+> OBS: I'm basically removing fallback mechanism from memfd, creating a
+> generic qemu_mmap_XXX implementation, adding a vhostlog parameter in tap
+> cmdline AND changing the decision on what to use: if vhostlog is present in
+> cmdline, qemu_mmap_XXX on vhostlog is used. If it is a directory, a random
+> file is created inside it. If it is a file, the file is used. If no
+> vhostlog is given (default while libvirt isn't changed), it tries first to
+> use memfd (all newer kernels), and, if not possible, it tries to fallback
+> using the qemu_mmap mechanism on "tmp" directory creating random files.
+>
+
+Sounds reasonable, but I am not sure so many fallbacks are necessary. I
+would just have an optional filename.
+
+>
+> PS: Remember that this is because selinux/apparmor labelling on tmp files
+> (and because file descriptors can be passed away, like we discussed before).
+>
+> If that is okay I'll provide a patch asap. Let me know if you prefer
+> something else.
+>
+
+Ok, I hope other comments on the idea, and I'll review your patch once on
+the ML.
+
+Thanks
+-- 
+Marc-André Lureau
+
+
+Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+check if memfd would succeed. It is better if this blocker first
+checks if vhost backend requires shared log. This will avoid a
+situation where a blocker is added inappropriately (e.g. shared
+log allocation fails when vhost backend doesn't support it).
+
+Commit: 35f9b6e added a fallback mechanism for systems not supporting
+memfd_create syscall (started being supported since 3.17).
+
+Backporting memfd_create might not be accepted for distros relying
+on older kernels. Nowadays there is no way for security driver
+to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+
+Also, because vhost log file descriptors can be passed to other
+processes, after discussion, we thought it is best to back mmap by
+using files that can be placed into a specific directory: this commit
+creates "vhostlog" argv parameter for such purpose. This will allow
+security drivers to operate on those files appropriately.
+
+Argv examples:
+
+    -netdev tap,id=net0,vhost=on
+    -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+    -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+
+For vhost backends supporting shared logs, if vhostlog is non-existent,
+or a directory, random files are going to be created in the specified
+directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+the filepath is always used when allocating vhost log files.
+
+Signed-off-by: Rafael David Tinoco <email address hidden>
+---
+ hw/net/vhost_net.c        |   4 +-
+ hw/scsi/vhost-scsi.c      |   2 +-
+ hw/virtio/vhost-vsock.c   |   2 +-
+ hw/virtio/vhost.c         |  41 +++++++------
+ include/hw/virtio/vhost.h |   4 +-
+ include/net/vhost_net.h   |   1 +
+ include/qemu/mmap-file.h  |  10 +++
+ net/tap.c                 |   6 ++
+ qapi-schema.json          |   3 +
+ qemu-options.hx           |   3 +-
+ util/Makefile.objs        |   1 +
+ util/mmap-file.c          | 153 ++++++++++++++++++++++++++++++++++++++++++++++
+ 12 files changed, 207 insertions(+), 23 deletions(-)
+ create mode 100644 include/qemu/mmap-file.h
+ create mode 100644 util/mmap-file.c
+
+diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+index f2d49ad..d650c92 100644
+--- a/hw/net/vhost_net.c
++++ b/hw/net/vhost_net.c
+@@ -171,8 +171,8 @@ struct vhost_net *vhost_net_init(VhostNetOptions *options)
+         net->dev.vq_index = net->nc->queue_index * net->dev.nvqs;
+     }
+ 
+-    r = vhost_dev_init(&net->dev, options->opaque,
+-                       options->backend_type, options->busyloop_timeout);
++    r = vhost_dev_init(&net->dev, options->opaque, options->backend_type,
++                       options->busyloop_timeout, options->vhostlog);
+     if (r < 0) {
+         goto fail;
+     }
+diff --git a/hw/scsi/vhost-scsi.c b/hw/scsi/vhost-scsi.c
+index 5b26946..5dc3d30 100644
+--- a/hw/scsi/vhost-scsi.c
++++ b/hw/scsi/vhost-scsi.c
+@@ -248,7 +248,7 @@ static void vhost_scsi_realize(DeviceState *dev, Error **errp)
+     s->dev.backend_features = 0;
+ 
+     ret = vhost_dev_init(&s->dev, (void *)(uintptr_t)vhostfd,
+-                         VHOST_BACKEND_TYPE_KERNEL, 0);
++                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+     if (ret < 0) {
+         error_setg(errp, "vhost-scsi: vhost initialization failed: %s",
+                    strerror(-ret));
+diff --git a/hw/virtio/vhost-vsock.c b/hw/virtio/vhost-vsock.c
+index b481562..6cf6081 100644
+--- a/hw/virtio/vhost-vsock.c
++++ b/hw/virtio/vhost-vsock.c
+@@ -342,7 +342,7 @@ static void vhost_vsock_device_realize(DeviceState *dev, Error **errp)
+     vsock->vhost_dev.nvqs = ARRAY_SIZE(vsock->vhost_vqs);
+     vsock->vhost_dev.vqs = vsock->vhost_vqs;
+     ret = vhost_dev_init(&vsock->vhost_dev, (void *)(uintptr_t)vhostfd,
+-                         VHOST_BACKEND_TYPE_KERNEL, 0);
++                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+     if (ret < 0) {
+         error_setg_errno(errp, -ret, "vhost-vsock: vhost_dev_init failed");
+         goto err_virtio;
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index bd051ab..d874ebb 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -20,7 +20,7 @@
+ #include "qemu/atomic.h"
+ #include "qemu/range.h"
+ #include "qemu/error-report.h"
+-#include "qemu/memfd.h"
++#include "qemu/mmap-file.h"
+ #include <linux/vhost.h>
+ #include "exec/address-spaces.h"
+ #include "hw/virtio/virtio-bus.h"
+@@ -326,7 +326,7 @@ static uint64_t vhost_get_log_size(struct vhost_dev *dev)
+     return log_size;
+ }
+ 
+-static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
++static struct vhost_log *vhost_log_alloc(char *path, uint64_t size, bool share)
+ {
+     struct vhost_log *log;
+     uint64_t logsize = size * sizeof(*(log->log));
+@@ -334,9 +334,7 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+ 
+     log = g_new0(struct vhost_log, 1);
+     if (share) {
+-        log->log = qemu_memfd_alloc("vhost-log", logsize,
+-                                    F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL,
+-                                    &fd);
++        log->log = qemu_mmap_alloc(path, logsize, &fd);
+         memset(log->log, 0, logsize);
+     } else {
+         log->log = g_malloc0(logsize);
+@@ -349,12 +347,12 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+     return log;
+ }
+ 
+-static struct vhost_log *vhost_log_get(uint64_t size, bool share)
++static struct vhost_log *vhost_log_get(char *path, uint64_t size, bool share)
+ {
+     struct vhost_log *log = share ? vhost_log_shm : vhost_log;
+ 
+     if (!log || log->size != size) {
+-        log = vhost_log_alloc(size, share);
++        log = vhost_log_alloc(path, size, share);
+         if (share) {
+             vhost_log_shm = log;
+         } else {
+@@ -388,8 +386,7 @@ static void vhost_log_put(struct vhost_dev *dev, bool sync)
+             g_free(log->log);
+             vhost_log = NULL;
+         } else if (vhost_log_shm == log) {
+-            qemu_memfd_free(log->log, log->size * sizeof(*(log->log)),
+-                            log->fd);
++            qemu_mmap_free(log->log, log->size * sizeof(*(log->log)), log->fd);
+             vhost_log_shm = NULL;
+         }
+ 
+@@ -405,9 +402,12 @@ static bool vhost_dev_log_is_shared(struct vhost_dev *dev)
+ 
+ static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+ {
+-    struct vhost_log *log = vhost_log_get(size, vhost_dev_log_is_shared(dev));
+-    uint64_t log_base = (uintptr_t)log->log;
+     int r;
++    struct vhost_log *log;
++    uint64_t log_base;
++
++    log = vhost_log_get(dev->log_filename, size, vhost_dev_log_is_shared(dev));
++    log_base = (uintptr_t)log->log;
+ 
+     /* inform backend of log switching, this must be done before
+        releasing the current log, to ensure no logging is lost */
+@@ -1049,7 +1049,8 @@ static void vhost_virtqueue_cleanup(struct vhost_virtqueue *vq)
+ }
+ 
+ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+-                   VhostBackendType backend_type, uint32_t busyloop_timeout)
++                   VhostBackendType backend_type,
++                   uint32_t busyloop_timeout, char *vhostlog)
+ {
+     uint64_t features;
+     int i, r, n_initialized_vqs = 0;
+@@ -1118,11 +1119,18 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+         .priority = 10
+     };
+ 
++    hdev->log = NULL;
++    hdev->log_size = 0;
++    hdev->log_enabled = false;
++    hdev->log_filename = vhostlog ? g_strdup(vhostlog) : NULL;
++    g_free(vhostlog);
++
+     if (hdev->migration_blocker == NULL) {
+         if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+-        } else if (!qemu_memfd_check()) {
++        } else if (vhost_dev_log_is_shared(hdev) &&
++                !qemu_mmap_check(hdev->log_filename)) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: failed to allocate shared memory");
+         }
+@@ -1135,9 +1143,6 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+     hdev->mem = g_malloc0(offsetof(struct vhost_memory, regions));
+     hdev->n_mem_sections = 0;
+     hdev->mem_sections = NULL;
+-    hdev->log = NULL;
+-    hdev->log_size = 0;
+-    hdev->log_enabled = false;
+     hdev->started = false;
+     hdev->memory_changed = false;
+     memory_listener_register(&hdev->memory_listener, &address_space_memory);
+@@ -1175,6 +1180,7 @@ void vhost_dev_cleanup(struct vhost_dev *hdev)
+     if (hdev->vhost_ops) {
+         hdev->vhost_ops->vhost_backend_cleanup(hdev);
+     }
++    g_free(hdev->log_filename);
+     assert(!hdev->log);
+ 
+     memset(hdev, 0, sizeof(struct vhost_dev));
+@@ -1335,7 +1341,8 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+         uint64_t log_base;
+ 
+         hdev->log_size = vhost_get_log_size(hdev);
+-        hdev->log = vhost_log_get(hdev->log_size,
++        hdev->log = vhost_log_get(hdev->log_filename,
++                                  hdev->log_size,
+                                   vhost_dev_log_is_shared(hdev));
+         log_base = (uintptr_t)hdev->log->log;
+         r = hdev->vhost_ops->vhost_set_log_base(hdev,
+diff --git a/include/hw/virtio/vhost.h b/include/hw/virtio/vhost.h
+index e433089..1ea4f3a 100644
+--- a/include/hw/virtio/vhost.h
++++ b/include/hw/virtio/vhost.h
+@@ -52,6 +52,7 @@ struct vhost_dev {
+     uint64_t max_queues;
+     bool started;
+     bool log_enabled;
++    char *log_filename;
+     uint64_t log_size;
+     Error *migration_blocker;
+     bool memory_changed;
+@@ -65,7 +66,8 @@ struct vhost_dev {
+ 
+ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+                    VhostBackendType backend_type,
+-                   uint32_t busyloop_timeout);
++                   uint32_t busyloop_timeout,
++                   char *vhostlog);
+ void vhost_dev_cleanup(struct vhost_dev *hdev);
+ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev);
+ void vhost_dev_stop(struct vhost_dev *hdev, VirtIODevice *vdev);
+diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+index 5a08eff..94161b2 100644
+--- a/include/net/vhost_net.h
++++ b/include/net/vhost_net.h
+@@ -12,6 +12,7 @@ typedef struct VhostNetOptions {
+     NetClientState *net_backend;
+     uint32_t busyloop_timeout;
+     void *opaque;
++    char *vhostlog;
+ } VhostNetOptions;
+ 
+ uint64_t vhost_net_get_max_queues(VHostNetState *net);
+diff --git a/include/qemu/mmap-file.h b/include/qemu/mmap-file.h
+new file mode 100644
+index 0000000..427612a
+--- /dev/null
++++ b/include/qemu/mmap-file.h
+@@ -0,0 +1,10 @@
++#ifndef QEMU_MMAP_FILE_H
++#define QEMU_MMAP_FILE_H
++
++#include "qemu-common.h"
++
++void *qemu_mmap_alloc(const char *path, size_t size, int *fd);
++void qemu_mmap_free(void *ptr, size_t size, int fd);
++bool qemu_mmap_check(const char *path);
++
++#endif
+diff --git a/net/tap.c b/net/tap.c
+index b6896a7..7b242cd 100644
+--- a/net/tap.c
++++ b/net/tap.c
+@@ -699,6 +699,12 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
+         }
+         options.opaque = (void *)(uintptr_t)vhostfd;
+ 
++        if (tap->has_vhostlog) {
++            options.vhostlog = g_strdup(tap->vhostlog);
++        } else {
++            options.vhostlog = NULL;
++        }
++
+         s->vhost_net = vhost_net_init(&options);
+         if (!s->vhost_net) {
+             error_setg(errp,
+diff --git a/qapi-schema.json b/qapi-schema.json
+index 5a8ec38..72608bd 100644
+--- a/qapi-schema.json
++++ b/qapi-schema.json
+@@ -2640,6 +2640,8 @@
+ #
+ # @vhostforce: #optional vhost on for non-MSIX virtio guests
+ #
++# @vhostlog: #optional file or directory for vhost backend log
++#
+ # @queues: #optional number of queues to be created for multiqueue capable tap
+ #
+ # @poll-us: #optional maximum number of microseconds that could
+@@ -2662,6 +2664,7 @@
+     '*vhostfd':    'str',
+     '*vhostfds':   'str',
+     '*vhostforce': 'bool',
++    '*vhostlog':   'str',
+     '*queues':     'uint32',
+     '*poll-us':    'uint32'} }
+ 
+diff --git a/qemu-options.hx b/qemu-options.hx
+index b1fbdb0..5c09c09 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -1599,7 +1599,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+ #else
+     "-netdev tap,id=str[,fd=h][,fds=x:y:...:z][,ifname=name][,script=file][,downscript=dfile]\n"
+     "         [,br=bridge][,helper=helper][,sndbuf=nbytes][,vnet_hdr=on|off][,vhost=on|off]\n"
+-    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,queues=n]\n"
++    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,vhostlog=file|dir][,queues=n]\n"
+     "         [,poll-us=n]\n"
+     "                configure a host TAP network backend with ID 'str'\n"
+     "                connected to a bridge (default=" DEFAULT_BRIDGE_INTERFACE ")\n"
+@@ -1618,6 +1618,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+     "                use vhost=on to enable experimental in kernel accelerator\n"
+     "                    (only has effect for virtio guests which use MSIX)\n"
+     "                use vhostforce=on to force vhost on for non-MSIX virtio guests\n"
++    "                use 'vhostlog=file|dir' file or directory for vhost backend log\n"
+     "                use 'vhostfd=h' to connect to an already opened vhost net device\n"
+     "                use 'vhostfds=x:y:...:z to connect to multiple already opened vhost net devices\n"
+     "                use 'queues=n' to specify the number of queues to be created for multiqueue TAP\n"
+diff --git a/util/Makefile.objs b/util/Makefile.objs
+index 36c7dcc..69bb27a 100644
+--- a/util/Makefile.objs
++++ b/util/Makefile.objs
+@@ -3,6 +3,7 @@ util-obj-y += bufferiszero.o
+ util-obj-$(CONFIG_POSIX) += compatfd.o
+ util-obj-$(CONFIG_POSIX) += event_notifier-posix.o
+ util-obj-$(CONFIG_POSIX) += mmap-alloc.o
++util-obj-$(CONFIG_POSIX) += mmap-file.o
+ util-obj-$(CONFIG_POSIX) += oslib-posix.o
+ util-obj-$(CONFIG_POSIX) += qemu-openpty.o
+ util-obj-$(CONFIG_POSIX) += qemu-thread-posix.o
+diff --git a/util/mmap-file.c b/util/mmap-file.c
+new file mode 100644
+index 0000000..ce778cf
+--- /dev/null
++++ b/util/mmap-file.c
+@@ -0,0 +1,153 @@
++/*
++ * Support for file backed by mmaped host memory.
++ *
++ * Authors:
++ *  Rafael David Tinoco <email address hidden>
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or
++ * later.  See the COPYING file in the top-level directory.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/mmap-file.h"
++
++static char *qemu_mmap_rand_name(void)
++{
++    char *name;
++    GRand *rsufix;
++    guint32 sufix;
++
++    rsufix = g_rand_new();
++    sufix = g_rand_int(rsufix);
++    g_free(rsufix);
++    name = g_strdup_printf("mmap-%u", sufix);
++
++    return name;
++}
++
++static inline void qemu_mmap_rand_name_free(char *str)
++{
++    g_free(str);
++}
++
++static bool qemu_mmap_is(const char *path, mode_t what)
++{
++    struct stat s;
++
++    memset(&s,  0, sizeof(struct stat));
++    if (stat(path, &s)) {
++        perror("stat");
++        goto negative;
++    }
++
++    if ((s.st_mode & S_IFMT) == what) {
++        return true;
++    }
++
++negative:
++    return false;
++}
++
++static inline bool qemu_mmap_is_file(const char *path)
++{
++    return qemu_mmap_is(path, S_IFREG);
++}
++
++static inline bool qemu_mmap_is_dir(const char *path)
++{
++    return qemu_mmap_is(path, S_IFDIR);
++}
++
++static void *qemu_mmap_alloc_file(const char *filepath, size_t size, int *fd)
++{
++    void *ptr;
++    int mfd = -1;
++
++    *fd = -1;
++
++    mfd = open(filepath, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
++    if (mfd == -1) {
++        perror("open");
++        return NULL;
++    }
++
++    unlink(filepath);
++
++    if (ftruncate(mfd, size) == -1) {
++        perror("ftruncate");
++        close(mfd);
++        return NULL;
++    }
++
++    ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
++    if (ptr == MAP_FAILED) {
++        perror("mmap");
++        close(mfd);
++        return NULL;
++    }
++
++    *fd = mfd;
++    return ptr;
++}
++
++static void *qemu_mmap_alloc_dir(const char *dirpath, size_t size, int *fd)
++{
++    void *ptr;
++    char *file, *rand, *tmp, *dir2use = NULL;
++
++    if (dirpath && !qemu_mmap_is_dir(dirpath)) {
++        return NULL;
++    }
++
++    tmp = (char *) g_get_tmp_dir();
++    dir2use = dirpath ? (char *) dirpath : tmp;
++    rand = qemu_mmap_rand_name();
++    file = g_strdup_printf("%s/%s", dir2use, rand);
++    ptr = qemu_mmap_alloc_file(file, size, fd);
++    g_free(tmp);
++    qemu_mmap_rand_name_free(rand);
++
++    return ptr;
++}
++
++/*
++ * "path" can be:
++ *
++ *   filename = full path for the file to back mmap
++ *   dir path = full dir path where to create random file for mmap
++ *   null     = will use <tmpdir>  to create random file for mmap
++ */
++void *qemu_mmap_alloc(const char *path, size_t size, int *fd)
++{
++    if (!path || qemu_mmap_is_dir(path)) {
++        return qemu_mmap_alloc_dir(path, size, fd);
++    }
++
++    return qemu_mmap_alloc_file(path, size, fd);
++}
++
++void qemu_mmap_free(void *ptr, size_t size, int fd)
++{
++    if (ptr) {
++        munmap(ptr, size);
++    }
++
++    if (fd != -1) {
++        close(fd);
++    }
++}
++
++bool qemu_mmap_check(const char *path)
++{
++    void *ptr;
++    int fd = -1;
++    bool r = true;
++
++    ptr = qemu_mmap_alloc(path, 4096, &fd);
++    if (!ptr) {
++        r = false;
++    }
++    qemu_mmap_free(ptr, 4096, fd);
++
++    return r == true ? true : false;
++}
+-- 
+2.9.3
+
+
+
+Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+check if memfd would succeed. It is better if this blocker first
+checks if vhost backend requires shared log. This will avoid a
+situation where a blocker is added inappropriately (e.g. shared
+log allocation fails when vhost backend doesn't support it).
+---
+ hw/virtio/vhost.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index bd051ab..742d0aa 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -1122,7 +1122,7 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+         if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+-        } else if (!qemu_memfd_check()) {
++        } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_check()) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: failed to allocate shared memory");
+         }
+-- 
+2.9.3
+
+
+
+
+> Begin forwarded message:
+> 
+> From: Marc-André Lureau <email address hidden>
+> Subject: Re: [Qemu-devel] [PATCH] vhost: secure vhost shared log files using argv paremeter
+> Date: October 22, 2016 at 05:18:02 GMT-2
+> To: Rafael David Tinoco <email address hidden>
+> Cc: QEMU <email address hidden>
+> 
+> Hi
+> 
+> On Sat, Oct 22, 2016 at 10:01 AM Rafael David Tinoco <<email address hidden> <mailto:<email address hidden>>> wrote:
+> Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+> check if memfd would succeed. It is better if this blocker first
+> checks if vhost backend requires shared log. This will avoid a
+> situation where a blocker is added inappropriately (e.g. shared
+> log allocation fails when vhost backend doesn't support it).
+> 
+> Could you make this a seperate patch?
+>  
+> Commit: 35f9b6e added a fallback mechanism for systems not supporting
+> memfd_create syscall (started being supported since 3.17).
+> 
+> Backporting memfd_create might not be accepted for distros relying
+> on older kernels. Nowadays there is no way for security driver
+> to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> 
+> Also, because vhost log file descriptors can be passed to other
+> processes, after discussion, we thought it is best to back mmap by
+> using files that can be placed into a specific directory: this commit
+> creates "vhostlog" argv parameter for such purpose. This will allow
+> security drivers to operate on those files appropriately.
+> 
+> Argv examples:
+> 
+>     -netdev tap,id=net0,vhost=on
+>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+> 
+> Could it be only a filename? This would simplify testing.
+>  
+> 
+> For vhost backends supporting shared logs, if vhostlog is non-existent,
+> or a directory, random files are going to be created in the specified
+> directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+> the filepath is always used when allocating vhost log files.
+> 
+> 
+> Regarding testing, you add utility code mmap-file, could you make this a seperate commit, with unit tests?
+> 
+> thanks
+> 
+> Signed-off-by: Rafael David Tinoco <<email address hidden> <mailto:<email address hidden>>>
+> ---
+>  hw/net/vhost_net.c        |   4 +-
+>  hw/scsi/vhost-scsi.c      |   2 +-
+>  hw/virtio/vhost-vsock.c   |   2 +-
+>  hw/virtio/vhost.c         |  41 +++++++------
+>  include/hw/virtio/vhost.h |   4 +-
+>  include/net/vhost_net.h   |   1 +
+>  include/qemu/mmap-file.h  |  10 +++
+>  net/tap.c                 |   6 ++
+>  qapi-schema.json          |   3 +
+>  qemu-options.hx           |   3 +-
+>  util/Makefile.objs        |   1 +
+>  util/mmap-file.c          | 153 ++++++++++++++++++++++++++++++++++++++++++++++
+>  12 files changed, 207 insertions(+), 23 deletions(-)
+>  create mode 100644 include/qemu/mmap-file.h
+>  create mode 100644 util/mmap-file.c
+> 
+> diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+> index f2d49ad..d650c92 100644
+> --- a/hw/net/vhost_net.c
+> +++ b/hw/net/vhost_net.c
+> @@ -171,8 +171,8 @@ struct vhost_net *vhost_net_init(VhostNetOptions *options)
+>          net->dev.vq_index = net->nc->queue_index * net->dev.nvqs;
+>      }
+> 
+> -    r = vhost_dev_init(&net->dev, options->opaque,
+> -                       options->backend_type, options->busyloop_timeout);
+> +    r = vhost_dev_init(&net->dev, options->opaque, options->backend_type,
+> +                       options->busyloop_timeout, options->vhostlog);
+>      if (r < 0) {
+>          goto fail;
+>      }
+> diff --git a/hw/scsi/vhost-scsi.c b/hw/scsi/vhost-scsi.c
+> index 5b26946..5dc3d30 100644
+> --- a/hw/scsi/vhost-scsi.c
+> +++ b/hw/scsi/vhost-scsi.c
+> @@ -248,7 +248,7 @@ static void vhost_scsi_realize(DeviceState *dev, Error **errp)
+>      s->dev.backend_features = 0;
+> 
+>      ret = vhost_dev_init(&s->dev, (void *)(uintptr_t)vhostfd,
+> -                         VHOST_BACKEND_TYPE_KERNEL, 0);
+> +                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+>      if (ret < 0) {
+>          error_setg(errp, "vhost-scsi: vhost initialization failed: %s",
+>                     strerror(-ret));
+> diff --git a/hw/virtio/vhost-vsock.c b/hw/virtio/vhost-vsock.c
+> index b481562..6cf6081 100644
+> --- a/hw/virtio/vhost-vsock.c
+> +++ b/hw/virtio/vhost-vsock.c
+> @@ -342,7 +342,7 @@ static void vhost_vsock_device_realize(DeviceState *dev, Error **errp)
+>      vsock->vhost_dev.nvqs = ARRAY_SIZE(vsock->vhost_vqs);
+>      vsock->vhost_dev.vqs = vsock->vhost_vqs;
+>      ret = vhost_dev_init(&vsock->vhost_dev, (void *)(uintptr_t)vhostfd,
+> -                         VHOST_BACKEND_TYPE_KERNEL, 0);
+> +                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+>      if (ret < 0) {
+>          error_setg_errno(errp, -ret, "vhost-vsock: vhost_dev_init failed");
+>          goto err_virtio;
+> diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+> index bd051ab..d874ebb 100644
+> --- a/hw/virtio/vhost.c
+> +++ b/hw/virtio/vhost.c
+> @@ -20,7 +20,7 @@
+>  #include "qemu/atomic.h"
+>  #include "qemu/range.h"
+>  #include "qemu/error-report.h"
+> -#include "qemu/memfd.h"
+> +#include "qemu/mmap-file.h"
+>  #include <linux/vhost.h>
+>  #include "exec/address-spaces.h"
+>  #include "hw/virtio/virtio-bus.h"
+> @@ -326,7 +326,7 @@ static uint64_t vhost_get_log_size(struct vhost_dev *dev)
+>      return log_size;
+>  }
+> 
+> -static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+> +static struct vhost_log *vhost_log_alloc(char *path, uint64_t size, bool share)
+>  {
+>      struct vhost_log *log;
+>      uint64_t logsize = size * sizeof(*(log->log));
+> @@ -334,9 +334,7 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+> 
+>      log = g_new0(struct vhost_log, 1);
+>      if (share) {
+> -        log->log = qemu_memfd_alloc("vhost-log", logsize,
+> -                                    F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL,
+> -                                    &fd);
+> +        log->log = qemu_mmap_alloc(path, logsize, &fd);
+>          memset(log->log, 0, logsize);
+>      } else {
+>          log->log = g_malloc0(logsize);
+> @@ -349,12 +347,12 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+>      return log;
+>  }
+> 
+> -static struct vhost_log *vhost_log_get(uint64_t size, bool share)
+> +static struct vhost_log *vhost_log_get(char *path, uint64_t size, bool share)
+>  {
+>      struct vhost_log *log = share ? vhost_log_shm : vhost_log;
+> 
+>      if (!log || log->size != size) {
+> -        log = vhost_log_alloc(size, share);
+> +        log = vhost_log_alloc(path, size, share);
+>          if (share) {
+>              vhost_log_shm = log;
+>          } else {
+> @@ -388,8 +386,7 @@ static void vhost_log_put(struct vhost_dev *dev, bool sync)
+>              g_free(log->log);
+>              vhost_log = NULL;
+>          } else if (vhost_log_shm == log) {
+> -            qemu_memfd_free(log->log, log->size * sizeof(*(log->log)),
+> -                            log->fd);
+> +            qemu_mmap_free(log->log, log->size * sizeof(*(log->log)), log->fd);
+>              vhost_log_shm = NULL;
+>          }
+> 
+> @@ -405,9 +402,12 @@ static bool vhost_dev_log_is_shared(struct vhost_dev *dev)
+> 
+>  static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+>  {
+> -    struct vhost_log *log = vhost_log_get(size, vhost_dev_log_is_shared(dev));
+> -    uint64_t log_base = (uintptr_t)log->log;
+>      int r;
+> +    struct vhost_log *log;
+> +    uint64_t log_base;
+> +
+> +    log = vhost_log_get(dev->log_filename, size, vhost_dev_log_is_shared(dev));
+> +    log_base = (uintptr_t)log->log;
+> 
+>      /* inform backend of log switching, this must be done before
+>         releasing the current log, to ensure no logging is lost */
+> @@ -1049,7 +1049,8 @@ static void vhost_virtqueue_cleanup(struct vhost_virtqueue *vq)
+>  }
+> 
+>  int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+> -                   VhostBackendType backend_type, uint32_t busyloop_timeout)
+> +                   VhostBackendType backend_type,
+> +                   uint32_t busyloop_timeout, char *vhostlog)
+>  {
+>      uint64_t features;
+>      int i, r, n_initialized_vqs = 0;
+> @@ -1118,11 +1119,18 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>          .priority = 10
+>      };
+> 
+> +    hdev->log = NULL;
+> +    hdev->log_size = 0;
+> +    hdev->log_enabled = false;
+> +    hdev->log_filename = vhostlog ? g_strdup(vhostlog) : NULL;
+> +    g_free(vhostlog);
+> +
+>      if (hdev->migration_blocker == NULL) {
+>          if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+>              error_setg(&hdev->migration_blocker,
+>                         "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+> -        } else if (!qemu_memfd_check()) {
+> +        } else if (vhost_dev_log_is_shared(hdev) &&
+> +                !qemu_mmap_check(hdev->log_filename)) {
+>              error_setg(&hdev->migration_blocker,
+>                         "Migration disabled: failed to allocate shared memory");
+>          }
+> @@ -1135,9 +1143,6 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>      hdev->mem = g_malloc0(offsetof(struct vhost_memory, regions));
+>      hdev->n_mem_sections = 0;
+>      hdev->mem_sections = NULL;
+> -    hdev->log = NULL;
+> -    hdev->log_size = 0;
+> -    hdev->log_enabled = false;
+>      hdev->started = false;
+>      hdev->memory_changed = false;
+>      memory_listener_register(&hdev->memory_listener, &address_space_memory);
+> @@ -1175,6 +1180,7 @@ void vhost_dev_cleanup(struct vhost_dev *hdev)
+>      if (hdev->vhost_ops) {
+>          hdev->vhost_ops->vhost_backend_cleanup(hdev);
+>      }
+> +    g_free(hdev->log_filename);
+>      assert(!hdev->log);
+> 
+>      memset(hdev, 0, sizeof(struct vhost_dev));
+> @@ -1335,7 +1341,8 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+>          uint64_t log_base;
+> 
+>          hdev->log_size = vhost_get_log_size(hdev);
+> -        hdev->log = vhost_log_get(hdev->log_size,
+> +        hdev->log = vhost_log_get(hdev->log_filename,
+> +                                  hdev->log_size,
+>                                    vhost_dev_log_is_shared(hdev));
+>          log_base = (uintptr_t)hdev->log->log;
+>          r = hdev->vhost_ops->vhost_set_log_base(hdev,
+> diff --git a/include/hw/virtio/vhost.h b/include/hw/virtio/vhost.h
+> index e433089..1ea4f3a 100644
+> --- a/include/hw/virtio/vhost.h
+> +++ b/include/hw/virtio/vhost.h
+> @@ -52,6 +52,7 @@ struct vhost_dev {
+>      uint64_t max_queues;
+>      bool started;
+>      bool log_enabled;
+> +    char *log_filename;
+>      uint64_t log_size;
+>      Error *migration_blocker;
+>      bool memory_changed;
+> @@ -65,7 +66,8 @@ struct vhost_dev {
+> 
+>  int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>                     VhostBackendType backend_type,
+> -                   uint32_t busyloop_timeout);
+> +                   uint32_t busyloop_timeout,
+> +                   char *vhostlog);
+>  void vhost_dev_cleanup(struct vhost_dev *hdev);
+>  int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev);
+>  void vhost_dev_stop(struct vhost_dev *hdev, VirtIODevice *vdev);
+> diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+> index 5a08eff..94161b2 100644
+> --- a/include/net/vhost_net.h
+> +++ b/include/net/vhost_net.h
+> @@ -12,6 +12,7 @@ typedef struct VhostNetOptions {
+>      NetClientState *net_backend;
+>      uint32_t busyloop_timeout;
+>      void *opaque;
+> +    char *vhostlog;
+>  } VhostNetOptions;
+> 
+>  uint64_t vhost_net_get_max_queues(VHostNetState *net);
+> diff --git a/include/qemu/mmap-file.h b/include/qemu/mmap-file.h
+> new file mode 100644
+> index 0000000..427612a
+> --- /dev/null
+> +++ b/include/qemu/mmap-file.h
+> @@ -0,0 +1,10 @@
+> +#ifndef QEMU_MMAP_FILE_H
+> +#define QEMU_MMAP_FILE_H
+> +
+> +#include "qemu-common.h"
+> +
+> +void *qemu_mmap_alloc(const char *path, size_t size, int *fd);
+> +void qemu_mmap_free(void *ptr, size_t size, int fd);
+> +bool qemu_mmap_check(const char *path);
+> +
+> +#endif
+> diff --git a/net/tap.c b/net/tap.c
+> index b6896a7..7b242cd 100644
+> --- a/net/tap.c
+> +++ b/net/tap.c
+> @@ -699,6 +699,12 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
+>          }
+>          options.opaque = (void *)(uintptr_t)vhostfd;
+> 
+> +        if (tap->has_vhostlog) {
+> +            options.vhostlog = g_strdup(tap->vhostlog);
+> +        } else {
+> +            options.vhostlog = NULL;
+> +        }
+> +
+>          s->vhost_net = vhost_net_init(&options);
+>          if (!s->vhost_net) {
+>              error_setg(errp,
+> diff --git a/qapi-schema.json b/qapi-schema.json
+> index 5a8ec38..72608bd 100644
+> --- a/qapi-schema.json
+> +++ b/qapi-schema.json
+> @@ -2640,6 +2640,8 @@
+>  #
+>  # @vhostforce: #optional vhost on for non-MSIX virtio guests
+>  #
+> +# @vhostlog: #optional file or directory for vhost backend log
+> +#
+>  # @queues: #optional number of queues to be created for multiqueue capable tap
+>  #
+>  # @poll-us: #optional maximum number of microseconds that could
+> @@ -2662,6 +2664,7 @@
+>      '*vhostfd':    'str',
+>      '*vhostfds':   'str',
+>      '*vhostforce': 'bool',
+> +    '*vhostlog':   'str',
+>      '*queues':     'uint32',
+>      '*poll-us':    'uint32'} }
+> 
+> diff --git a/qemu-options.hx b/qemu-options.hx
+> index b1fbdb0..5c09c09 100644
+> --- a/qemu-options.hx
+> +++ b/qemu-options.hx
+> @@ -1599,7 +1599,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+>  #else
+>      "-netdev tap,id=str[,fd=h][,fds=x:y:...:z][,ifname=name][,script=file][,downscript=dfile]\n"
+>      "         [,br=bridge][,helper=helper][,sndbuf=nbytes][,vnet_hdr=on|off][,vhost=on|off]\n"
+> -    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,queues=n]\n"
+> +    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,vhostlog=file|dir][,queues=n]\n"
+>      "         [,poll-us=n]\n"
+>      "                configure a host TAP network backend with ID 'str'\n"
+>      "                connected to a bridge (default=" DEFAULT_BRIDGE_INTERFACE ")\n"
+> @@ -1618,6 +1618,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+>      "                use vhost=on to enable experimental in kernel accelerator\n"
+>      "                    (only has effect for virtio guests which use MSIX)\n"
+>      "                use vhostforce=on to force vhost on for non-MSIX virtio guests\n"
+> +    "                use 'vhostlog=file|dir' file or directory for vhost backend log\n"
+>      "                use 'vhostfd=h' to connect to an already opened vhost net device\n"
+>      "                use 'vhostfds=x:y:...:z to connect to multiple already opened vhost net devices\n"
+>      "                use 'queues=n' to specify the number of queues to be created for multiqueue TAP\n"
+> diff --git a/util/Makefile.objs b/util/Makefile.objs
+> index 36c7dcc..69bb27a 100644
+> --- a/util/Makefile.objs
+> +++ b/util/Makefile.objs
+> @@ -3,6 +3,7 @@ util-obj-y += bufferiszero.o
+>  util-obj-$(CONFIG_POSIX) += compatfd.o
+>  util-obj-$(CONFIG_POSIX) += event_notifier-posix.o
+>  util-obj-$(CONFIG_POSIX) += mmap-alloc.o
+> +util-obj-$(CONFIG_POSIX) += mmap-file.o
+>  util-obj-$(CONFIG_POSIX) += oslib-posix.o
+>  util-obj-$(CONFIG_POSIX) += qemu-openpty.o
+>  util-obj-$(CONFIG_POSIX) += qemu-thread-posix.o
+> diff --git a/util/mmap-file.c b/util/mmap-file.c
+> new file mode 100644
+> index 0000000..ce778cf
+> --- /dev/null
+> +++ b/util/mmap-file.c
+> @@ -0,0 +1,153 @@
+> +/*
+> + * Support for file backed by mmaped host memory.
+> + *
+> + * Authors:
+> + *  Rafael David Tinoco <<email address hidden> <mailto:<email address hidden>>>
+> + *
+> + * This work is licensed under the terms of the GNU GPL, version 2 or
+> + * later.  See the COPYING file in the top-level directory.
+> + */
+> +
+> +#include "qemu/osdep.h"
+> +#include "qemu/mmap-file.h"
+> +
+> +static char *qemu_mmap_rand_name(void)
+> +{
+> +    char *name;
+> +    GRand *rsufix;
+> +    guint32 sufix;
+> +
+> +    rsufix = g_rand_new();
+> +    sufix = g_rand_int(rsufix);
+> +    g_free(rsufix);
+> +    name = g_strdup_printf("mmap-%u", sufix);
+> +
+> +    return name;
+> +}
+> +
+> +static inline void qemu_mmap_rand_name_free(char *str)
+> +{
+> +    g_free(str);
+> +}
+> +
+> +static bool qemu_mmap_is(const char *path, mode_t what)
+> +{
+> +    struct stat s;
+> +
+> +    memset(&s,  0, sizeof(struct stat));
+> +    if (stat(path, &s)) {
+> +        perror("stat");
+> +        goto negative;
+> +    }
+> +
+> +    if ((s.st_mode & S_IFMT) == what) {
+> +        return true;
+> +    }
+> +
+> +negative:
+> +    return false;
+> +}
+> +
+> +static inline bool qemu_mmap_is_file(const char *path)
+> +{
+> +    return qemu_mmap_is(path, S_IFREG);
+> +}
+> +
+> +static inline bool qemu_mmap_is_dir(const char *path)
+> +{
+> +    return qemu_mmap_is(path, S_IFDIR);
+> +}
+> +
+> +static void *qemu_mmap_alloc_file(const char *filepath, size_t size, int *fd)
+> +{
+> +    void *ptr;
+> +    int mfd = -1;
+> +
+> +    *fd = -1;
+> +
+> +    mfd = open(filepath, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+> +    if (mfd == -1) {
+> +        perror("open");
+> +        return NULL;
+> +    }
+> +
+> +    unlink(filepath);
+> +
+> +    if (ftruncate(mfd, size) == -1) {
+> +        perror("ftruncate");
+> +        close(mfd);
+> +        return NULL;
+> +    }
+> +
+> +    ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+> +    if (ptr == MAP_FAILED) {
+> +        perror("mmap");
+> +        close(mfd);
+> +        return NULL;
+> +    }
+> +
+> +    *fd = mfd;
+> +    return ptr;
+> +}
+> +
+> +static void *qemu_mmap_alloc_dir(const char *dirpath, size_t size, int *fd)
+> +{
+> +    void *ptr;
+> +    char *file, *rand, *tmp, *dir2use = NULL;
+> +
+> +    if (dirpath && !qemu_mmap_is_dir(dirpath)) {
+> +        return NULL;
+> +    }
+> +
+> +    tmp = (char *) g_get_tmp_dir();
+> +    dir2use = dirpath ? (char *) dirpath : tmp;
+> +    rand = qemu_mmap_rand_name();
+> +    file = g_strdup_printf("%s/%s", dir2use, rand);
+> +    ptr = qemu_mmap_alloc_file(file, size, fd);
+> +    g_free(tmp);
+> +    qemu_mmap_rand_name_free(rand);
+> +
+> +    return ptr;
+> +}
+> +
+> +/*
+> + * "path" can be:
+> + *
+> + *   filename = full path for the file to back mmap
+> + *   dir path = full dir path where to create random file for mmap
+> + *   null     = will use <tmpdir>  to create random file for mmap
+> + */
+> +void *qemu_mmap_alloc(const char *path, size_t size, int *fd)
+> +{
+> +    if (!path || qemu_mmap_is_dir(path)) {
+> +        return qemu_mmap_alloc_dir(path, size, fd);
+> +    }
+> +
+> +    return qemu_mmap_alloc_file(path, size, fd);
+> +}
+> +
+> +void qemu_mmap_free(void *ptr, size_t size, int fd)
+> +{
+> +    if (ptr) {
+> +        munmap(ptr, size);
+> +    }
+> +
+> +    if (fd != -1) {
+> +        close(fd);
+> +    }
+> +}
+> +
+> +bool qemu_mmap_check(const char *path)
+> +{
+> +    void *ptr;
+> +    int fd = -1;
+> +    bool r = true;
+> +
+> +    ptr = qemu_mmap_alloc(path, 4096, &fd);
+> +    if (!ptr) {
+> +        r = false;
+> +    }
+> +    qemu_mmap_free(ptr, 4096, fd);
+> +
+> +    return r == true ? true : false;
+> +}
+> --
+> 2.9.3
+> 
+> 
+> -- 
+> Marc-André Lureau
+
+
+
+
+
+> Begin forwarded message:
+> 
+> From: Rafael David Tinoco <email address hidden>
+> Subject: Re: [Qemu-devel] [PATCH] vhost: secure vhost shared log files using argv paremeter
+> Date: October 22, 2016 at 19:52:31 GMT-2
+> To: Marc-André Lureau <email address hidden>
+> Cc: Rafael David Tinoco <email address hidden>, qemu-devel <email address hidden>
+> 
+> Hello,
+> 
+>> On Oct 22, 2016, at 05:18, Marc-André Lureau <email address hidden> wrote:
+>> 
+>> Hi
+>> 
+>> On Sat, Oct 22, 2016 at 10:01 AM Rafael David Tinoco <email address hidden> wrote:
+>> Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+>> check if memfd would succeed. It is better if this blocker first
+>> checks if vhost backend requires shared log. This will avoid a
+>> situation where a blocker is added inappropriately (e.g. shared
+>> log allocation fails when vhost backend doesn't support it).
+>> 
+>> Could you make this a seperate patch?
+> 
+> Just did, in another e-mail, cc'ing you.
+> 
+>> Argv examples:
+>> 
+>>    -netdev tap,id=net0,vhost=on
+>>    -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+>>    -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+>> 
+>> Could it be only a filename? This would simplify testing.
+> 
+> It could. Should I keep the /tmp/<random> logic if no vhostlog arg is present ? Or you think it should fail if no arg is given ? I'm afraid of backward compatibility when back-porting this to older qemu versions on stable releases (like my case: I'll backport this to ~3 different versions). 
+> 
+>> For vhost backends supporting shared logs, if vhostlog is non-existent,
+>> or a directory, random files are going to be created in the specified
+>> directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+>> the filepath is always used when allocating vhost log files.
+>> 
+>> 
+>> Regarding testing, you add utility code mmap-file, could you make this a seperate commit, with unit tests?
+>> 
+> 
+> Sure, I'll work on it.
+> 
+>> thanks
+> 
+> Thank u!
+> 
+> -Rafael Tinoco
+
+
+
+Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+check if memfd would succeed. It is better if this blocker first
+checks if vhost backend requires shared log. This will avoid a
+situation where a blocker is added inappropriately (e.g. shared
+log allocation fails when vhost backend doesn't support it).
+
+Signed-off-by: Rafael David Tinoco <email address hidden>
+Reviewed-by: Marc-André Lureau <email address hidden>
+---
+ hw/virtio/vhost.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index bd051ab..742d0aa 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -1122,7 +1122,7 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+         if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+-        } else if (!qemu_memfd_check()) {
++        } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_check()) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: failed to allocate shared memory");
+         }
+-- 
+2.9.3
+
+
+
+On Sat, Oct 22, 2016 at 07:00:41AM +0000, Rafael David Tinoco wrote:
+> Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+> check if memfd would succeed. It is better if this blocker first
+> checks if vhost backend requires shared log. This will avoid a
+> situation where a blocker is added inappropriately (e.g. shared
+> log allocation fails when vhost backend doesn't support it).
+
+Sounds like a bugfix but I'm not sure. Can this part be split
+out in a patch by itself?
+
+> Commit: 35f9b6e added a fallback mechanism for systems not supporting
+> memfd_create syscall (started being supported since 3.17).
+> 
+> Backporting memfd_create might not be accepted for distros relying
+> on older kernels. Nowadays there is no way for security driver
+> to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> 
+> Also, because vhost log file descriptors can be passed to other
+> processes, after discussion, we thought it is best to back mmap by
+> using files that can be placed into a specific directory: this commit
+> creates "vhostlog" argv parameter for such purpose. This will allow
+> security drivers to operate on those files appropriately.
+> 
+> Argv examples:
+> 
+>     -netdev tap,id=net0,vhost=on
+>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+> 
+> For vhost backends supporting shared logs, if vhostlog is non-existent,
+> or a directory, random files are going to be created in the specified
+> directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+> the filepath is always used when allocating vhost log files.
+
+When vhostlog is not specified, can we just use memfd as we did?
+
+> Signed-off-by: Rafael David Tinoco <email address hidden>
+> ---
+>  hw/net/vhost_net.c        |   4 +-
+>  hw/scsi/vhost-scsi.c      |   2 +-
+>  hw/virtio/vhost-vsock.c   |   2 +-
+>  hw/virtio/vhost.c         |  41 +++++++------
+>  include/hw/virtio/vhost.h |   4 +-
+>  include/net/vhost_net.h   |   1 +
+>  include/qemu/mmap-file.h  |  10 +++
+>  net/tap.c                 |   6 ++
+>  qapi-schema.json          |   3 +
+>  qemu-options.hx           |   3 +-
+>  util/Makefile.objs        |   1 +
+>  util/mmap-file.c          | 153 ++++++++++++++++++++++++++++++++++++++++++++++
+>  12 files changed, 207 insertions(+), 23 deletions(-)
+>  create mode 100644 include/qemu/mmap-file.h
+>  create mode 100644 util/mmap-file.c
+> 
+> diff --git a/hw/net/vhost_net.c b/hw/net/vhost_net.c
+> index f2d49ad..d650c92 100644
+> --- a/hw/net/vhost_net.c
+> +++ b/hw/net/vhost_net.c
+> @@ -171,8 +171,8 @@ struct vhost_net *vhost_net_init(VhostNetOptions *options)
+>          net->dev.vq_index = net->nc->queue_index * net->dev.nvqs;
+>      }
+>  
+> -    r = vhost_dev_init(&net->dev, options->opaque,
+> -                       options->backend_type, options->busyloop_timeout);
+> +    r = vhost_dev_init(&net->dev, options->opaque, options->backend_type,
+> +                       options->busyloop_timeout, options->vhostlog);
+>      if (r < 0) {
+>          goto fail;
+>      }
+> diff --git a/hw/scsi/vhost-scsi.c b/hw/scsi/vhost-scsi.c
+> index 5b26946..5dc3d30 100644
+> --- a/hw/scsi/vhost-scsi.c
+> +++ b/hw/scsi/vhost-scsi.c
+> @@ -248,7 +248,7 @@ static void vhost_scsi_realize(DeviceState *dev, Error **errp)
+>      s->dev.backend_features = 0;
+>  
+>      ret = vhost_dev_init(&s->dev, (void *)(uintptr_t)vhostfd,
+> -                         VHOST_BACKEND_TYPE_KERNEL, 0);
+> +                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+>      if (ret < 0) {
+>          error_setg(errp, "vhost-scsi: vhost initialization failed: %s",
+>                     strerror(-ret));
+> diff --git a/hw/virtio/vhost-vsock.c b/hw/virtio/vhost-vsock.c
+> index b481562..6cf6081 100644
+> --- a/hw/virtio/vhost-vsock.c
+> +++ b/hw/virtio/vhost-vsock.c
+> @@ -342,7 +342,7 @@ static void vhost_vsock_device_realize(DeviceState *dev, Error **errp)
+>      vsock->vhost_dev.nvqs = ARRAY_SIZE(vsock->vhost_vqs);
+>      vsock->vhost_dev.vqs = vsock->vhost_vqs;
+>      ret = vhost_dev_init(&vsock->vhost_dev, (void *)(uintptr_t)vhostfd,
+> -                         VHOST_BACKEND_TYPE_KERNEL, 0);
+> +                         VHOST_BACKEND_TYPE_KERNEL, 0, NULL);
+>      if (ret < 0) {
+>          error_setg_errno(errp, -ret, "vhost-vsock: vhost_dev_init failed");
+>          goto err_virtio;
+> diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+> index bd051ab..d874ebb 100644
+> --- a/hw/virtio/vhost.c
+> +++ b/hw/virtio/vhost.c
+> @@ -20,7 +20,7 @@
+>  #include "qemu/atomic.h"
+>  #include "qemu/range.h"
+>  #include "qemu/error-report.h"
+> -#include "qemu/memfd.h"
+> +#include "qemu/mmap-file.h"
+>  #include <linux/vhost.h>
+>  #include "exec/address-spaces.h"
+>  #include "hw/virtio/virtio-bus.h"
+> @@ -326,7 +326,7 @@ static uint64_t vhost_get_log_size(struct vhost_dev *dev)
+>      return log_size;
+>  }
+>  
+> -static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+> +static struct vhost_log *vhost_log_alloc(char *path, uint64_t size, bool share)
+>  {
+>      struct vhost_log *log;
+>      uint64_t logsize = size * sizeof(*(log->log));
+> @@ -334,9 +334,7 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+>  
+>      log = g_new0(struct vhost_log, 1);
+>      if (share) {
+> -        log->log = qemu_memfd_alloc("vhost-log", logsize,
+> -                                    F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL,
+> -                                    &fd);
+> +        log->log = qemu_mmap_alloc(path, logsize, &fd);
+>          memset(log->log, 0, logsize);
+>      } else {
+>          log->log = g_malloc0(logsize);
+> @@ -349,12 +347,12 @@ static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
+>      return log;
+>  }
+>  
+> -static struct vhost_log *vhost_log_get(uint64_t size, bool share)
+> +static struct vhost_log *vhost_log_get(char *path, uint64_t size, bool share)
+>  {
+>      struct vhost_log *log = share ? vhost_log_shm : vhost_log;
+>  
+>      if (!log || log->size != size) {
+> -        log = vhost_log_alloc(size, share);
+> +        log = vhost_log_alloc(path, size, share);
+>          if (share) {
+>              vhost_log_shm = log;
+>          } else {
+> @@ -388,8 +386,7 @@ static void vhost_log_put(struct vhost_dev *dev, bool sync)
+>              g_free(log->log);
+>              vhost_log = NULL;
+>          } else if (vhost_log_shm == log) {
+> -            qemu_memfd_free(log->log, log->size * sizeof(*(log->log)),
+> -                            log->fd);
+> +            qemu_mmap_free(log->log, log->size * sizeof(*(log->log)), log->fd);
+>              vhost_log_shm = NULL;
+>          }
+>  
+> @@ -405,9 +402,12 @@ static bool vhost_dev_log_is_shared(struct vhost_dev *dev)
+>  
+>  static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+>  {
+> -    struct vhost_log *log = vhost_log_get(size, vhost_dev_log_is_shared(dev));
+> -    uint64_t log_base = (uintptr_t)log->log;
+>      int r;
+> +    struct vhost_log *log;
+> +    uint64_t log_base;
+> +
+> +    log = vhost_log_get(dev->log_filename, size, vhost_dev_log_is_shared(dev));
+> +    log_base = (uintptr_t)log->log;
+>  
+>      /* inform backend of log switching, this must be done before
+>         releasing the current log, to ensure no logging is lost */
+> @@ -1049,7 +1049,8 @@ static void vhost_virtqueue_cleanup(struct vhost_virtqueue *vq)
+>  }
+>  
+>  int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+> -                   VhostBackendType backend_type, uint32_t busyloop_timeout)
+> +                   VhostBackendType backend_type,
+> +                   uint32_t busyloop_timeout, char *vhostlog)
+>  {
+>      uint64_t features;
+>      int i, r, n_initialized_vqs = 0;
+> @@ -1118,11 +1119,18 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>          .priority = 10
+>      };
+>  
+> +    hdev->log = NULL;
+> +    hdev->log_size = 0;
+> +    hdev->log_enabled = false;
+> +    hdev->log_filename = vhostlog ? g_strdup(vhostlog) : NULL;
+> +    g_free(vhostlog);
+> +
+>      if (hdev->migration_blocker == NULL) {
+>          if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+>              error_setg(&hdev->migration_blocker,
+>                         "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+> -        } else if (!qemu_memfd_check()) {
+> +        } else if (vhost_dev_log_is_shared(hdev) &&
+> +                !qemu_mmap_check(hdev->log_filename)) {
+>              error_setg(&hdev->migration_blocker,
+>                         "Migration disabled: failed to allocate shared memory");
+>          }
+> @@ -1135,9 +1143,6 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>      hdev->mem = g_malloc0(offsetof(struct vhost_memory, regions));
+>      hdev->n_mem_sections = 0;
+>      hdev->mem_sections = NULL;
+> -    hdev->log = NULL;
+> -    hdev->log_size = 0;
+> -    hdev->log_enabled = false;
+>      hdev->started = false;
+>      hdev->memory_changed = false;
+>      memory_listener_register(&hdev->memory_listener, &address_space_memory);
+> @@ -1175,6 +1180,7 @@ void vhost_dev_cleanup(struct vhost_dev *hdev)
+>      if (hdev->vhost_ops) {
+>          hdev->vhost_ops->vhost_backend_cleanup(hdev);
+>      }
+> +    g_free(hdev->log_filename);
+>      assert(!hdev->log);
+>  
+>      memset(hdev, 0, sizeof(struct vhost_dev));
+> @@ -1335,7 +1341,8 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
+>          uint64_t log_base;
+>  
+>          hdev->log_size = vhost_get_log_size(hdev);
+> -        hdev->log = vhost_log_get(hdev->log_size,
+> +        hdev->log = vhost_log_get(hdev->log_filename,
+> +                                  hdev->log_size,
+>                                    vhost_dev_log_is_shared(hdev));
+>          log_base = (uintptr_t)hdev->log->log;
+>          r = hdev->vhost_ops->vhost_set_log_base(hdev,
+> diff --git a/include/hw/virtio/vhost.h b/include/hw/virtio/vhost.h
+> index e433089..1ea4f3a 100644
+> --- a/include/hw/virtio/vhost.h
+> +++ b/include/hw/virtio/vhost.h
+> @@ -52,6 +52,7 @@ struct vhost_dev {
+>      uint64_t max_queues;
+>      bool started;
+>      bool log_enabled;
+> +    char *log_filename;
+>      uint64_t log_size;
+>      Error *migration_blocker;
+>      bool memory_changed;
+> @@ -65,7 +66,8 @@ struct vhost_dev {
+>  
+>  int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+>                     VhostBackendType backend_type,
+> -                   uint32_t busyloop_timeout);
+> +                   uint32_t busyloop_timeout,
+> +                   char *vhostlog);
+>  void vhost_dev_cleanup(struct vhost_dev *hdev);
+>  int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev);
+>  void vhost_dev_stop(struct vhost_dev *hdev, VirtIODevice *vdev);
+> diff --git a/include/net/vhost_net.h b/include/net/vhost_net.h
+> index 5a08eff..94161b2 100644
+> --- a/include/net/vhost_net.h
+> +++ b/include/net/vhost_net.h
+> @@ -12,6 +12,7 @@ typedef struct VhostNetOptions {
+>      NetClientState *net_backend;
+>      uint32_t busyloop_timeout;
+>      void *opaque;
+> +    char *vhostlog;
+>  } VhostNetOptions;
+>  
+>  uint64_t vhost_net_get_max_queues(VHostNetState *net);
+> diff --git a/include/qemu/mmap-file.h b/include/qemu/mmap-file.h
+> new file mode 100644
+> index 0000000..427612a
+> --- /dev/null
+> +++ b/include/qemu/mmap-file.h
+> @@ -0,0 +1,10 @@
+> +#ifndef QEMU_MMAP_FILE_H
+> +#define QEMU_MMAP_FILE_H
+> +
+> +#include "qemu-common.h"
+> +
+> +void *qemu_mmap_alloc(const char *path, size_t size, int *fd);
+> +void qemu_mmap_free(void *ptr, size_t size, int fd);
+> +bool qemu_mmap_check(const char *path);
+> +
+> +#endif
+> diff --git a/net/tap.c b/net/tap.c
+> index b6896a7..7b242cd 100644
+> --- a/net/tap.c
+> +++ b/net/tap.c
+> @@ -699,6 +699,12 @@ static void net_init_tap_one(const NetdevTapOptions *tap, NetClientState *peer,
+>          }
+>          options.opaque = (void *)(uintptr_t)vhostfd;
+>  
+> +        if (tap->has_vhostlog) {
+> +            options.vhostlog = g_strdup(tap->vhostlog);
+> +        } else {
+> +            options.vhostlog = NULL;
+> +        }
+> +
+>          s->vhost_net = vhost_net_init(&options);
+>          if (!s->vhost_net) {
+>              error_setg(errp,
+> diff --git a/qapi-schema.json b/qapi-schema.json
+> index 5a8ec38..72608bd 100644
+> --- a/qapi-schema.json
+> +++ b/qapi-schema.json
+> @@ -2640,6 +2640,8 @@
+>  #
+>  # @vhostforce: #optional vhost on for non-MSIX virtio guests
+>  #
+> +# @vhostlog: #optional file or directory for vhost backend log
+> +#
+>  # @queues: #optional number of queues to be created for multiqueue capable tap
+>  #
+>  # @poll-us: #optional maximum number of microseconds that could
+> @@ -2662,6 +2664,7 @@
+>      '*vhostfd':    'str',
+>      '*vhostfds':   'str',
+>      '*vhostforce': 'bool',
+> +    '*vhostlog':   'str',
+>      '*queues':     'uint32',
+>      '*poll-us':    'uint32'} }
+>  
+> diff --git a/qemu-options.hx b/qemu-options.hx
+> index b1fbdb0..5c09c09 100644
+> --- a/qemu-options.hx
+> +++ b/qemu-options.hx
+> @@ -1599,7 +1599,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+>  #else
+>      "-netdev tap,id=str[,fd=h][,fds=x:y:...:z][,ifname=name][,script=file][,downscript=dfile]\n"
+>      "         [,br=bridge][,helper=helper][,sndbuf=nbytes][,vnet_hdr=on|off][,vhost=on|off]\n"
+> -    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,queues=n]\n"
+> +    "         [,vhostfd=h][,vhostfds=x:y:...:z][,vhostforce=on|off][,vhostlog=file|dir][,queues=n]\n"
+>      "         [,poll-us=n]\n"
+>      "                configure a host TAP network backend with ID 'str'\n"
+>      "                connected to a bridge (default=" DEFAULT_BRIDGE_INTERFACE ")\n"
+> @@ -1618,6 +1618,7 @@ DEF("netdev", HAS_ARG, QEMU_OPTION_netdev,
+>      "                use vhost=on to enable experimental in kernel accelerator\n"
+>      "                    (only has effect for virtio guests which use MSIX)\n"
+>      "                use vhostforce=on to force vhost on for non-MSIX virtio guests\n"
+> +    "                use 'vhostlog=file|dir' file or directory for vhost backend log\n"
+>      "                use 'vhostfd=h' to connect to an already opened vhost net device\n"
+>      "                use 'vhostfds=x:y:...:z to connect to multiple already opened vhost net devices\n"
+>      "                use 'queues=n' to specify the number of queues to be created for multiqueue TAP\n"
+> diff --git a/util/Makefile.objs b/util/Makefile.objs
+> index 36c7dcc..69bb27a 100644
+> --- a/util/Makefile.objs
+> +++ b/util/Makefile.objs
+> @@ -3,6 +3,7 @@ util-obj-y += bufferiszero.o
+>  util-obj-$(CONFIG_POSIX) += compatfd.o
+>  util-obj-$(CONFIG_POSIX) += event_notifier-posix.o
+>  util-obj-$(CONFIG_POSIX) += mmap-alloc.o
+> +util-obj-$(CONFIG_POSIX) += mmap-file.o
+>  util-obj-$(CONFIG_POSIX) += oslib-posix.o
+>  util-obj-$(CONFIG_POSIX) += qemu-openpty.o
+>  util-obj-$(CONFIG_POSIX) += qemu-thread-posix.o
+> diff --git a/util/mmap-file.c b/util/mmap-file.c
+> new file mode 100644
+> index 0000000..ce778cf
+> --- /dev/null
+> +++ b/util/mmap-file.c
+> @@ -0,0 +1,153 @@
+> +/*
+> + * Support for file backed by mmaped host memory.
+> + *
+> + * Authors:
+> + *  Rafael David Tinoco <email address hidden>
+> + *
+> + * This work is licensed under the terms of the GNU GPL, version 2 or
+> + * later.  See the COPYING file in the top-level directory.
+> + */
+> +
+> +#include "qemu/osdep.h"
+> +#include "qemu/mmap-file.h"
+> +
+> +static char *qemu_mmap_rand_name(void)
+> +{
+> +    char *name;
+> +    GRand *rsufix;
+> +    guint32 sufix;
+> +
+> +    rsufix = g_rand_new();
+> +    sufix = g_rand_int(rsufix);
+> +    g_free(rsufix);
+> +    name = g_strdup_printf("mmap-%u", sufix);
+> +
+> +    return name;
+> +}
+> +
+> +static inline void qemu_mmap_rand_name_free(char *str)
+> +{
+> +    g_free(str);
+> +}
+> +
+> +static bool qemu_mmap_is(const char *path, mode_t what)
+> +{
+> +    struct stat s;
+> +
+> +    memset(&s,  0, sizeof(struct stat));
+> +    if (stat(path, &s)) {
+> +        perror("stat");
+> +        goto negative;
+> +    }
+> +
+> +    if ((s.st_mode & S_IFMT) == what) {
+> +        return true;
+> +    }
+> +
+> +negative:
+> +    return false;
+> +}
+> +
+> +static inline bool qemu_mmap_is_file(const char *path)
+> +{
+> +    return qemu_mmap_is(path, S_IFREG);
+> +}
+> +
+> +static inline bool qemu_mmap_is_dir(const char *path)
+> +{
+> +    return qemu_mmap_is(path, S_IFDIR);
+> +}
+> +
+> +static void *qemu_mmap_alloc_file(const char *filepath, size_t size, int *fd)
+> +{
+> +    void *ptr;
+> +    int mfd = -1;
+> +
+> +    *fd = -1;
+> +
+> +    mfd = open(filepath, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+> +    if (mfd == -1) {
+> +        perror("open");
+> +        return NULL;
+> +    }
+> +
+> +    unlink(filepath);
+> +
+> +    if (ftruncate(mfd, size) == -1) {
+> +        perror("ftruncate");
+> +        close(mfd);
+> +        return NULL;
+> +    }
+> +
+> +    ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+> +    if (ptr == MAP_FAILED) {
+> +        perror("mmap");
+> +        close(mfd);
+> +        return NULL;
+> +    }
+> +
+> +    *fd = mfd;
+> +    return ptr;
+> +}
+> +
+> +static void *qemu_mmap_alloc_dir(const char *dirpath, size_t size, int *fd)
+> +{
+> +    void *ptr;
+> +    char *file, *rand, *tmp, *dir2use = NULL;
+> +
+> +    if (dirpath && !qemu_mmap_is_dir(dirpath)) {
+> +        return NULL;
+> +    }
+> +
+> +    tmp = (char *) g_get_tmp_dir();
+> +    dir2use = dirpath ? (char *) dirpath : tmp;
+> +    rand = qemu_mmap_rand_name();
+> +    file = g_strdup_printf("%s/%s", dir2use, rand);
+> +    ptr = qemu_mmap_alloc_file(file, size, fd);
+> +    g_free(tmp);
+> +    qemu_mmap_rand_name_free(rand);
+> +
+> +    return ptr;
+> +}
+> +
+> +/*
+> + * "path" can be:
+> + *
+> + *   filename = full path for the file to back mmap
+> + *   dir path = full dir path where to create random file for mmap
+> + *   null     = will use <tmpdir>  to create random file for mmap
+> + */
+> +void *qemu_mmap_alloc(const char *path, size_t size, int *fd)
+> +{
+> +    if (!path || qemu_mmap_is_dir(path)) {
+> +        return qemu_mmap_alloc_dir(path, size, fd);
+> +    }
+> +
+> +    return qemu_mmap_alloc_file(path, size, fd);
+> +}
+> +
+> +void qemu_mmap_free(void *ptr, size_t size, int fd)
+> +{
+> +    if (ptr) {
+> +        munmap(ptr, size);
+> +    }
+> +
+> +    if (fd != -1) {
+> +        close(fd);
+> +    }
+> +}
+> +
+> +bool qemu_mmap_check(const char *path)
+> +{
+> +    void *ptr;
+> +    int fd = -1;
+> +    bool r = true;
+> +
+> +    ptr = qemu_mmap_alloc(path, 4096, &fd);
+> +    if (!ptr) {
+> +        r = false;
+> +    }
+> +    qemu_mmap_free(ptr, 4096, fd);
+> +
+> +    return r == true ? true : false;
+> +}
+> -- 
+> 2.9.3
+
+
+On Sun, Oct 30, 2016 at 5:26 PM, Michael S. Tsirkin <email address hidden> wrote:
+>
+> On Sat, Oct 22, 2016 at 07:00:41AM +0000, Rafael David Tinoco wrote:
+> > Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+> > check if memfd would succeed. It is better if this blocker first
+> > checks if vhost backend requires shared log. This will avoid a
+> > situation where a blocker is added inappropriately (e.g. shared
+> > log allocation fails when vhost backend doesn't support it).
+>
+> Sounds like a bugfix but I'm not sure. Can this part be split
+> out in a patch by itself?
+
+Already sent some days ago (and pointed by Marc today).
+
+> > Commit: 35f9b6e added a fallback mechanism for systems not supporting
+> > memfd_create syscall (started being supported since 3.17).
+> >
+> > Backporting memfd_create might not be accepted for distros relying
+> > on older kernels. Nowadays there is no way for security driver
+> > to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> >
+> > Also, because vhost log file descriptors can be passed to other
+> > processes, after discussion, we thought it is best to back mmap by
+> > using files that can be placed into a specific directory: this commit
+> > creates "vhostlog" argv parameter for such purpose. This will allow
+> > security drivers to operate on those files appropriately.
+> >
+> > Argv examples:
+> >
+> >     -netdev tap,id=net0,vhost=on
+> >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+> >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+> >
+> > For vhost backends supporting shared logs, if vhostlog is non-existent,
+> > or a directory, random files are going to be created in the specified
+> > directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+> > the filepath is always used when allocating vhost log files.
+>
+> When vhostlog is not specified, can we just use memfd as we did?
+>
+
+This was my approach on a "pastebin" example before this patch (in the
+discussion thread we had). Problem goes back to when vhost log file
+descriptor is shared with some vhost-user implementation - like the
+interface allows to - and the security driver labelling issue. IMO,
+yes, we could let vhostlog to specify a log file, and, if not
+specified, assume memfd is ok to be used.
+
+Please let me know if you - and Marc - want me to keep using memfd.
+I'll create the mmap-file tests and files in a different commit, like
+Marc has asked for, and will propose the patch again by the end of
+this week.
+
+
+On Mon, Oct 31, 2016 at 08:35:33AM -0200, Rafael David Tinoco wrote:
+> On Sun, Oct 30, 2016 at 5:26 PM, Michael S. Tsirkin <email address hidden> wrote:
+> >
+> > On Sat, Oct 22, 2016 at 07:00:41AM +0000, Rafael David Tinoco wrote:
+> > > Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+> > > check if memfd would succeed. It is better if this blocker first
+> > > checks if vhost backend requires shared log. This will avoid a
+> > > situation where a blocker is added inappropriately (e.g. shared
+> > > log allocation fails when vhost backend doesn't support it).
+> >
+> > Sounds like a bugfix but I'm not sure. Can this part be split
+> > out in a patch by itself?
+> 
+> Already sent some days ago (and pointed by Marc today).
+> 
+> > > Commit: 35f9b6e added a fallback mechanism for systems not supporting
+> > > memfd_create syscall (started being supported since 3.17).
+> > >
+> > > Backporting memfd_create might not be accepted for distros relying
+> > > on older kernels. Nowadays there is no way for security driver
+> > > to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> > >
+> > > Also, because vhost log file descriptors can be passed to other
+> > > processes, after discussion, we thought it is best to back mmap by
+> > > using files that can be placed into a specific directory: this commit
+> > > creates "vhostlog" argv parameter for such purpose. This will allow
+> > > security drivers to operate on those files appropriately.
+> > >
+> > > Argv examples:
+> > >
+> > >     -netdev tap,id=net0,vhost=on
+> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+> > >
+> > > For vhost backends supporting shared logs, if vhostlog is non-existent,
+> > > or a directory, random files are going to be created in the specified
+> > > directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+> > > the filepath is always used when allocating vhost log files.
+> >
+> > When vhostlog is not specified, can we just use memfd as we did?
+> >
+> 
+> This was my approach on a "pastebin" example before this patch (in the
+> discussion thread we had). Problem goes back to when vhost log file
+> descriptor is shared with some vhost-user implementation - like the
+> interface allows to - and the security driver labelling issue. IMO,
+> yes, we could let vhostlog to specify a log file, and, if not
+> specified, assume memfd is ok to be used.
+> 
+> Please let me know if you - and Marc - want me to keep using memfd.
+> I'll create the mmap-file tests and files in a different commit, like
+> Marc has asked for, and will propose the patch again by the end of
+> this week.
+
+I think that the best approach is to allow passing in the fd,
+not the file path. If not passed, use memfd.
+
+-- 
+MST
+
+
+Hello Michael, André,
+
+Could you do a quick review before a final submission ?
+
+http://paste.ubuntu.com/23446279/
+
+- I split the commits into 1) bugfix, 2) new util with test, 3) vhostlog
+
+The unit test is testing passing fds between 2 processes and asserting
+contents of mmap buffer coming from the "vhostlog" util (mmap-file).
+
+Your final comment on the "vhostlog" was:
+
+>> Argv examples:
+>>
+>>     -netdev tap,id=net0,vhost=on
+>>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+>>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+
+(André) > Could it be only a filename? This would simplify testing.
+(Michael) > When vhostlog is not specified, can we just use memfd as we did?
+
+I'm going to change this to:
+
+1 - if vhostlog is not provided shared log can't be used. Use memfd.
+
+2 - for shared logs, vhostlog has to be provided as a "file" ?
+
+Should i keep vhostlog being a directory also ? (i know we are unlinking the
+file so might not be needed BUT a static file might have a race condition in
+between different instances and providing a directory - that creates random
+files on it - might be better approach).
+
+Is there anything else ?
+
+Thank you
+
+Rafael Tinoco
+
+On Mon, Oct 31, 2016 at 8:30 PM, Michael S. Tsirkin <email address hidden> wrote:
+> On Mon, Oct 31, 2016 at 08:35:33AM -0200, Rafael David Tinoco wrote:
+>> On Sun, Oct 30, 2016 at 5:26 PM, Michael S. Tsirkin <email address hidden> wrote:
+>> >
+>> > On Sat, Oct 22, 2016 at 07:00:41AM +0000, Rafael David Tinoco wrote:
+>> > > Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+>> > > check if memfd would succeed. It is better if this blocker first
+>> > > checks if vhost backend requires shared log. This will avoid a
+>> > > situation where a blocker is added inappropriately (e.g. shared
+>> > > log allocation fails when vhost backend doesn't support it).
+>> >
+>> > Sounds like a bugfix but I'm not sure. Can this part be split
+>> > out in a patch by itself?
+>>
+>> Already sent some days ago (and pointed by Marc today).
+>>
+>> > > Commit: 35f9b6e added a fallback mechanism for systems not supporting
+>> > > memfd_create syscall (started being supported since 3.17).
+>> > >
+>> > > Backporting memfd_create might not be accepted for distros relying
+>> > > on older kernels. Nowadays there is no way for security driver
+>> > > to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+>> > >
+>> > > Also, because vhost log file descriptors can be passed to other
+>> > > processes, after discussion, we thought it is best to back mmap by
+>> > > using files that can be placed into a specific directory: this commit
+>> > > creates "vhostlog" argv parameter for such purpose. This will allow
+>> > > security drivers to operate on those files appropriately.
+>> > >
+>> > > Argv examples:
+>> > >
+>> > >     -netdev tap,id=net0,vhost=on
+>> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+>> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+>> > >
+>> > > For vhost backends supporting shared logs, if vhostlog is non-existent,
+>> > > or a directory, random files are going to be created in the specified
+>> > > directory (or, for non-existent, in tmpdir). If vhostlog is specified,
+>> > > the filepath is always used when allocating vhost log files.
+>> >
+>> > When vhostlog is not specified, can we just use memfd as we did?
+>> >
+>>
+>> This was my approach on a "pastebin" example before this patch (in the
+>> discussion thread we had). Problem goes back to when vhost log file
+>> descriptor is shared with some vhost-user implementation - like the
+>> interface allows to - and the security driver labelling issue. IMO,
+>> yes, we could let vhostlog to specify a log file, and, if not
+>> specified, assume memfd is ok to be used.
+>>
+>> Please let me know if you - and Marc - want me to keep using memfd.
+>> I'll create the mmap-file tests and files in a different commit, like
+>> Marc has asked for, and will propose the patch again by the end of
+>> this week.
+>
+> I think that the best approach is to allow passing in the fd,
+> not the file path. If not passed, use memfd.
+>
+> --
+> MST
+
+
+Hi
+
+On Tue, Nov 8, 2016 at 4:49 PM Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> Hello Michael, André,
+>
+> Could you do a quick review before a final submission ?
+>
+> http://paste.ubuntu.com/23446279/
+>
+> - I split the commits into 1) bugfix, 2) new util with test, 3) vhostlog
+>
+> The unit test is testing passing fds between 2 processes and asserting
+> contents of mmap buffer coming from the "vhostlog" util (mmap-file).
+>
+> Your final comment on the "vhostlog" was:
+>
+> >> Argv examples:
+> >>
+> >>     -netdev tap,id=net0,vhost=on
+> >>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+> >>     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+>
+> (André) > Could it be only a filename? This would simplify testing.
+> (Michael) > When vhostlog is not specified, can we just use memfd as we
+> did?
+>
+>
+Michael said:
+https://lists.gnu.org/archive/html/qemu-devel/2016-10/msg08197.html
+I think that the best approach is to allow passing in the fd, not the file
+path. If not passed, use memfd.
+
+I do agree :)
+
+I'm going to change this to:
+>
+> 1 - if vhostlog is not provided shared log can't be used. Use memfd.
+>
+> 2 - for shared logs, vhostlog has to be provided as a "file" ?
+>
+> Should i keep vhostlog being a directory also ? (i know we are unlinking
+> the
+> file so might not be needed BUT a static file might have a race condition
+> in
+> between different instances and providing a directory - that creates random
+> files on it - might be better approach).
+>
+> Is there anything else ?
+>
+
+Do we really need to give a path? (pass fd with -add-fd/qmp add-fd)
+
+Thank you
+>
+> Rafael Tinoco
+>
+> On Mon, Oct 31, 2016 at 8:30 PM, Michael S. Tsirkin <email address hidden>
+> wrote:
+> > On Mon, Oct 31, 2016 at 08:35:33AM -0200, Rafael David Tinoco wrote:
+> >> On Sun, Oct 30, 2016 at 5:26 PM, Michael S. Tsirkin <email address hidden>
+> wrote:
+> >> >
+> >> > On Sat, Oct 22, 2016 at 07:00:41AM +0000, Rafael David Tinoco wrote:
+> >> > > Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+> >> > > check if memfd would succeed. It is better if this blocker first
+> >> > > checks if vhost backend requires shared log. This will avoid a
+> >> > > situation where a blocker is added inappropriately (e.g. shared
+> >> > > log allocation fails when vhost backend doesn't support it).
+> >> >
+> >> > Sounds like a bugfix but I'm not sure. Can this part be split
+> >> > out in a patch by itself?
+> >>
+> >> Already sent some days ago (and pointed by Marc today).
+> >>
+> >> > > Commit: 35f9b6e added a fallback mechanism for systems not
+> supporting
+> >> > > memfd_create syscall (started being supported since 3.17).
+> >> > >
+> >> > > Backporting memfd_create might not be accepted for distros relying
+> >> > > on older kernels. Nowadays there is no way for security driver
+> >> > > to discover memfd filename to be created: <tmpdir>/memfd-XXXXXX.
+> >> > >
+> >> > > Also, because vhost log file descriptors can be passed to other
+> >> > > processes, after discussion, we thought it is best to back mmap by
+> >> > > using files that can be placed into a specific directory: this
+> commit
+> >> > > creates "vhostlog" argv parameter for such purpose. This will allow
+> >> > > security drivers to operate on those files appropriately.
+> >> > >
+> >> > > Argv examples:
+> >> > >
+> >> > >     -netdev tap,id=net0,vhost=on
+> >> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp/guest.log
+> >> > >     -netdev tap,id=net0,vhost=on,vhostlog=/tmp
+> >> > >
+> >> > > For vhost backends supporting shared logs, if vhostlog is
+> non-existent,
+> >> > > or a directory, random files are going to be created in the
+> specified
+> >> > > directory (or, for non-existent, in tmpdir). If vhostlog is
+> specified,
+> >> > > the filepath is always used when allocating vhost log files.
+> >> >
+> >> > When vhostlog is not specified, can we just use memfd as we did?
+> >> >
+> >>
+> >> This was my approach on a "pastebin" example before this patch (in the
+> >> discussion thread we had). Problem goes back to when vhost log file
+> >> descriptor is shared with some vhost-user implementation - like the
+> >> interface allows to - and the security driver labelling issue. IMO,
+> >> yes, we could let vhostlog to specify a log file, and, if not
+> >> specified, assume memfd is ok to be used.
+> >>
+> >> Please let me know if you - and Marc - want me to keep using memfd.
+> >> I'll create the mmap-file tests and files in a different commit, like
+> >> Marc has asked for, and will propose the patch again by the end of
+> >> this week.
+> >
+> > I think that the best approach is to allow passing in the fd,
+> > not the file path. If not passed, use memfd.
+> >
+> > --
+> > MST
+>
+> --
+Marc-André Lureau
+
+
+Hello, 
+
+> On Tue, Nov 8, 2016 at 4:49 PM Rafael David Tinoco <email address hidden> wrote:
+> Hello Michael, André,
+> 
+> Could you do a quick review before a final submission ?
+> 
+> http://paste.ubuntu.com/23446279/
+> ...
+> (André) > Could it be only a filename? This would simplify testing.
+> (Michael) > When vhostlog is not specified, can we just use memfd as we did?
+> 
+> Michael said: https://lists.gnu.org/archive/html/qemu-devel/2016-10/msg08197.html
+> I think that the best approach is to allow passing in the fd, not the file path. If not passed, use memfd.
+
+Missed this one.
+
+> I do agree :)
+
+Sounds good. I see that the new approach is to let the managing library to create the files and just pass the file descriptors, this way security rules are applied to library itself and not to qemu processes. 
+
+> Do we really need to give a path? (pass fd with -add-fd/qmp add-fd)
+
+I guess not. So, for shared logs:
+
+- vhostlogfd has to be provided.
+- if vhostlogfd is not provided, use memfd.
+(we don't  want writes in /tmp, should i remove fallback mechanism from memfd logic)
+- if memfd fails, log can't be shared/created and there is a migration blocker.
+
+André, Michael,
+
+I'll work on that and get the patches soon, meanwhile, could u push:
+
+- "vhost: migration blocker only if shared log is use"
+
+so I can backport it to Debian ? 
+
+Thank you,
+-Rafael Tinoco
+
+For Ubuntu Xenial (Mitaka), Yakkety (Newton), Zesty: Commit 0d34fbabc1 fixes the issue for vhost-net kernel. Vhost-net kernel doesn't use shared log so the verification is not used and apparmor profiles won't block the live migration. With customers using vhost-user that might still cause migration problems, but, likely, those are the vast minority.
+
+commit 0d34fbabc13891da41582b0823867dc5733fffef
+Author: Rafael David Tinoco <email address hidden>
+Date: Mon Oct 24 15:35:03 2016 +0000
+
+    vhost: migration blocker only if shared log is used
+
+    Commit 31190ed7 added a migration blocker in vhost_dev_init() to
+    check if memfd would succeed. It is better if this blocker first
+    checks if vhost backend requires shared log. This will avoid a
+    situation where a blocker is added inappropriately (e.g. shared
+    log allocation fails when vhost backend doesn't support it).
+
+    Signed-off-by: Rafael David Tinoco <email address hidden>
+    Reviewed-by: Marc-André Lureau <email address hidden>
+    Reviewed-by: Michael S. Tsirkin <email address hidden>
+    Signed-off-by: Michael S. Tsirkin <email address hidden>
+
+diff --git a/hw/virtio/vhost.c b/hw/virtio/vhost.c
+index 131f164..25bf67f 100644
+--- a/hw/virtio/vhost.c
++++ b/hw/virtio/vhost.c
+@@ -1122,7 +1122,7 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
+         if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+- } else if (!qemu_memfd_check()) {
++ } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_check()) {
+             error_setg(&hdev->migration_blocker,
+                        "Migration disabled: failed to allocate shared memory");
+         }
+
+The "final" fix for upstream fix is being finished by me, but, might not be suitable for SRU since it will add features in qemu (and likely to libvirt) in order for the vhost log file to be passed (by using an already opened file descriptor). This will require changes in libvirt and nova-compute but this change will, finally, allow security driver to apply rules to vhost log file for shared logs (mostly for vhost-user drivers).
+
+On Fri, Nov 18, 2016 at 11:21 AM, Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> With customers using vhost-user that might
+> still cause migration problems, but, likely, those are the vast
+> minority.
+>
+
+It is and has migration issues in general atm anyway - see:
+https://lists.gnu.org/archive/html/qemu-devel/2016-10/msg03026.html
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg03223.html
+
+So that needs more work and is not in your current scope IMHO.
+
+
+Thanks Christian, 
+
+Then I'll finish this SRU first. Will work in the vhost mmap log file right after.
+
+
+
+Took some more time here because of LP: #1621269. 
+
+Right now Zesty is behind Yakkety because of a Security Update. Not sure you need me to attach a debdiff for Zesty as well. Let me know. 
+
+On Tue, Nov 22, 2016 at 1:02 PM, Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> Right now Zesty is behind Yakkety because of a Security Update. Not sure
+> you need me to attach a debdiff for Zesty as well. Let me know.
+>
+
+Arr - bad timing It got an upload about 5 minutes ago.
+So yes a Zesty debdiff would be nice.
+
+-- 
+Christian Ehrhardt
+Software Engineer, Ubuntu Server
+Canonical Ltd
+
+
+
+
+Thanks Rafael - the upstream work on this is excellent!
+
+I already built all those fine and I'm now looking into some regression checks before considering/doing an upload to Dev-Release & SRU-queue
+
+Some other stages of my extra tests are currently WIP, but those that work worked fine on the ppa I built of your debdiffs.
+
+That covers:
+- migration with various workloads
+- different types of migrations (live, offline, postcopy)
+- upgrading onto the new qemu version
+- migration into the upgraded version
+
+I'll attach the log and upload your changes, thanks for your work.
+I see you already set the SRU Teamplate for the SRU Team to review then - thanks.
+
+
+
+Uploaded into Zesty - per SRU policy (and experience that always something happens at the last minute at LP build/tests) waiting with the SRU uploads until that fully migrated.
+
+This bug was fixed in the package qemu - 1:2.6.1+dfsg-0ubuntu7
+
+---------------
+qemu (1:2.6.1+dfsg-0ubuntu7) zesty; urgency=medium
+
+  [ Rafael David Tinoco ]
+  * Fixed wrong migration blocker when vhost is used (LP: #1626972)
+    - d/p/vhost_migration-blocker-only-if-shared-log-is-used.patch
+
+ -- Christian Ehrhardt <email address hidden>  Tue, 22 Nov 2016 13:45:52 +0100
+
+Ok, update into Zesty has passed and you already supplied the SRU Template.
+Uploaded to Xenial and Yakkety queues for the SRU Team to consider your Fix.
+
+Hello Rafael, or anyone else affected,
+
+Accepted qemu into xenial-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.5+dfsg-5ubuntu10.7 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Commit 0d34fbabc13 is upstream, so setting this to "Fix committed", too.
+
+
+This bug was fixed in the package qemu - 1:2.6.1+dfsg-0ubuntu7~cloud0
+---------------
+
+ qemu (1:2.6.1+dfsg-0ubuntu7~cloud0) xenial-ocata; urgency=medium
+ .
+   * New update for the Ubuntu Cloud Archive.
+ .
+ qemu (1:2.6.1+dfsg-0ubuntu7) zesty; urgency=medium
+ .
+   [ Rafael David Tinoco ]
+   * Fixed wrong migration blocker when vhost is used (LP: #1626972)
+     - d/p/vhost_migration-blocker-only-if-shared-log-is-used.patch
+
+
+Hello Rafael, or anyone else affected,
+
+Accepted qemu into yakkety-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.6.1+dfsg-0ubuntu5.2 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Hi all,
+
+I am facing this issue too, and although I can confirm the patch can be easily backported to Trusty (we run Mitaka on Trusty), some of our customers have VMs started with the old qemu and I cannot live migrate anymore or update qemu without stopping and starting the VM.
+
+Do you have any suggestion on how to allow the live migration of VMs currently running with qemu pre-patch and kernel 3.13?
+
+Thank you in advance
+
+Hello Antonio (@arcimboldo)
+
+The fix only makes sense for newer QEMUs (>= Xenial, like the one from Mitaka Ubuntu Cloud Archive).
+
+OBS:
+
+The "migration check" is done in VHOST initialization functions when the devices are virtually attached to the virtual machine. If you are using kernel 3.13 and have apparmor enabled, then all the running instances have the "migration blocker" ON - because of this buggy migration check - and won't be able to live migration. 
+
+Unfortunately there is a "in-memory" linked list telling qemu that is has a blocker (with the reason). This blocker was added during instance startup and will be checked/used only when instance is live-migrated. 
+
+Check this: http://pastebin.ubuntu.com/23517175/ 
+
+If you started the instance in a host not running apparmor (or not having libvirt profile loaded, for example) it won't block the creation of /tmp/memfd-XXX files during instance initialization. That won't trigger the "blocker flag" inside the running program and, if/when needed, the live migration will be able to occur. 
+
+This means that, after installing the new package, if you're using apparmor, yes, you would have to RESTART running instances that were affected by this bug in order to live migrating them. Sorry for the bad news!  Even if you remove the apparmor rules, the migration blocker is already set. 
+
+Hacking your process virtual memory would jeopardize the contents of the virtual memory (could be catastrophic specially for a virtual machine). 
+
+
+@jamespage, @cpaelzer, 
+
+I'll verify this fix in couple of days so it can be released.
+
+Thank you!
+
+Rafael
+
+Xenial Verification (with 3.13 kernel from Trusty since a <= 3.17 kernel is needed). This verifies that Ubuntu Cloud Archive repositories will be alright with this new packages (from Xenial / Yakkety). 
+
+## CURRENT
+
+inaddy@(xkvm01):~$ apt-cache policy qemu-kvm
+qemu-kvm:
+  Installed: 1:2.5+dfsg-5ubuntu10.6
+  Candidate: 1:2.5+dfsg-5ubuntu10.6
+
+xkvm01 (sender):
+
+Jan 11 01:07:54 xkvm01 kernel: type=1400 audit(1484104074.014:13): apparmor="DENIED" operation="mknod" profile="libvirt-7cdcb6c0-f85e-4639-912b-c785bd5992d9" name="/tmp/memfd-Jh5UhR" pid=2535 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=112 ouid=112
+
+$ sudo virsh migrate --live guest qemu+ssh://xkvm02/system
+error: internal error: unable to execute QEMU command 'migrate': Migration disabled: failed to allocate shared memory
+
+xkvm02 (receiver):
+
+Jan 11 01:08:23 xkvm02 kernel: type=1400 audit(1484104103.888:53): apparmor="DENIED" operation="mknod" profile="libvirt-7cdcb6c0-f85e-4639-912b-c785bd5992d9" name="/tmp/memfd-fc9rij" pid=2000 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=112 ouid=112
+
+OBS: The check was being done in the wrong place AND situation, like I showed in this bug.
+
+## PROPOSED
+
+
+inaddy@(xkvm01):~$ apt-cache policy qemu-kvm
+qemu-kvm:
+  Installed: 1:2.5+dfsg-5ubuntu10.7
+  Candidate: 1:2.5+dfsg-5ubuntu10.7
+
+xkvm01 (sender):
+
+<nothing related to /tmp/memfd>
+
+xkvm02 (receiver):
+
+inaddy@(xkvm02):~$ virsh list
+ Id    Name                           State
+----------------------------------------------------
+ 1     guest                          running
+
+<nothing related to /tmp/memfd>
+
+Its all good.
+
+verification-xenial-done
+
+Yakkety Verification (with 3.13 kernel from Trusty since a <= 3.17 kernel is needed). This verifies that Ubuntu Cloud Archive repositories will be alright with this new packages (from Xenial / Yakkety).
+
+## CURRENT
+
+inaddy@(ykvm01):~$ apt-cache policy qemu-kvm
+qemu-kvm:
+  Installed: 1:2.6.1+dfsg-0ubuntu5.1
+  Candidate: 1:2.6.1+dfsg-0ubuntu5.1
+
+ykvm01 (sender):
+
+Jan 11 11:34:35 ykvm01 kernel: type=1400 audit(1484141675.962:53): apparmor="DENIED" operation="mknod" profile="libvirt-7cdcb6c0-f85e-4639-912b-c785bd5992d9" name="/tmp/memfd-bF8new" pid=1934 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=111 ouid=111
+
+inaddy@(ykvm01):~$ sudo virsh migrate --live guest qemu+ssh://ykvm02/system
+error: internal error: unable to execute QEMU command 'migrate': Migration disabled: failed to allocate shared memory
+
+ykvm02 (receiver):
+
+Jan 11 11:39:31 ykvm02 kernel: type=1400 audit(1484141971.526:53): apparmor="DENIED" operation="mknod" profile="libvirt-7cdcb6c0-f85e-4639-912b-c785bd5992d9" name="/tmp/memfd-JZ6L9T" pid=2177 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=111 ouid=111
+
+OBS: The check was being done in the wrong place AND situation, like I showed in this bug.
+
+
+
+## PROPOSED
+
+inaddy@(ykvm01):~$ apt-cache policy qemu-kvm
+qemu-kvm:
+  Installed: 1:2.6.1+dfsg-0ubuntu5.2
+  Candidate: 1:2.6.1+dfsg-0ubuntu5.2
+
+ykvm01 (sender):
+
+<nothing related to /tmp/memfd>
+
+ykvm02 (receiver):
+
+inaddy@(ykvm02):~$ virsh list
+ Id    Name                           State
+----------------------------------------------------
+ 1     guest                          running
+
+<nothing related to /tmp/memfd>
+
+Its all good.
+
+verification-yakkety-done
+
+Commit 0d34fbabc13 has been released with QEMU v2.8
+
+This bug was fixed in the package qemu - 1:2.6.1+dfsg-0ubuntu5.2
+
+---------------
+qemu (1:2.6.1+dfsg-0ubuntu5.2) yakkety; urgency=medium
+
+  [ Rafael David Tinoco ]
+  * Fixed wrong migration blocker when vhost is used (LP: #1626972)
+    - d/p/vhost_migration-blocker-only-if-shared-log-is-used.patch
+
+ -- Christian Ehrhardt <email address hidden>  Tue, 22 Nov 2016 13:45:46 +0100
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+Ping - we have the next fix for Xenial in the queue - all others are released now, has this one "baked" enough for Xenial SRU to migrate?
+
+For me we had enough tests already. Upstream development/tests, Zesty, Yakkety. Christian, could you please move Xenial for me ? I have some end users waiting for this. Thank you very much.
+
+On Tue, Jan 24, 2017 at 1:52 AM, Rafael David Tinoco <
+<email address hidden>> wrote:
+
+> Christian, could you please move Xenial for me ? I have some
+> end users waiting for this. Thank you very much.
+>
+
+I can't - IIRC that is up to the SRU Team, I pinged the #ubuntu-release
+channel if one could take a look.
+You could do so again today if you want.
+
+
+Thanks Christian! Will do!!
+
+This bug was fixed in the package qemu - 1:2.5+dfsg-5ubuntu10.7
+
+---------------
+qemu (1:2.5+dfsg-5ubuntu10.7) xenial; urgency=medium
+
+  [ Rafael David Tinoco ]
+  * Fixed wrong migration blocker when vhost is used (LP: #1626972)
+    - d/p/vhost_migration-blocker-only-if-shared-log-is-used.patch
+
+ -- Christian Ehrhardt <email address hidden>  Tue, 22 Nov 2016 13:45:39 +0100
+
+For Mitaka, this bug will be included in UCA together with the fix for:
+
+https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1656480
+
+When it becomes available.
+

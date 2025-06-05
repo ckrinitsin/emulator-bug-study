@@ -1,0 +1,114 @@
+semantic: 0.906
+permissions: 0.905
+other: 0.901
+KVM: 0.898
+graphic: 0.898
+debug: 0.885
+device: 0.854
+performance: 0.845
+files: 0.838
+PID: 0.836
+socket: 0.818
+network: 0.810
+boot: 0.787
+vnc: 0.782
+
+Incorrect feature negotiation for vhost-vdpa netdevice
+
+QEMU cmdline:
+=============
+./x86_64-softmmu/qemu-system-x86_64 -machine accel=kvm -m 2G -hda  /gautam/centos75_1.qcow2 -name gautam,process=gautam -enable-kvm -netdev vhost-vdpa,id=mynet0,vhostdev=/dev/vhost-vdpa-0 -device virtio-net-pci,netdev=mynet0,mac=02:AA:BB:DD:00:20,disable-modern=off,page-per-vq=on -cpu host --nographic
+
+Host OS:
+========
+Linux kernel 5.11 running on x86 host
+
+Guest OS:
+==========
+CentOS 7.5
+
+Root cause analysis:
+=====================
+
+For vhost-vdpa netdevice, the feature negotiation results in sending the superset of features received from device in call to get_features vdpa ops callback.
+
+During the feature-negotiation phase, the acknowledged feature bits are initialized with backend_features  and then checked for supported feature bits in vhost_ack_features():
+
+void vhost_net_ack_features(struct vhost_net *net, uint64_t features)
+{
+  net->dev.acked_features = net->dev.backend_features;
+  vhost_ack_features(&net->dev, vhost_net_get_feature_bits(net), features);
+}
+
+ 
+The vhost_ack_features() function just builds up on the dev.acked_features and never trims it down:
+
+void vhost_ack_features(struct vhost_dev *hdev, const int *feature_bits, uint64_t features)
+{     const int *bit = feature_bits;
+
+      while (*bit != VHOST_INVALID_FEATURE_BIT) {
+           uint64_t bit_mask = (1ULL << *bit);      
+
+            if (features & bit_mask)
+                 hdev->acked_features |= bit_mask;
+
+            bit++;
+       }
+}
+
+Because of this hdev->acked_features is always minimally equal to the value of device features and this is the value that is passed to the device in set_features callback:
+
+static int vhost_dev_set_features(struct vhost_dev *dev, bool enable_log)
+{
+       uint64_t *features = dev->acked_features;
+       .....
+       r = dev->vhost_ops->*vhost_set_features*(dev, features);
+}
+
+QEMU version: 5.1.0
+
+https://qemu-devel.nongnu.narkive.com/jUimpLt0/patch-vhost-net-initialize-acked-features-to-a-safe-value-during-ack
+This review of a patch that introduced "acked_features = backend_features" behaviour suggests that acked_features should be 0 by default, but it ended up pushing it as it is now (as they say that not setting acked_features to backend_features sometimes makes acked_features value 'unexpected')
+
+Other devices initialize acked_features to guest_features (basically what VM writes to driver_features ANDed with device_features), changing default value to any of those (0 as review initially suggested, or guest_features) should fix this problem for us
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+This ticket has been moved here (thanks, Gautam):
+https://gitlab.com/qemu-project/qemu/-/issues/331
+... thus I'm closing this on Launchpad now.
+
+Thanks Thomas Huth.
+
+I couldn't find an option to assign the issue on gitlab to anyone. Can you please help with that?
+
+Not sure who should be the assignee here ... maybe it's best if you write a mail to the people who have been involved in the original code (see https://gitlab.com/qemu-project/qemu/-/commit/108a64818e69be0a97c ) and ask them who could have a look at this issue.
+

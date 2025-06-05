@@ -1,0 +1,75 @@
+graphic: 0.594
+other: 0.515
+device: 0.495
+PID: 0.487
+network: 0.481
+permissions: 0.476
+performance: 0.440
+debug: 0.439
+vnc: 0.436
+semantic: 0.436
+files: 0.415
+boot: 0.382
+socket: 0.340
+KVM: 0.332
+
+linux-user: Qemu doesn't support `set_robust_list` used by glibc robust mutex implementation
+Description of problem:
+It seems that syscall set_robust_list is not implemented on Qemu for any Linux platform: [link]( https://github.com/qemu/qemu/blob/master/linux-user/syscall.c#L12811)
+Steps to reproduce:
+1.  Use below toy program `set_robust_list.c` and compile it without optimizations like:
+```
+    gcc -Wall -W -Wextra -std=gnu17 -pedantic set_robust_list.c -o set_robust_list
+```
+
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <linux/futex.h>
+#include <syscall.h>
+
+int main(void)
+{
+#ifdef __NR_set_robust_list
+    struct robust_list_head head;
+    size_t len = sizeof(struct robust_list_head);
+
+    // This call to set_robust_list function should fail
+    int err = syscall(__NR_set_robust_list, &head, -1);
+    if (err < 0)
+        perror("1st set_robust_list error");
+    else
+        puts("1st set_robust_list OK");
+
+    // This call to set_robust_list function should be sucessful
+    err = syscall(__NR_set_robust_list, &head, len);
+    if (err < 0)
+        perror("2nd set_robust_list error");
+    else
+        puts("2nd set_robust_list OK");
+#else
+    puts("No set_robust_list support");
+#endif
+    exit(0);
+}
+```
+
+2. Run program on Qemu and compare output with output from x64 build. In my case it looks like:
+```
+root@AMDC4705:/runtime/set_robust_list# ./set_robust_list
+1st set_robust_list error: Invalid argument
+2nd set_robust_list OK
+root@AMDC4705:/runtime/set_robust_list# ./set_robust_list-riscv
+1st set_robust_list error: Function not implemented
+2nd set_robust_list error: Function not implemented
+```
+Additional information:
+Working `set_robust_list` on Linux is quite important in context of named robust mutexes. In NPTL `set_robust_list` is used internally at ld.so initialization time to perform following check: [link](https://github.com/bminor/glibc/blob/master/sysdeps/nptl/dl-tls_init_tp.c#L96)
+
+When syscall fails, later `pthread_mutex_init` (with `PTHREAD_MUTEX_ROBUST` + `PTHREAD_PROCESS_SHARED` attributes) end up with `ENOTSUP` error [link](https://github.com/bminor/glibc/blob/master/nptl/pthread_mutex_init.c#L99).
+
+In dotnet we use robust mutexes for process synchronization purpose. Although there are other available techniques like named semaphores or file locks, robust mutexes are better locking option in case of unexpected process death.

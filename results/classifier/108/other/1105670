@@ -1,0 +1,449 @@
+semantic: 0.968
+other: 0.965
+permissions: 0.964
+graphic: 0.958
+performance: 0.955
+debug: 0.941
+device: 0.939
+PID: 0.938
+socket: 0.931
+files: 0.919
+network: 0.907
+boot: 0.902
+vnc: 0.893
+KVM: 0.841
+
+Converting vpc image to raw results in an image that is smaller than it should be.
+
+When using qemu-img to convert a 3GB dynamic vhd image to raw, the resultant image was smaller than what I was expecting.  I was expecting a new raw image of size  3221225472bytes but the size generated was 3220955136bytes.  I had similar results when I used a fixed vhd image and explicitly specified the format as vpc.
+
+Details about my configuration
+OS: Centos 5.4, 64bit
+Qemu used 1.1.1-1, but also saw the same behavior on 1.3.3 and the development build.
+
+Command used for dynamic vhd image file:
+qemu-img convert -O raw inputDynamic.vhd outputFromDynamic.raw
+
+Command used for fixed vhd image file:
+qemu-img convert f vpc -O raw inputFixed.vhd outputFromFixed.raw
+
+Both images were first created on hyperv running on windows 2008 r2 using the hyperv manager interface.  I think I tried their diskpart utility and had the same results.
+
+Output from the following commands (I saw this on Bug#893956)
+$ hexdump -C -n 512 image.VHD
+00000000  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+00000010  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+00000020  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+00000030  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+00000040  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+00000050  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00000200
+
+$ hexdump -C -n 512 -s $(($(ls -l image.VHD | awk '{ print $5 }') - 512)) image.VHD
+56057e00  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+56057e10  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+56057e20  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+56057e30  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+56057e40  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+56057e50  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+56057e60  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+56058000
+-----
+When I investigated this a bit further I found that the disk geometry calculations needed to be one cylinder more than the information stored in the footer size information.  The disk size information in the file was 3221225472 bytes, and the disk geometry was cylinders 6241, heads 10, sectors per cylinder 63.  Multiplying that together and with a sector size of 512 gives  3220955136bytes...the size qemu made the image as, but the new image is now smaller than the original image.
+
+When I added one to the cylinder size I got a size larger than I was expecting, but large enough to hold all of the data from the original image.
+
+My suggested fix for this is to add one to the cylinder size when reading a vhd image file.  And subtracting one when writing out to a vhd file.  I've attached a patch with the suggested fix.
+
+Please let me know if you need additional information.
+
+
+
+On Sat, Jan 26, 2013 at 03:21:27AM -0000, Peter Rehley wrote:
+> Public bug reported:
+
+CCed Stefan Weil and Jeff Cody who may be thoughts on this bug.
+
+If you would like to contribute your patch, please see
+http://wiki.qemu.org/Contribute/SubmitAPatch.  (Patches attached on the
+bug tracker are not reviewed, they must be sent to the
+<email address hidden> mailing list).
+
+> When using qemu-img to convert a 3GB dynamic vhd image to raw, the
+> resultant image was smaller than what I was expecting.  I was expecting
+> a new raw image of size  3221225472bytes but the size generated was
+> 3220955136bytes.  I had similar results when I used a fixed vhd image
+> and explicitly specified the format as vpc.
+> 
+> Details about my configuration
+> OS: Centos 5.4, 64bit
+> Qemu used 1.1.1-1, but also saw the same behavior on 1.3.3 and the development build.
+> 
+> Command used for dynamic vhd image file:
+> qemu-img convert -O raw inputDynamic.vhd outputFromDynamic.raw
+> 
+> Command used for fixed vhd image file:
+> qemu-img convert f vpc -O raw inputFixed.vhd outputFromFixed.raw
+> 
+> Both images were first created on hyperv running on windows 2008 r2
+> using the hyperv manager interface.  I think I tried their diskpart
+> utility and had the same results.
+> 
+> Output from the following commands (I saw this on Bug#893956)
+> $ hexdump -C -n 512 image.VHD
+> 00000000  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> 00000010  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> 00000020  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> 00000030  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> 00000040  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> 00000050  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> 00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> *
+> 00000200
+> 
+> $ hexdump -C -n 512 -s $(($(ls -l image.VHD | awk '{ print $5 }') - 512)) image.VHD
+> 56057e00  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> 56057e10  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> 56057e20  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> 56057e30  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> 56057e40  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> 56057e50  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> 56057e60  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> *
+> 56058000
+> -----
+> When I investigated this a bit further I found that the disk geometry calculations needed to be one cylinder more than the information stored in the footer size information.  The disk size information in the file was 3221225472 bytes, and the disk geometry was cylinders 6241, heads 10, sectors per cylinder 63.  Multiplying that together and with a sector size of 512 gives  3220955136bytes...the size qemu made the image as, but the new image is now smaller than the original image.
+> 
+> When I added one to the cylinder size I got a size larger than I was
+> expecting, but large enough to hold all of the data from the original
+> image.
+> 
+> My suggested fix for this is to add one to the cylinder size when
+> reading a vhd image file.  And subtracting one when writing out to a vhd
+> file.  I've attached a patch with the suggested fix.
+> 
+> Please let me know if you need additional information.
+
+
+On Wed, Jan 30, 2013 at 10:24:44AM +0100, Stefan Hajnoczi wrote:
+> On Sat, Jan 26, 2013 at 03:21:27AM -0000, Peter Rehley wrote:
+> > Public bug reported:
+> 
+> CCed Stefan Weil and Jeff Cody who may be thoughts on this bug.
+> 
+> If you would like to contribute your patch, please see
+> http://wiki.qemu.org/Contribute/SubmitAPatch.  (Patches attached on the
+> bug tracker are not reviewed, they must be sent to the
+> <email address hidden> mailing list).
+> 
+> > When using qemu-img to convert a 3GB dynamic vhd image to raw, the
+> > resultant image was smaller than what I was expecting.  I was expecting
+> > a new raw image of size  3221225472bytes but the size generated was
+> > 3220955136bytes.  I had similar results when I used a fixed vhd image
+> > and explicitly specified the format as vpc.
+> > 
+> > Details about my configuration
+> > OS: Centos 5.4, 64bit
+> > Qemu used 1.1.1-1, but also saw the same behavior on 1.3.3 and the development build.
+> > 
+> > Command used for dynamic vhd image file:
+> > qemu-img convert -O raw inputDynamic.vhd outputFromDynamic.raw
+> > 
+> > Command used for fixed vhd image file:
+> > qemu-img convert f vpc -O raw inputFixed.vhd outputFromFixed.raw
+> > 
+
+There is indeed a bug when importing VHD files created from Hyper-V,
+and I was able to verify this size discrepancy.  Thanks for reporting
+the issue.
+
+> > Both images were first created on hyperv running on windows 2008 r2
+> > using the hyperv manager interface.  I think I tried their diskpart
+> > utility and had the same results.
+> > 
+> > Output from the following commands (I saw this on Bug#893956)
+> > $ hexdump -C -n 512 image.VHD
+> > 00000000  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> > 00000010  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> > 00000020  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> > 00000030  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> > 00000040  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> > 00000050  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> > 00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> > *
+> > 00000200
+> > 
+> > $ hexdump -C -n 512 -s $(($(ls -l image.VHD | awk '{ print $5 }') - 512)) image.VHD
+> > 56057e00  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> > 56057e10  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> > 56057e20  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> > 56057e30  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> > 56057e40  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> > 56057e50  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> > 56057e60  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> > *
+> > 56058000
+> > -----
+> > When I investigated this a bit further I found that the disk geometry calculations needed to be one cylinder more than the information stored in the footer size information.  The disk size information in the file was 3221225472 bytes, and the disk geometry was cylinders 6241, heads 10, sectors per cylinder 63.  Multiplying that together and with a sector size of 512 gives  3220955136bytes...the size qemu made the image as, but the new image is now smaller than the original image.
+> > 
+> > When I added one to the cylinder size I got a size larger than I was
+> > expecting, but large enough to hold all of the data from the original
+> > image.
+> > 
+> > My suggested fix for this is to add one to the cylinder size when
+> > reading a vhd image file.  And subtracting one when writing out to a vhd
+> > file.  I've attached a patch with the suggested fix.
+> > 
+> > Please let me know if you need additional information.
+> 
+
+Thanks again, for the suggested fix.  However, I think the proper
+solution is slightly different.
+
+Rather than do a blind addition to the cylinder count, we need to
+figure out what is occuring.  Adding 1 in some instances suggests
+a rounding error, and it is best to see where it occurs for a proper
+fix.
+
+From what I've been able to tell by examining some dynamic VHD images,
+it looks to me that the problem may lie on the side of Hyper-V.
+
+From a sample image I created, using the Hyper-V defaults for a
+dynamic VHD image, the CHS header field was: FE FE 10 FF.  This should
+correspond to an image with the following geometry, according to the
+VHD spec:
+
+Cylinders: 65278
+Heads: 16
+Sectors/cyl: 255
+
+So, this gives a total sector count of 266,334,240.
+
+The size and orig size field in my  VHD sample header is: 
+    1F C0 00 00 00.  
+    
+This is a size of 136,365,211,648 bytes, which is the correct size for
+the drive I created.
+
+However, this is not a multiple of the sector count:
+
+136,365,211,648 / 266,334,240 = 512.007812619
+
+This is accounted for in the VHD specification, however.
+
+The VHD spec shows the calculations for the CHS, and states that these
+values are rounded down, which appears to be true.  So our rounded
+down size should be: 136,363,130,880 bytes, which is exactly what I
+get when I do a qemu-img convert.
+
+So the above should not be an issue, because both Hyper-V and QEMU
+should be using the smaller CHS fields, yielding a slightly smaller
+drive as seen by the virtual machine.
+
+However, it would appear that Hyper-V is not using the rounded-down
+CHS fields in the header, and is rather calculating the CHS used by
+the disk size, divided by sector size.
+
+So I think QEMU should do the same - I'll do some more testing on
+various VHD images to verify this, and then post a patch.
+
+Thanks,
+Jeff
+
+
+On Fri, Feb 01, 2013 at 07:04:36PM +0100, Stefan Weil wrote:
+> Am 01.02.2013 18:48, schrieb Jeff Cody:
+> > On Wed, Jan 30, 2013 at 10:24:44AM +0100, Stefan Hajnoczi wrote:
+> >> On Sat, Jan 26, 2013 at 03:21:27AM -0000, Peter Rehley wrote:
+> >>> Public bug reported:
+> >> CCed Stefan Weil and Jeff Cody who may be thoughts on this bug.
+> >>
+> >> If you would like to contribute your patch, please see
+> >> http://wiki.qemu.org/Contribute/SubmitAPatch.  (Patches attached on the
+> >> bug tracker are not reviewed, they must be sent to the
+> >> <email address hidden> mailing list).
+> >>
+> >>> When using qemu-img to convert a 3GB dynamic vhd image to raw, the
+> >>> resultant image was smaller than what I was expecting.  I was expecting
+> >>> a new raw image of size  3221225472bytes but the size generated was
+> >>> 3220955136bytes.  I had similar results when I used a fixed vhd image
+> >>> and explicitly specified the format as vpc.
+> >>>
+> >>> Details about my configuration
+> >>> OS: Centos 5.4, 64bit
+> >>> Qemu used 1.1.1-1, but also saw the same behavior on 1.3.3 and the development build.
+> >>>
+> >>> Command used for dynamic vhd image file:
+> >>> qemu-img convert -O raw inputDynamic.vhd outputFromDynamic.raw
+> >>>
+> >>> Command used for fixed vhd image file:
+> >>> qemu-img convert f vpc -O raw inputFixed.vhd outputFromFixed.raw
+> >>>
+> > There is indeed a bug when importing VHD files created from Hyper-V,
+> > and I was able to verify this size discrepancy.  Thanks for reporting
+> > the issue.
+> >
+> >>> Both images were first created on hyperv running on windows 2008 r2
+> >>> using the hyperv manager interface.  I think I tried their diskpart
+> >>> utility and had the same results.
+> >>>
+> >>> Output from the following commands (I saw this on Bug#893956)
+> >>> $ hexdump -C -n 512 image.VHD
+> >>> 00000000  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> >>> 00000010  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> >>> 00000020  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> >>> 00000030  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> >>> 00000040  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> >>> 00000050  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> >>> 00000060  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> >>> *
+> >>> 00000200
+> >>>
+> >>> $ hexdump -C -n 512 -s $(($(ls -l image.VHD | awk '{ print $5 }') - 512)) image.VHD
+> >>> 56057e00  63 6f 6e 65 63 74 69 78  00 00 00 02 00 01 00 00  |conectix........|
+> >>> 56057e10  00 00 00 00 00 00 02 00  18 25 da 57 77 69 6e 20  |.........%.Wwin |
+> >>> 56057e20  00 06 00 01 57 69 32 6b  00 00 00 00 c0 00 00 00  |....Wi2k........|
+> >>> 56057e30  00 00 00 00 c0 00 00 00  18 61 10 3f 00 00 00 03  |.........a.?....|
+> >>> 56057e40  ff ff ee b1 83 34 83 78  26 0a 13 4f 99 9c 9e e9  |.....4.x&..O....|
+> >>> 56057e50  dc 93 21 d1 00 00 00 00  00 00 00 00 00 00 00 00  |..!.............|
+> >>> 56057e60  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+> >>> *
+> >>> 56058000
+> >>> -----
+> >>> When I investigated this a bit further I found that the disk geometry calculations needed to be one cylinder more than the information stored in the footer size information.  The disk size information in the file was 3221225472 bytes, and the disk geometry was cylinders 6241, heads 10, sectors per cylinder 63.  Multiplying that together and with a sector size of 512 gives  3220955136bytes...the size qemu made the image as, but the new image is now smaller than the original image.
+> >>>
+> >>> When I added one to the cylinder size I got a size larger than I was
+> >>> expecting, but large enough to hold all of the data from the original
+> >>> image.
+> >>>
+> >>> My suggested fix for this is to add one to the cylinder size when
+> >>> reading a vhd image file.  And subtracting one when writing out to a vhd
+> >>> file.  I've attached a patch with the suggested fix.
+> >>>
+> >>> Please let me know if you need additional information.
+> > Thanks again, for the suggested fix.  However, I think the proper
+> > solution is slightly different.
+> >
+> > Rather than do a blind addition to the cylinder count, we need to
+> > figure out what is occuring.  Adding 1 in some instances suggests
+> > a rounding error, and it is best to see where it occurs for a proper
+> > fix.
+> >
+> > From what I've been able to tell by examining some dynamic VHD images,
+> > it looks to me that the problem may lie on the side of Hyper-V.
+> >
+> > From a sample image I created, using the Hyper-V defaults for a
+> > dynamic VHD image, the CHS header field was: FE FE 10 FF.  This should
+> > correspond to an image with the following geometry, according to the
+> > VHD spec:
+> >
+> > Cylinders: 65278
+> > Heads: 16
+> > Sectors/cyl: 255
+> >
+> > So, this gives a total sector count of 266,334,240.
+> >
+> > The size and orig size field in my  VHD sample header is: 
+> >     1F C0 00 00 00.  
+> >     
+> > This is a size of 136,365,211,648 bytes, which is the correct size for
+> > the drive I created.
+> >
+> > However, this is not a multiple of the sector count:
+> >
+> > 136,365,211,648 / 266,334,240 = 512.007812619
+> >
+> > This is accounted for in the VHD specification, however.
+> >
+> > The VHD spec shows the calculations for the CHS, and states that these
+> > values are rounded down, which appears to be true.  So our rounded
+> > down size should be: 136,363,130,880 bytes, which is exactly what I
+> > get when I do a qemu-img convert.
+> >
+> > So the above should not be an issue, because both Hyper-V and QEMU
+> > should be using the smaller CHS fields, yielding a slightly smaller
+> > drive as seen by the virtual machine.
+> >
+> > However, it would appear that Hyper-V is not using the rounded-down
+> > CHS fields in the header, and is rather calculating the CHS used by
+> > the disk size, divided by sector size.
+> >
+> > So I think QEMU should do the same - I'll do some more testing on
+> > various VHD images to verify this, and then post a patch.
+> >
+> > Thanks,
+> > Jeff
+> 
+> 
+> Hi Jeff,
+> 
+> I'm already preparing a patch series which should fix this and
+> some other issues in vpc.c.
+> 
+> See this URL for a preliminary patch:
+> http://qemu.weilnetz.de/patches/0001-block-vpc-Improve-code.patch
+> 
+
+Hi Stefan,
+
+I checked out your patch -  this part of your fix is almost exactly
+what I was thinking, and what I tested:
+
+-    bs->total_sectors = (int64_t)
+-        be16_to_cpu(footer->cyls) * footer->heads * footer->secs_per_cyl;
++    // is usually larger). Nevertheless we must use the real size here.
++    bs->total_sectors = be64_to_cpu(footer->size) / 512;
+
+And I agree with using 512 here instead of BDRV_SECTOR_SIZE as well,
+because the VHD format seems to inherently assume 512 byte sectors.
+
+However, one suggestion to add to the patch - in vpc_create, your
+proposed patch continues to use BDRV_SECTOR_SIZE, so if QEMU ever
+switches away from 512 bytes, the CHS calculations embedded in the VHD
+footer may not be what is desired.  From your patch, we have:
+
++     * Calculate geometry. For guests which use the geometry values,
++     * the last blocks may be invisible.
+      */
+     total_sectors = total_size / BDRV_SECTOR_SIZE;
+-    for (i = 0; total_sectors > (int64_t)cyls * heads * secs_per_cyl; i++) {
+-        if (calculate_geometry(total_sectors + i, &cyls, &heads,
+-                               &secs_per_cyl))
+-        {
+-            ret = -EFBIG;
+-            goto fail;
+-        }
++    if (calculate_geometry(total_sectors, &cyls, &heads, &secs_per_cyl)) {
++        ret = -EFBIG;
++        goto fail;
+     }
+
+
+I would suggest changing total_sectors in vpc_create() to be
+calculated the way your patch does in vpc_open():
+
+-    total_sectors = total_size / BDRV_SECTOR_SIZE;
++    total_sectors = total_size / 512;
+
+> Your analysis is basically correct: the size calculated from CHSis
+> usually smaller than the real size of the virtual disk. QEMU incorrectly
+> uses that smaller size.
+> 
+> Real hard disk show the same behaviour. It depends on the guest
+> whether it uses CHS values to calculate the disk size(then it will
+> use the disk only partially) or whether it uses the real size.
+> 
+> Regards,
+> 
+> Stefan
+> 
+> 
+
+
+Looks like the fix for this problem has been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=f880defbb06708d30a38ce
+... so I think it should be OK now to close this ticket.
+

@@ -1,0 +1,124 @@
+debug: 0.956
+socket: 0.936
+device: 0.936
+PID: 0.932
+other: 0.929
+semantic: 0.928
+permissions: 0.919
+performance: 0.913
+graphic: 0.911
+boot: 0.909
+files: 0.899
+vnc: 0.895
+network: 0.886
+KVM: 0.855
+
+armeb regression since qemu version 2.8
+
+Hi,
+
+I have noticed a regression when I upgraded from qemu-armeb 2.7 to 2.8, and the problem is still present with version 2.10.1.
+
+I am using qemu for GCC validation, noticed problems with testcases involving atomics, I'm attaching here atomic-exchange-4.exe.
+
+# with 2.7:
+$ qemu-armeb -cpu any -R 0 -L $PWD -E LD_LIBRARY_PATH=$PWD/lib $PWD/atomic-exchange-4.exe
+$ echo $?
+0
+# with 2.8, 2.10.1:
+$ qemu-armeb -cpu any -R 0 -L $PWD -E LD_LIBRARY_PATH=$PWD/lib $PWD/atomic-exchange-4.exe
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted (core dumped)
+$ echo $?
+134
+
+The source code is gcc/testsuite/gcc.dg/atomic-exchange-4.c
+
+Running with -d in_asm shows a difference early in the startup code:
+IN: _dl_sysdep_start
+[...]
+0x40a17790:  908ff103      addls	pc, pc, r3, lsl #2
+
+and then the next address is not the same with qemu 2.7 and 2.10.1
+
+I hope you have enough data/information to reproduce and confirm/fix the problem.
+
+Thanks
+
+
+
+
+
+
+
+Hi Christophe -- RTH posted a patchset yesterday which should fix this:
+https://lists.gnu.org/archive/html/qemu-devel/2017-10/msg04809.html
+
+
+Oh, wait, different bug. Sorry for the noise...
+
+
+I rather suspect something is going wrong when the dynamic loader attempts to paw through the ELF auxiliary vector...
+
+
+Ah, that's a false positive. We flipped the order we put entries in the AUXV in commit 7c4ee5bcc82e64, so the code divergence is just because now _dl_sysdep_start is processing the entries in the opposite order to what it used to. (The "addls pc, pc, r3, lsl #2" is jumping into the jump table for the switch on different AUXV entry tags.) The traces converge again at 0x40817830.
+
+
+I think what's actually happening is that we're failing on one of the tests in main(). This would be much easier to diagnose if the test case code printed information about what it was doing and what the failed test case was...
+
+
+Indeed I wish GCC tests printed information rather than just calling abort()...
+
+I'll add some printfs and see what this says.
+
+
+I added printfs after each 'count++' statement, and here is what I got:
+
+qemu-2.7:
+ATOMIC_RELAXED OK
+ATOMIC_ACQUIRE OK
+ATOMIC_RELEASE OK
+ATOMIC_ACQ_REL OK
+ATOMIC_SEQ_CST OK
+ATOMIC_RELAXED OK
+ATOMIC_ACQUIRE OK
+ATOMIC_RELEASE OK
+ATOMIC_ACQ_REL OK
+ATOMIC_SEQ_CST OK
+ALL TESTS PASSED
+
+qemu-2.10.1:
+ATOMIC_RELAXED OK
+ATOMIC_ACQUIRE OK
+ATOMIC_RELEASE OK
+ATOMIC_ACQ_REL OK
+ATOMIC_SEQ_CST OK
+qemu: uncaught target signal 6 (Aborted) - core dumped
+
+
+
+
+
+
+On 20 October 2017 at 16:12, Christophe Lyon
+<email address hidden> wrote:
+> I'll add some printfs and see what this says.
+
+I had a dig further in the logs and I suspect that we're either
+doing the two halves of strexd or the two halves of ldrexd wrong
+for linux-user bigendian.
+
+thanks
+-- PMM
+
+
+https://lists.gnu.org/archive/html/qemu-devel/2017-11/msg00155.html should fix this bug.
+
+
+Fix committed and will be in 2.11.0 rc0.
+
+
+Great, thanks!
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=3448d47b3172015006b7
+

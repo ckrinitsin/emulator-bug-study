@@ -1,0 +1,1345 @@
+permissions: 0.971
+debug: 0.968
+semantic: 0.967
+other: 0.965
+device: 0.961
+graphic: 0.961
+performance: 0.961
+boot: 0.959
+network: 0.958
+PID: 0.950
+socket: 0.938
+vnc: 0.923
+files: 0.914
+KVM: 0.874
+
+AMD CPUID leaf 0x8000'0008 reported number of cores  inconsistent with ACPI.MADT
+
+Setup:
+CPU: AMD EPYC-v2 or host's EPYC cpu
+Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+qemu version: self build
+git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+
+Cmdline: 
+qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+
+Issue:
+We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+
+The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+The lower four bits of ECX are the [NC] field and all set.
+
+When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+
+I'm debugging it using my local machine and the QEMU provided EPYC-v2 CPU model and it is reproducible there as well and reports:  EAX: 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+
+I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+
+The following table shows my findings with the -smp option:
+Option | Qemu guest observed ECX value
+-smp 4 | 0x0
+-smp 4,cores=4  | 0x3
+-smp 4,cores=2,thread=2 | 0x3
+-smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+
+Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+
+Querying 0x8000'0008 on the physical processor results in different reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+
+Furthermore, the ACPI.MADT shows 4 local APICs to be present while the CPU leave reports a single core processor.
+
+This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the wrong number.
+
+
+Please let me know, if you need more information from my side.
+
+
+[0] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/kernel_thread-ia32.cpp#L109
+[1] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/cpu-ia32.cpp#L1120
+[2] https://github.com/qemu/qemu/blob/f2a8261110c32c4dccd84e774d8dd7a0524e00fb/target/i386/cpu.c#L5835
+[3] https://www.amd.com/system/files/TechDocs/24594.pdf
+
+On Thu, 09 Apr 2020 12:58:11 -0000
+Philipp Eppelt <email address hidden> wrote:
+
+> Public bug reported:
+> 
+> Setup:
+> CPU: AMD EPYC-v2 or host's EPYC cpu
+> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+> qemu version: self build
+> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+> 
+> Cmdline: 
+> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+> 
+> Issue:
+> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+> 
+> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+> The lower four bits of ECX are the [NC] field and all set.
+> 
+> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+> 
+> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+> CPU model and it is reproducible there as well and reports:  EAX:
+> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+> 
+> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+> 
+> The following table shows my findings with the -smp option:
+> Option | Qemu guest observed ECX value
+> -smp 4 | 0x0
+> -smp 4,cores=4  | 0x3
+> -smp 4,cores=2,thread=2 | 0x3
+> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+> 
+> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+I'd say X corresponds to number of logical CPUs.
+Depending on presence of other options these are distributed among them in magical manner
+(see pc_smp_parse() for starters)
+
+> Querying 0x8000'0008 on the physical processor results in different
+> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+> 
+> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+> CPU leave reports a single core processor.
+it matches -smp X as it should be.
+
+> 
+> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+> wrong number.
+CCed author of recent epyc patches who might know how AMD should work better than me.
+
+> 
+> Please let me know, if you need more information from my side.
+> 
+> 
+> [0] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/kernel_thread-ia32.cpp#L109
+> [1] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/cpu-ia32.cpp#L1120
+> [2] https://github.com/qemu/qemu/blob/f2a8261110c32c4dccd84e774d8dd7a0524e00fb/target/i386/cpu.c#L5835
+> [3] https://www.amd.com/system/files/TechDocs/24594.pdf
+> 
+> ** Affects: qemu
+>      Importance: Undecided
+>          Status: New
+> 
+
+
+
+
+
+On 4/9/20 9:00 AM, Igor Mammedov wrote:
+> On Thu, 09 Apr 2020 12:58:11 -0000
+> Philipp Eppelt <email address hidden> wrote:
+> 
+>> Public bug reported:
+>>
+>> Setup:
+>> CPU: AMD EPYC-v2 or host's EPYC cpu
+>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+>> qemu version: self build
+>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+>>
+>> Cmdline: 
+>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+>>
+>> Issue:
+>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+>>
+>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+>> The lower four bits of ECX are the [NC] field and all set.
+>>
+>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+>>
+>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+>> CPU model and it is reproducible there as well and reports:  EAX:
+>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+>>
+>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+>>
+>> The following table shows my findings with the -smp option:
+>> Option | Qemu guest observed ECX value
+>> -smp 4 | 0x0
+>> -smp 4,cores=4  | 0x3
+>> -smp 4,cores=2,thread=2 | 0x3
+>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+>>
+>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+> I'd say X corresponds to number of logical CPUs.
+> Depending on presence of other options these are distributed among them in magical manner
+> (see pc_smp_parse() for starters)
+> 
+>> Querying 0x8000'0008 on the physical processor results in different
+>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+>>
+>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+>> CPU leave reports a single core processor.
+> it matches -smp X as it should be.
+> 
+>>
+>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+>> wrong number.
+> CCed author of recent epyc patches who might know how AMD should work better than me.
+
+Hmm.. Interesting.. Not sure why this did not come up during my testing.
+Probably this cpuid information is not widely used.
+
+Yes. I am looking at it right now. I see that EPYC model is reporting
+wrong. Not sure why -cpu host is reporting wrong. I thought -cpu host gets
+the information directly from the host. Will investigate.
+
+
+Philipp,
+  Can you please check if this patch works for you.
+
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 90ffc5f..e467fee 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -5831,10 +5831,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t
+index, uint32_t count,
+         }
+         *ebx = env->features[FEAT_8000_0008_EBX];
+         *ecx = 0;
+-        *edx = 0;
+         if (cs->nr_cores * cs->nr_threads > 1) {
+-            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
++            unsigned long max_apicids, bits_required;
++
++            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
++            if (max_apicids) {
++                /* Find out the number of bits to represent all the
+apicids */
++                bits_required = find_last_bit(&max_apicids,
+BITS_PER_BYTE) + 1;
++                *ecx |= bits_required << 12 | max_apicids;
++            }
+         }
++        *edx = 0;
+         break;
+     case 0x8000000A:
+         if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+
+
+
+On 4/9/20 9:00 AM, Igor Mammedov wrote:
+> On Thu, 09 Apr 2020 12:58:11 -0000
+> Philipp Eppelt <email address hidden> wrote:
+> 
+>> Public bug reported:
+>>
+>> Setup:
+>> CPU: AMD EPYC-v2 or host's EPYC cpu
+>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+>> qemu version: self build
+>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+>>
+>> Cmdline: 
+>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+>>
+>> Issue:
+>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+>>
+>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+>> The lower four bits of ECX are the [NC] field and all set.
+>>
+>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+>>
+>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+>> CPU model and it is reproducible there as well and reports:  EAX:
+>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+>>
+>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+>>
+>> The following table shows my findings with the -smp option:
+>> Option | Qemu guest observed ECX value
+>> -smp 4 | 0x0
+>> -smp 4,cores=4  | 0x3
+>> -smp 4,cores=2,thread=2 | 0x3
+>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+>>
+>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+> I'd say X corresponds to number of logical CPUs.
+> Depending on presence of other options these are distributed among them in magical manner
+> (see pc_smp_parse() for starters)
+> 
+>> Querying 0x8000'0008 on the physical processor results in different
+>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+>>
+>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+>> CPU leave reports a single core processor.
+> it matches -smp X as it should be.
+> 
+>>
+>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+>> wrong number.
+> CCed author of recent epyc patches who might know how AMD should work better than me.
+> 
+>>
+>> Please let me know, if you need more information from my side.
+>>
+>>
+>> [0] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fkernel_thread-ia32.cpp%23L109&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=hcFJzLAVQoIh5IN9CP%2F9cUQNOZoBnpRA6FliJur1wzQ%3D&amp;reserved=0
+>> [1] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fcpu-ia32.cpp%23L1120&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=ANJIbYKbwfq2bDelH%2FRLKnDPIUZc1BwxHspmgxLU7gs%3D&amp;reserved=0
+>> [2] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fqemu%2Fqemu%2Fblob%2Ff2a8261110c32c4dccd84e774d8dd7a0524e00fb%2Ftarget%2Fi386%2Fcpu.c%23L5835&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=oj3mv9e5YOzUsfUjXK44gC8LybyWgMKo8JBIrRR%2BmDA%3D&amp;reserved=0
+>> [3] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.amd.com%2Fsystem%2Ffiles%2FTechDocs%2F24594.pdf&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=7Yr3J9ihlqSqXCXKN5JJNTByO3NGI%2BGMz2EqBF2Y4hw%3D&amp;reserved=0
+>>
+>> ** Affects: qemu
+>>      Importance: Undecided
+>>          Status: New
+>>
+> 
+
+
+Hi,
+
+thanks for looking into this so quickly.
+
+With this patch applied ontop of git commit
+f3bac27cc1e303e1860cc55b9b6889ba39dee587 I still have the issue and it
+reports the same numbers. I like the new usage of the ApicIdSize field.
+
+
+I looked into the mentioned pc_smp_parse() and had it print the topology
+for -smp 4:
+
+qemu-system-x86_64: warning: cpu topology: sockets (4) , dies (1) ,
+cores (1) , threads (1) , maxcpus (4), cpus (4)
+
+and with -smp 4,cores=4:
+
+qemu-system-x86_64: warning: cpu topology: sockets (1) , dies (1) ,
+cores (4) , threads (1) , maxcpus (4), cpus (4)
+
+As far as I understand it, these are the numbers the cpuid:8000'0008
+code relies on:
+`cs->nr_cores`, `cs->nr_threads` with `cs` being of type CPUState.
+
+So I think the issue is rooted with the preferring sockets over cores
+when the -smp cmdline option is parsed, as stated in hw/i386/pc.c:729.
+
+I guess this is the same code for Intel and AMD CPUs alike and this
+issue just didn't surface for us on Intel CPUs, as they don't have this
+CPUID leaf and we don't look at the topology.
+
+This seems to boil down to a more careful use of the -smp option on my end.
+
+Thanks again for looking into this.
+
+Cheers,
+Philipp
+
+
+
+On 4/10/20 2:12 AM, Babu Moger wrote:
+> Philipp,
+>   Can you please check if this patch works for you.
+> 
+> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+> index 90ffc5f..e467fee 100644
+> --- a/target/i386/cpu.c
+> +++ b/target/i386/cpu.c
+> @@ -5831,10 +5831,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t
+> index, uint32_t count,
+>          }
+>          *ebx = env->features[FEAT_8000_0008_EBX];
+>          *ecx = 0;
+> -        *edx = 0;
+>          if (cs->nr_cores * cs->nr_threads > 1) {
+> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+> +            unsigned long max_apicids, bits_required;
+> +
+> +            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
+> +            if (max_apicids) {
+> +                /* Find out the number of bits to represent all the
+> apicids */
+> +                bits_required = find_last_bit(&max_apicids,
+> BITS_PER_BYTE) + 1;
+> +                *ecx |= bits_required << 12 | max_apicids;
+> +            }
+>          }
+> +        *edx = 0;
+>          break;
+>      case 0x8000000A:
+>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+> 
+> 
+> On 4/9/20 9:00 AM, Igor Mammedov wrote:
+>> On Thu, 09 Apr 2020 12:58:11 -0000
+>> Philipp Eppelt <email address hidden> wrote:
+>>
+>>> Public bug reported:
+>>>
+>>> Setup:
+>>> CPU: AMD EPYC-v2 or host's EPYC cpu
+>>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+>>> qemu version: self build
+>>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+>>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+>>>
+>>> Cmdline: 
+>>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+>>>
+>>> Issue:
+>>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+>>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+>>>
+>>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+>>> The lower four bits of ECX are the [NC] field and all set.
+>>>
+>>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+>>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+>>>
+>>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+>>> CPU model and it is reproducible there as well and reports:  EAX:
+>>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+>>>
+>>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+>>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+>>>
+>>> The following table shows my findings with the -smp option:
+>>> Option | Qemu guest observed ECX value
+>>> -smp 4 | 0x0
+>>> -smp 4,cores=4  | 0x3
+>>> -smp 4,cores=2,thread=2 | 0x3
+>>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+>>>
+>>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+>>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+>> I'd say X corresponds to number of logical CPUs.
+>> Depending on presence of other options these are distributed among them in magical manner
+>> (see pc_smp_parse() for starters)
+>>
+>>> Querying 0x8000'0008 on the physical processor results in different
+>>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+>>>
+>>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+>>> CPU leave reports a single core processor.
+>> it matches -smp X as it should be.
+>>
+>>>
+>>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+>>> wrong number.
+>> CCed author of recent epyc patches who might know how AMD should work better than me.
+>>
+>>>
+>>> Please let me know, if you need more information from my side.
+>>>
+>>>
+>>> [0] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fkernel_thread-ia32.cpp%23L109&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=hcFJzLAVQoIh5IN9CP%2F9cUQNOZoBnpRA6FliJur1wzQ%3D&amp;reserved=0
+>>> [1] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fcpu-ia32.cpp%23L1120&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=ANJIbYKbwfq2bDelH%2FRLKnDPIUZc1BwxHspmgxLU7gs%3D&amp;reserved=0
+>>> [2] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fqemu%2Fqemu%2Fblob%2Ff2a8261110c32c4dccd84e774d8dd7a0524e00fb%2Ftarget%2Fi386%2Fcpu.c%23L5835&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=oj3mv9e5YOzUsfUjXK44gC8LybyWgMKo8JBIrRR%2BmDA%3D&amp;reserved=0
+>>> [3] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.amd.com%2Fsystem%2Ffiles%2FTechDocs%2F24594.pdf&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=7Yr3J9ihlqSqXCXKN5JJNTByO3NGI%2BGMz2EqBF2Y4hw%3D&amp;reserved=0
+>>>
+>>> ** Affects: qemu
+>>>      Importance: Undecided
+>>>          Status: New
+>>>
+>>
+> 
+
+-- 
+<email address hidden> - Tel. 0351-41 883 221
+http://www.kernkonzept.com
+
+Kernkonzept GmbH.  Sitz: Dresden.  Amtsgericht Dresden, HRB 31129.
+Geschäftsführer: Dr.-Ing. Michael Hohmuth
+
+
+Hi,
+
+I have to clarify some things mentioned in my last post:
+
+I only tested the change with an emulated EPYC-v2 CPU, I cannot test on
+a physical EPYC CPU at the moment. However, I doubt that the results
+will be different regarding the 0x8000_0008.ECX result.
+
+The topology information printed is from the EPYC-v2 CPU model. I try to
+get access to the machine and have a look if -cpu host affects this
+topology.
+
+So there is still the open question for the -enable-kvm -cpu host -smp 4
+case. Shouldn't in this case the topology of the host CPU be reported?
+
+
+In all emulated-CPU cases it's on the user to define the topology or to
+live with the generated one (although I think preferring multi-socket
+systems is outdated, but it's likely just the case in my 'world').
+
+
+Cheers,
+Philipp
+
+
+On 4/14/20 10:24 AM, Philipp Eppelt wrote:
+> Hi,
+> 
+> thanks for looking into this so quickly.
+> 
+> With this patch applied ontop of git commit
+> f3bac27cc1e303e1860cc55b9b6889ba39dee587 I still have the issue and it
+> reports the same numbers. I like the new usage of the ApicIdSize field.
+> 
+> 
+> I looked into the mentioned pc_smp_parse() and had it print the topology
+> for -smp 4:
+> 
+> qemu-system-x86_64: warning: cpu topology: sockets (4) , dies (1) ,
+> cores (1) , threads (1) , maxcpus (4), cpus (4)
+> 
+> and with -smp 4,cores=4:
+> 
+> qemu-system-x86_64: warning: cpu topology: sockets (1) , dies (1) ,
+> cores (4) , threads (1) , maxcpus (4), cpus (4)
+> 
+> As far as I understand it, these are the numbers the cpuid:8000'0008
+> code relies on:
+> `cs->nr_cores`, `cs->nr_threads` with `cs` being of type CPUState.
+> 
+> So I think the issue is rooted with the preferring sockets over cores
+> when the -smp cmdline option is parsed, as stated in hw/i386/pc.c:729.
+> 
+> I guess this is the same code for Intel and AMD CPUs alike and this
+> issue just didn't surface for us on Intel CPUs, as they don't have this
+> CPUID leaf and we don't look at the topology.
+> 
+> This seems to boil down to a more careful use of the -smp option on my end.
+> 
+> Thanks again for looking into this.
+> 
+> Cheers,
+> Philipp
+> 
+> 
+> 
+> On 4/10/20 2:12 AM, Babu Moger wrote:
+>> Philipp,
+>>   Can you please check if this patch works for you.
+>>
+>> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+>> index 90ffc5f..e467fee 100644
+>> --- a/target/i386/cpu.c
+>> +++ b/target/i386/cpu.c
+>> @@ -5831,10 +5831,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t
+>> index, uint32_t count,
+>>          }
+>>          *ebx = env->features[FEAT_8000_0008_EBX];
+>>          *ecx = 0;
+>> -        *edx = 0;
+>>          if (cs->nr_cores * cs->nr_threads > 1) {
+>> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+>> +            unsigned long max_apicids, bits_required;
+>> +
+>> +            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
+>> +            if (max_apicids) {
+>> +                /* Find out the number of bits to represent all the
+>> apicids */
+>> +                bits_required = find_last_bit(&max_apicids,
+>> BITS_PER_BYTE) + 1;
+>> +                *ecx |= bits_required << 12 | max_apicids;
+>> +            }
+>>          }
+>> +        *edx = 0;
+>>          break;
+>>      case 0x8000000A:
+>>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+>>
+>>
+>> On 4/9/20 9:00 AM, Igor Mammedov wrote:
+>>> On Thu, 09 Apr 2020 12:58:11 -0000
+>>> Philipp Eppelt <email address hidden> wrote:
+>>>
+>>>> Public bug reported:
+>>>>
+>>>> Setup:
+>>>> CPU: AMD EPYC-v2 or host's EPYC cpu
+>>>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+>>>> qemu version: self build
+>>>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+>>>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+>>>>
+>>>> Cmdline: 
+>>>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+>>>>
+>>>> Issue:
+>>>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+>>>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+>>>>
+>>>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+>>>> The lower four bits of ECX are the [NC] field and all set.
+>>>>
+>>>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+>>>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+>>>>
+>>>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+>>>> CPU model and it is reproducible there as well and reports:  EAX:
+>>>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+>>>>
+>>>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+>>>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+>>>>
+>>>> The following table shows my findings with the -smp option:
+>>>> Option | Qemu guest observed ECX value
+>>>> -smp 4 | 0x0
+>>>> -smp 4,cores=4  | 0x3
+>>>> -smp 4,cores=2,thread=2 | 0x3
+>>>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+>>>>
+>>>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+>>>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+>>> I'd say X corresponds to number of logical CPUs.
+>>> Depending on presence of other options these are distributed among them in magical manner
+>>> (see pc_smp_parse() for starters)
+>>>
+>>>> Querying 0x8000'0008 on the physical processor results in different
+>>>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+>>>>
+>>>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+>>>> CPU leave reports a single core processor.
+>>> it matches -smp X as it should be.
+>>>
+>>>>
+>>>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+>>>> wrong number.
+>>> CCed author of recent epyc patches who might know how AMD should work better than me.
+>>>
+>>>>
+>>>> Please let me know, if you need more information from my side.
+>>>>
+>>>>
+>>>> [0] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fkernel_thread-ia32.cpp%23L109&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=hcFJzLAVQoIh5IN9CP%2F9cUQNOZoBnpRA6FliJur1wzQ%3D&amp;reserved=0
+>>>> [1] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fcpu-ia32.cpp%23L1120&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=ANJIbYKbwfq2bDelH%2FRLKnDPIUZc1BwxHspmgxLU7gs%3D&amp;reserved=0
+>>>> [2] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fqemu%2Fqemu%2Fblob%2Ff2a8261110c32c4dccd84e774d8dd7a0524e00fb%2Ftarget%2Fi386%2Fcpu.c%23L5835&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=oj3mv9e5YOzUsfUjXK44gC8LybyWgMKo8JBIrRR%2BmDA%3D&amp;reserved=0
+>>>> [3] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.amd.com%2Fsystem%2Ffiles%2FTechDocs%2F24594.pdf&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=7Yr3J9ihlqSqXCXKN5JJNTByO3NGI%2BGMz2EqBF2Y4hw%3D&amp;reserved=0
+>>>>
+>>>> ** Affects: qemu
+>>>>      Importance: Undecided
+>>>>          Status: New
+>>>>
+>>>
+>>
+> 
+
+-- 
+<email address hidden> - Tel. 0351-41 883 221
+http://www.kernkonzept.com
+
+Kernkonzept GmbH.  Sitz: Dresden.  Amtsgericht Dresden, HRB 31129.
+Geschäftsführer: Dr.-Ing. Michael Hohmuth
+
+
+On Tue, 14 Apr 2020 13:27:34 -0000
+Philipp Eppelt <email address hidden> wrote:
+
+> Hi,
+> 
+> I have to clarify some things mentioned in my last post:
+> 
+> I only tested the change with an emulated EPYC-v2 CPU, I cannot test on
+> a physical EPYC CPU at the moment. However, I doubt that the results
+> will be different regarding the 0x8000_0008.ECX result.
+> 
+> The topology information printed is from the EPYC-v2 CPU model. I try to
+> get access to the machine and have a look if -cpu host affects this
+> topology.
+> 
+> So there is still the open question for the -enable-kvm -cpu host -smp 4
+> case. Shouldn't in this case the topology of the host CPU be reported?
+topology was never affected by the choice of -cpu, it's up to users to
+define it using -smp the way they prefer.
+ 
+
+> In all emulated-CPU cases it's on the user to define the topology or to
+> live with the generated one (although I think preferring multi-socket
+> systems is outdated, but it's likely just the case in my 'world').
+> 
+> 
+> Cheers,
+> Philipp
+> 
+> 
+> On 4/14/20 10:24 AM, Philipp Eppelt wrote:
+> > Hi,
+> > 
+> > thanks for looking into this so quickly.
+> > 
+> > With this patch applied ontop of git commit
+> > f3bac27cc1e303e1860cc55b9b6889ba39dee587 I still have the issue and it
+> > reports the same numbers. I like the new usage of the ApicIdSize field.
+> > 
+> > 
+> > I looked into the mentioned pc_smp_parse() and had it print the topology
+> > for -smp 4:
+> > 
+> > qemu-system-x86_64: warning: cpu topology: sockets (4) , dies (1) ,
+> > cores (1) , threads (1) , maxcpus (4), cpus (4)
+> > 
+> > and with -smp 4,cores=4:
+> > 
+> > qemu-system-x86_64: warning: cpu topology: sockets (1) , dies (1) ,
+> > cores (4) , threads (1) , maxcpus (4), cpus (4)
+> > 
+> > As far as I understand it, these are the numbers the cpuid:8000'0008
+> > code relies on:
+> > `cs->nr_cores`, `cs->nr_threads` with `cs` being of type CPUState.
+> > 
+> > So I think the issue is rooted with the preferring sockets over cores
+> > when the -smp cmdline option is parsed, as stated in hw/i386/pc.c:729.
+> > 
+> > I guess this is the same code for Intel and AMD CPUs alike and this
+> > issue just didn't surface for us on Intel CPUs, as they don't have this
+> > CPUID leaf and we don't look at the topology.
+> > 
+> > This seems to boil down to a more careful use of the -smp option on my end.
+> > 
+> > Thanks again for looking into this.
+> > 
+> > Cheers,
+> > Philipp
+> > 
+> > 
+> > 
+> > On 4/10/20 2:12 AM, Babu Moger wrote:  
+> >> Philipp,
+> >>   Can you please check if this patch works for you.
+> >>
+> >> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+> >> index 90ffc5f..e467fee 100644
+> >> --- a/target/i386/cpu.c
+> >> +++ b/target/i386/cpu.c
+> >> @@ -5831,10 +5831,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t
+> >> index, uint32_t count,
+> >>          }
+> >>          *ebx = env->features[FEAT_8000_0008_EBX];
+> >>          *ecx = 0;
+> >> -        *edx = 0;
+> >>          if (cs->nr_cores * cs->nr_threads > 1) {
+> >> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+> >> +            unsigned long max_apicids, bits_required;
+> >> +
+> >> +            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
+> >> +            if (max_apicids) {
+> >> +                /* Find out the number of bits to represent all the
+> >> apicids */
+> >> +                bits_required = find_last_bit(&max_apicids,
+> >> BITS_PER_BYTE) + 1;
+> >> +                *ecx |= bits_required << 12 | max_apicids;
+> >> +            }
+> >>          }
+> >> +        *edx = 0;
+> >>          break;
+> >>      case 0x8000000A:
+> >>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+> >>
+> >>
+> >> On 4/9/20 9:00 AM, Igor Mammedov wrote:  
+> >>> On Thu, 09 Apr 2020 12:58:11 -0000
+> >>> Philipp Eppelt <email address hidden> wrote:
+> >>>  
+> >>>> Public bug reported:
+> >>>>
+> >>>> Setup:
+> >>>> CPU: AMD EPYC-v2 or host's EPYC cpu
+> >>>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+> >>>> qemu version: self build
+> >>>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+> >>>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+> >>>>
+> >>>> Cmdline: 
+> >>>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+> >>>>
+> >>>> Issue:
+> >>>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+> >>>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+> >>>>
+> >>>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+> >>>> The lower four bits of ECX are the [NC] field and all set.
+> >>>>
+> >>>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+> >>>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+> >>>>
+> >>>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+> >>>> CPU model and it is reproducible there as well and reports:  EAX:
+> >>>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+> >>>>
+> >>>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+> >>>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+> >>>>
+> >>>> The following table shows my findings with the -smp option:
+> >>>> Option | Qemu guest observed ECX value
+> >>>> -smp 4 | 0x0
+> >>>> -smp 4,cores=4  | 0x3
+> >>>> -smp 4,cores=2,thread=2 | 0x3
+> >>>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+> >>>>
+> >>>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+> >>>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?  
+> >>> I'd say X corresponds to number of logical CPUs.
+> >>> Depending on presence of other options these are distributed among them in magical manner
+> >>> (see pc_smp_parse() for starters)
+> >>>  
+> >>>> Querying 0x8000'0008 on the physical processor results in different
+> >>>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+> >>>>
+> >>>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+> >>>> CPU leave reports a single core processor.  
+> >>> it matches -smp X as it should be.
+> >>>  
+> >>>>
+> >>>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+> >>>> wrong number.  
+> >>> CCed author of recent epyc patches who might know how AMD should work better than me.
+> >>>  
+> >>>>
+> >>>> Please let me know, if you need more information from my side.
+> >>>>
+> >>>>
+> >>>> [0] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fkernel_thread-ia32.cpp%23L109&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=hcFJzLAVQoIh5IN9CP%2F9cUQNOZoBnpRA6FliJur1wzQ%3D&amp;reserved=0
+> >>>> [1] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fkernkonzept%2Ffiasco%2Fblob%2F522ccc5f29ab120213cf02d71328e2b879cbbd19%2Fsrc%2Fkern%2Fia32%2Fcpu-ia32.cpp%23L1120&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=ANJIbYKbwfq2bDelH%2FRLKnDPIUZc1BwxHspmgxLU7gs%3D&amp;reserved=0
+> >>>> [2] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fgithub.com%2Fqemu%2Fqemu%2Fblob%2Ff2a8261110c32c4dccd84e774d8dd7a0524e00fb%2Ftarget%2Fi386%2Fcpu.c%23L5835&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=oj3mv9e5YOzUsfUjXK44gC8LybyWgMKo8JBIrRR%2BmDA%3D&amp;reserved=0
+> >>>> [3] https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.amd.com%2Fsystem%2Ffiles%2FTechDocs%2F24594.pdf&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C57569f7959744399655b08d7dc8e6e24%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637220379083511672&amp;sdata=7Yr3J9ihlqSqXCXKN5JJNTByO3NGI%2BGMz2EqBF2Y4hw%3D&amp;reserved=0
+> >>>>
+> >>>> ** Affects: qemu
+> >>>>      Importance: Undecided
+> >>>>          Status: New
+> >>>>  
+> >>>  
+> >>  
+> >   
+> 
+
+
+
+Thanks. I saw the update in the thread.
+https://<email address hidden>/
+Looks like you have found a way to take care of your problem.
+But We need to fix the CPUID leaf 0x8000'0008 anyways.
+Will send the patch to review later this week. Thanks
+
+
+On 4/9/20 12:48 PM, Babu Moger wrote:
+> 
+> 
+> On 4/9/20 9:00 AM, Igor Mammedov wrote:
+>> On Thu, 09 Apr 2020 12:58:11 -0000
+>> Philipp Eppelt <email address hidden> wrote:
+>>
+>>> Public bug reported:
+>>>
+>>> Setup:
+>>> CPU: AMD EPYC-v2 or host's EPYC cpu
+>>> Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+>>> qemu version: self build
+>>> git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+>>> config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+>>>
+>>> Cmdline: 
+>>> qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+>>>
+>>> Issue:
+>>> We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+>>> In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+>>>
+>>> The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+>>> The lower four bits of ECX are the [NC] field and all set.
+>>>
+>>> When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+>>> Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+>>>
+>>> I'm debugging it using my local machine and the QEMU provided EPYC-v2
+>>> CPU model and it is reproducible there as well and reports:  EAX:
+>>> 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+>>>
+>>> I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+>>> I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+>>>
+>>> The following table shows my findings with the -smp option:
+>>> Option | Qemu guest observed ECX value
+>>> -smp 4 | 0x0
+>>> -smp 4,cores=4  | 0x3
+>>> -smp 4,cores=2,thread=2 | 0x3
+>>> -smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+>>>
+>>> Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+>>> Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+>> I'd say X corresponds to number of logical CPUs.
+>> Depending on presence of other options these are distributed among them in magical manner
+>> (see pc_smp_parse() for starters)
+>>
+>>> Querying 0x8000'0008 on the physical processor results in different
+>>> reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+>>>
+>>> Furthermore, the ACPI.MADT shows 4 local APICs to be present while the
+>>> CPU leave reports a single core processor.
+>> it matches -smp X as it should be.
+>>
+>>>
+>>> This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the
+>>> wrong number.
+>> CCed author of recent epyc patches who might know how AMD should work better than me.
+> 
+> Hmm.. Interesting.. Not sure why this did not come up during my testing.
+> Probably this cpuid information is not widely used.
+> 
+> Yes. I am looking at it right now. I see that EPYC model is reporting
+> wrong. Not sure why -cpu host is reporting wrong. I thought -cpu host gets
+> the information directly from the host. Will investigate.
+> 
+> 
+
+
+CPUID leaf CPUID_Fn80000008_ECX provides information about the
+number of threads supported by the processor. It was found that
+the field ApicIdSize(bits 15-12) was not set correctly.
+
+ApicIdSize is defined as the number of bits required to represent
+all the ApicId values within a package.
+
+Valid Values: Value Description
+3h-0h		Reserved.
+4h		up to 16 threads.
+5h		up to 32 threads.
+6h		up to 64 threads.
+7h		up to 128 threads.
+Fh-8h		Reserved.
+
+Fix the bit appropriately.
+
+This came up during following thread.
+https://lore.kernel.<email address hidden>/#t
+
+Refer the Processor Programming Reference (PPR) for AMD Family 17h
+Model 01h, Revision B1 Processors. The documentation is available
+from the bugzilla Link below.
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=206537
+
+Reported-by: Philipp Eppelt <email address hidden>
+Signed-off-by: Babu Moger <email address hidden>
+---
+ target/i386/cpu.c |   12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 90ffc5f..68210f6 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -5830,11 +5830,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+             *eax = cpu->phys_bits;
+         }
+         *ebx = env->features[FEAT_8000_0008_EBX];
+-        *ecx = 0;
+-        *edx = 0;
+         if (cs->nr_cores * cs->nr_threads > 1) {
+-            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
++            unsigned int max_apicids, bits_required;
++
++            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
++            /* Find out the number of bits to represent all the apicids */
++            bits_required = 32 - clz32(max_apicids);
++            *ecx = bits_required << 12 | max_apicids;
++        } else {
++            *ecx = 0;
+         }
++        *edx = 0;
+         break;
+     case 0x8000000A:
+         if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+
+
+
+Good catch, thanks for the patch.  Comments below:
+
+On Fri, Apr 17, 2020 at 10:14:32AM -0500, Babu Moger wrote:
+> CPUID leaf CPUID_Fn80000008_ECX provides information about the
+> number of threads supported by the processor. It was found that
+> the field ApicIdSize(bits 15-12) was not set correctly.
+> 
+> ApicIdSize is defined as the number of bits required to represent
+> all the ApicId values within a package.
+> 
+> Valid Values: Value Description
+> 3h-0h		Reserved.
+> 4h		up to 16 threads.
+> 5h		up to 32 threads.
+> 6h		up to 64 threads.
+> 7h		up to 128 threads.
+> Fh-8h		Reserved.
+> 
+> Fix the bit appropriately.
+> 
+> This came up during following thread.
+> https://lore.kernel.<email address hidden>/#t
+> 
+> Refer the Processor Programming Reference (PPR) for AMD Family 17h
+> Model 01h, Revision B1 Processors. The documentation is available
+> from the bugzilla Link below.
+> Link: https://bugzilla.kernel.org/show_bug.cgi?id=206537
+> 
+> Reported-by: Philipp Eppelt <email address hidden>
+> Signed-off-by: Babu Moger <email address hidden>
+> ---
+>  target/i386/cpu.c |   12 +++++++++---
+>  1 file changed, 9 insertions(+), 3 deletions(-)
+> 
+> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+> index 90ffc5f..68210f6 100644
+> --- a/target/i386/cpu.c
+> +++ b/target/i386/cpu.c
+> @@ -5830,11 +5830,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+>              *eax = cpu->phys_bits;
+>          }
+>          *ebx = env->features[FEAT_8000_0008_EBX];
+> -        *ecx = 0;
+> -        *edx = 0;
+>          if (cs->nr_cores * cs->nr_threads > 1) {
+> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+
+I'm not sure we want a compatibility flag to keep ABI on older
+machine types, here.  Strictly speaking, CPUID must never change
+on older machine types, but sometimes trying hard to emulate bugs
+of old QEMU versions is a pointless exercise.
+
+
+> +            unsigned int max_apicids, bits_required;
+> +
+> +            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
+> +            /* Find out the number of bits to represent all the apicids */
+> +            bits_required = 32 - clz32(max_apicids);
+
+This won't work if nr_cores > 1 and nr_threads is not a power of
+2, will it?
+
+For reference, the field is documented[1] as:
+
+"The number of bits in the initial Core::X86::Apic::ApicId[ApicId]
+value that indicate thread ID within a package"
+
+This sounds like the value already stored at
+CPUX86State::pkg_offset.
+
+
+> +            *ecx = bits_required << 12 | max_apicids;
+
+Bits 7:0 are documented as "The number of threads in the package
+is NC+1", with no reference to APIC IDs at all.
+
+Using ((nr_cores * nr_threads) - 1) for bits 7:0 sounds correct,
+but the variable name seems misleading.
+
+
+> +        } else {
+> +            *ecx = 0;
+>          }
+> +        *edx = 0;
+>          break;
+>      case 0x8000000A:
+>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+> 
+> 
+
+References:
+
+[1] Processor Programming Reference (PPR) for
+    AMD Family 17h Model 18h, Revision B1 Processors
+    55570-B1 Rev 3.14 - Sep 26, 2019
+    https://bugzilla.kernel.org/attachment.cgi?id=287395&action=edit
+
+
+-- 
+Eduardo
+
+
+
+
+
+On 4/17/20 2:15 PM, Eduardo Habkost wrote:
+> Good catch, thanks for the patch.  Comments below:
+> 
+> On Fri, Apr 17, 2020 at 10:14:32AM -0500, Babu Moger wrote:
+>> CPUID leaf CPUID_Fn80000008_ECX provides information about the
+>> number of threads supported by the processor. It was found that
+>> the field ApicIdSize(bits 15-12) was not set correctly.
+>>
+>> ApicIdSize is defined as the number of bits required to represent
+>> all the ApicId values within a package.
+>>
+>> Valid Values: Value Description
+>> 3h-0h		Reserved.
+>> 4h		up to 16 threads.
+>> 5h		up to 32 threads.
+>> 6h		up to 64 threads.
+>> 7h		up to 128 threads.
+>> Fh-8h		Reserved.
+>>
+>> Fix the bit appropriately.
+>>
+>> This came up during following thread.
+>> https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Flore.kernel.org%2Fqemu-devel%2F158643709116.17430.15995069125716778943.malonedeb%40wampee.canonical.com%2F%23t&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C1b8d59370cdb403dd54308d7e303adb7%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637227477274521298&amp;sdata=NZHLwOkQrbjkGeqYSI0wgRNUd3QHRCf7lBtdqoR5XfI%3D&amp;reserved=0
+>>
+>> Refer the Processor Programming Reference (PPR) for AMD Family 17h
+>> Model 01h, Revision B1 Processors. The documentation is available
+>> from the bugzilla Link below.
+>> Link: https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fbugzilla.kernel.org%2Fshow_bug.cgi%3Fid%3D206537&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C1b8d59370cdb403dd54308d7e303adb7%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637227477274521298&amp;sdata=oNLqu0J49eTrJ8pQ6GKg64ZUDfV3egZN2VVkU0DwMaU%3D&amp;reserved=0
+>>
+>> Reported-by: Philipp Eppelt <email address hidden>
+>> Signed-off-by: Babu Moger <email address hidden>
+>> ---
+>>  target/i386/cpu.c |   12 +++++++++---
+>>  1 file changed, 9 insertions(+), 3 deletions(-)
+>>
+>> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+>> index 90ffc5f..68210f6 100644
+>> --- a/target/i386/cpu.c
+>> +++ b/target/i386/cpu.c
+>> @@ -5830,11 +5830,17 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+>>              *eax = cpu->phys_bits;
+>>          }
+>>          *ebx = env->features[FEAT_8000_0008_EBX];
+>> -        *ecx = 0;
+>> -        *edx = 0;
+>>          if (cs->nr_cores * cs->nr_threads > 1) {
+>> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+> 
+> I'm not sure we want a compatibility flag to keep ABI on older
+> machine types, here.  Strictly speaking, CPUID must never change
+> on older machine types, but sometimes trying hard to emulate bugs
+> of old QEMU versions is a pointless exercise.
+
+Not sure about this. But it seemed like nobody cared about this field before.
+> 
+> 
+>> +            unsigned int max_apicids, bits_required;
+>> +
+>> +            max_apicids = (cs->nr_cores * cs->nr_threads) - 1;
+>> +            /* Find out the number of bits to represent all the apicids */
+>> +            bits_required = 32 - clz32(max_apicids);
+> 
+> This won't work if nr_cores > 1 and nr_threads is not a power of
+> 2, will it?
+
+It seem to work. Tested with threads=5,cores=3.
+
+> 
+> For reference, the field is documented[1] as:
+> 
+> "The number of bits in the initial Core::X86::Apic::ApicId[ApicId]
+> value that indicate thread ID within a package"
+> 
+> This sounds like the value already stored at
+> CPUX86State::pkg_offset.
+
+Yes, it is already in pkg_offset. We can use it.
+
+> 
+> 
+>> +            *ecx = bits_required << 12 | max_apicids;
+> 
+> Bits 7:0 are documented as "The number of threads in the package
+> is NC+1", with no reference to APIC IDs at all.
+> 
+> Using ((nr_cores * nr_threads) - 1) for bits 7:0 sounds correct,
+> but the variable name seems misleading.
+
+I can change the variable name to num_threads.
+> 
+> 
+>> +        } else {
+>> +            *ecx = 0;
+>>          }
+>> +        *edx = 0;
+>>          break;
+>>      case 0x8000000A:
+>>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+>>
+>>
+> 
+> References:
+> 
+> [1] Processor Programming Reference (PPR) for
+>     AMD Family 17h Model 18h, Revision B1 Processors
+>     55570-B1 Rev 3.14 - Sep 26, 2019
+>     https://nam11.safelinks.protection.outlook.com/?url=https%3A%2F%2Fbugzilla.kernel.org%2Fattachment.cgi%3Fid%3D287395%26action%3Dedit&amp;data=02%7C01%7Cbabu.moger%40amd.com%7C1b8d59370cdb403dd54308d7e303adb7%7C3dd8961fe4884e608e11a82d994e183d%7C0%7C0%7C637227477274521298&amp;sdata=UsM3h4vp3dTgigqOvt7GrGiIUHvH8Kn1g%2BO%2FfGMav%2Bc%3D&amp;reserved=0
+> 
+> 
+
+
+CPUID leaf CPUID_Fn80000008_ECX provides information about the
+number of threads supported by the processor. It was found that
+the field ApicIdSize(bits 15-12) was not set correctly.
+
+ApicIdSize is defined as the number of bits required to represent
+all the ApicId values within a package.
+
+Valid Values: Value Description
+3h-0h		Reserved.
+4h		up to 16 threads.
+5h		up to 32 threads.
+6h		up to 64 threads.
+7h		up to 128 threads.
+Fh-8h		Reserved.
+
+Fix the bit appropriately.
+
+This came up during following thread.
+https://lore.kernel.<email address hidden>/#t
+
+Refer the Processor Programming Reference (PPR) for AMD Family 17h
+Model 01h, Revision B1 Processors. The documentation is available
+from the bugzilla Link below.
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=206537
+
+Reported-by: Philipp Eppelt <email address hidden>
+Signed-off-by: Babu Moger <email address hidden>
+---
+v2: 
+  Used env->pkg_offset for bits 15:12 which is already available.
+
+ target/i386/cpu.c |   15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+index 90ffc5f..5e5a605 100644
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -5830,11 +5830,20 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+             *eax = cpu->phys_bits;
+         }
+         *ebx = env->features[FEAT_8000_0008_EBX];
+-        *ecx = 0;
+-        *edx = 0;
+         if (cs->nr_cores * cs->nr_threads > 1) {
+-            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
++            /*
++             * Bits 15:12 is "The number of bits in the initial
++             * Core::X86::Apic::ApicId[ApicId] value that indicate
++             * thread ID within a package". This is already stored at
++             * CPUX86State::pkg_offset.
++             * Bits 7:0 is "The number of threads in the package is NC+1"
++             */
++            *ecx = (env->pkg_offset << 12) |
++                   ((cs->nr_cores * cs->nr_threads) - 1);
++        } else {
++            *ecx = 0;
+         }
++        *edx = 0;
+         break;
+     case 0x8000000A:
+         if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+
+
+
+Hi,
+
+thanks for the patch, I tested it in my setup and I'm seeing numbers
+that make sense.
+
+However, I can create a setup which places the value 02h* into the
+ApicIdSize field, which is reserved. However, I deem this a
+configuration issue as well.
+
+* -cpu EPYC-v2 -smp 4,cores=4 --> 0x8000_0008[ECX] = 0x2003
+
+Cheers,
+Philipp
+
+On 4/17/20 11:55 PM, Babu Moger wrote:
+> CPUID leaf CPUID_Fn80000008_ECX provides information about the
+> number of threads supported by the processor. It was found that
+> the field ApicIdSize(bits 15-12) was not set correctly.
+> 
+> ApicIdSize is defined as the number of bits required to represent
+> all the ApicId values within a package.
+> 
+> Valid Values: Value Description
+> 3h-0h		Reserved.
+> 4h		up to 16 threads.
+> 5h		up to 32 threads.
+> 6h		up to 64 threads.
+> 7h		up to 128 threads.
+> Fh-8h		Reserved.
+> 
+> Fix the bit appropriately.
+> 
+> This came up during following thread.
+> https://lore.kernel.<email address hidden>/#t
+> 
+> Refer the Processor Programming Reference (PPR) for AMD Family 17h
+> Model 01h, Revision B1 Processors. The documentation is available
+> from the bugzilla Link below.
+> Link: https://bugzilla.kernel.org/show_bug.cgi?id=206537
+> 
+> Reported-by: Philipp Eppelt <email address hidden>
+> Signed-off-by: Babu Moger <email address hidden>
+> ---
+> v2: 
+>   Used env->pkg_offset for bits 15:12 which is already available.
+> 
+>  target/i386/cpu.c |   15 ++++++++++++---
+>  1 file changed, 12 insertions(+), 3 deletions(-)
+> 
+> diff --git a/target/i386/cpu.c b/target/i386/cpu.c
+> index 90ffc5f..5e5a605 100644
+> --- a/target/i386/cpu.c
+> +++ b/target/i386/cpu.c
+> @@ -5830,11 +5830,20 @@ void cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
+>              *eax = cpu->phys_bits;
+>          }
+>          *ebx = env->features[FEAT_8000_0008_EBX];
+> -        *ecx = 0;
+> -        *edx = 0;
+>          if (cs->nr_cores * cs->nr_threads > 1) {
+> -            *ecx |= (cs->nr_cores * cs->nr_threads) - 1;
+> +            /*
+> +             * Bits 15:12 is "The number of bits in the initial
+> +             * Core::X86::Apic::ApicId[ApicId] value that indicate
+> +             * thread ID within a package". This is already stored at
+> +             * CPUX86State::pkg_offset.
+> +             * Bits 7:0 is "The number of threads in the package is NC+1"
+> +             */
+> +            *ecx = (env->pkg_offset << 12) |
+> +                   ((cs->nr_cores * cs->nr_threads) - 1);
+> +        } else {
+> +            *ecx = 0;
+>          }
+> +        *edx = 0;
+>          break;
+>      case 0x8000000A:
+>          if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
+> 
+
+-- 
+<email address hidden> - Tel. 0351-41 883 221
+http://www.kernkonzept.com
+
+Kernkonzept GmbH.  Sitz: Dresden.  Amtsgericht Dresden, HRB 31129.
+Geschäftsführer: Dr.-Ing. Michael Hohmuth
+
+
+If I got that right, there were some patches proposed for this bug ... has this been fixed already? Or is there still anything left to do?
+
+The patch mentioned earlier has been included here:
+https://gitlab.com/qemu-project/qemu/-/commit/cac9edfc4dad2a7d2ad7e
+So I assume this has been fixed. If you still have problems, please open a new ticket in the new bug tracker at gitlab.
+

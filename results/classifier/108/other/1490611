@@ -1,0 +1,358 @@
+other: 0.707
+graphic: 0.681
+device: 0.649
+PID: 0.640
+permissions: 0.623
+network: 0.598
+semantic: 0.583
+vnc: 0.581
+debug: 0.454
+KVM: 0.453
+socket: 0.434
+files: 0.421
+performance: 0.404
+boot: 0.358
+
+Using qemu >=2.2.1 to convert raw->VHD (fixed) adds extra padding to the result file, which Microsoft Azure rejects as invalid
+
+Starting with a raw disk image, using "qemu-img convert" to convert from raw to VHD results in the output VHD file's virtual size being aligned to the nearest 516096 bytes (16 heads x 63 sectors per head x 512 bytes per sector), instead of preserving the input file's size as the output VHD's virtual disk size.
+
+Microsoft Azure requires that disk images (VHDs) submitted for upload have virtual sizes aligned to a megabyte boundary. (Ex. 4096MB, 4097MB, 4098MB, etc. are OK, 4096.5MB is rejected with an error.) This is reflected in Microsoft's documentation: https://azure.microsoft.com/en-us/documentation/articles/virtual-machines-linux-create-upload-vhd-generic/
+
+This is reproducible with the following set of commands (including the Azure command line tools from https://github.com/Azure/azure-xplat-cli). For the following example, I used qemu version 2.2.1:
+
+$ dd if=/dev/zero of=source-disk.img bs=1M count=4096
+
+$ stat source-disk.img 
+  File: ‘source-disk.img’
+  Size: 4294967296      Blocks: 798656     IO Block: 4096   regular file
+Device: fc01h/64513d    Inode: 13247963    Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/  smkent)   Gid: ( 1000/  smkent)
+Access: 2015-08-18 09:48:02.613988480 -0700
+Modify: 2015-08-18 09:48:02.825985646 -0700
+Change: 2015-08-18 09:48:02.825985646 -0700
+ Birth: -
+
+$ qemu-img convert -f raw -o subformat=fixed -O vpc source-disk.img dest-disk.vhd
+
+$ stat dest-disk.vhd 
+  File: ‘dest-disk.vhd’
+  Size: 4296499712      Blocks: 535216     IO Block: 4096   regular file
+Device: fc01h/64513d    Inode: 13247964    Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/  smkent)   Gid: ( 1000/  smkent)
+Access: 2015-08-18 09:50:22.252077624 -0700
+Modify: 2015-08-18 09:49:24.424868868 -0700
+Change: 2015-08-18 09:49:24.424868868 -0700
+ Birth: -
+
+$ azure vm image create testimage1 dest-disk.vhd -o linux -l "West US"
+info:    Executing command vm image create
++ Retrieving storage accounts                                                  
+info:    VHD size : 4097 MB
+info:    Uploading 4195800.5 KB
+Requested:100.0% Completed:100.0% Running:   0 Time: 1m 0s Speed:  6744 KB/s 
+info:    https://[redacted].blob.core.windows.net/vm-images/dest-disk.vhd was uploaded successfully
+error:   The VHD https://[redacted].blob.core.windows.net/vm-images/dest-disk.vhd has an unsupported virtual size of 4296499200 bytes.  The size must be a whole number (in MBs).
+info:    Error information has been recorded to /home/smkent/.azure/azure.err
+error:   vm image create command failed
+
+I also ran the above commands using qemu 2.4.0, which resulted in the same error as the conversion behavior is the same.
+
+However, qemu 2.1.1 and earlier (including qemu 2.0.0 installed by Ubuntu 14.04) does not pad the virtual disk size during conversion. Using qemu-img convert from qemu versions <=2.1.1 results in a VHD that is exactly the size of the raw input file plus 512 bytes (for the VHD footer). Those qemu versions do not attempt to realign the disk. As a result, Azure accepts VHD files created using those versions of qemu-img convert for upload.
+
+Is there a reason why newer qemu realigns the converted VHD file? It would be useful if an option were added to disable this feature, as current versions of qemu cannot be used to create VHD files for Azure using Microsoft's official instructions.
+
+Which release contains this fix?
+
+Judging by their comments on bug 1399191, jan-wang1989 doesn't appear to be a QEMU developer.
+
+I bisected to this commit:
+c70221df1f89953e85a3f1f96ceefbd6888bb55f
+
+Kevin Wolf, I added you since you were the author of the commit that I bisected this bug to. Can you advise at all on this bug? Thank you.
+
+In short: VHD is a mess and Microsoft isn't compatible with itself. That's the root cause of all the trouble we have with it.
+
+When the qemu VHD driver was written, it was designed to be compatible with Virtual PC, which used the disk geometry as the definite source for the image size. In order to achieve exactly the same results on qemu, we had to calculate the image size the same way, otherwise VMs would see a larger disk when run in qemu compared to Virtual PC. qemu-img always creates images so that real size and geometry match, which is the rounding you are seeing. The commit that you bisected to fixed that geometry and real size were inconsistent on fixed size disks.
+
+Now HyperV treats images differently. It still stores a geometry, but it doesn't actually use it to determine the size of a disk. Images created by qemu-img are generally okay because geometry and real size match, but when opening a HyperV image with qemu, the rounding we had to apply for Virtual PC is suddenly wrong. This has given us some trouble before. Now the requirement of Azure, which basically means we can't round any more even though we have to do it for Virtual PC compatibility, completes the mess.
+
+While we considered hacks for opening images correctly, like checking the creator application in the image, we can't do that automatically when creating an image. I'm afraid the best we can do here is to add an explicit subformat option that the user needs to specify manually.
+
+Jeff, any opinion on this? And should we finally implement the vpc_open() hack to distinguish by creator_app?
+
+If you create a subformat option I would humbly recommend focusing on Hyper-V and Azure compat, and then create an option that enforces the legacy behavior with your patch.  This is essentially what some Linux distros have started to do.
+
+
+First, I'd say that if you are converting an image over to use on Hyper-V, you would probably be better served using the VHDX format (completely different from VHD) - it is the newer format (and completely different from VHD), and is supported by QEMU as well.  It is better defined and more consistent (at least so far) in its specification.
+
+That said, I think for the specific VHD problem we could look at the Creator field in the image.  My only reservations on that are:
+
+1.) I haven't looked at the Creator field comprehensively across all revisions of Hyper-V and Virtual PC.  But in my small sample size, it seems feasible.
+
+2.) It most likely won't be 100%, because of edge cases (e.g. I don't know what happens when Hyper-V opens a Virtual-PC produced VHD file, and under what circumstances it may or may not alter the Creator field)
+
+But the above two reservations can be overcome with the appropriate options that can be passed to the VHD format, to override the auto-detection method.
+
+I have access to both Virtual PC and Hyper-V, so I can put together a small patch series tomorrow to try that out.
+
+Unfortunately, VHDX is not supported in Azure.
+
+I would be happy to help test out any patches.
+
+I've posted a series to qemu-devel to hopefully address this issue.  Cole, or anyone else that wants to test it out: http://lists.nongnu.org/archive/html/qemu-devel/2016-02/msg05511.html
+
+For the specific qemu-img convert case mentioned in this bug report, I believe using the new "force-size" option should address it, e.g.:
+
+# qemu-img convert -f raw -o subformat=fixed,force-size -O vpc source-disk.img dest-disk.vhd
+
+
+It looks like the option is "force_size" rather than "force-size".
+
+It also seems to be having the intended effect. I regenerate my nixos iso with various configurations:
+
+qemu-master + jeffcody patches + force_size = 2147484160
+qemu-master + jeffcody patches (no force_size) = 2147992064
+qemu-stable: 2147992064
+qemu-220: 2147484160
+
+2147992064 - 512 = 2147991552 (2048.484375 MiB)
+2147484160 - 512 = 2147483648 (exactly 2048 MiB)
+
+It appears to be working. Thanks!
+
+(Note, I only applied the non-test patches. I have them applied on master in a fork under my user on GitHub if someone else wants to test easily).
+
+Thanks for testing!  It is worth noting there is a v2 on the list now, that changes the creator app string to "qem2" from "qemu" when using the force_size option.  That should only matter if you try to use your converted images on QEMU (so QEMU will know on that image to rely by default on the current_size field).
+
+Sounds good. I don't plan to retest unless you'd like me to; that change shouldn't affect me.
+
+For the status change, I am really sorry.
+I think at that time, I just want to check the status/history of this bug, but I  maybe click certain button by mistake.
+
+Fix is available with QEMU 2.6:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=fb9245c2610932d33ce14
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+Just did a source check of 1:2.6+dfsg-3ubuntu1 in yakkety and the upstream fix is already present (as it is 2.6 based). Working on the backport now to 16.04.
+
+I have submitted a test build of 2.5+dfsg-5ubuntu10.1~ppa1 to https://launchpad.net/~nacc/+archive/ubuntu/lp1490611. Please test that version on 16.04.
+
+Apologies, I uploaded an incorrect version to the PPA, please test 2.5+dfsg-5ubuntu10.3~ppa1.
+
+
+
+Uploaded to Xenial, thanks. Am I right in thinking that the new option force_size is required to be used with the patch to fix the problem? It's probably worth mentioning this in the Test Case in the bug description; otherwise it will appear to testers that the fix doesn't work.
+
+On 04.08.2016 [10:49:47 -0000], Robie Basak wrote:
+> Uploaded to Xenial, thanks. Am I right in thinking that the new option
+> force_size is required to be used with the patch to fix the problem?
+> It's probably worth mentioning this in the Test Case in the bug
+> description; otherwise it will appear to testers that the fix doesn't
+> work.
+
+Agreed, updated.
+
+
+Rejected:                                                                       
+
+Rejected by Brian Murray: There was a security update to qemu today, so the SRU will need to be redone on top of that.
+
+
+
+Uploaded.
+
+It looks like there was a regression caused by that security update see bug 1612089.  It might be best to coordinate with the security team, if they are doing a regular SRU, regarding the the fix for this bug.
+
+Can you rebase your fix on 1:2.5+dfsg-5ubuntu10.4 (due to the regression fix mentioned in #25)?
+Another thing about your backport is that it dropped the qem2 bits from the patch. Is there a reason for this? If so please mention it in the debian/patch file.
+
+On 17.08.2016 [13:12:19 -0000], Chris J Arges wrote:
+> Can you rebase your fix on 1:2.5+dfsg-5ubuntu10.4 (due to the
+> regression fix mentioned in #25)?
+
+Will do!
+
+> Another thing about your backport is that it dropped the qem2 bits
+> from the patch. Is there a reason for this? If so please mention it in
+> the debian/patch file.
+
+Ah yes, those sections of the upstream fix do not apply cleanly due to
+differing context (not even present).
+
+That does bring up another question, though:
+
+@smkbot or anyone else that might know. It seems the original series was
+4 patches
+(http://lists.nongnu.org/archive/html/qemu-devel/2016-02/msg06037.html),
+and there was a follow-on of 7 patches that fixed a regression in that
+series
+(http://lists.nongnu.org/archive/html/qemu-devel/2016-03/msg05424.html).
+Do we need to backport all 11 patches? In the first series, at least,
+there is mention that patch 1/4 fixes an issue for reading VHD images.
+While I realize that this particular bug is just for creating/converting
+images, would it also be appropriate to backport the full set of fixes
+for VHD/VPC?
+
+
+
+
+On 17.08.2016 [10:20:26 -0700], Nish Aravamudan wrote:
+> On 17.08.2016 [13:12:19 -0000], Chris J Arges wrote:
+> > Can you rebase your fix on 1:2.5+dfsg-5ubuntu10.4 (due to the
+> > regression fix mentioned in #25)?
+> 
+> Will do!
+
+Done.
+
+> > Another thing about your backport is that it dropped the qem2 bits
+> > from the patch. Is there a reason for this? If so please mention it in
+> > the debian/patch file.
+> 
+> Ah yes, those sections of the upstream fix do not apply cleanly due to
+> differing context (not even present).
+
+The latest update includes the relevant context...
+
+> That does bring up another question, though:
+> 
+> @smkbot or anyone else that might know. It seems the original series was
+> 4 patches
+> (http://lists.nongnu.org/archive/html/qemu-devel/2016-02/msg06037.html),
+> and there was a follow-on of 7 patches that fixed a regression in that
+> series
+> (http://lists.nongnu.org/archive/html/qemu-devel/2016-03/msg05424.html).
+> Do we need to backport all 11 patches? In the first series, at least,
+> there is mention that patch 1/4 fixes an issue for reading VHD images.
+> While I realize that this particular bug is just for creating/converting
+> images, would it also be appropriate to backport the full set of fixes
+> for VHD/VPC?
+
+On my own review, I believe we want to backport the 1 and 3 patch from
+the first series, so that qemu-img is self-consistent, in terms of
+reading and writing the new 'qem2' images. The second series does
+include fixes, but not related to this bug, so if we were to include
+them in a SRU, I'd rather they come in from a related bug report.
+
+@Stephen or anyone else affected, I've submitted an updated build at
+https://launchpad.net/~nacc/+archive/ubuntu/lp1490611 for qemu
+1:2.5+dfsg-5ubuntu10.5~ppa1 which should include the relevant. Please
+test once it has finished building.
+
+
+Is it correct to assume that current 16.04.2 Xenial with the 2.5 QEMU package, doesn't have this patch and can't generate MiB aligned Azure images with qemu-img (no force_size support) ?
+
+Any recommended PPA backport of QEMU from 16.10 (2.6+) ?
+
+cheers.
+
+Hello Alexandre,
+
+Yes, sorry, there have been several qemu SRUs pending and this one kept getting pushed back. Note that as far as end-users are concerned wrt. qemu, 16.04.2 is not really a relevant milestone. You'd still need to `apt update; apt upgrade` to get the latest from the repositories -- and yes, that version from the repositories does not yet have this fix. I believe Christian has it on his todo for the next SRU, though; Christian, could you confirm?
+
+On Fri, Feb 17, 2017 at 11:29 PM, Nish Aravamudan <
+<email address hidden>> wrote:
+
+> I believe Christian has it on his todo for the next SRU, though;
+> Christian, could you confirm?
+>
+
+Yes, that is correct.
+Sorry for the inconvenient delay due to the chain SRUs.
+But at least the bigger ones we need to unbundle to make sure not making
+things worse for end-users when SRU'ing.
+
+
+Preliminary builds as preparation for an SRU currently building at
+
+Xenial https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/2502
+
+My testing will start on those, but if you can please give it as much testing as you can as well.
+
+Tests for any regressions on the ppa look good so far, going to try to test the fixed case explicitly.
+
+I could confirm the fix on its raw alignment:
+Image with 4G
+Pre Fix (4295467520-512)/1024/1024 = 4096,4765625
+With Fix (4295467520-512)/1024/1024 = 4096,4765625
+With Fix + force_size set: (4294967808-512)/1024/1024 = 4096
+
+That means
+1. no change without opt in
+2. the desired effect when option is set
+
+Waiting a few days for the other bugs in the SRU suggestion ppa to resolve/confirm fixes (or be dropped) and then moving to the actual SRU.
+
+Simplified steps to reproduce (without Azure cli / credentials)
+
+1. Start as in the SRU Template:
+2. qemu-img convert -f raw -o subformat=fixed,force_size -O vpc source-disk.img dest-disk-old.vhd
+3. upgrade
+4. qemu-img convert -f raw -o subformat=fixed,force_size -O vpc source-disk.img dest-disk-new.vhd
+5. qemu-img convert -f raw -o subformat=fixed -O vpc source-disk.img dest-disk-new-forced.vhd
+6. check alignment:
+$ stat dest-disk-old.vhd dest-disk-new.vhd dest-disk-new-forced.vhd | awk '/^  Size:/ {print ($2-512)/1024/1024}'
+4096.48
+4096.48
+4096
+
+
+The other fixes I wanted to bundle turned out to have a too low rate of response and some show  issues on testing. To not postpone this fix any longer (which it already had it share of) I un-bundled this fix and moved it into xenial-proposed now.
+
+It is now in the SRU review queue and given that the SRU Team acks it should show up here soon for final proposed verification.
+
+Hello Stephen, or anyone else affected,
+
+Accepted qemu into xenial-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.5+dfsg-5ubuntu10.10 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Verified Proposed:
+
+dd if=/dev/zero of=source-disk.img bs=1M count=4096
+qemu-img convert -f raw -o subformat=fixed -O vpc source-disk.img dest-disk-old.vhd
+#upgrade
+$qemu-img convert -f raw -o subformat=fixed -O vpc source-disk.img dest-disk-new.vhd
+$qemu-img convert -f raw -o subformat=fixed,force_size -O vpc source-disk.img dest-disk-new-forced.vhd
+#check alignment:
+$ stat dest-disk-old.vhd dest-disk-new.vhd dest-disk-new-forced.vhd | awk '/^ *Size:/ {print ($2-512)/1024/1024}'
+4096.48
+4096.48
+4096
+
+That means:
+1. without adding the new parm no behaviour change (good since it is SRU)
+2. with the force_size parm the size is aligned
+
+That is enough for verification, but it would be even greater if that could also be tested on real azure.
+
+This bug was fixed in the package qemu - 1:2.5+dfsg-5ubuntu10.10
+
+---------------
+qemu (1:2.5+dfsg-5ubuntu10.10) xenial; urgency=medium
+
+  [Nishanth Aravamudan]
+  * debian/patches/ubuntu/add_force_size_option.patch:
+    block/vpc: fix VHD size calculation. (LP: #1490611)
+
+ -- Christian Ehrhardt <email address hidden>  Mon, 20 Feb 2017 13:09:53 +0100
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+I'm using this version on xenial,
+andy@bastion:~/temp$ qemu-img -h
+qemu-img version 2.5.0 (Debian 1:2.5+dfsg-5ubuntu10.31), Copyright (c) 2004-2008 Fabrice Bellard
+
+qemu-img convert -f raw -O vpc -o subformat=fixed,force_size /tmp/azure_config_disk_image20180901-22672-16zxelu papapa2.vhd
+
+unfortunately the papapa2.vhd size is 25166336!=25165824 which means it's not aligned in MiB.
+
+could you please help?
+
+

@@ -1,0 +1,214 @@
+other: 0.871
+graphic: 0.861
+performance: 0.843
+debug: 0.814
+semantic: 0.788
+vnc: 0.775
+boot: 0.764
+files: 0.757
+device: 0.754
+permissions: 0.753
+KVM: 0.738
+PID: 0.727
+socket: 0.628
+network: 0.622
+
+linux-user riscv32: wait4/waitpid returns wrong value
+Description of problem:
+Background job started by bash shell in riscv32 chroot environment under qemu linux-user emulation hangs indefinitely.
+
+strace shows repeated waitid flood `waitid(P_ALL, -1, {}, WNOHANG|WEXITED|WSTOPPED|WCONTINUED, NULL) = 0`.
+Steps to reproduce:
+1. cross compile a riscv32 environment with crossdev on gentoo or other way and chroot into it.
+2. run `sleep 1000 &`
+3. run `ls`
+4. infinite hangs
+
+I have a small reproducer that I think may uncover the issue, but I am not 100% sure. I also tried running qemu with sanitizers enabled, but it produces no warning. Happy to provide a tar bar of my riscv32 rootfs if needed.
+
+<details><summary>simple_shell.c</summary>
+
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+#define MAX_LINE 80 /* The maximum length command */
+
+#define BACKGROUND 0
+#define FOREGROUND 1
+
+struct Job {
+    pid_t pid;
+    char command[MAX_LINE];
+    int state; // 0 for background, 1 for foreground
+};
+
+struct Job jobs[10]; // Maximum 10 background jobs
+int num_jobs = 0;
+
+void handle_signal(int signum) {
+    // Do nothing for now
+}
+
+int launch_process(char **args, int state) {
+    pid_t pid;
+    int status;
+
+    pid = fork();
+    if (pid == 0) {
+        // Child process
+        if (execvp(args[0], args) == -1) {
+            perror("Error in execvp");
+            exit(EXIT_FAILURE);
+        }
+    } else if (pid < 0) {
+        // Error forking
+        perror("Error forking");
+    } else {
+        // Parent process
+        if (state == FOREGROUND) {
+            // Wait for the child process to finish if it's foreground
+            do {
+                wait4(pid, &status, WUNTRACED, NULL);
+            } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+        } else {
+            // Background process, add to jobs list
+            jobs[num_jobs].pid = pid;
+            strcpy(jobs[num_jobs].command, args[0]);
+            jobs[num_jobs].state = BACKGROUND;
+            num_jobs++;
+        }
+    }
+    return 1;
+}
+
+void bg_command(int job_number) {
+    // Send SIGCONT signal to a background job
+    if (kill(jobs[job_number].pid, SIGCONT) == -1) {
+        perror("kill");
+    } else {
+        jobs[job_number].state = BACKGROUND;
+    }
+}
+
+void fg_command(int job_number) {
+    // Bring a background job to foreground
+    if (kill(jobs[job_number].pid, SIGCONT) == -1) {
+        perror("kill");
+    } else {
+        jobs[job_number].state = FOREGROUND;
+        int status;
+        wait4(jobs[job_number].pid, &status, WUNTRACED, NULL);
+    }
+}
+
+int main(void) {
+    char *args[MAX_LINE/2 + 1]; /* command line arguments */
+    int should_run = 1; /* flag to determine when to exit program */
+    char command[MAX_LINE]; /* buffer to hold the command */
+    char *token; /* token for parsing the command */
+
+    signal(SIGINT, handle_signal); /* Ignore SIGINT for now */
+    signal(SIGTSTP, handle_signal); /* Ignore SIGTSTP for now */
+
+    while (should_run) {
+        printf("Shell> ");
+        fflush(stdout);
+        fgets(command, MAX_LINE, stdin); /* read command from stdin */
+        command[strcspn(command, "\n")] = '\0'; /* remove newline character */
+
+        if (strcmp(command, "exit") == 0) {
+            should_run = 0; /* exit the shell */
+            continue;
+        }
+
+        if (strcmp(command, "") == 0) {
+            continue; /* skip empty commands */
+        }
+
+        if (strcmp(command, "cd") == 0) {
+            char *home = getenv("HOME");
+            chdir(home);
+            continue;
+        }
+
+        if (strcmp(command, "bg") == 0) {
+            // Run the most recent background job in the background
+            bg_command(num_jobs - 1);
+            continue;
+        }
+
+        if (strcmp(command, "fg") == 0) {
+            // Bring the most recent background job to foreground
+            fg_command(num_jobs - 1);
+            continue;
+        }
+
+        token = strtok(command, " ");
+        int i = 0;
+        while (token != NULL) {
+            args[i] = token;
+            token = strtok(NULL, " ");
+            i++;
+        }
+        args[i] = NULL;
+
+        if (strcmp(args[i-1], "&") == 0) {
+            args[i-1] = NULL;
+            launch_process(args, BACKGROUND);
+        } else {
+            launch_process(args, FOREGROUND);
+        }
+
+        pid_t tmp;
+        // Check if any background jobs have finished
+        for (int j = 0; j < num_jobs; j++) {
+            if ((tmp = wait4(jobs[j].pid, NULL, WNOHANG, NULL)) > 0) {
+                printf("[%d] Done\t%s\n", j, jobs[j].command);
+                // Remove job from list
+                for (int k = j; k < num_jobs - 1; k++) {
+                    jobs[k] = jobs[k + 1];
+                }
+                num_jobs--;
+            }
+            printf("wait4 ret: %d\n", tmp);
+        }
+    }
+    return 0;
+}
+```
+
+</details>
+
+<details><summary>loop.c</summary>
+int main() {while(1){}}
+</details>
+
+1. compile simple_shell.c, statically for simplicity. `riscv32-unknown-gnu-gcc simple_shell.c --static -o shell_riscv32`
+2. compile loop.c to riscv32 or x86_64 (x86_64 is simpler with same result) `gcc loop.c --static -o loop`
+3. run shell with qemu user
+```
+qemu-user-riscv32 ./shell_riscv32
+shell> ./loop &
+[0] Done        ./sleep_riscv32
+wait4 ret: 98298
+```
+where it is supposed to return 0 on riscv64 or x86
+Additional information:
+More context:
+This was found on the side when I was trying to track down a riscv32 infinite loop issue with linux-user emulation that has been blocking riscv32 gentoo bootstrap. I am not certain if my reproducer does reproduced that issue, but feels it is close. strace attached to the process repeats,
+```
+waitid(P_ALL, -1, {}, WNOHANG|WEXITED, NULL) = 0
+rt_sigprocmask(SIG_SETMASK, ~[RTMIN RT_1], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, ~[RTMIN RT_1], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, [CHLD], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, ~[RTMIN RT_1], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, ~[RTMIN RT_1], NULL, 8) = 0
+rt_sigprocmask(SIG_SETMASK, [CHLD], NULL, 8) = 0
+waitid(P_ALL, -1, ^Cstrace: Process 237805 detached
+```
+It appears to be first mentioned here <https://lists.gnu.org/archive/html/qemu-devel/2021-01/msg05475.html>.

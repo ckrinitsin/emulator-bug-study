@@ -1,0 +1,44 @@
+boot: 0.910
+performance: 0.902
+graphic: 0.880
+device: 0.822
+other: 0.820
+KVM: 0.796
+semantic: 0.659
+vnc: 0.585
+socket: 0.584
+PID: 0.528
+permissions: 0.433
+network: 0.399
+debug: 0.381
+files: 0.370
+
+CPU boot sometimes fails on big.LITTLE CPUs with varying cache sizes
+Description of problem:
+The RK3588 SoC has three core clusters; one with A55 cores, and the other two have A76 cores. The big cores have more L2 cache than the little cores, so the value of `CCSIDR` depends on the core that it is read from.
+
+In `write_list_to_kvmstate`, QEMU attempts to use `KVM_SET_ONE_REG` with an ID for `KVM_REG_ARM_DEMUX_ID_CCSIDR`, trying to set `CCSIDR` to a previously read value.
+
+Normally, that works fine, but if the host kernel has moved QEMU from one core cluster to the other, then the value will be different and `demux_c15_set` will return `EINVAL`, causing the entire `arm_set_cpu_on` to fail, and the guest kernel to print an error.
+
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/arch/arm64/kvm/sys_regs.c?h=v6.2#n2827
+
+I tried changing the condition for the `ok = false` line in `write_list_to_kvmstate` to `ret && r.id >> 8 != 0x60200000001100`. This causes all CPUs to initialize correctly in the guest, but obviously that's a hack.
+
+I assume that `CCSIDR` not being uniform across all CPUs means that the guest's copy of `CCSIDR` may be wrong, and so cache maintenance operations may not act on the entire cache. I do not know whether that could actually cause problems. Will QEMU need to find the maximum cache size across all CPUs and present that to guests?
+Steps to reproduce:
+On a SoC where big and little cores have different cache sizes (e.g. RK3588):
+
+```text
+$ qemu-system-aarch64 -M virt -accel kvm -cpu host -smp 4 -nographic -kernel arch/arm64/boot/Image -append quiet
+[    0.001399][    T1] psci: failed to boot CPU1 (-22)
+[    0.001407][    T1] CPU1: failed to boot: -22
+[    0.001685][    T1] psci: failed to boot CPU2 (-22)
+[    0.001691][    T1] CPU2: failed to boot: -22
+[    0.001809][    T1] psci: failed to boot CPU3 (-22)
+[    0.001814][    T1] CPU3: failed to boot: -22
+```
+
+The error is not always printed, because it depends on which core cluster the processes are scheduled on.
+
+Using `taskset -c 0-3` or `taskset -c 4-7` to force QEMU to stick to the little or big cores respectively makes the bug not reproduce.

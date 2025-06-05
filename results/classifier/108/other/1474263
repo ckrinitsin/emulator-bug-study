@@ -1,0 +1,179 @@
+permissions: 0.838
+other: 0.786
+semantic: 0.748
+device: 0.730
+PID: 0.704
+performance: 0.702
+debug: 0.607
+graphic: 0.602
+vnc: 0.600
+files: 0.574
+network: 0.567
+boot: 0.500
+KVM: 0.438
+socket: 0.369
+
+"Image format was not specified" warning should be suppressed for the vvfat (and probably nbd) driver
+
+Running
+
+qemu -drive file.driver=vvfat,file.dir=.
+
+displays
+
+WARNING: Image format was not specified for 'json:{"dir": ".", "driver": "vvfat"}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+
+However, since "images" provided by the vvfat driver are always raw (and the first sector isn't writeable in any case), this warning is superfluous and should not be displayed.
+
+A similar warning is displayed for NBD devices; I suspect it should be also disabled for similar reasons, but I'm not sure if serving non-raw images is actually a violation of the protocol. qemu-nbd translates them to raw images, for what it's worth, even if it may be suppressed with -f raw.
+
+Noticed on 2.3.0; the code that causes this behaviour is still apparently present in today's git master (f3a1b5068cea303a55e2a21a97e66d057eaae638). Speaking of versions: you may want to update the copyright notice that qemu -version displays.
+
+Hi,
+
+Indeed using non-raw images should not be used over NBD. The warning however is not superfluous, since qemu does indeed probe the image format, so a malicious guest might write a qcow2 header into the raw image, thus making qemu probe a qcow2 image the next time the same configuration is used. The problem would be solved by not making qemu probe the image format over NBD, but always assume raw; but I guess this will break existing use cases, even though they were wrong from the start. Anyway, this is solved by explicitly specifying the image format to be raw, which is what the warning says.
+
+When it comes to vvfat, we might actually put up another warning saying that vvfat is deprecated, but anyway: Here, too, the warning is suppressed by doing what the warning says. Use -drive format=raw,file.driver=vvfat,file.dir=. and the warning disappears (or driver=raw instead of format=raw, it's the same).
+
+Concluding: Doing what the warning says makes it disappear (-drive format=raw,…), which is, not coincidentally, the warning's purpose, actually. If we want to do something about this, we would have to allow protocols like NBD and vvfat be able to force the default image format used on top of them (i.e. raw). But this may break existing use cases, at least for NBD, so I'd be wary about that.
+
+Max
+
+On 07/15/2015 09:42 AM, Max Reitz wrote:
+> Hi,
+> 
+> Indeed using non-raw images should not be used over NBD. The warning
+> however is not superfluous, since qemu does indeed probe the image
+> format, so a malicious guest might write a qcow2 header into the raw
+> image, thus making qemu probe a qcow2 image the next time the same
+> configuration is used. The problem would be solved by not making qemu
+> probe the image format over NBD, but always assume raw; but I guess this
+> will break existing use cases, even though they were wrong from the
+> start. Anyway, this is solved by explicitly specifying the image format
+> to be raw, which is what the warning says.
+
+I could actually see the use of non-raw over NBD.  We support nested
+protocols (where you can use qcow2->qcow2->file), that is, where a file
+contains a qcow2 file whose contents are themselves a qcow2 image.
+(Perhaps useful in nested guests, where the outer qcow2 layer serves a
+disk to an L0 guest, which in turn uses the inner layer to present a
+disk to an L1 guest).  In such a case, opening just one layer of qcow2
+for service over NBD will expose the inner qcow2 image, and connecting
+qemu as an NBD client with format=raw will directly manipulate the qcow2
+data seen by the L0 guest, while connecting as an NBD client with
+format=qcow2 will see the raw data seen by the L1 guest.
+
+But it's more likely to encounter this scenario with NBD, and not with
+vvfat.
+
+> 
+> When it comes to vvfat, we might actually put up another warning saying
+> that vvfat is deprecated, but anyway: Here, too, the warning is
+> suppressed by doing what the warning says. Use -drive
+> format=raw,file.driver=vvfat,file.dir=. and the warning disappears (or
+> driver=raw instead of format=raw, it's the same).
+> 
+> Concluding: Doing what the warning says makes it disappear (-drive
+> format=raw,…), which is, not coincidentally, the warning's purpose,
+> actually. If we want to do something about this, we would have to allow
+> protocols like NBD and vvfat be able to force the default image format
+> used on top of them (i.e. raw). But this may break existing use cases,
+> at least for NBD, so I'd be wary about that.
+
+Yeah, I don't have any objections to vvfat forcing raw, but I'm very
+reluctant to have NBD force raw.
+
+-- 
+Eric Blake   eblake redhat com    +1-919-301-3266
+Libvirt virtualization library http://libvirt.org
+
+
+
+On Wed, Jul 15, 2015 at 10:54:47AM -0600, Eric Blake wrote:
+> On 07/15/2015 09:42 AM, Max Reitz wrote:
+> > Hi,
+> > 
+> > Indeed using non-raw images should not be used over NBD. The warning
+> > however is not superfluous, since qemu does indeed probe the image
+> > format, so a malicious guest might write a qcow2 header into the raw
+> > image, thus making qemu probe a qcow2 image the next time the same
+> > configuration is used. The problem would be solved by not making qemu
+> > probe the image format over NBD, but always assume raw; but I guess this
+> > will break existing use cases, even though they were wrong from the
+> > start. Anyway, this is solved by explicitly specifying the image format
+> > to be raw, which is what the warning says.
+> 
+> I could actually see the use of non-raw over NBD.  We support nested
+> protocols (where you can use qcow2->qcow2->file), that is, where a file
+> contains a qcow2 file whose contents are themselves a qcow2 image.
+> (Perhaps useful in nested guests, where the outer qcow2 layer serves a
+> disk to an L0 guest, which in turn uses the inner layer to present a
+> disk to an L1 guest).  In such a case, opening just one layer of qcow2
+> for service over NBD will expose the inner qcow2 image, and connecting
+> qemu as an NBD client with format=raw will directly manipulate the qcow2
+> data seen by the L0 guest, while connecting as an NBD client with
+> format=qcow2 will see the raw data seen by the L1 guest.
+> 
+> But it's more likely to encounter this scenario with NBD, and not with
+> vvfat.
+
+I agree that it's perfectly okay to use non-raw on top of NBD.
+
+We allow image formats on host block devices and iSCSI LUNs.  Why
+shouldn't they be allowed on NBD exports?
+
+Stefan
+
+
+> I could actually see the use of non-raw over NBD.  We support nested
+> protocols (where you can use qcow2->qcow2->file), that is, where a file
+> contains a qcow2 file whose contents are themselves a qcow2 image.
+> (Perhaps useful in nested guests, where the outer qcow2 layer serves a
+> disk to an L0 guest, which in turn uses the inner layer to present a
+> disk to an L1 guest).  In such a case, opening just one layer of qcow2
+> for service over NBD will expose the inner qcow2 image, and connecting
+> qemu as an NBD client with format=raw will directly manipulate the qcow2
+> data seen by the L0 guest, while connecting as an NBD client with
+> format=qcow2 will see the raw data seen by the L1 guest.
+
+Seems like an academic exercise, really. But if this use case is practical, I believe three levels of wrapping is just as useful, and the only way to work with that one is to run two or three instances of qemu-nbd. With more layers, the set-up quickly becomes tangled and unmanageable.
+
+And I still doubt anyone would actually want to create a set-up like this. It seems incredibly wasteful (but then, so is virtualisation in general, so maybe that isn't an issue) and doesn't seem to accomplish anything that couldn't be done with just one layer of wrapping.
+
+Looking through old bug tickets...  can you still reproduce this bug with the latest version of QEMU? At least for vvfat, the warning message does not seem to occur anymore.
+
+Yes, it does appear, you just need to make vvfat rw:
+
+$ qemu-system-x86_64 -drive file.driver=vvfat,file.dir=foo,file.rw=on
+vvfat foo chs 1024,16,63
+WARNING: Image format was not specified for 'json:{"dir": "foo", "driver": "vvfat", "rw": "on"}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+
+(The warning is not shown with R/O devices because they don’t have the security issue.)
+
+My point hasn’t changed, though,  I fundamentally agree with the points in this report, but I don‘t think “fixing” this is worth it.
+
+For NBD, “fixing” it would mean potentially breaking existing use cases (which I still don’t see the point of, but there’s no point in breaking them just to make a warning disappear).
+
+For vvfat, there are three things: First of all, I don’t like it very much, so as I said, I’d rather deprecate it altogether (though this BZ shows we shouldn’t do that).
+Secondly, in order for the warning to disappear, a protocol driver would need to enforce a certain format on top when probing.  That would require a bit of new infrastructure, although I have to admit it wouldn’t be impossible.
+Thirdly, I suppose most people use vvfat with block device options like done in the bug report?  In that case, it is trivial to add a format=raw (or driver=raw), exactly like the warning suggests.
+
+(Though you can use vvfat with a plain filename, too:
+
+$  qemu-system-x86_64 fat:32:rw:foo
+qemu-system-x86_64: warning: FAT32 has not been tested. You are welcome to do so!
+vvfat foo chs 1024,16,63
+WARNING: Image format was not specified for 'json:{"fat-type": 32, "dir": "foo", "driver": "vvfat", "floppy": false, "rw": true}' and probing guessed raw.
+         Automatically detecting the format is dangerous for raw images, write operations on block 0 will be restricted.
+         Specify the 'raw' format explicitly to remove the restrictions.
+
+)
+
+So all in all I think this is indeed kind of a bug (at least it’s a nuisance that could be better), fixing it would not be impossible, but it’s just very low on at least my priority list (probably somewhere around “implement bdrv_refresh_filename() for vvfat so you don't get the json:{} filenames you can see above”).
+
+Max
+

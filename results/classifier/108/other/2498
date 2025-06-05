@@ -1,0 +1,66 @@
+performance: 0.813
+files: 0.805
+other: 0.772
+debug: 0.753
+socket: 0.727
+PID: 0.724
+boot: 0.713
+graphic: 0.664
+permissions: 0.656
+network: 0.647
+vnc: 0.639
+semantic: 0.610
+device: 0.584
+KVM: 0.512
+
+m68k: fpu: fmovem with multiple control registers has incorrect in memory order
+Description of problem:
+It looks like the order of reading/writing registers is currently incorrect for `fmovem` with multiple fpu control registers.
+
+According to the manual:
+
+```
+The
+registers are always moved in the same order, regardless of the addressing mode
+used; the floating-point control register is moved first, followed by the floating-point
+status register, and the floating-point instruction address register is moved last.
+```
+
+Current QEMU reads/writes them in the reverse order which is fine for most things but the test cases in 147bug compare against data that is in its binary and expects the data generated in memory by the CPU to match what is in it's binary.
+
+Maybe something like this is needed:
+
+``` diff
+commit 466e8ead0115b6535e89aa2715f171112444b294 (HEAD -> m68kdt)
+Author: Daniel Palmer <daniel@thingy.jp>
+Date:   Tue Aug 13 09:52:54 2024 +0900
+
+    fix fmovem ordering
+
+diff --git a/target/m68k/translate.c b/target/m68k/translate.c
+index 92dc9d8563..64ff2df06e 100644
+--- a/target/m68k/translate.c
++++ b/target/m68k/translate.c
+@@ -4924,8 +4924,8 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
+      */
+ 
+     if (is_write && mode == 4) {
+-        for (i = 2; i >= 0; i--, mask >>= 1) {
+-            if (mask & 1) {
++        for (i = 2; i >= 0; i--, mask <<= 1) {
++            if (mask & 0b100) {
+                 gen_qemu_store_fcr(s, addr, 1 << i);
+                 if (mask != 1) {
+                     tcg_gen_subi_i32(addr, addr, opsize_bytes(OS_LONG));
+@@ -4934,8 +4934,8 @@ static void gen_op_fmove_fcr(CPUM68KState *env, DisasContext *s,
+        }
+        tcg_gen_mov_i32(AREG(insn, 0), addr);
+     } else {
+-        for (i = 0; i < 3; i++, mask >>= 1) {
+-            if (mask & 1) {
++        for (i = 2; i >= 0; i--, mask <<= 1) {
++            if (mask & 0b100) {
+                 if (is_write) {
+                     gen_qemu_store_fcr(s, addr, 1 << i);
+                 } else {
+```

@@ -1,0 +1,98 @@
+semantic: 0.952
+debug: 0.942
+graphic: 0.938
+permissions: 0.936
+other: 0.932
+device: 0.931
+boot: 0.923
+PID: 0.920
+performance: 0.918
+files: 0.913
+vnc: 0.913
+network: 0.910
+KVM: 0.880
+socket: 0.817
+
+DoS possible on - a QEMU process using userspace SLIRP?
+
+Steps to reproduce:
+
+- Launch a VM using QEMU:
+
+$ qemu-system-x86_64 -machine accel=kvm \
+                     -hda Fedora-Cloud-Base-25-1.3.x86_64.qcow2 \
+                     -m 2G \
+                     -smp 2 \
+                     -vnc :8 \
+                     -boot dc \
+                     -vga std \
+                     -cpu host \
+                     -net nic,vlan=0 \
+                     -net user,vlan=0,hostfwd=tcp::10024-:22,hostfwd=tcp::8082-:80
+
+- SSH into the VM, install httpd, start httpd
+
+$ ssh -p 10024 root@localhost 'dnf install -y httpd && systemctl start httpd'
+
+- Compile and run the following Java program:
+
+$ cat <<EOF > URLConnectionReader.java
+import java.net.*;
+import java.io.*;
+
+public class URLConnectionReader {
+    public static void main(String[] args) throws Exception {
+        int i = 0;
+        while (i < 1024) {
+            URL this_is_404 = new URL("http://localhost:8082/blah");
+            URLConnection yc = this_is_404.openConnection();
+            try {
+                BufferedReader in = new BufferedReader(new InputStreamReader(
+                            yc.getInputStream()));
+                String inputLine;
+                while ((inputLine = in.readLine()) != null)
+                    System.out.println(inputLine);
+                in.close();
+            } catch (Exception e) {
+                //HttpURLConnection urlConnection = (HttpURLConnection) yc;
+                //urlConnection.disconnect();
+            }
+            i++;
+        }
+        Thread.sleep(1000000000);
+    }
+}
+
+$ javac URLConnectionReader.java
+
+$ java URLConnectionReader &
+
+The java program tries to open a lot of HTTP connections, but never calls disconnect() on any.
+
+- Take a look at the list of open FDs of the qemu process:
+
+$ ls -tl /proc/${qemu-pid}/fd
+
+$ lsof -p ${qemu-pid}
+All of the TCP connections will be stuck at FIN_WAIT2
+
+The VM becomes unresponsive. Neither SSH or VNC works on this.
+
+Unless I'm mis-understanding what you're saying you have an app which opens 100's of TCP conenctions in the guest, and this causes QEMU to have 100's of file descriptors open in the host. 
+
+If so, this is normal behaviour of SLIRP - it opens a socket for every connection it has to proxy across from the guest, so the number of file descriptors it will use is essentially unbounded. If this is a concern, then the best answer is to not use SLIRP.
+
+But lsof shows that all connections are stuck at FIN_WAIT2 for an indefinite amount of time. Is that expected? 
+
+IIUC, a socket staying around in FIN_WAIT2 state means that a socket has been closed in one direction, but not the other direction. Assuming SLIRP is just mirroring what the guest OS has done with the socket shutdown process, this would be expected.
+
+Responding to comment #1:
+
+Nehal's scenario seems to be the other way round. An external application hammers on QEMU with bogus http requests, httpd within the guest closes the socket, but the external application doesn't and QEMU stays with tons of dangling sockets, and "The VM becomes unresponsive. Neither SSH or VNC works after this; even after tcp_fin_timeout expires."
+
+This being said maybe the answer is don't ever use SLIRP if you don't trust both ends of network connections (which sounds a bit like don't ever use SLIRP to me).
+
+
+Slirp has been moved to an external project now. If this is still an issue, please report the problem there instead:
+https://gitlab.freedesktop.org/slirp/libslirp
+

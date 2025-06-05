@@ -1,0 +1,87 @@
+other: 0.738
+debug: 0.724
+graphic: 0.717
+semantic: 0.710
+KVM: 0.705
+permissions: 0.701
+performance: 0.698
+device: 0.694
+PID: 0.689
+vnc: 0.673
+files: 0.661
+socket: 0.641
+boot: 0.627
+network: 0.587
+
+qemu-ppc segfaults(SIGSEGV) on pthread_create
+
+qemu-ppc running on x86-64 hardware leads to a segfault when running the
+attached program (test.c). It simply creates a pthread, joins it and exits.
+
+It was compiled as follows on a Debian testing system:
+> powerpc-linux-gnuspe-gcc-6 -static -Wall -g -o test -pthread test.c
+
+Sample execution (expected output is "Hello - World!"):
+> qemu-ppc -cpu e500 ./test
+[...output...]
+Hello - qemu-ppc: /build/qemu-_M2UL5/qemu-2.8+dfsg/translate-all.c:175: tb_lock: Assertion `!have_tb_lock' failed.
+qemu-ppc: /build/qemu-_M2UL5/qemu-2.8+dfsg/translate-all.c:175: tb_lock: Assertion `!have_tb_lock' failed.
+[1]    25747 segmentation fault  qemu-ppc -cpu e500 test
+[...end output...]
+
+The same behavior is observed when running on a PPC 604:
+
+> powerpc-linux-gnu-gcc -Wall -g -o test -pthread test.c
+> qemu-ppc ./test
+[... as above ...]
+
+Version information:
+powerpc-linux-gnu-gcc -v => gcc version 6.3.0 20170124 (Debian 6.3.0-5)
+qemu-ppc -version => qemu-ppc version 2.8.0(Debian 1:2.8+dfsg-2)
+
+The same experiment was conducted again using qemu from the git repository (commit: 796b288f7be875045670f963ce99991b3c8e96ac):
+~/tools/qemu/build/ppc-linux-user/qemu-ppc -version => qemu-ppc version 2.8.50 (v2.8.0-1417-g796b288f7b-dirty)
+[...output...]
+Hello - qemu-ppc: [...redacted...]/tools/qemu/translate-all.c:175: tb_lock: Assertion `!have_tb_lock' failed.
+qemu-ppc: [...redacted...]/tools/qemu/translate-all.c:175: tb_lock: Assertion `!have_tb_lock' failed.
+[1]    25996 segmentation fault  ~/tools/qemu/build/ppc-linux-user/qemu-ppc -cpu e500 test
+[...end output...]
+
+
+Executing with -strace option yields a surprising entry (see second clone() syscall below):
+[...]
+26007 clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID,child_stack=0xf67fde60,parent_tidptr=0xf67fe368,tls=0xf68057d0,child_tidptr=0xf67fe368) = 26009
+26007 clone(0,child_stack=0xf67fde60,parent_tidptr=0xf67fe368,tls=0xf68057d0,child_tidptr=0xf67fe368) = -1 errno=22 (Invalid argument)
+
+
+test.c works just fine if the pthread_create & pthread_join calls are removed
+(i.e. when compiled with -DNO_PTHREAD_CREATE).
+
+At first glance, the issue seems specific to PPC because compiling and running
+for x86_64 using qemu-x86_64 works fine.
+
+
+Additional info:
+> lddtree =qemu-ppc
+qemu-ppc => /usr/bin/qemu-ppc (interpreter => /lib64/ld-linux-x86-64.so.2)
+    libgmodule-2.0.so.0 => /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0
+        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2
+            ld-linux-x86-64.so.2 => /lib64/ld-linux-x86-64.so.2
+    libglib-2.0.so.0 => /lib/x86_64-linux-gnu/libglib-2.0.so.0
+        libpcre.so.3 => /lib/x86_64-linux-gnu/libpcre.so.3
+    librt.so.1 => /lib/x86_64-linux-gnu/librt.so.1
+    libm.so.6 => /lib/x86_64-linux-gnu/libm.so.6
+    libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1
+    libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0
+    libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6
+
+> /lib/x86_64-linux-gnu/libc.so.6
+GNU C Library (Debian GLIBC 2.24-9) stable release version 2.24, by Roland McGrath et al.
+
+> uname -a
+Linux [...redacted...] 4.9.0-1-amd64 #1 SMP Debian 4.9.6-3 (2017-01-28) x86_64 GNU/Linux
+
+
+
+Fixed by commit 2635531f2006bfb0f943ad25b41e176709b79b37 (available in 2.9.0rc0)
+

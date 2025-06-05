@@ -1,0 +1,128 @@
+other: 0.953
+semantic: 0.946
+permissions: 0.931
+files: 0.929
+PID: 0.927
+debug: 0.926
+device: 0.919
+performance: 0.914
+graphic: 0.887
+boot: 0.852
+vnc: 0.845
+socket: 0.810
+network: 0.741
+KVM: 0.721
+
+qemu-system-arm segfaults while servicing SYS_HEAPINFO
+
+I compiled QEMU version 5.2.0 from source on Ubuntu 18.04, and tried to use it to run the attached bare-metal Arm hello-world image, using the command line
+
+qemu-system-arm -M microbit -semihosting -nographic -device loader,file=hello.hex
+
+The result was that qemu-system-arm itself died of a segfault. Compiling it for debugging, the location of the segfault was in target/arm/arm-semi.c, in the case handler for the semihosting call TARGET_SYS_HEAPINFO, on line 1020 which assigns to 'rambase':
+
+            const struct arm_boot_info *info = env->boot_info;
+            target_ulong rambase = info->loader_start;
+
+and the problem seems to be that 'info', aka env->boot_info, is NULL in this context.
+
+
+
+Note that this only happens for M-profile in system emulation mode.
+
+
+...oh, and also for A-profile where we do a boot of firmware and not a Linux-kernel style boot.
+
+Testing with:
+
+Subject: [PATCH  v5 0/5] semihosting/next (SYS_HEAPINFO)
+Date: Fri, 12 Mar 2021 10:20:24 +0000
+Message-Id: <email address hidden>
+
+it doesn't seem to segfault QEMU anymore although the guest itself hangs which probably means it's not happy with the numbers it got.
+
+Ends doing:
+
+(gdb)
+0x00000ce4 in ?? ()
+=> 0xce4:       b.n     0xce4
+
+
+I think this was fixed earlier by:
+
+commit 095f8c029319b79cce487e3b566cd826b93da3e6
+Author: Keith Packard <email address hidden>
+Date:   Fri Jan 8 22:42:51 2021 +0000
+
+    semihosting: Support SYS_HEAPINFO when env->boot_info is not set
+
+    env->boot_info is only set in some ARM startup paths, so we cannot
+    rely on it to support the SYS_HEAPINFO semihosting function. When not
+    available, fallback to finding a RAM memory region containing the
+    current stack and use the base of that.
+
+    Signed-off-by: Keith Packard <email address hidden>
+    Signed-off-by: Alex Bennée <email address hidden>
+    Message-Id: <email address hidden>
+    Message-Id: <email address hidden>
+
+Not withstanding the other fix to the ARG usage.
+
+Looking at the current stack seems an odd approach, because often semihosting guest programs use HEAPINFO to find out what they should set SP to in the first place...
+
+
+I think this is fixed now - it would be useful if the OP could confirm with the current state of master.
+
+I think there's still work to do here -- we don't properly tell semihosting where the memory is on M-profile or in all A-profile cases. I don't think that "look at the stack pointer" is a very good heuristic.
+
+
+Firstly, I agree with Peter's comment – this test image is exactly an example of what he describes, in that it carefully doesn't make any use of the value of SP it started up with (doesn't push or pop anything, doesn't make sp-relative offsets). Very near the start, it invokes SYS_HEAPINFO to decide what to set SP to.
+
+I retried the image with qemu master, running qemu-system-arm itself inside gdb to help figure out what was going on. What seems to happen, in detail, is:
+
+1. common_semi_find_region_base falls through to the fallback "return 0;" at the end of the function, because the iteration found no subregion at all with subregion->ram set to true. In fact the five regions it iterated through were:
+addr = 0x4000a000, size = 0x1000, ram = 0x0, readonly = 0x0
+addr = 0x40009000, size = 0x1000, ram = 0x0, readonly = 0x0
+addr = 0x40008000, size = 0x1000, ram = 0x0, readonly = 0x0
+addr = 0xf0000000, size = 0x10000000, ram = 0x0, readonly = 0x0
+addr = 0x40000000, size = 0x20000000, ram = 0x0, readonly = 0x0
+
+2. So common_semi_rambase returns zero to the TARGET_SYS_HEAPINFO handler in do_common_semihosting().
+
+3. current_machine->ram_size is set to 0x8000000, and with rambase=0, the SYS_HEAPINFO handler ends up computing the following values in retvals[]:
+retvals[0] (heap base)   = 0x4000000
+retvals[1] (heap limit)  = 0x8000000
+retvals[2] (stack base)  = 0x8000000
+retvals[3] (stack limit) = 0x0
+
+4. The setup code faithfully initializes sp to 0x8000000, and then crashes on the first PUSH instruction that the program executes:
+0x00001950:  b5b0       push     {r4, r5, r7, lr}
+
+5. That's how we end up in the tight loop at 0xce4 as mentioned above: in this test image, that's the address of the dummy handler for (among other things) memory faults.
+
+The emulated machine definitely has some RAM at 0x20000000, because that's where the SYS_HEAPINFO output block was, and the semihosting code was happy to write to there. So I think SYS_HEAPINFO surely _ought_ to have returned some heap and stack values in that region. And the reason it didn't was that for some reason it didn't find any RAM regions at all in the iteration through get_system_memory()->subregions.
+
+So I think there are still two problems. Using the input value of SP to decide which RAM region to return is surely the wrong policy, because SP is literally uninitialised at this point. But also, finding any RAM regions *at all* seems to be failing in this case.
+
+Oops – naturally, I realised just *after* hitting send that it would have been a good idea to say exactly which git commit I was testing on. It was 9e2e9fe3df9f539f8b6941ceb96d25355fdae47e .
+
+Since this is an M-profile board, "SP is literally uninitialised at this point" isn't correct unless the loaded image failed to provide a valid vector table, because M-profile loads the initial SP from there. Generally for bare metal programs, the linker has a much better idea of what would be a good stack and heap than QEMU can have.
+
+
+Yes, fair enough. I suppose what I meant was that that particular part of the startup code was *regarding* SP as being uninitialised: it didn't read it, or use it, or set it on purpose to any kind of interim temp value before calling SYS_HEAPINFO.
+
+It's true, of course, that this particular image does include an M-profile vector table that sets sp = 0x20004000 at startup. But the code (from newlib startup) that calls SYS_HEAPINFO is apparently intended to be generic enough not to depend on that, so in a different context, it might perfectly well be run with total nonsense in sp and expect to be able to get away with not doing anything about that until it gets back a more sensible value from semihosting.
+
+The state of this bug is "Fix committed", but the last comments look like there is still work to do ... should this get reset to "New" or can we close this bug now?
+
+I still want to look at this.
+
+
+
+This is an automated cleanup. This bug report has been moved
+to QEMU's new bug tracker on gitlab.com and thus gets marked
+as 'expired' now. Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/61
+
+

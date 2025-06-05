@@ -1,0 +1,622 @@
+permissions: 0.760
+semantic: 0.692
+graphic: 0.690
+debug: 0.669
+other: 0.659
+network: 0.626
+PID: 0.618
+device: 0.589
+performance: 0.552
+vnc: 0.488
+socket: 0.486
+boot: 0.428
+files: 0.384
+KVM: 0.319
+
+QEMU x87 emulation of trig and other complex ops is only at 64-bit precision, not 80-bit
+
+When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+
+Regression testing errors:
+
+test_cmath
+test test_cmath failed -- Traceback (most recent call last):
+  File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+    self.fail(error_message)
+AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+Received: complex(3.141592653589793, -2.1073424338879928e-08)
+Received value insufficiently close to expected value.
+
+
+test_float
+test test_float failed -- Traceback (most recent call last):
+  File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+    self.assertEqual(s, repr(float(s)))
+AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+
+
+test_math
+test test_math failed -- multiple errors occurred; run in verbose mode for deta
+
+=>
+
+runtests.sh -v test_math
+
+le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+test_math BAD
+ 1 BAD
+ 0 GOOD
+ 0 SKIPPED
+ 1 total
+le01:~/tools/python3/Python-3.1.2#
+
+Just found time to look a bit deeper into this. The problem is in the (real) asinh() function. 
+I think it is possible that somewhere a calculation was done in float instead of double or a double value was shortened to float.
+Please note that until this is fixed, qemu i386 is not IEEE754 conform.
+
+Minimal test code in c:
+---
+#include <stdio.h>
+#include <math.h>
+
+int main(){ /* compile with gcc -lm test.c */
+  double x, y;
+  x = -2.1073424255447017e-08;
+  y = asinh(x);
+  printf("y =         %20.16e\n",y);
+  printf("should be   -2.1073424255447017e-08\n");
+}
+
+---
+
+
+Forgot so say: This is still present in 0.13.0.
+
+And I unexpectedly had more time to dig.
+
+Findings:
+
+  - asinh() is not in IEEE754, please ignore my comment about
+    non-conformity, sorry.
+  - The calculation for asinh() is pretty badly conditioned, i.e.
+    it blows up errors in the basic calculations.
+  - asinh() is implemented in glibc in assembler on the FPU stack.   
+    This would mean 80 bits float representation.
+
+Error observations: 
+
+  Calculations for asinh( -2.1073424255447017e-08), derived from
+  the Python 3.1.2 selftest. Formula is asinh(x) = log(x+sqrt(x*x+1))
+  Reference is a calculation with long double (128 bit)
+
+  - qemu:           6 correct digits behind the dot
+  - C with double:  7 correct digits behind the dot
+  - i387:          10 correct digits behind the dot
+
+Possible root cause:
+
+   The observed error may be due to qemu using 64 bit double math in
+   the FPU implementation, instead of the 80 bit internal precision   
+   a real i387 uses.
+
+Comparison with kernel i387 emulation
+
+   As an additional verification, I tried the calculations using the
+   Linux kernel coprocessor emulation. This basically failed. With
+   kernel 2_6_26 and 2_6_27 and the ''no387'' flag, the kernel locked
+   up without output early during boot. With 2.6.34, I could not do
+   an ssh login. I may try this again later, and especially try
+   to find out what is wrong with qemu and 2.6.34.
+
+Consequences:
+
+  1) qemu is significantly less accurate for some mathematics than a
+     genuine i387. This may cause problesm with sensitive mathematics
+     developed on a real i387.
+  2) qemu can be fingerprinted easily using this problem. This may
+     have security implications.
+
+Fix Options:
+
+  1) - Moving the FPU internal representation to long double. It will
+       still not be the same results as on an  i387, but it will be
+       _more_ accurate instead of less, which generally is far less
+       of a problem.
+
+       Pro:  Higher accuracy
+       Cons: Slower
+
+     - Use code derived from the Linux kernel i387 FPU emulator.
+       The emulator is not bit-exact, but relatively close and it
+       is used at least on some small x86 architectures.
+
+       Pro:  Higher accuracy
+       Cons: Need to integrate foreign code
+
+     - Leave it as it is but add a clear warning to the "Known qemu
+       Problems" Section in the manual and Wiki (I did not find one, I
+       think it should be added in an easily findable place), that
+       i387 FPU emulation is only 64 bits internally and may be less
+       exact for combined calculations done on the FPU stack, such
+       as asinh() in glibc(), than a real i387.
+
+       You may recommend to use kernel FPU emulation, but
+       this may not work or be a pain to get working.
+
+       Pro: Least work
+       Cons: Not really a solution 
+
+2) Fixing this is difficult and there are other ways to find
+     out that you are running in qemu anyways. I think the security
+     implications are insiginficant in most cases.
+
+
+
+
+
+
+
+Can you still reproduce this problem with the latest version of QEMU? As far as I know, the FPU emulation has been completely switched to softfloat with the latest versions, so I assume your problem might be fixed in recent releases...
+
+Hi,
+
+I just tried for about 2 hours without success or getting any useful 
+diagnostic to compile and run current qemu 2.8. No console,
+no window opens, -curses does not work in .configure, despite
+ncurses-dev being installed, etc. 
+
+Quite frankly, as I have not used qemu for several years now, 
+I cannot be bothered to fight through an apparently mostly
+broken build and install process. I did include two diagnostic
+options in my bug-report, please try them out yourself.
+
+Regards,
+Arno
+
+On Thu, Jan 19, 2017 at 09:34:56 CET, Thomas Huth wrote:
+> Can you still reproduce this problem with the latest version of QEMU? As
+> far as I know, the FPU emulation has been completely switched to
+> softfloat with the latest versions, so I assume your problem might be
+> fixed in recent releases...
+> 
+> ** Changed in: qemu
+>        Status: New => Incomplete
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/645662
+> 
+> Title:
+>   Python 3.1.2 math errors with Qemu 0.12.5
+> 
+> Status in QEMU:
+>   Incomplete
+> 
+> Bug description:
+>   When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+>   gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+>   3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+>   on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+> 
+>   Regression testing errors:
+> 
+>   test_cmath
+>   test test_cmath failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+>       self.fail(error_message)
+>   AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+>   Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+>   Received: complex(3.141592653589793, -2.1073424338879928e-08)
+>   Received value insufficiently close to expected value.
+> 
+>   
+>   test_float
+>   test test_float failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+>       self.assertEqual(s, repr(float(s)))
+>   AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+> 
+>   
+>   test_math
+>   test test_math failed -- multiple errors occurred; run in verbose mode for deta
+> 
+>   =>
+> 
+>   runtests.sh -v test_math
+> 
+>   le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+>   test_math BAD
+>    1 BAD
+>    0 GOOD
+>    0 SKIPPED
+>    1 total
+>   le01:~/tools/python3/Python-3.1.2#
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/645662/+subscriptions
+
+-- 
+Arno Wagner,     Dr. sc. techn., Dipl. Inform.,    Email: <email address hidden>
+GnuPG: ID: CB5D9718  FP: 12D6 C03B 1B30 33BB 13CF  B774 E35C 5FA1 CB5D 9718
+----
+A good decision is based on knowledge and not on numbers. -- Plato
+
+If it's in the news, don't worry about it.  The very definition of 
+"news" is "something that hardly ever happens." -- Bruce Schneier
+
+
+Looks like your test code from comment #1 still prints out a wrong value, so the bug has apparently not been fixed by the FPU updates...
+
+I had a brief look at softfloat. In principle, it should fix the 
+issue, but only if the FPU uses 80-bit double-extended-precision
+internally. I guess the qemu FPU is still stuck at 64 bit double
+internally and that does not cut it for some calculations.
+
+Just to be sure, I re-tested the code from comment 1 and it does
+work as expected with a real FPU.
+
+Regards,
+Arno
+
+
+On Mon, Jan 23, 2017 at 22:20:18 CET, Thomas Huth wrote:
+> Looks like your test code from comment #1 still prints out a wrong
+> value, so the bug has apparently not been fixed by the FPU updates...
+> 
+> ** Changed in: qemu
+>        Status: Incomplete => Triaged
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/645662
+> 
+> Title:
+>   Python 3.1.2 math errors with Qemu 0.12.5
+> 
+> Status in QEMU:
+>   Triaged
+> 
+> Bug description:
+>   When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+>   gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+>   3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+>   on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+> 
+>   Regression testing errors:
+> 
+>   test_cmath
+>   test test_cmath failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+>       self.fail(error_message)
+>   AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+>   Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+>   Received: complex(3.141592653589793, -2.1073424338879928e-08)
+>   Received value insufficiently close to expected value.
+> 
+>   
+>   test_float
+>   test test_float failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+>       self.assertEqual(s, repr(float(s)))
+>   AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+> 
+>   
+>   test_math
+>   test test_math failed -- multiple errors occurred; run in verbose mode for deta
+> 
+>   =>
+> 
+>   runtests.sh -v test_math
+> 
+>   le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+>   test_math BAD
+>    1 BAD
+>    0 GOOD
+>    0 SKIPPED
+>    1 total
+>   le01:~/tools/python3/Python-3.1.2#
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/645662/+subscriptions
+
+-- 
+Arno Wagner,     Dr. sc. techn., Dipl. Inform.,    Email: <email address hidden>
+GnuPG: ID: CB5D9718  FP: 12D6 C03B 1B30 33BB 13CF  B774 E35C 5FA1 CB5D 9718
+----
+A good decision is based on knowledge and not on numbers. -- Plato
+
+If it's in the news, don't worry about it.  The very definition of 
+"news" is "something that hardly ever happens." -- Bruce Schneier
+
+
+softfloat deals with doing the basic IEEE ops (add, subtract, multiply, etc) at the correct 80 bit precision, but it doesn't provide implementations of the x87's more complex operations (sin, cos, log, etc), so QEMU is still doing those by converting from 80 bit to host double and using the host C math library routines. Fixing this would require writing hand-coded routines for all these operations, which is quite a tricky bit of work. (Sadly we can't just use the bochs implementations, because they're under the softfloat2b license which isn't GPL2 compatible.)
+
+
+Laurent Vivier recently started to adapt some of function from the "Previous" NeXT emulator for m68k, see e.g. this patch series here:
+
+ https://lists.gnu.org/archive/html/qemu-devel/2017-11/msg04454.html
+
+Not sure, but I think that could help to fix at least some of the missing functions.
+
+That explains it. For most operations that approach works well as basically nobody uses the 80 bit formats directly anyways. Unfortunately asinh() is very badly conditioned in the region tested and it is not enough. 
+
+A possible approach to fix this would be to use long double (128 bit) were available instead of just double and to document this limitation for double. 
+
+The test code from comment #1 now prints out the correct value with QEMU v4.1, so I think this has been fixed with the softfloat work that has been done within the last year.
+
+To be sure, you can also run my original C test code from
+2010. If that produces a bit-identtical result, then this
+has indeed been fixed. If there are deviations in the last
+digits, then the fingerprinting issues is still there, but
+at least Python has stopped complaining.
+
+Regards,
+Arno
+
+On Fri, Aug 16, 2019 at 07:47:59 CEST, Thomas Huth wrote:
+> The test code from comment #1 now prints out the correct value with QEMU
+> v4.1, so I think this has been fixed with the softfloat work that has
+> been done within the last year.
+> 
+> ** Changed in: qemu
+>        Status: Confirmed => Fix Released
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/645662
+> 
+> Title:
+>   QEMU x87 emulation of trig and other complex ops is only at 64-bit
+>   precision, not 80-bit
+> 
+> Status in QEMU:
+>   Fix Released
+> 
+> Bug description:
+>   When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+>   gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+>   3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+>   on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+> 
+>   Regression testing errors:
+> 
+>   test_cmath
+>   test test_cmath failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+>       self.fail(error_message)
+>   AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+>   Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+>   Received: complex(3.141592653589793, -2.1073424338879928e-08)
+>   Received value insufficiently close to expected value.
+> 
+>   
+>   test_float
+>   test test_float failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+>       self.assertEqual(s, repr(float(s)))
+>   AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+> 
+>   
+>   test_math
+>   test test_math failed -- multiple errors occurred; run in verbose mode for deta
+> 
+>   =>
+> 
+>   runtests.sh -v test_math
+> 
+>   le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+>   test_math BAD
+>    1 BAD
+>    0 GOOD
+>    0 SKIPPED
+>    1 total
+>   le01:~/tools/python3/Python-3.1.2#
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/645662/+subscriptions
+
+-- 
+Arno Wagner,     Dr. sc. techn., Dipl. Inform.,    Email: <email address hidden>
+GnuPG: ID: CB5D9718  FP: 12D6 C03B 1B30 33BB 13CF  B774 E35C 5FA1 CB5D 9718
+----
+A good decision is based on knowledge and not on numbers. -- Plato
+
+If it's in the news, don't worry about it.  The very definition of 
+"news" is "something that hardly ever happens." -- Bruce Schneier
+
+
+Looking at our code we're still implementing the x87 insns FSIN, FCOS, FSINCOS, FPTAN, FPATAN, F2XM1, FYL2X, FYL2XP1 by "convert the floatx80 to a host double and use the host C library functions", so I think this bug is still unfixed. If the C program in comment 1 and/or the Python code has stopped reporting failures it's probably just because the guest C library routines have stopped using the x87 80-bit FPU instructions internally.
+
+
+Fine by me. I suggest to keep tracking this though, if necessary
+in another bug item.
+
+Regards,
+Arno
+
+
+On Fri, Aug 16, 2019 at 16:06:29 CEST, Peter Maydell wrote:
+> Looking at our code we're still implementing the x87 insns FSIN, FCOS,
+> FSINCOS, FPTAN, FPATAN, F2XM1, FYL2X, FYL2XP1 by "convert the floatx80
+> to a host double and use the host C library functions", so I think this
+> bug is still unfixed. If the C program in comment 1 and/or the Python
+> code has stopped reporting failures it's probably just because the guest
+> C library routines have stopped using the x87 80-bit FPU instructions
+> internally.
+> 
+> 
+> ** Changed in: qemu
+>        Status: Fix Released => Confirmed
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/645662
+> 
+> Title:
+>   QEMU x87 emulation of trig and other complex ops is only at 64-bit
+>   precision, not 80-bit
+> 
+> Status in QEMU:
+>   Confirmed
+> 
+> Bug description:
+>   When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+>   gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+>   3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+>   on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+> 
+>   Regression testing errors:
+> 
+>   test_cmath
+>   test test_cmath failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+>       self.fail(error_message)
+>   AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+>   Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+>   Received: complex(3.141592653589793, -2.1073424338879928e-08)
+>   Received value insufficiently close to expected value.
+> 
+>   
+>   test_float
+>   test test_float failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+>       self.assertEqual(s, repr(float(s)))
+>   AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+> 
+>   
+>   test_math
+>   test test_math failed -- multiple errors occurred; run in verbose mode for deta
+> 
+>   =>
+> 
+>   runtests.sh -v test_math
+> 
+>   le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+>   test_math BAD
+>    1 BAD
+>    0 GOOD
+>    0 SKIPPED
+>    1 total
+>   le01:~/tools/python3/Python-3.1.2#
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/645662/+subscriptions
+
+-- 
+Arno Wagner,     Dr. sc. techn., Dipl. Inform.,    Email: <email address hidden>
+GnuPG: ID: CB5D9718  FP: 12D6 C03B 1B30 33BB 13CF  B774 E35C 5FA1 CB5D 9718
+----
+A good decision is based on knowledge and not on numbers. -- Plato
+
+If it's in the news, don't worry about it.  The very definition of 
+"news" is "something that hardly ever happens." -- Bruce Schneier
+
+
+For 5.1 (commits 1f18a1e6ab8368a4, 5eebc49d2d0aa5fc7e, 5ef396e2ba865f34a, eca30647fc078f4) we reimplemented FPATAN, FYL2X, FYL2XP1, FPREM, FPREM1, F2XM1 to do proper 80-bit precision operations. However the trig operations FPTAN, FSINCOS, FSIN, FCOS are still implemented as naive "convert to host double and use host C library functions".
+
+
+Talk about a "blast form the past!" This Bug is now over 10 years old. 
+But at least somebody is still working on it and it was not
+just quietly dropped. I can respect that. 
+
+My original recommendation stands: At least use long double for the
+calcuations where available. 
+
+Regards,
+Arno
+
+On Sun, Nov 22, 2020 at 00:21:50 CET, Peter Maydell wrote:
+> For 5.1 (commits 1f18a1e6ab8368a4, 5eebc49d2d0aa5fc7e,
+> 5ef396e2ba865f34a, eca30647fc078f4) we reimplemented FPATAN, FYL2X,
+> FYL2XP1, FPREM, FPREM1, F2XM1 to do proper 80-bit precision operations.
+> However the trig operations FPTAN, FSINCOS, FSIN, FCOS are still
+> implemented as naive "convert to host double and use host C library
+> functions".
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/645662
+> 
+> Title:
+>   QEMU x87 emulation of trig and other complex ops is only at 64-bit
+>   precision, not 80-bit
+> 
+> Status in QEMU:
+>   Confirmed
+> 
+> Bug description:
+>   When doing the regression tests for Python 3.1.2 with Qemu 0.12.5, (Linux version 2.6.26-2-686 (Debian 2.6.26-25lenny1)),
+>   gcc (Debian 4.3.2-1.1) 4.3.2, Python compiled from sources within qemu,
+>   3 math tests fail, apparently because the floating point unit is buggy. Qmeu was compiled from original sources
+>   on Debian Lenny with kernel  2.6.34.6 from kernel.org, gcc  (Debian 4.3.2-1.1) 4.3. 
+> 
+>   Regression testing errors:
+> 
+>   test_cmath
+>   test test_cmath failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_cmath.py", line 364, in
+>       self.fail(error_message)
+>   AssertionError: acos0034: acos(complex(-1.0000000000000002, 0.0))
+>   Expected: complex(3.141592653589793, -2.1073424255447014e-08)
+>   Received: complex(3.141592653589793, -2.1073424338879928e-08)
+>   Received value insufficiently close to expected value.
+> 
+>   
+>   test_float
+>   test test_float failed -- Traceback (most recent call last):
+>     File "/root/tools/python3/Python-3.1.2/Lib/test/test_float.py", line 479, in
+>       self.assertEqual(s, repr(float(s)))
+>   AssertionError: '8.72293771110361e+25' != '8.722937711103609e+25'
+> 
+>   
+>   test_math
+>   test test_math failed -- multiple errors occurred; run in verbose mode for deta
+> 
+>   =>
+> 
+>   runtests.sh -v test_math
+> 
+>   le01:~/tools/python3/Python-3.1.2# ./runtests.sh -v test_math
+>   test_math BAD
+>    1 BAD
+>    0 GOOD
+>    0 SKIPPED
+>    1 total
+>   le01:~/tools/python3/Python-3.1.2#
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/645662/+subscriptions
+
+-- 
+Arno Wagner,     Dr. sc. techn., Dipl. Inform.,    Email: <email address hidden>
+GnuPG: ID: CB5D9718  FP: 12D6 C03B 1B30 33BB 13CF  B774 E35C 5FA1 CB5D 9718
+----
+A good decision is based on knowledge and not on numbers. -- Plato
+
+If it's in the news, don't worry about it.  The very definition of 
+"news" is "something that hardly ever happens." -- Bruce Schneier
+
+
+In the meantime, target/m68k has implemented these trig
+functions for its (only slightly different) 96-bit
+extended-float format.
+
+With a minor amount of work this code could be shared.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/83
+
+

@@ -1,0 +1,130 @@
+device: 0.959
+permissions: 0.959
+vnc: 0.951
+other: 0.949
+graphic: 0.945
+semantic: 0.945
+performance: 0.942
+PID: 0.926
+boot: 0.922
+socket: 0.919
+debug: 0.914
+KVM: 0.906
+files: 0.903
+network: 0.790
+
+[SPARC/Leon3] Application compiled by RCC 1.2 won't start
+Description of problem:
+Even simple "hello world" application compiled by Gaisler RCC 1.2 compiler ("space-certified" GCC 4.4.6 with RTEMS OS) for Leon3 CPU won't start on QEMU - QEMU silently exits before getting into `Init`.
+
+In real hardware it works.
+
+(I know that the GCC 4.4.6 is quite ancient now, usage of this toolchain is forced)
+Steps to reproduce:
+Steps provided for Windows system, but I suspect it works exactly the same in Linux system.
+
+1. Get `sparc-rtems-4.10-gcc-4.4.6-1.2.25-mingw` GCC from here: https://www.gaisler.com/anonftp/rcc/rcc-1.2/1.2.25/
+2. Unpack it to `c:\opt` (it doesn't work from other directories. `/opt` for Linux)
+3. Create simple "Hello world" RTEMS application.
+4. Run it by `qemu-system-sparc -machine leon3_generic -nographic -monitor null -serial stdio -m 64M -kernel fail.elf`
+5. Result is exiting before getting into `Init`.
+
+Simple example attached (with ELF). It should print `It works. Exiting.` and exit.
+
+[leon3-rcc-start-fail.zip](/uploads/69d79dcc496e86bb07d5c69212d94ced/leon3-rcc-start-fail.zip)
+Additional information:
+Log:
+
+```
+...
+
+----------------
+IN: ambapp_for_each_dev
+0x40005430:  clr  %o0   ! 0x0
+0x40005434:  ret
+0x40005438:  restore  %g0, %o0, %o0
+
+----------------
+IN: amba_initialize
+0x40003aa8:  cmp  %o0, 0
+0x40003aac:  be  0x40003b4c
+0x40003ab0:  nop
+
+----------------
+IN: amba_initialize
+0x40003b4c:  mov  1, %g1
+0x40003b50:  ta  0
+
+     1: Trap Instruction (v=80)
+pc: 40003b50  npc: 40003b54
+%g0-7: 00000000 00000001 00000000 00000000 00000000 00000000 400007c0 00000000
+%o0-7: 00000000 00000034 00000001 0000000d 40004b04 00000000 43fffe60 40003aa0
+%l0-7: 40025800 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+%i0-7: 00000000 00000000 00000000 00000000 00000000 00000000 43fffec0 40002b78
+psr: f3400fe5 (icc: -Z-- SPE: SPE) wim: 00000002
+fsr: 00000000 y: ffffffff
+
+----------------
+IN:
+0x40003a18:  cmp  %g1, 3
+0x40003a1c:  bne  0x40003a34
+0x40003a20:  and  %i0, 0xf00, %l4
+
+----------------
+IN:
+0x40003a34:  ta  0
+
+     2: Trap Instruction (v=80)
+pc: 40003a34  npc: 40003a38
+%g0-7: 00000000 00000001 00000000 00000000 00000000 00000000 400007c0 00000000
+%o0-7: 00000000 00000034 00000001 0000000d 40004b04 00000000 43fffe00 40005470
+%l0-7: f3400fc4 40003b50 40003b54 00000080 00000000 40026ab8 00000000 fffff800
+%i0-7: 00000000 00000034 00000001 0000000d 40004b04 00000000 43fffe60 40003aa0
+psr: f3900fc4 (icc: N--C SPE: SP-) wim: 00000002
+fsr: 00000000 y: ffffffff
+
+     3: Trap Instruction (v=80)
+pc: 40003a34  npc: 40003a38
+%g0-7: 00000000 00000001 00000000 00000000 00000000 00000000 400007c0 00000000
+%o0-7: 00000000 00000034 00000001 0000000d 40004b04 00000000 43fffe00 40005470
+%l0-7: f3400fc4 40003b50 40003b54 00000080 00000000 40026ab8 00000000 fffff800
+%i0-7: 00000000 00000034 00000001 0000000d 40004b04 00000000 43fffe60 40003aa0
+psr: f3900fc4 (icc: N--C SPE: SP-) wim: 00000002
+fsr: 00000000 y: ffffffff
+
+// repeating until sudden and quiet exit from QEMU
+```
+
+After digging it seems that target code requires byte access to GRLIB APB PNP registers that is not implemented in QEMU now. 
+Adding code supporting byte access seems to help.
+
+The quick patch is:
+
+```
+--- a/hw/misc/grlib_ahb_apb_pnp.c
++++ b/hw/misc/grlib_ahb_apb_pnp.c
+@@ -249,6 +249,11 @@ static uint64_t grlib_apb_pnp_read(void *opaque, hwaddr offset, unsigned size)
+     val = apb_pnp->regs[offset >> 2];
+     trace_grlib_apb_pnp_read(offset, val);
+ 
++    if (size == 1) {
++        val >>= (24 - (offset & 3) * 8);
++        val &= 0x0ff;
++    }
++
+     return val;
+ }
+ 
+@@ -263,7 +268,7 @@ static const MemoryRegionOps grlib_apb_pnp_ops = {
+     .write      = grlib_apb_pnp_write,
+     .endianness = DEVICE_BIG_ENDIAN,
+     .impl = {
+-        .min_access_size = 4,
++        .min_access_size = 1,
+         .max_access_size = 4,
+     },
+ };
+
+```
+
+The custom compiled QEMU with this patch is used in project for over half a year and it works fine, but I don't know if it is a proper fix.

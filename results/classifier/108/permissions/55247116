@@ -1,0 +1,1320 @@
+permissions: 0.946
+other: 0.945
+debug: 0.941
+performance: 0.938
+graphic: 0.933
+PID: 0.929
+socket: 0.929
+semantic: 0.928
+device: 0.919
+boot: 0.918
+network: 0.916
+vnc: 0.916
+files: 0.912
+KVM: 0.894
+
+[Qemu-devel]  [RFC/BUG] xen-mapcache: buggy invalidate map cache?
+
+Hi,
+
+In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+instead of first level entry (if map to rom other than guest memory
+comes first), while in xen_invalidate_map_cache(), when VM ballooned
+out memory, qemu did not invalidate cache entries in linked
+list(entry->next), so when VM balloon back in memory, gfns probably
+mapped to different mfns, thus if guest asks device to DMA to these
+GPA, qemu may DMA to stale MFNs.
+
+So I think in xen_invalidate_map_cache() linked lists should also be
+checked and invalidated.
+
+Whatâs your opinion? Is this a bug? Is my analyze correct?
+
+On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+Hi,
+>
+>
+In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+instead of first level entry (if map to rom other than guest memory
+>
+comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+out memory, qemu did not invalidate cache entries in linked
+>
+list(entry->next), so when VM balloon back in memory, gfns probably
+>
+mapped to different mfns, thus if guest asks device to DMA to these
+>
+GPA, qemu may DMA to stale MFNs.
+>
+>
+So I think in xen_invalidate_map_cache() linked lists should also be
+>
+checked and invalidated.
+>
+>
+Whatâs your opinion? Is this a bug? Is my analyze correct?
+Added Jun Nakajima and Alexander Graf
+
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> Hi,
+>
+>
+>
+> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+> instead of first level entry (if map to rom other than guest memory
+>
+> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+> out memory, qemu did not invalidate cache entries in linked
+>
+> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+> mapped to different mfns, thus if guest asks device to DMA to these
+>
+> GPA, qemu may DMA to stale MFNs.
+>
+>
+>
+> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+> checked and invalidated.
+>
+>
+>
+> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+>
+Added Jun Nakajima and Alexander Graf
+And correct Stefano Stabellini's email address.
+
+On Mon, 10 Apr 2017 00:36:02 +0800
+hrg <address@hidden> wrote:
+
+Hi,
+
+>
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+>> Hi,
+>
+>>
+>
+>> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+>> instead of first level entry (if map to rom other than guest memory
+>
+>> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+>> out memory, qemu did not invalidate cache entries in linked
+>
+>> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+>> mapped to different mfns, thus if guest asks device to DMA to these
+>
+>> GPA, qemu may DMA to stale MFNs.
+>
+>>
+>
+>> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+>> checked and invalidated.
+>
+>>
+>
+>> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+>
+>
+> Added Jun Nakajima and Alexander Graf
+>
+And correct Stefano Stabellini's email address.
+There is a real issue with the xen-mapcache corruption in fact. I encountered
+it a few months ago while experimenting with Q35 support on Xen. Q35 emulation
+uses an AHCI controller by default, along with NCQ mode enabled. The issue can
+be (somewhat) easily reproduced there, though using a normal i440 emulation
+might possibly allow to reproduce the issue as well, using a dedicated test
+code from a guest side. In case of Q35+NCQ the issue can be reproduced "as is".
+
+The issue occurs when a guest domain performs an intensive disk I/O, ex. while
+guest OS booting. QEMU crashes with "Bad ram offset 980aa000"
+message logged, where the address is different each time. The hard thing with
+this issue is that it has a very low reproducibility rate.
+
+The corruption happens when there are multiple I/O commands in the NCQ queue.
+So there are overlapping emulated DMA operations in flight and QEMU uses a
+sequence of mapcache actions which can be executed in the "wrong" order thus
+leading to an inconsistent xen-mapcache - so a bad address from the wrong
+entry is returned.
+
+The bad thing with this issue is that QEMU crash due to "Bad ram offset"
+appearance is a relatively good situation in the sense that this is a caught
+error. But there might be a much worse (artificial) situation where the returned
+address looks valid but points to a different mapped memory.
+
+The fix itself is not hard (ex. an additional checked field in MapCacheEntry),
+but there is a need of some reliable way to test it considering the low
+reproducibility rate.
+
+Regards,
+Alex
+
+On Mon, 10 Apr 2017, hrg wrote:
+>
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+>> Hi,
+>
+>>
+>
+>> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+>> instead of first level entry (if map to rom other than guest memory
+>
+>> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+>> out memory, qemu did not invalidate cache entries in linked
+>
+>> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+>> mapped to different mfns, thus if guest asks device to DMA to these
+>
+>> GPA, qemu may DMA to stale MFNs.
+>
+>>
+>
+>> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+>> checked and invalidated.
+>
+>>
+>
+>> Whatâs your opinion? Is this a bug? Is my analyze correct?
+Yes, you are right. We need to go through the list for each element of
+the array in xen_invalidate_map_cache. Can you come up with a patch?
+
+On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+On Mon, 10 Apr 2017, hrg wrote:
+>
+> On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> >> Hi,
+>
+> >>
+>
+> >> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+> >> instead of first level entry (if map to rom other than guest memory
+>
+> >> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+> >> out memory, qemu did not invalidate cache entries in linked
+>
+> >> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+> >> mapped to different mfns, thus if guest asks device to DMA to these
+>
+> >> GPA, qemu may DMA to stale MFNs.
+>
+> >>
+>
+> >> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+> >> checked and invalidated.
+>
+> >>
+>
+> >> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+>
+Yes, you are right. We need to go through the list for each element of
+>
+the array in xen_invalidate_map_cache. Can you come up with a patch?
+I spoke too soon. In the regular case there should be no locked mappings
+when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+beginning of the functions). Without locked mappings, there should never
+be more than one element in each list (see xen_map_cache_unlocked:
+entry->lock == true is a necessary condition to append a new entry to
+the list, otherwise it is just remapped).
+
+Can you confirm that what you are seeing are locked mappings
+when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+by turning it into a printf or by defininig MAPCACHE_DEBUG.
+
+On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+<address@hidden> wrote:
+>
+On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+> On Mon, 10 Apr 2017, hrg wrote:
+>
+> > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> > >> Hi,
+>
+> > >>
+>
+> > >> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+> > >> instead of first level entry (if map to rom other than guest memory
+>
+> > >> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+> > >> out memory, qemu did not invalidate cache entries in linked
+>
+> > >> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+> > >> mapped to different mfns, thus if guest asks device to DMA to these
+>
+> > >> GPA, qemu may DMA to stale MFNs.
+>
+> > >>
+>
+> > >> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+> > >> checked and invalidated.
+>
+> > >>
+>
+> > >> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+>
+>
+> Yes, you are right. We need to go through the list for each element of
+>
+> the array in xen_invalidate_map_cache. Can you come up with a patch?
+>
+>
+I spoke too soon. In the regular case there should be no locked mappings
+>
+when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+>
+beginning of the functions). Without locked mappings, there should never
+>
+be more than one element in each list (see xen_map_cache_unlocked:
+>
+entry->lock == true is a necessary condition to append a new entry to
+>
+the list, otherwise it is just remapped).
+>
+>
+Can you confirm that what you are seeing are locked mappings
+>
+when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+>
+by turning it into a printf or by defininig MAPCACHE_DEBUG.
+In fact, I think the DPRINTF above is incorrect too. In
+pci_add_option_rom(), rtl8139 rom is locked mapped in
+pci_add_option_rom->memory_region_get_ram_ptr (after
+memory_region_init_ram). So actually I think we should remove the
+DPRINTF warning as it is normal.
+
+On Tue, 11 Apr 2017, hrg wrote:
+>
+On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+>
+<address@hidden> wrote:
+>
+> On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+>> On Mon, 10 Apr 2017, hrg wrote:
+>
+>> > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+>> > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+>> > >> Hi,
+>
+>> > >>
+>
+>> > >> In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+>
+>> > >> instead of first level entry (if map to rom other than guest memory
+>
+>> > >> comes first), while in xen_invalidate_map_cache(), when VM ballooned
+>
+>> > >> out memory, qemu did not invalidate cache entries in linked
+>
+>> > >> list(entry->next), so when VM balloon back in memory, gfns probably
+>
+>> > >> mapped to different mfns, thus if guest asks device to DMA to these
+>
+>> > >> GPA, qemu may DMA to stale MFNs.
+>
+>> > >>
+>
+>> > >> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+>> > >> checked and invalidated.
+>
+>> > >>
+>
+>> > >> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+>>
+>
+>> Yes, you are right. We need to go through the list for each element of
+>
+>> the array in xen_invalidate_map_cache. Can you come up with a patch?
+>
+>
+>
+> I spoke too soon. In the regular case there should be no locked mappings
+>
+> when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+>
+> beginning of the functions). Without locked mappings, there should never
+>
+> be more than one element in each list (see xen_map_cache_unlocked:
+>
+> entry->lock == true is a necessary condition to append a new entry to
+>
+> the list, otherwise it is just remapped).
+>
+>
+>
+> Can you confirm that what you are seeing are locked mappings
+>
+> when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+>
+> by turning it into a printf or by defininig MAPCACHE_DEBUG.
+>
+>
+In fact, I think the DPRINTF above is incorrect too. In
+>
+pci_add_option_rom(), rtl8139 rom is locked mapped in
+>
+pci_add_option_rom->memory_region_get_ram_ptr (after
+>
+memory_region_init_ram). So actually I think we should remove the
+>
+DPRINTF warning as it is normal.
+Let me explain why the DPRINTF warning is there: emulated dma operations
+can involve locked mappings. Once a dma operation completes, the related
+mapping is unlocked and can be safely destroyed. But if we destroy a
+locked mapping in xen_invalidate_map_cache, while a dma is still
+ongoing, QEMU will crash. We cannot handle that case.
+
+However, the scenario you described is different. It has nothing to do
+with DMA. It looks like pci_add_option_rom calls
+memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+locked mapping and it is never unlocked or destroyed.
+
+It looks like "ptr" is not used after pci_add_option_rom returns. Does
+the append patch fix the problem you are seeing? For the proper fix, I
+think we probably need some sort of memory_region_unmap wrapper or maybe
+a call to address_space_unmap.
+
+
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index e6b08e1..04f98b7 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -2242,6 +2242,7 @@ static void pci_add_option_rom(PCIDevice *pdev, bool 
+is_default_rom,
+     }
+ 
+     pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
++    xen_invalidate_map_cache_entry(ptr);
+ }
+ 
+ static void pci_del_option_rom(PCIDevice *pdev)
+
+On Tue, 11 Apr 2017 15:32:09 -0700 (PDT)
+Stefano Stabellini <address@hidden> wrote:
+
+>
+On Tue, 11 Apr 2017, hrg wrote:
+>
+> On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+>
+> <address@hidden> wrote:
+>
+> > On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+> >> On Mon, 10 Apr 2017, hrg wrote:
+>
+> >> > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> >> > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> >> > >> Hi,
+>
+> >> > >>
+>
+> >> > >> In xen_map_cache_unlocked(), map to guest memory maybe in
+>
+> >> > >> entry->next instead of first level entry (if map to rom other than
+>
+> >> > >> guest memory comes first), while in xen_invalidate_map_cache(),
+>
+> >> > >> when VM ballooned out memory, qemu did not invalidate cache entries
+>
+> >> > >> in linked list(entry->next), so when VM balloon back in memory,
+>
+> >> > >> gfns probably mapped to different mfns, thus if guest asks device
+>
+> >> > >> to DMA to these GPA, qemu may DMA to stale MFNs.
+>
+> >> > >>
+>
+> >> > >> So I think in xen_invalidate_map_cache() linked lists should also be
+>
+> >> > >> checked and invalidated.
+>
+> >> > >>
+>
+> >> > >> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+> >>
+>
+> >> Yes, you are right. We need to go through the list for each element of
+>
+> >> the array in xen_invalidate_map_cache. Can you come up with a patch?
+>
+> >
+>
+> > I spoke too soon. In the regular case there should be no locked mappings
+>
+> > when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+>
+> > beginning of the functions). Without locked mappings, there should never
+>
+> > be more than one element in each list (see xen_map_cache_unlocked:
+>
+> > entry->lock == true is a necessary condition to append a new entry to
+>
+> > the list, otherwise it is just remapped).
+>
+> >
+>
+> > Can you confirm that what you are seeing are locked mappings
+>
+> > when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+>
+> > by turning it into a printf or by defininig MAPCACHE_DEBUG.
+>
+>
+>
+> In fact, I think the DPRINTF above is incorrect too. In
+>
+> pci_add_option_rom(), rtl8139 rom is locked mapped in
+>
+> pci_add_option_rom->memory_region_get_ram_ptr (after
+>
+> memory_region_init_ram). So actually I think we should remove the
+>
+> DPRINTF warning as it is normal.
+>
+>
+Let me explain why the DPRINTF warning is there: emulated dma operations
+>
+can involve locked mappings. Once a dma operation completes, the related
+>
+mapping is unlocked and can be safely destroyed. But if we destroy a
+>
+locked mapping in xen_invalidate_map_cache, while a dma is still
+>
+ongoing, QEMU will crash. We cannot handle that case.
+>
+>
+However, the scenario you described is different. It has nothing to do
+>
+with DMA. It looks like pci_add_option_rom calls
+>
+memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+>
+locked mapping and it is never unlocked or destroyed.
+>
+>
+It looks like "ptr" is not used after pci_add_option_rom returns. Does
+>
+the append patch fix the problem you are seeing? For the proper fix, I
+>
+think we probably need some sort of memory_region_unmap wrapper or maybe
+>
+a call to address_space_unmap.
+Hmm, for some reason my message to the Xen-devel list got rejected but was sent
+to Qemu-devel instead, without any notice. Sorry if I'm missing something
+obvious as a list newbie.
+
+Stefano, hrg,
+
+There is an issue with inconsistency between the list of normal MapCacheEntry's
+and their 'reverse' counterparts - MapCacheRev's in locked_entries.
+When bad situation happens, there are multiple (locked) MapCacheEntry
+entries in the bucket's linked list along with a number of MapCacheRev's. And
+when it comes to a reverse lookup, xen-mapcache picks the wrong entry from the
+first list and calculates a wrong pointer from it which may then be caught with
+the "Bad RAM offset" check (or not). Mapcache invalidation might be related to
+this issue as well I think.
+
+I'll try to provide a test code which can reproduce the issue from the
+guest side using an emulated IDE controller, though it's much simpler to achieve
+this result with an AHCI controller using multiple NCQ I/O commands. So far I've
+seen this issue only with Windows 7 (and above) guest on AHCI, but any block I/O
+DMA should be enough I think.
+
+On 2017/4/12 14:17, Alexey G wrote:
+On Tue, 11 Apr 2017 15:32:09 -0700 (PDT)
+Stefano Stabellini <address@hidden> wrote:
+On Tue, 11 Apr 2017, hrg wrote:
+On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+<address@hidden> wrote:
+On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+On Mon, 10 Apr 2017, hrg wrote:
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+Hi,
+
+In xen_map_cache_unlocked(), map to guest memory maybe in
+entry->next instead of first level entry (if map to rom other than
+guest memory comes first), while in xen_invalidate_map_cache(),
+when VM ballooned out memory, qemu did not invalidate cache entries
+in linked list(entry->next), so when VM balloon back in memory,
+gfns probably mapped to different mfns, thus if guest asks device
+to DMA to these GPA, qemu may DMA to stale MFNs.
+
+So I think in xen_invalidate_map_cache() linked lists should also be
+checked and invalidated.
+
+Whatâs your opinion? Is this a bug? Is my analyze correct?
+Yes, you are right. We need to go through the list for each element of
+the array in xen_invalidate_map_cache. Can you come up with a patch?
+I spoke too soon. In the regular case there should be no locked mappings
+when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+beginning of the functions). Without locked mappings, there should never
+be more than one element in each list (see xen_map_cache_unlocked:
+entry->lock == true is a necessary condition to append a new entry to
+the list, otherwise it is just remapped).
+
+Can you confirm that what you are seeing are locked mappings
+when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+by turning it into a printf or by defininig MAPCACHE_DEBUG.
+In fact, I think the DPRINTF above is incorrect too. In
+pci_add_option_rom(), rtl8139 rom is locked mapped in
+pci_add_option_rom->memory_region_get_ram_ptr (after
+memory_region_init_ram). So actually I think we should remove the
+DPRINTF warning as it is normal.
+Let me explain why the DPRINTF warning is there: emulated dma operations
+can involve locked mappings. Once a dma operation completes, the related
+mapping is unlocked and can be safely destroyed. But if we destroy a
+locked mapping in xen_invalidate_map_cache, while a dma is still
+ongoing, QEMU will crash. We cannot handle that case.
+
+However, the scenario you described is different. It has nothing to do
+with DMA. It looks like pci_add_option_rom calls
+memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+locked mapping and it is never unlocked or destroyed.
+
+It looks like "ptr" is not used after pci_add_option_rom returns. Does
+the append patch fix the problem you are seeing? For the proper fix, I
+think we probably need some sort of memory_region_unmap wrapper or maybe
+a call to address_space_unmap.
+Hmm, for some reason my message to the Xen-devel list got rejected but was sent
+to Qemu-devel instead, without any notice. Sorry if I'm missing something
+obvious as a list newbie.
+
+Stefano, hrg,
+
+There is an issue with inconsistency between the list of normal MapCacheEntry's
+and their 'reverse' counterparts - MapCacheRev's in locked_entries.
+When bad situation happens, there are multiple (locked) MapCacheEntry
+entries in the bucket's linked list along with a number of MapCacheRev's. And
+when it comes to a reverse lookup, xen-mapcache picks the wrong entry from the
+first list and calculates a wrong pointer from it which may then be caught with
+the "Bad RAM offset" check (or not). Mapcache invalidation might be related to
+this issue as well I think.
+
+I'll try to provide a test code which can reproduce the issue from the
+guest side using an emulated IDE controller, though it's much simpler to achieve
+this result with an AHCI controller using multiple NCQ I/O commands. So far I've
+seen this issue only with Windows 7 (and above) guest on AHCI, but any block I/O
+DMA should be enough I think.
+Yes, I think there may be other bugs lurking, considering the complexity, 
+though we need to reproduce it if we want to delve into it.
+
+On Wed, 12 Apr 2017, Alexey G wrote:
+>
+On Tue, 11 Apr 2017 15:32:09 -0700 (PDT)
+>
+Stefano Stabellini <address@hidden> wrote:
+>
+>
+> On Tue, 11 Apr 2017, hrg wrote:
+>
+> > On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+>
+> > <address@hidden> wrote:
+>
+> > > On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+> > >> On Mon, 10 Apr 2017, hrg wrote:
+>
+> > >> > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> > >> > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> > >> > >> Hi,
+>
+> > >> > >>
+>
+> > >> > >> In xen_map_cache_unlocked(), map to guest memory maybe in
+>
+> > >> > >> entry->next instead of first level entry (if map to rom other than
+>
+> > >> > >> guest memory comes first), while in xen_invalidate_map_cache(),
+>
+> > >> > >> when VM ballooned out memory, qemu did not invalidate cache
+>
+> > >> > >> entries
+>
+> > >> > >> in linked list(entry->next), so when VM balloon back in memory,
+>
+> > >> > >> gfns probably mapped to different mfns, thus if guest asks device
+>
+> > >> > >> to DMA to these GPA, qemu may DMA to stale MFNs.
+>
+> > >> > >>
+>
+> > >> > >> So I think in xen_invalidate_map_cache() linked lists should also
+>
+> > >> > >> be
+>
+> > >> > >> checked and invalidated.
+>
+> > >> > >>
+>
+> > >> > >> Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+> > >>
+>
+> > >> Yes, you are right. We need to go through the list for each element of
+>
+> > >> the array in xen_invalidate_map_cache. Can you come up with a patch?
+>
+> > >
+>
+> > > I spoke too soon. In the regular case there should be no locked mappings
+>
+> > > when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+>
+> > > beginning of the functions). Without locked mappings, there should never
+>
+> > > be more than one element in each list (see xen_map_cache_unlocked:
+>
+> > > entry->lock == true is a necessary condition to append a new entry to
+>
+> > > the list, otherwise it is just remapped).
+>
+> > >
+>
+> > > Can you confirm that what you are seeing are locked mappings
+>
+> > > when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+>
+> > > by turning it into a printf or by defininig MAPCACHE_DEBUG.
+>
+> >
+>
+> > In fact, I think the DPRINTF above is incorrect too. In
+>
+> > pci_add_option_rom(), rtl8139 rom is locked mapped in
+>
+> > pci_add_option_rom->memory_region_get_ram_ptr (after
+>
+> > memory_region_init_ram). So actually I think we should remove the
+>
+> > DPRINTF warning as it is normal.
+>
+>
+>
+> Let me explain why the DPRINTF warning is there: emulated dma operations
+>
+> can involve locked mappings. Once a dma operation completes, the related
+>
+> mapping is unlocked and can be safely destroyed. But if we destroy a
+>
+> locked mapping in xen_invalidate_map_cache, while a dma is still
+>
+> ongoing, QEMU will crash. We cannot handle that case.
+>
+>
+>
+> However, the scenario you described is different. It has nothing to do
+>
+> with DMA. It looks like pci_add_option_rom calls
+>
+> memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+>
+> locked mapping and it is never unlocked or destroyed.
+>
+>
+>
+> It looks like "ptr" is not used after pci_add_option_rom returns. Does
+>
+> the append patch fix the problem you are seeing? For the proper fix, I
+>
+> think we probably need some sort of memory_region_unmap wrapper or maybe
+>
+> a call to address_space_unmap.
+>
+>
+Hmm, for some reason my message to the Xen-devel list got rejected but was
+>
+sent
+>
+to Qemu-devel instead, without any notice. Sorry if I'm missing something
+>
+obvious as a list newbie.
+>
+>
+Stefano, hrg,
+>
+>
+There is an issue with inconsistency between the list of normal
+>
+MapCacheEntry's
+>
+and their 'reverse' counterparts - MapCacheRev's in locked_entries.
+>
+When bad situation happens, there are multiple (locked) MapCacheEntry
+>
+entries in the bucket's linked list along with a number of MapCacheRev's. And
+>
+when it comes to a reverse lookup, xen-mapcache picks the wrong entry from the
+>
+first list and calculates a wrong pointer from it which may then be caught
+>
+with
+>
+the "Bad RAM offset" check (or not). Mapcache invalidation might be related to
+>
+this issue as well I think.
+>
+>
+I'll try to provide a test code which can reproduce the issue from the
+>
+guest side using an emulated IDE controller, though it's much simpler to
+>
+achieve
+>
+this result with an AHCI controller using multiple NCQ I/O commands. So far
+>
+I've
+>
+seen this issue only with Windows 7 (and above) guest on AHCI, but any block
+>
+I/O
+>
+DMA should be enough I think.
+That would be helpful. Please see if you can reproduce it after fixing
+the other issue (
+http://marc.info/?l=qemu-devel&m=149195042500707&w=2
+).
+
+On 2017/4/12 6:32, Stefano Stabellini wrote:
+On Tue, 11 Apr 2017, hrg wrote:
+On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+<address@hidden> wrote:
+On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+On Mon, 10 Apr 2017, hrg wrote:
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+Hi,
+
+In xen_map_cache_unlocked(), map to guest memory maybe in entry->next
+instead of first level entry (if map to rom other than guest memory
+comes first), while in xen_invalidate_map_cache(), when VM ballooned
+out memory, qemu did not invalidate cache entries in linked
+list(entry->next), so when VM balloon back in memory, gfns probably
+mapped to different mfns, thus if guest asks device to DMA to these
+GPA, qemu may DMA to stale MFNs.
+
+So I think in xen_invalidate_map_cache() linked lists should also be
+checked and invalidated.
+
+Whatâs your opinion? Is this a bug? Is my analyze correct?
+Yes, you are right. We need to go through the list for each element of
+the array in xen_invalidate_map_cache. Can you come up with a patch?
+I spoke too soon. In the regular case there should be no locked mappings
+when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+beginning of the functions). Without locked mappings, there should never
+be more than one element in each list (see xen_map_cache_unlocked:
+entry->lock == true is a necessary condition to append a new entry to
+the list, otherwise it is just remapped).
+
+Can you confirm that what you are seeing are locked mappings
+when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+by turning it into a printf or by defininig MAPCACHE_DEBUG.
+In fact, I think the DPRINTF above is incorrect too. In
+pci_add_option_rom(), rtl8139 rom is locked mapped in
+pci_add_option_rom->memory_region_get_ram_ptr (after
+memory_region_init_ram). So actually I think we should remove the
+DPRINTF warning as it is normal.
+Let me explain why the DPRINTF warning is there: emulated dma operations
+can involve locked mappings. Once a dma operation completes, the related
+mapping is unlocked and can be safely destroyed. But if we destroy a
+locked mapping in xen_invalidate_map_cache, while a dma is still
+ongoing, QEMU will crash. We cannot handle that case.
+
+However, the scenario you described is different. It has nothing to do
+with DMA. It looks like pci_add_option_rom calls
+memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+locked mapping and it is never unlocked or destroyed.
+
+It looks like "ptr" is not used after pci_add_option_rom returns. Does
+the append patch fix the problem you are seeing? For the proper fix, I
+think we probably need some sort of memory_region_unmap wrapper or maybe
+a call to address_space_unmap.
+Yes, I think so, maybe this is the proper way to fix this.
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index e6b08e1..04f98b7 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -2242,6 +2242,7 @@ static void pci_add_option_rom(PCIDevice *pdev, bool 
+is_default_rom,
+      }
+pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
++    xen_invalidate_map_cache_entry(ptr);
+  }
+static void pci_del_option_rom(PCIDevice *pdev)
+
+On Wed, 12 Apr 2017, Herongguang (Stephen) wrote:
+>
+On 2017/4/12 6:32, Stefano Stabellini wrote:
+>
+> On Tue, 11 Apr 2017, hrg wrote:
+>
+> > On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+>
+> > <address@hidden> wrote:
+>
+> > > On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+> > > > On Mon, 10 Apr 2017, hrg wrote:
+>
+> > > > > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+>
+> > > > > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+>
+> > > > > > > Hi,
+>
+> > > > > > >
+>
+> > > > > > > In xen_map_cache_unlocked(), map to guest memory maybe in
+>
+> > > > > > > entry->next
+>
+> > > > > > > instead of first level entry (if map to rom other than guest
+>
+> > > > > > > memory
+>
+> > > > > > > comes first), while in xen_invalidate_map_cache(), when VM
+>
+> > > > > > > ballooned
+>
+> > > > > > > out memory, qemu did not invalidate cache entries in linked
+>
+> > > > > > > list(entry->next), so when VM balloon back in memory, gfns
+>
+> > > > > > > probably
+>
+> > > > > > > mapped to different mfns, thus if guest asks device to DMA to
+>
+> > > > > > > these
+>
+> > > > > > > GPA, qemu may DMA to stale MFNs.
+>
+> > > > > > >
+>
+> > > > > > > So I think in xen_invalidate_map_cache() linked lists should
+>
+> > > > > > > also be
+>
+> > > > > > > checked and invalidated.
+>
+> > > > > > >
+>
+> > > > > > > Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+> > > > Yes, you are right. We need to go through the list for each element of
+>
+> > > > the array in xen_invalidate_map_cache. Can you come up with a patch?
+>
+> > > I spoke too soon. In the regular case there should be no locked mappings
+>
+> > > when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+>
+> > > beginning of the functions). Without locked mappings, there should never
+>
+> > > be more than one element in each list (see xen_map_cache_unlocked:
+>
+> > > entry->lock == true is a necessary condition to append a new entry to
+>
+> > > the list, otherwise it is just remapped).
+>
+> > >
+>
+> > > Can you confirm that what you are seeing are locked mappings
+>
+> > > when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+>
+> > > by turning it into a printf or by defininig MAPCACHE_DEBUG.
+>
+> > In fact, I think the DPRINTF above is incorrect too. In
+>
+> > pci_add_option_rom(), rtl8139 rom is locked mapped in
+>
+> > pci_add_option_rom->memory_region_get_ram_ptr (after
+>
+> > memory_region_init_ram). So actually I think we should remove the
+>
+> > DPRINTF warning as it is normal.
+>
+> Let me explain why the DPRINTF warning is there: emulated dma operations
+>
+> can involve locked mappings. Once a dma operation completes, the related
+>
+> mapping is unlocked and can be safely destroyed. But if we destroy a
+>
+> locked mapping in xen_invalidate_map_cache, while a dma is still
+>
+> ongoing, QEMU will crash. We cannot handle that case.
+>
+>
+>
+> However, the scenario you described is different. It has nothing to do
+>
+> with DMA. It looks like pci_add_option_rom calls
+>
+> memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+>
+> locked mapping and it is never unlocked or destroyed.
+>
+>
+>
+> It looks like "ptr" is not used after pci_add_option_rom returns. Does
+>
+> the append patch fix the problem you are seeing? For the proper fix, I
+>
+> think we probably need some sort of memory_region_unmap wrapper or maybe
+>
+> a call to address_space_unmap.
+>
+>
+Yes, I think so, maybe this is the proper way to fix this.
+Would you be up for sending a proper patch and testing it? We cannot call
+xen_invalidate_map_cache_entry directly from pci.c though, it would need
+to be one of the other functions like address_space_unmap for example.
+
+
+>
+> diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+>
+> index e6b08e1..04f98b7 100644
+>
+> --- a/hw/pci/pci.c
+>
+> +++ b/hw/pci/pci.c
+>
+> @@ -2242,6 +2242,7 @@ static void pci_add_option_rom(PCIDevice *pdev, bool
+>
+> is_default_rom,
+>
+>       }
+>
+>         pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
+>
+> +    xen_invalidate_map_cache_entry(ptr);
+>
+>   }
+>
+>     static void pci_del_option_rom(PCIDevice *pdev)
+
+On 2017/4/13 7:51, Stefano Stabellini wrote:
+On Wed, 12 Apr 2017, Herongguang (Stephen) wrote:
+On 2017/4/12 6:32, Stefano Stabellini wrote:
+On Tue, 11 Apr 2017, hrg wrote:
+On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+<address@hidden> wrote:
+On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+On Mon, 10 Apr 2017, hrg wrote:
+On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden> wrote:
+On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden> wrote:
+Hi,
+
+In xen_map_cache_unlocked(), map to guest memory maybe in
+entry->next
+instead of first level entry (if map to rom other than guest
+memory
+comes first), while in xen_invalidate_map_cache(), when VM
+ballooned
+out memory, qemu did not invalidate cache entries in linked
+list(entry->next), so when VM balloon back in memory, gfns
+probably
+mapped to different mfns, thus if guest asks device to DMA to
+these
+GPA, qemu may DMA to stale MFNs.
+
+So I think in xen_invalidate_map_cache() linked lists should
+also be
+checked and invalidated.
+
+Whatâs your opinion? Is this a bug? Is my analyze correct?
+Yes, you are right. We need to go through the list for each element of
+the array in xen_invalidate_map_cache. Can you come up with a patch?
+I spoke too soon. In the regular case there should be no locked mappings
+when xen_invalidate_map_cache is called (see the DPRINTF warning at the
+beginning of the functions). Without locked mappings, there should never
+be more than one element in each list (see xen_map_cache_unlocked:
+entry->lock == true is a necessary condition to append a new entry to
+the list, otherwise it is just remapped).
+
+Can you confirm that what you are seeing are locked mappings
+when xen_invalidate_map_cache is called? To find out, enable the DPRINTK
+by turning it into a printf or by defininig MAPCACHE_DEBUG.
+In fact, I think the DPRINTF above is incorrect too. In
+pci_add_option_rom(), rtl8139 rom is locked mapped in
+pci_add_option_rom->memory_region_get_ram_ptr (after
+memory_region_init_ram). So actually I think we should remove the
+DPRINTF warning as it is normal.
+Let me explain why the DPRINTF warning is there: emulated dma operations
+can involve locked mappings. Once a dma operation completes, the related
+mapping is unlocked and can be safely destroyed. But if we destroy a
+locked mapping in xen_invalidate_map_cache, while a dma is still
+ongoing, QEMU will crash. We cannot handle that case.
+
+However, the scenario you described is different. It has nothing to do
+with DMA. It looks like pci_add_option_rom calls
+memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+locked mapping and it is never unlocked or destroyed.
+
+It looks like "ptr" is not used after pci_add_option_rom returns. Does
+the append patch fix the problem you are seeing? For the proper fix, I
+think we probably need some sort of memory_region_unmap wrapper or maybe
+a call to address_space_unmap.
+Yes, I think so, maybe this is the proper way to fix this.
+Would you be up for sending a proper patch and testing it? We cannot call
+xen_invalidate_map_cache_entry directly from pci.c though, it would need
+to be one of the other functions like address_space_unmap for example.
+Yes, I will look into this.
+diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+index e6b08e1..04f98b7 100644
+--- a/hw/pci/pci.c
++++ b/hw/pci/pci.c
+@@ -2242,6 +2242,7 @@ static void pci_add_option_rom(PCIDevice *pdev, bool
+is_default_rom,
+       }
+         pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
++    xen_invalidate_map_cache_entry(ptr);
+   }
+     static void pci_del_option_rom(PCIDevice *pdev)
+
+On Thu, 13 Apr 2017, Herongguang (Stephen) wrote:
+>
+On 2017/4/13 7:51, Stefano Stabellini wrote:
+>
+> On Wed, 12 Apr 2017, Herongguang (Stephen) wrote:
+>
+> > On 2017/4/12 6:32, Stefano Stabellini wrote:
+>
+> > > On Tue, 11 Apr 2017, hrg wrote:
+>
+> > > > On Tue, Apr 11, 2017 at 3:50 AM, Stefano Stabellini
+>
+> > > > <address@hidden> wrote:
+>
+> > > > > On Mon, 10 Apr 2017, Stefano Stabellini wrote:
+>
+> > > > > > On Mon, 10 Apr 2017, hrg wrote:
+>
+> > > > > > > On Sun, Apr 9, 2017 at 11:55 PM, hrg <address@hidden>
+>
+> > > > > > > wrote:
+>
+> > > > > > > > On Sun, Apr 9, 2017 at 11:52 PM, hrg <address@hidden>
+>
+> > > > > > > > wrote:
+>
+> > > > > > > > > Hi,
+>
+> > > > > > > > >
+>
+> > > > > > > > > In xen_map_cache_unlocked(), map to guest memory maybe in
+>
+> > > > > > > > > entry->next
+>
+> > > > > > > > > instead of first level entry (if map to rom other than guest
+>
+> > > > > > > > > memory
+>
+> > > > > > > > > comes first), while in xen_invalidate_map_cache(), when VM
+>
+> > > > > > > > > ballooned
+>
+> > > > > > > > > out memory, qemu did not invalidate cache entries in linked
+>
+> > > > > > > > > list(entry->next), so when VM balloon back in memory, gfns
+>
+> > > > > > > > > probably
+>
+> > > > > > > > > mapped to different mfns, thus if guest asks device to DMA
+>
+> > > > > > > > > to
+>
+> > > > > > > > > these
+>
+> > > > > > > > > GPA, qemu may DMA to stale MFNs.
+>
+> > > > > > > > >
+>
+> > > > > > > > > So I think in xen_invalidate_map_cache() linked lists should
+>
+> > > > > > > > > also be
+>
+> > > > > > > > > checked and invalidated.
+>
+> > > > > > > > >
+>
+> > > > > > > > > Whatâs your opinion? Is this a bug? Is my analyze correct?
+>
+> > > > > > Yes, you are right. We need to go through the list for each
+>
+> > > > > > element of
+>
+> > > > > > the array in xen_invalidate_map_cache. Can you come up with a
+>
+> > > > > > patch?
+>
+> > > > > I spoke too soon. In the regular case there should be no locked
+>
+> > > > > mappings
+>
+> > > > > when xen_invalidate_map_cache is called (see the DPRINTF warning at
+>
+> > > > > the
+>
+> > > > > beginning of the functions). Without locked mappings, there should
+>
+> > > > > never
+>
+> > > > > be more than one element in each list (see xen_map_cache_unlocked:
+>
+> > > > > entry->lock == true is a necessary condition to append a new entry
+>
+> > > > > to
+>
+> > > > > the list, otherwise it is just remapped).
+>
+> > > > >
+>
+> > > > > Can you confirm that what you are seeing are locked mappings
+>
+> > > > > when xen_invalidate_map_cache is called? To find out, enable the
+>
+> > > > > DPRINTK
+>
+> > > > > by turning it into a printf or by defininig MAPCACHE_DEBUG.
+>
+> > > > In fact, I think the DPRINTF above is incorrect too. In
+>
+> > > > pci_add_option_rom(), rtl8139 rom is locked mapped in
+>
+> > > > pci_add_option_rom->memory_region_get_ram_ptr (after
+>
+> > > > memory_region_init_ram). So actually I think we should remove the
+>
+> > > > DPRINTF warning as it is normal.
+>
+> > > Let me explain why the DPRINTF warning is there: emulated dma operations
+>
+> > > can involve locked mappings. Once a dma operation completes, the related
+>
+> > > mapping is unlocked and can be safely destroyed. But if we destroy a
+>
+> > > locked mapping in xen_invalidate_map_cache, while a dma is still
+>
+> > > ongoing, QEMU will crash. We cannot handle that case.
+>
+> > >
+>
+> > > However, the scenario you described is different. It has nothing to do
+>
+> > > with DMA. It looks like pci_add_option_rom calls
+>
+> > > memory_region_get_ram_ptr to map the rtl8139 rom. The mapping is a
+>
+> > > locked mapping and it is never unlocked or destroyed.
+>
+> > >
+>
+> > > It looks like "ptr" is not used after pci_add_option_rom returns. Does
+>
+> > > the append patch fix the problem you are seeing? For the proper fix, I
+>
+> > > think we probably need some sort of memory_region_unmap wrapper or maybe
+>
+> > > a call to address_space_unmap.
+>
+> >
+>
+> > Yes, I think so, maybe this is the proper way to fix this.
+>
+>
+>
+> Would you be up for sending a proper patch and testing it? We cannot call
+>
+> xen_invalidate_map_cache_entry directly from pci.c though, it would need
+>
+> to be one of the other functions like address_space_unmap for example.
+>
+>
+>
+>
+>
+Yes, I will look into this.
+Any updates?
+
+
+>
+> > > diff --git a/hw/pci/pci.c b/hw/pci/pci.c
+>
+> > > index e6b08e1..04f98b7 100644
+>
+> > > --- a/hw/pci/pci.c
+>
+> > > +++ b/hw/pci/pci.c
+>
+> > > @@ -2242,6 +2242,7 @@ static void pci_add_option_rom(PCIDevice *pdev,
+>
+> > > bool
+>
+> > > is_default_rom,
+>
+> > >        }
+>
+> > >          pci_register_bar(pdev, PCI_ROM_SLOT, 0, &pdev->rom);
+>
+> > > +    xen_invalidate_map_cache_entry(ptr);
+>
+> > >    }
+>
+> > >      static void pci_del_option_rom(PCIDevice *pdev)
+>
+

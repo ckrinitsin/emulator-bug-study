@@ -1,0 +1,130 @@
+semantic: 0.869
+permissions: 0.861
+device: 0.777
+PID: 0.742
+debug: 0.729
+performance: 0.727
+other: 0.705
+vnc: 0.702
+graphic: 0.657
+socket: 0.605
+files: 0.600
+boot: 0.576
+network: 0.533
+KVM: 0.518
+
+X86-64 flags handling broken
+
+The current qemu sources cause improper handling of flags on x86-64.
+This bug seems to have shown up a few weeks ago.
+
+A plain install of Debian GNU/Linux makes user processes catch
+spurious signals.  The kernel seems to run stably, though.
+
+The ADX feature works very poorly.  It might be related; at least it
+allows for reproducibly provoking invalid behaviour.
+
+Here is a test case:
+
+================================================================
+qemumain.c
+#include <stdio.h>
+long adx();
+int
+main ()
+{
+  printf ("%lx\n", adx (0xffbeef, 17));
+  return 0;
+}
+================================================================
+qemuadx.s:
+        .globl  adx
+adx:    xor     %rax, %rax
+1:      dec     %rdi
+        jnz     1b
+        .byte 0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc0        # adox  %rax, %rax
+        .byte 0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc0        # adcx  %rax, %rax
+        ret
+================================================================
+
+Compile and execute:
+$ gcc -m64 qemumain.c qemuadx.s
+$ a.out
+ffffff8000378cd8
+
+Expected output is simply "0".  The garbage value varies between qemu
+compiles and guest systems.
+
+Note that one needs a recent GNU assembler in order to handle adox and
+adcx.  For convenience I have supplied them as byte sequences.
+
+Exaplanation and feeble analysis:
+
+The 0xffbeef argument is a loop count.  It is necessary to loop for a
+while in order to trigger this bug.  If the loop count is decreased,
+the bug will seen intermittently; the lower the count, the less
+frequent the invalid behaviour.
+
+It seems like a reasonable assumption that this bug is related to
+flags handling at context switch.  Presumably, qemu keeps flags state
+in some internal format, then recomputes then when needing to form the
+eflags register, as needed for example for context switching.
+
+I haven't tried to reproduce this bug using qemu-x86_64 and SYSROOT,
+but I strongly suspect that to be impossible.  I use
+qemu-system-x86_64 and the guest Debian GNU/Linux x86_64 (version
+6.0.6) .
+
+The bug happens also with the guest FreeBSD x86_64 version 9.1.  (The
+iteration count for triggering the problem 50% of the runs is not the
+same when using the kernel Linux and FreeBSD's kernel, presumably due
+to different ticks.)
+
+The bug happens much more frequently for a loaded system; in fact, the
+loop count can be radically decreased if two instances of the trigger
+program are run in parallel.
+
+Richard Henderson <email address hidden> writes:
+
+  Patch at http://patchwork.ozlabs.org/patch/229139/
+  
+Thanks.  I can confirm that this fixes the bug triggered by my test case
+(and yours).  However, the instability of Debian GNU/Linux x86_64 has
+not improved.
+
+The exact same Debian version (debian "testing") updated at the same
+time runs well on hardware.
+
+My qemu Debian system now got messed up, since I attempted an upgrade in
+the buggy qemu, which segfaulted several times during the upgrade.  I
+need to reinstall, and then rely on -snapshot.
+
+There is a problem with denorms which is reproducible, but whether that
+is a qemu bug, and whether it can actually cause the observed
+instability, is questionable.  Here is a testcase for that problem:
+
+
+
+
+It should terminate.  The observed buggy behaviour is that it hangs.
+
+The instability problem can be observed at gmplib.org/devel/tm-date.html.
+hwl-deb.gmplib.org is Debian under qemu with -cpu Haswell,+adx.
+
+Not that the exact same qemu runs FreeBSD flawlessly (hwl.gmplib.org).
+It is neither instable nor does it run the denorms testcase poorly.
+
+I fully realise this is a hopeless bug report, but I am sure you can
+reproduce it, since it is far from GMP specific.  After all apt-get
+update; apt-get upgrade triggered it.  Debugging it will be a nightmare.
+
+Qemu version: main git repo from less than a week ago + Richard ADX
+patch.
+
+-- 
+Torbjörn
+
+
+It looks from this bug that we fixed the initial ADOX bug in commit c53de1a2896cc (2013), and I've just tried the 'qemu-denorm-problem.s' test case from comment #1 and it works OK, so I think we've fixed that denormals bug too. Given that, and that this bug report is 4 years old, I'm going to close it. If you're still having problems with recent versions of QEMU, please open a new bug.
+
+

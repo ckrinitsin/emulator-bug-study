@@ -1,0 +1,248 @@
+permissions: 0.973
+device: 0.972
+debug: 0.966
+performance: 0.965
+files: 0.964
+semantic: 0.962
+socket: 0.962
+other: 0.960
+PID: 0.957
+boot: 0.956
+graphic: 0.949
+vnc: 0.944
+KVM: 0.935
+network: 0.928
+
+btrfs qemu-ga - multiple mounts block fsfreeze
+
+Having two mounts of the same device makes fsfreeze through qemu-ga impossible.
+root@CmsrvMTA:/# mount -l | grep /dev/vda2
+/dev/vda2 on / type btrfs (rw,relatime,space_cache,subvolid=257,subvol=/@)
+/dev/vda2 on /home type btrfs (rw,relatime,space_cache,subvolid=258,subvol=/@home)
+
+Having two mounts is rather common with btrfs, so the feature fsfreeze is unusable on these systems. 
+
+
+Below more information about how we encountered this issue...
+
+Message send to <email address hidden>:
+
+Message 1:
+----------
+I use external snapshots to backup my guests. I use the 'quiesce' option to flush and frees the guest file system with the qemu guest agent.
+
+With the exeption of one guest, this procedure works fine. On the 'unwilling' guest, I get this error message:
+"ERROR 2016-05-25 00:51:19 | T25-bakVMSCmsrvVH2 | fout: internal error: unable to execute QEMU agent command 'guest-fsfreeze-freeze': failed to freeze /: Device or resource busy"
+
+I don't think this is not some sort of time-out error, because activation of the fsfreeze and the error message happen immediately after each other:
+
+$ grep qemu-ga syslog.1
+May 25 00:51:19 CmsrvMTA qemu-ga: info: guest-fsfreeze called
+
+This is the only entry of the qemu guest agent in syslog.
+
+$ sudo virsh version
+Compiled against library: libvirt 1.3.1
+Using library: libvirt 1.3.1
+Gebruikte API: QEMU 1.3.1
+Draaiende hypervisor: QEMU 2.5.0
+
+$ virsh qemu-agent-command CmsrvMTA '{"execute": "guest-info"}'
+{"return":{"version":"2.5.0", ... ,{"enabled":true,"name":"guest-fstrim","success-response":true},{"enabled":true,"name":"guest-fsfreeze-thaw","success-response":true},{"enabled":true,"name":"guest-fsfreeze-status","success-response":true},{"enabled":true,"name":"guest-fsfreeze-freeze-list","success-response":true},{"enabled":true,"name":"guest-fsfreeze-freeze","success-response":true}, ... }
+
+For making an external snapshot, I use this command:
+$ virsh snapshot-create-as --domain CmsrvMTA sn1 --disk-only --atomic --quiesce --no-metadata --diskspec vda,file=/srv/poolVMS/CmsrvMTA.sn1
+
+Piece of reply 1:
+-----------------
+I have encountered this before. Some operating systems
+ may have bind-mounts that let a device appear multiple times in the mount list. Unfortunately the guest agent is not smart enough to consider a device that has been frozen as succesfull and keep going. This causes this specific error.
+
+Piece of reply 2:
+-----------------
+Ok, that seems to be it.
+
+I’ve got the ‘/’ and ‘/home’ on the same device formatted as btrfs on two separate sub volumes.
+
+I'm the responder from the Qemu list. I reviewed that C code a while ago when I stumbled over it. If someone helps me through the Qemu patch acceptance process then I'm willing to provide a patch.
+
+I have a related Problem with a libvirt Guest running some Docker-Containers.
+
+root@docker1:~# df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1       7.9G  2.9G  4.6G  39% /
+udev             10M     0   10M   0% /dev
+tmpfs           794M  8.6M  785M   2% /run
+tmpfs           2.0G  672K  2.0G   1% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+tmpfs           2.0G     0  2.0G   0% /sys/fs/cgroup
+none            7.9G  2.9G  4.6G  39% /var/lib/docker/aufs/mnt/8b510e9eb71523cf9afc723e11831a169c822b7251049f95ebed5e978b22184b
+shm              64M     0   64M   0% /var/lib/docker/containers/3d5542423739bc1a4467ce5e15a3b82224d2d1b315af75d7d91a0cc04e1e7b07/shm
+none            7.9G  2.9G  4.6G  39% /var/lib/docker/aufs/mnt/5d186a68a1fca2b58a440e6dbdf293853011a9526b819ac1dbcba7f91272535f
+shm              64M     0   64M   0% /var/lib/docker/containers/a4355f5e2a66b25a564c5027f818b4385cd417f85d8aaf79700ca4086fb86e63/shm
+none            7.9G  2.9G  4.6G  39% /var/lib/docker/aufs/mnt/e972052c347006cd8c79dc5bf9aaba07fdba2edeadc01e18e903d04ca4b05a86
+none            7.9G  2.9G  4.6G  39% /var/lib/docker/aufs/mnt/e22995e962919ea50fcf7b4a5e52916e6839f76708d22e57e81de687af2f0dd0
+shm              64M     0   64M   0% /var/lib/docker/containers/00e3490e37ded90e7421eb19e650cc684dec2b65a848a203c21212a549bf9e0e/shm
+shm              64M     0   64M   0% /var/lib/docker/containers/631b37644a0ac106b7d7403c2fcc3760d4647cb96141915b0aa7ae78f98e4e05/shm
+root@docker1:~# mount -l | grep /dev/vda2
+root@docker1:~# mount -l | grep /dev/sda
+/dev/sda1 on / type ext4 (rw,relatime,discard,errors=remount-ro,data=ordered)
+/dev/sda1 on /var/lib/docker/aufs type ext4 (rw,relatime,discard,errors=remount-ro,data=ordered)
+
+I am not able to take snapshots:
+
+error: internal error: unable to execute QEMU agent command 'guest-fsfreeze-freeze': failed to freeze /: Device or resource busy
+
+Thank you
+Tim
+
+Strangely I've started having the same problem as Tim this week, beside regular upgrade I did reboot since last backup... (Ubuntu LTS 16.04)
+
+if I stop docker, the backup will proceed, otherwise i get the same failed to freeze / error message, even with no container running, just the daemon. That's both true with 1.11.2 and 1.12.1 docker dameon version.
+
+I also have a path mounted twice, but this time it's devicemapper and not AUFS like tim, so maybe not fs type related.
+
+virsh version:
+  Compiled against library: libvirt 1.3.1
+  Using library: libvirt 1.3.1
+  Using API: QEMU 1.3.1
+  Running hypervisor: QEMU 2.5.0
+
+
+KVM/QEMU Host command:
+    virsh snapshot-create-as $VM_NAME \
+            ${VM_NAME}_snapshot \
+            "${VM_NAME} snapshot $(date +%Y-%m-%d-%H%M%S)" \
+        --diskspec vda,file=${VM_QCOW_FILE}-snap.qcow2 \
+        --disk-only \
+        --atomic \
+        --no-metadata \
+        --quiesce
+
+VM similar mount source:
+  /dev/mapper/delve--vg-root on / type ext4 (rw,relatime,discard,errors=remount-ro,data=ordered)
+  /dev/mapper/delve--vg-root on /var/lib/docker/devicemapper type ext4 (rw,relatime,discard,errors=remount-ro,data=ordered)
+
+
+In the VM logs:
+  Sep  8 12:48:45 xxxxxxxx qemu-ga: info: guest-fsfreeze called
+
+Same problem here ! More infos : https://forum.opennebula.org/t/backup-live-vms-with-snapshots-quiesce-atomic/4471
+
+This has been merged in upstream Qemu a while ago.
+
+Was that this commit here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=ce2eb6c4a044d809c
+?
+That was included in QEMU v2.9.0, so I think we can set the status to "Fix released" now?
+
+Any chance this will ever get backported to 2.5 on Xenial?
+cheers!
+
+You've got to open this (or a new bug) against Ubuntu's qemu package to get it included there. So far, this bug here is only opened against the upstream QEMU project.
+
+This affects Ubuntu 16.04 as in #4
+
+
+
+
+Fix is known and seems backportable, marking as server-next and subscribing for somebody to take a look.
+Also as mentioned it is in 2.9, so newer releases are already fixed.
+
+Steps to reproduce
+
+uvt-simplestreams-libvirt --verbose sync --source http://cloud-images.ubuntu.com/daily arch=amd64 release=xenial label=daily
+uvt-kvm create --password ubuntu x-freeze arch=amd64 release=xenial label=daily
+
+Add this to the guest definition and restart it
+<channel type='unix'>
+   <source mode='bind'/>
+   <target type='virtio' name='org.qemu.guest_agent.0'/>
+</channel>
+
+From the host freeze and thaw it:
+$ virsh domfsfreeze x-freeze
+$ virsh domfsthaw x-freeze
+
+# The above works
+
+In the Guest then add a bind mount to trigger the issue
+$ sudo mkdir /mnt/test
+$ sudo mount -o bind / /mnt/test/
+
+Then again try to freeze/unfreeze
+$ virsh domfsfreeze x-freeze
+error: Unable to freeze filesystems
+error: internal error: unable to execute QEMU agent command 'guest-fsfreeze-freeze': failed to freeze /: Device or resource busy
+
+
+I installed a fix from my PPA [1] and with that it works just fine now.
+Proposing an MP for review by the team, to afterwards move on into SRU processing.
+
+[1]: https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/3310
+
+
+Tests are all ok, MP review was acked and case confirmed.
+No Security Update since then in between, so sponsoring into SRU queue now ...
+
+Hello Dominique, or anyone else affected,
+
+Accepted qemu into xenial-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.5+dfsg-5ubuntu10.31 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested and change the tag from verification-needed-xenial to verification-done-xenial. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-xenial. In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Prior to the update:
+
+$ virsh domfsfreeze x-freeze; virsh domfsthaw x-freeze
+error: Unable to freeze filesystems
+error: internal error: unable to execute QEMU agent command 'guest-fsfreeze-freeze': failed to freeze /: Device or resource busy
+
+Thawed 0 filesystem(s)
+
+
+$ sudo apt install qemu-guest-agent
+Reading package lists... Done
+Building dependency tree       
+Reading state information... Done
+The following packages will be upgraded:
+  qemu-guest-agent
+1 upgraded, 0 newly installed, 0 to remove and 27 not upgraded.
+Need to get 132 kB of archives.
+After this operation, 0 B of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu xenial-proposed/universe amd64 qemu-guest-agent amd64 1:2.5+dfsg-5ubuntu10.31 [132 kB]
+Fetched 132 kB in 0s (1.161 kB/s)    
+(Reading database ... 54125 files and directories currently installed.)
+Preparing to unpack .../qemu-guest-agent_1%3a2.5+dfsg-5ubuntu10.31_amd64.deb ...
+Unpacking qemu-guest-agent (1:2.5+dfsg-5ubuntu10.31) over (1:2.5+dfsg-5ubuntu10.30) ...
+Processing triggers for man-db (2.7.5-1) ...
+Processing triggers for systemd (229-4ubuntu21.2) ...
+Processing triggers for ureadahead (0.100.0-19) ...
+Setting up qemu-guest-agent (1:2.5+dfsg-5ubuntu10.31) ...
+
+
+Retesting the above:
+$ virsh domfsfreeze x-freeze; virsh domfsthaw x-freeze
+Froze 1 filesystem(s)
+
+Thawed 1 filesystem(s)
+
+
+Found no other hickups due to the update, setting verified.
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 1:2.5+dfsg-5ubuntu10.31
+
+---------------
+qemu (1:2.5+dfsg-5ubuntu10.31) xenial; urgency=medium
+
+  * d/p/ubuntu/lp-1587065-qga-ignore-EBUSY-when-freezing-a-filesystem.patch:
+    Fix qemu-guest-agent failing to freeze filesystems that were mounted
+    multiple times like bind mounts. (LP: #1587065).
+
+ -- Christian Ehrhardt <email address hidden>  Thu, 28 Jun 2018 11:35:05 +0200
+

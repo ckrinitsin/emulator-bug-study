@@ -1,0 +1,192 @@
+permissions: 0.991
+other: 0.990
+debug: 0.989
+network: 0.987
+device: 0.986
+performance: 0.983
+boot: 0.982
+socket: 0.981
+graphic: 0.981
+PID: 0.979
+semantic: 0.979
+vnc: 0.977
+KVM: 0.967
+files: 0.964
+
+TCG memory leak with FreeDOS 'edit'
+
+qemu trunk as of today leaks memory FAST when freedos' edit is running.
+
+To reproduce, download:
+
+https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/1.3/cdrom.iso
+
+Then run:
+
+$ qemu-system-i386 -cdrom cdrom.iso
+
+select your language then select "return to DOS", then type 
+
+> edit
+
+it will consume memory at ~10MB/s
+
+This does NOT happen when adding -enable-kvm
+
+Note, this also occurs with freeDOS 1.2, at least.
+
+Note 2, 4.2 stable does not exhibit the bug.
+
+
+Confirmed, this is still reproducible with the current v5.2-rc4...
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/283
+
+
+Just to repeat the work around discussed on the GitLab page: -accel tcg,tb-size=32 will prevent the rapid increase of memory due to self modifying code.
+
+There are two justifications for making this change. The first is that
+i386 emulation is typically for smaller machines where having a 1gb of
+generated code is overkill for basic emulation. The second is the
+propensity of self-modifying code (c.f. Doom/edit) utilised on i386
+systems can trigger a rapid growth in invalidated and re-translated
+buffers. This is seen in bug #283. Execution is still inefficient but
+at least the host memory isn't so aggressively used up.
+
+That said it's still really just a sticking plaster for user
+convenience.
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: Thomas Huth <email address hidden>
+Cc: <email address hidden>
+---
+ accel/tcg/translate-all.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index 640ff6e3e7..f442165674 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -951,9 +951,13 @@ static void page_lock_pair(PageDesc **ret_p1, tb_page_addr_t phys1,
+  * Users running large scale system emulation may want to tweak their
+  * runtime setup via the tb-size control on the command line.
+  */
++#ifdef TARGET_I386
++#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (32 * MiB)
++#else
+ #define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (1 * GiB)
+ #endif
+ #endif
++#endif
+ 
+ #define DEFAULT_CODE_GEN_BUFFER_SIZE \
+   (DEFAULT_CODE_GEN_BUFFER_SIZE_1 < MAX_CODE_GEN_BUFFER_SIZE \
+-- 
+2.20.1
+
+
+
+
+Alex Bennée <email address hidden> writes:
+
+> There are two justifications for making this change. The first is that
+> i386 emulation is typically for smaller machines where having a 1gb of
+> generated code is overkill for basic emulation. The second is the
+> propensity of self-modifying code (c.f. Doom/edit) utilised on i386
+> systems can trigger a rapid growth in invalidated and re-translated
+> buffers. This is seen in bug #283. Execution is still inefficient but
+> at least the host memory isn't so aggressively used up.
+>
+> That said it's still really just a sticking plaster for user
+> convenience.
+
+ping?
+
+
+-- 
+Alex Bennée
+
+
+
+Richard Henderson <email address hidden> writes:
+
+> On 5/25/21 9:45 AM, Alex Bennée wrote:
+>> There are two justifications for making this change. The first is that
+>> i386 emulation is typically for smaller machines where having a 1gb of
+>> generated code is overkill for basic emulation. The second is the
+>> propensity of self-modifying code (c.f. Doom/edit) utilised on i386
+>> systems can trigger a rapid growth in invalidated and re-translated
+>> buffers. This is seen in bug #283. Execution is still inefficient but
+>> at least the host memory isn't so aggressively used up.
+>> That said it's still really just a sticking plaster for user
+>> convenience.
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> Cc: Thomas Huth <email address hidden>
+>> Cc: <email address hidden>
+>> ---
+>>   accel/tcg/translate-all.c | 4 ++++
+>>   1 file changed, 4 insertions(+)
+>> diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+>> index 640ff6e3e7..f442165674 100644
+>> --- a/accel/tcg/translate-all.c
+>> +++ b/accel/tcg/translate-all.c
+>> @@ -951,9 +951,13 @@ static void page_lock_pair(PageDesc **ret_p1, tb_page_addr_t phys1,
+>>    * Users running large scale system emulation may want to tweak their
+>>    * runtime setup via the tb-size control on the command line.
+>>    */
+>> +#ifdef TARGET_I386
+>> +#define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (32 * MiB)
+>> +#else
+>>   #define DEFAULT_CODE_GEN_BUFFER_SIZE_1 (1 * GiB)
+>>   #endif
+>>   #endif
+>> +#endif
+>>     #define DEFAULT_CODE_GEN_BUFFER_SIZE \
+>>     (DEFAULT_CODE_GEN_BUFFER_SIZE_1 < MAX_CODE_GEN_BUFFER_SIZE \
+>> 
+>
+> I'm not thrilled, as it is ultra-hacky.
+
+I don't disagree.
+
+> (1) I've got a re-org of this code out for review:
+> https://<email address hidden>/
+
+OK I'll have a look at that.
+
+> (2) I'm keen to reorg TCG such that it gets compiled once.  There's
+> currently nothing standing in the way of that except work.  But this
+> would introduce a use of a target-specific define for the first time
+> into tcg/.  I guess I could leave the default sizing back in
+> accel/tcg/ and pass in the default.
+>
+> Other options?
+
+Some random thoughts in no particular order:
+
+ - a separately flushable translation region for code we detect as SMC heavy
+
+ - a front-end interpreter for SMC code
+
+ - smarter code generation that dynamically loads values from codemem
+   (usually the SMC code is just tweaking an #imm value)
+
+None of these seem particularly amenable to a clean non-complex
+implementation though. A front-end interpreter would be useful for other
+things though - it could even be incomplete and handle only common code
+patterns falling back to full generation for anything it can't handle.
+
+>
+>
+> r~
+
+
+-- 
+Alex Bennée
+
+

@@ -1,0 +1,249 @@
+permissions: 0.817
+performance: 0.735
+semantic: 0.730
+boot: 0.722
+debug: 0.706
+device: 0.701
+graphic: 0.684
+PID: 0.672
+socket: 0.669
+files: 0.664
+vnc: 0.657
+other: 0.656
+KVM: 0.579
+network: 0.567
+
+Windows 95 and Windows 98 will not install or run
+
+The last version of QEMU I have been able to run Windows 95 or Windows 98 on was 2.7 or 2.8. Recent versions since then even up to 3.1 will either not install or will not run 95 or 98 at all. I have tried every combination of options like isapc or no isapc, cpu pentium  or cpu as 486. Tried different memory configurations, but they just don't work anymore.
+
+I was able to get both running on 3.11.0, but something broke again by the time I re-tested on 4.0.0. 98 seems to work on 4.0 at least, but 95 just reboots infinitely after trying to boot from HDD after the initial setup. I tried searching their mailing list and asking around but nobody seems interested in fixing it.
+
+Whoops, 3.11.0 does not exist. Went back and did a full bisect. 3.0.0 works fine, and the breakage starts before 3.0.1 and 3.1.0 was released, specifically, with commit 05306935b1ae49107c2dc2f301574dd6c29b6838.
+
+On 8/19/19 7:26 PM, Brad Parker wrote:
+> Whoops, 3.11.0 does not exist. Went back and did a full bisect. 3.0.0
+> works fine, and the breakage starts before 3.0.1 and 3.1.0 was released,
+> specifically, with commit 05306935b1ae49107c2dc2f301574dd6c29b6838.
+
+This commit is migration related. Are you trying to restore/launch a pre-installed image?
+
+John reported "either not install or will not run 95 or 98 at all" but you report "95 just reboots infinitely after trying to boot from HDD after the initial setup." which is slighly different.
+
+What host/os/distrib are you using?
+
+What command line are you using to start QEMU?
+
+If you are using migration, I wonder if the following commit might affect here:
+
+commit 341ba0df4c69269cac839ddbacb2a0ca641a856d
+Author: Peter Maydell <email address hidden>
+Date:   Tue Sep 25 17:19:24 2018 +0100
+
+    migration/ram.c: Avoid taking address of fields in packed MultiFDInit_t struct
+    
+    Taking the address of a field in a packed struct is a bad idea, because
+    it might not be actually aligned enough for that pointer type (and
+    thus cause a crash on dereference on some host architectures). Newer
+    versions of clang warn about this:
+    
+    Avoid the bug by not using the "modify in place" byteswapping
+    functions.
+
+
+I am not using anything related to migration, just launching with a simple flat qcow2 file, no snapshots, backing stores or anything like that.
+
+The host is Archlinux x64 but I'm running inside of a docker container that runs Ubuntu 18.04.
+
+The command-line is:
+
+qemu-system-i386 -spice port=5800,disable-ticketing=on -cpu pentium -m 128 -vga std -no-kvm -hda Win95C.qcow2 -nodefaults -no-hpet -no-acpi -cdrom Win95C.iso -nodefaults -M isapc -monitor stdio
+
+Just FYI that was the second bisect I had to do, the first time it produced an even more unrelated commit, so I assumed I must have done something wrong... apparently that is still the case. After trying the "working" commit outside of the Docker container, it now does not work... so I'm at a loss as to how to reliably bisect I guess. Never had any issues with other projects doing it though.
+
+Yep, these types of bugs don't necessarily bisect cleanly if they're todo with code layout or dirty memory.
+Still, it's good to keep a note of the earliest patches that you find a failure on - because then we know it must be somewhere before that.
+
+I remember there was a problem reported booting FreeDOS as well; and I've got to wonder if it's related.
+
+Hopefully third time's the charm. I ran yet another bisect, between 2.5.0 (working) and 2.11.0 (not working), this time reinstalling the entire OS from scratch with a blank disk every single time. Results:
+
+$ git bisect good
+e3af7c788b73a6495eb9d94992ef11f6ad6f3c56 is the first bad commit
+commit e3af7c788b73a6495eb9d94992ef11f6ad6f3c56
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Apr 26 13:59:34 2017 +0200
+
+    target/i386: introduce x86_ld*_code
+    
+    These take care of advancing s->pc, and will provide a unified point
+    where to check for the 15-byte instruction length limit.
+    
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+ target/i386/translate.c | 228 ++++++++++++++++++++++++++----------------------
+ 1 file changed, 125 insertions(+), 103 deletions(-)
+
+
+If your bisect hit e3af7c788b73a6495 can you try it with cfcca361d77142f25f applied on top? That commit fixed a bug in e3af7c788b73a6495 which may be throwing off your bisection results.
+
+
+e3af7c788b73a6495 was indeed one of the bad commits I tested during the bisect. If I apply cfcca361d77142f25f on top of it, Windows starts up normally instead of giving me a BSOD on bootup.
+
+So it looks like even though that commit fixed it, it seems to break again (differently) in 3.0.0, so I'll need to do another bisect between cfcca36 and v3.0.0 then I guess. And keep working my way up to master as well.
+
+Just finished a bisect between cfcca36 (working) and current master (not working), here is the result:
+
+$ git bisect bad
+cd1bfd5ef336166b275a09dc9842542bf5e63ae3 is the first bad commit
+commit cd1bfd5ef336166b275a09dc9842542bf5e63ae3
+Author: Gerd Hoffmann <email address hidden>
+Date:   Wed Jun 20 12:17:34 2018 +0200
+
+    seabios: update bios and vgabios binaries
+    
+    Adds two new vgabios binaries, for ramfb and bochs-display.
+    
+    Signed-off-by: Gerd Hoffmann <email address hidden>
+
+ pc-bios/bios-256k.bin             | Bin 262144 -> 262144 bytes
+ pc-bios/bios.bin                  | Bin 131072 -> 131072 bytes
+ pc-bios/vgabios-bochs-display.bin | Bin 0 -> 27648 bytes
+ pc-bios/vgabios-cirrus.bin        | Bin 38400 -> 38400 bytes
+ pc-bios/vgabios-qxl.bin           | Bin 38912 -> 38912 bytes
+ pc-bios/vgabios-ramfb.bin         | Bin 0 -> 28160 bytes
+ pc-bios/vgabios-stdvga.bin        | Bin 38912 -> 38912 bytes
+ pc-bios/vgabios-virtio.bin        | Bin 38912 -> 38912 bytes
+ pc-bios/vgabios-vmware.bin        | Bin 38912 -> 38912 bytes
+ pc-bios/vgabios.bin               | Bin 38400 -> 38400 bytes
+ 10 files changed, 0 insertions(+), 0 deletions(-)
+ create mode 100644 pc-bios/vgabios-bochs-display.bin
+ create mode 100644 pc-bios/vgabios-ramfb.bin
+
+
+I tried reverting that commit on top of master but it did not help, so I'm guessing it broke yet again (differently) somewhere else. I'll try reverting cd1bfd5 on top of the very next commit and bisect from there to master, and see where that takes me.
+
+> cd1bfd5ef336166b275a09dc9842542bf5e63ae3 is the first bad commit
+
+Unfortunately this is a commit related to SeaBIOS submodule.
+This commit only update the built BIOS roms.
+
+The commits before this one are the ones modifying SeaBIOS, justifying roms to be rebuilt:
+
+eda553a442 seabios: enable ide dma
+429d3ae2c8 seabios: update submodule to release 1.11.2
+
+The first one (enable ide dma) is a change in the config.
+You can rebuild the BIOS image and bisect around this commit.
+
+You can rebuild the SeaBIOS image running this command in QEMU source repository:
+
+  $ make -C roms bios
+
+This will update 'pc-bios/bios.bin' which you use while bisecting.
+
+The second one update the SeaBIOS submodule from commit 0551a4be2c to commit f9626ccb91.
+
+These are not so many commits, so the bisect won't be painful:
+
+$ git log --oneline 0551a4be2~..f9626ccb91
+f9626cc (tag: rel-1.11.2) cbvga_set_mode: refine clear display logic
+f88297a qemu: add qemu ramfb support
+a2e4001 vgasrc: add allocate_pmm()
+17b01f4 pmm: use tmp zone on oom
+44b17d0 bochs_display_setup: return error on failure
+4ba61fa cbvga_set_mode: disable clearmem in windows x86 emulator.
+dd69189 cbvga_list_modes: don't list current mode twice
+5f0e7c9 cbvga_setup_modes: use real mode number instead of 0x140
+961f67c qemu: add bochs-display support
+767365e cbvga: factor out cbvga_setup_modes()
+7906460 optionrom: enable non-vga display devices
+0551a4b (tag: rel-1.11.1) paravirt: Only enable sercon in NOGRAPHIC mode if no other console specified
+
+I recommend doing your bisection using 2 terminals:
+
+- one in QEMU source, running 'make -C roms bios' to rebuild 'pc-bios/bios.bin' and run QEMU installing your image,
+
+- one in roms/seabios/ where you run the 'git bisect' commands.
+
+Note, you don't have to rebuild QEMU.
+
+Alternatively, using a single terminal, you can stand in the roms/seabios/ directory, bisect and run 'make -C .. bios'. In this case it might be useful to run QEMU with -L ../../pc-bios to specify the path to the generated bios.bin.
+
+You are close, good luck!
+
+After hours bisecting various QEMU/SeaBIOS combinations, Brad figured out a new commit:
+
+0a7fa00a13f0852ec6fa83ab987a5ee7978d9867 is the first bad commit
+Author: Emilio G. Cota <email address hidden>
+Date:   Mon Aug 13 20:52:26 2018 -0400
+
+    configure: enable mttcg for i386 and x86_64
+
+Note 1: Brad was not using '-M isapc'.
+Note 2: Brad was using the pc-bios/ folder checkout'd at v4.1.0 or 33f18cf7dc to avoid the SeaBIOS issues reported previously
+
+Brad could succeed booting QEMU using '-accel thread=single' on 0a7fa00a13.
+
+
+
+Here is the exact working command line I used for Windows 95C (OSR2.5):
+
+qemu-system-i386 -cpu pentium -m 128 -vga std -no-kvm -hda ~/Win95C.qcow2 -nodefaults -no-hpet -no-acpi -nodefaults -monitor stdio -sdl -boot menu=on,order=c,splash-time=2000 -accel tcg,thread=single
+
+To install the OS I simply added -cdrom and -fda, but everything else stayed the same.
+
+This was using the latest master (33f18cf, after v4.1.0) and its included bios binaries.
+
+I just did an install of Windows 95 in 4.2 and it installs and runs out of the box with -accel tcg. Thanks!!
+
+According to the last comment, the problem seems to be fixed since QEMU 4.2, right? ... so I'm closing this ticket now. If there is still something left to do, please open again.
+
+Per Brad on IRC, this issue persists. Re-opening to move to GitLab.
+
+Since there is some unclear information in here (which version is working? which is not?), could you please open a new ticket on gitlab instead, with a proper description what is not working with which version?
+
+Brad said later after testing v6.1 it was fixed so please disregard previous comment ¯\_(ツ)_/¯
+
+This is happening again in 8.1. I used Windows 95 for a while in 6.1 and it
+was fine, but when I tried to upgrade to 8.1, it started happening again. I
+tried reducing the memory and it still happens. Not an urgent issue though.
+
+On Mon, Aug 30, 2021 at 2:05 AM Philippe Mathieu-Daudé <
+<email address hidden>> wrote:
+
+> Brad said later after testing v6.1 it was fixed so please disregard
+> previous comment ¯\_(ツ)_/¯
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1819289
+>
+> Title:
+>   Windows 95 and Windows 98 will not install or run
+>
+> Status in QEMU:
+>   Fix Released
+>
+> Bug description:
+>   The last version of QEMU I have been able to run Windows 95 or Windows
+>   98 on was 2.7 or 2.8. Recent versions since then even up to 3.1 will
+>   either not install or will not run 95 or 98 at all. I have tried every
+>   combination of options like isapc or no isapc, cpu pentium  or cpu as
+>   486. Tried different memory configurations, but they just don't work
+>   anymore.
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1819289/+subscriptions
+>
+>
+
+
+I found a win98 iso image and gave this a try with qemu 8.1.  It works here just fine - either kvm or tcg mode, either qemu x86_64 or i386.  Without any extra options, just this:
+
+
+  qemu-system-i386 -cdrom w98.iso -drive file=w98.img,format=raw
+
+It also works fine with a few previous versions of qemu (tried 5.2 and 7.2).  Everything tested on debian bookworm (with various versions of qemu debian packages).
+

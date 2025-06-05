@@ -1,0 +1,85 @@
+other: 0.668
+graphic: 0.663
+permissions: 0.640
+debug: 0.611
+boot: 0.592
+performance: 0.588
+files: 0.587
+KVM: 0.587
+device: 0.574
+network: 0.573
+semantic: 0.553
+socket: 0.549
+PID: 0.538
+vnc: 0.520
+
+qemu-system-aarch64 segfault at startup with --enable-rust
+Description of problem:
+The following commit breaks type class initialization for `pl011_luminary`:
+
+```
+d9434f29ca83e114fe02ed24c8ad2ccfa7ac3fe9 is the first bad commit
+commit d9434f29ca83e114fe02ed24c8ad2ccfa7ac3fe9
+Author: Paolo Bonzini <pbonzini@redhat.com>
+Date:   Fri Nov 29 11:38:59 2024 +0100
+
+    rust: qom: move device_id to PL011 class side
+
+    There is no need to monkeypatch DeviceId::Luminary into the already-initialized
+    PL011State.  Instead, now that we can define a class hierarchy, we can define
+    PL011Class and make device_id a field in there.
+
+    There is also no need anymore to have "Arm" as zero, so change DeviceId into a
+    wrapper for the array; all it does is provide an Index<hwaddr> implementation
+    because arrays can only be indexed by usize.
+
+    Reviewed-by: Zhao Liu <zhao1.liu@intel.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+ rust/hw/char/pl011/src/device.rs | 59 +++++++++++++++++++---------------------
+ 1 file changed, 28 insertions(+), 31 deletions(-)
+bisect found first bad commit
+```
+
+It results in a segmentation fault during type initialization at startup:
+
+```
+$ ./build/qemu-system-aarch64 -machine help
+zsh: segmentation fault (core dumped)  ./build/qemu-system-aarch64 -machine help
+```
+
+Because the class is uninitialized on the `pl011_luminary` TypeInfo (I think):
+
+```
+$ gdb --args ./build/qemu-system-aarch64 -machine help
+...
+Thread 1 "qemu-system-aar" received signal SIGSEGV, Segmentation fault.
+0x0000555555fc0fcf in object_class_dynamic_cast (class=class@entry=0x5555575ca128, typename=typename@entry=0x5555562650cd "resettable") at ../qom/object.c:966
+966         if (type->class->interfaces &&
+(gdb) p type->class
+$1 = (ObjectClass *) 0x0
+(gdb) bt
+#0  0x0000555555fc0fcf in object_class_dynamic_cast (class=class@entry=0x5555575ca128, typename=typename@entry=0x5555562650cd "resettable") at ../qom/object.c:966
+#1  0x0000555555fc1473 in object_class_dynamic_cast_assert (class=class@entry=0x5555575ca128, typename=typename@entry=0x5555562650cd "resettable",
+    file=file@entry=0x5555562651a0 "/home/pdel/qemu/include/hw/resettable.h", line=line@entry=21, func=func@entry=0x55555643d2b0 <__func__.13> "RESETTABLE_CLASS") at ../qom/object.c:1016
+#2  0x0000555555fbc61b in RESETTABLE_CLASS (klass=0x5555575ca128) at /home/pdel/qemu/include/hw/resettable.h:21
+#3  device_class_set_legacy_reset (dc=0x5555575ca128, dev_reset=0x5555560dacb0 <qemu_api::qdev::rust_reset_fn>) at ../hw/core/qdev.c:790
+#4  0x00005555560dac03 in qemu_api::qdev::<impl qemu_api::qom::ClassInitImpl<qemu_api::bindings::DeviceClass> for T>::class_init (dc=0x5555575ca128)
+    at rust/qemu-api/libqemu_api.rlib.p/structured/qdev.rs:84
+#5  qemu_api::sysbus::<impl qemu_api::qom::ClassInitImpl<qemu_api::bindings::SysBusDeviceClass> for T>::class_init (sdc=0x5555575ca128) at rust/qemu-api/libqemu_api.rlib.p/structured/sysbus.rs:31
+#6  <pl011::device::PL011State as qemu_api::qom::ClassInitImpl<pl011::device::PL011Class>>::class_init (klass=0x5555575ca120) at ../rust/hw/char/pl011/src/device.rs:140
+#7  qemu_api::qom::rust_class_init (klass=0x5555575ca120, _data=<optimized out>) at rust/qemu-api/libqemu_api.rlib.p/structured/qom.rs:176
+#8  0x0000555555fc0930 in type_initialize (ti=0x555557555eb0) at ../qom/object.c:359
+#9  type_initialize (ti=ti@entry=0x555557556070) at ../qom/object.c:365
+#10 0x0000555555fc1190 in type_initialize (ti=0x555557556070) at ../qom/object.c:1122
+#11 object_class_foreach_tramp (key=<optimized out>, value=0x555557556070, opaque=0x7fffffffdd00) at ../qom/object.c:1110
+#12 0x00007ffff7528668 in g_hash_table_foreach () from /lib64/libglib-2.0.so.0
+#13 0x0000555555fc1931 in object_class_foreach (opaque=0x7fffffffdcf8, include_abstract=false, implements_type=<optimized out>, fn=0x555555fbf810 <object_class_get_list_tramp>) at ../qom/object.c:87
+#14 object_class_get_list (implements_type=implements_type@entry=0x5555562c5440 "machine", include_abstract=include_abstract@entry=false) at ../qom/object.c:1189
+#15 0x0000555555bf53ac in machine_help_func (qdict=<error reading variable: dwarf2_find_location_expression: Corrupted DWARF expression.>) at ../system/vl.c:1559
+#16 qemu_init (argc=3, argv=<optimized out>) at ../system/vl.c:3319
+#17 0x00005555558f1a89 in main (argc=<optimized out>, argv=<optimized out>) at ../system/main.c:68
+```
+Steps to reproduce:
+1. Checkout cf86770c7aa31ebd6e56f4eeb25c34107f92c51e
+2. `./configure --target-list=aarch64-softmmu --enable-rust && ninja -C build && ./build/qemu-system-aarch64 -machine help`

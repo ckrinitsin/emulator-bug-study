@@ -1,0 +1,369 @@
+debug: 0.866
+permissions: 0.845
+semantic: 0.818
+graphic: 0.806
+performance: 0.792
+boot: 0.784
+other: 0.778
+network: 0.775
+device: 0.766
+PID: 0.754
+files: 0.715
+vnc: 0.712
+socket: 0.665
+KVM: 0.521
+
+images used as scsi disks not readable (qemu-system-arm, macos 10.8)
+
+Using a arm1176 kernel and the raspbian image (10-28 or 12-16) as my disk, I get as far as mounting root and then get SCSI errors with 1.3.0 and the current origin/master. git bisect says the issue is
+
+commit f563a5d7a820424756f358e747238f03e866838a
+Merge: a273652 aee0bf7
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Oct 31 10:42:51 2012 +0100
+
+    Merge remote-tracking branch 'origin/master' into threadpool
+    
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+
+I am using:
+qemu-system-arm -no-reboot -M versatilepb -cpu arm1176 -m 256 -hda 2012-12-16-wheezy-raspbian.img -kernel kernel-qemu -append "root=/dev/sda2 rootfstype=ext4 elevator=deadline rootwait panic=1" -serial stdio -usbdevice tablet -net nic -net user,hostfwd=tcp::40022-:22
+
+Configured on MacOS 10.8.2 with current Xcode and MacPorts installed, thus:
+CPATH=/opt/local/include CFLAGS="-pipe -O2 -arch x86_64" CPPFLAGS="-I/opt/local/include" CXXFLAGS="-pipe -O2 -arch x86_64" LIBRARY_PATH="/opt/local/lib" MACOSX_DEPLOYMENT_TARGET="10.8" CXX="/usr/bin/clang++" LDFLAGS="-L/opt/local/lib -arch x86_64" OBJC=/usr/bin/clang FCFLAGS="-pipe -O2 -m64" INSTALL="/usr/bin/install -c" OBJCFLAGS="-pipe -O2 -arch x86_64" CC="/usr/bin/clang"  ./configure --prefix=/opt/local --cpu=x86_64 --cc=/usr/bin/clang --objcc=/usr/bin/clang --host-cc=/usr/bin/clang --python=/opt/local/bin/python2.7 --target-list=arm-softmmu
+
+I duplicated this as well. I tried both the qemu-system-arm available in macports and also from homebrew with the same results. Host system is also 10.8 "mountain lion".
+
+My boot command: qemu-system-arm -kernel kernel/zImage -cpu arm1176 -m 256 -M versatilepb -no-reboot -serial stdio -append "root=/dev/sda2 panic=1" -hda pifi-4g.img -redir tcp:5022::22
+
+I'm running QEMU emulator version 1.4.1 on OS X 10.8.3
+Interestingly, this exact same boot command works perfectly on my Ubuntu virtual (in virtualbox) running QEMU emulator version 1.4.0 (Debian 1.4.0+dfsg-1expubuntu4)
+
+So the bug would seem to either be specific to OS X or to the 1.4.1 release.
+
+See the attached screenshot to see what happens in the boot process.
+
+I managed to capture a little more info about this bug by passing -drive file='myharddrive.img'. The kernel panic is happening in the sym53c8xx driver. See the attached screenshot for detail.
+
+I can also attach the kernel that I'm using if needed. Just let me know.
+
+
+I suspect this may be because we were defaulting to a broken coroutine backend (a bug fixed with commit 7c2acc7). Can you retry with the current 1.5 release candidate? (source download available at http://wiki.qemu.org/Download)
+
+
+Hi Peter,
+
+Thanks, that made an improvement. Now I'm just stuck in a loop of the kernel resetting the scsi bus :)
+
+(see attachment)
+
+And the same QEMU/kernel/image works fine on a Linux host?
+
+If you can provide the files I need to reproduce I might be able to take a look at it. (If it did the same thing on linux host that would be higher priority for me, so if you can cross-check that would be helpful.)
+
+
+I just compiled 1.5.0-rc1 on my Linux host with the same configure/compiler flags and duplicated the error (see screenshot). The configure flags are:
+./configure --disable-guest-agent --disable-bsd-user --enable-sdl --target-list="arm-linux-user armeb-linux-user arm-softmmu"
+
+As before, it goes into an infinite loop of reseting the scsi controller for each (emulated) channel. Note that the Ubuntu provided qemu-system-arm works perfectly. They are using 1.4.0 with a rather large number of patches ( I did a `dpkg source qemu` to examine the Ubuntu build setup).
+
+Looking through the Ubuntu patches, this one looks like a likely fix: 
+dpkg-source: info: applying patches-arm-1.4.0/0002-hw-sd-Expose-sd_reset-as-public-function.patch
+
+Please find a zip of my raspberrypi image (hda) and the kernel that I built from https://github.com/raspberrypi/linux.git
+at https://www.dropbox.com/sh/mbz8jh4fcjvdj4m/Gh3bKFyJyC
+
+I included the boot command in a txt file in the tarball.
+
+cheers,
+Joss
+
+
+
+It's very unlikely to be the patch you mention, since that's for SD card emulation and you're not using SD card emulation. It's probably just a regression between 1.4 and 1.5, and I'm fairly sure it's in some changes I made to the versatilepb PCI controller model -- I will investigate.
+
+
+Ah, I interpreted it to mean "scsi disk" instead of SD card :)
+
+I'll leave this to the experts. Thanks so much for looking into this and please let me know if I can be of further assistance.
+
+-Joss
+
+Hi Peter,
+
+Thanks so much for the patch and including me on the thread. I can confirm that it did fix the problem running on a Linux host, but the OS X bug cited by myself and the OP still remains elusive. It's rather puzzling as I pulled from HEAD and built using the same options on both. I've gotten a bit better with the qemu options now, so I will paste the console output here instead of doing yet another screenshot :) As you can see, it's still getting a fatal exception in the interrupt code. Do you know of a kernel version that would be better behaved than the 3.6.11+ from the "raspberrypi/linux" repo on github? Could I provide a core file that would help?
+
+Thanks again for your efforts.
+Joss
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+phoenix:RaspberryPi mysfitt$ qemu-system-arm -kernel kernel/zImage -cpu arm1176 -m 256 -M versatilepb -no-reboot -serial stdio -append "root=/dev/sda2 panic=1 console=ttyAMA0" -redir tcp:5022::22 -bt hci,null -global versatile_pci.broken-irq-mapping=1 pifi-4g.img 
+Uncompressing Linux... done, booting the kernel.
+Booting Linux on physical CPU 0
+Linux version 3.6.11+ (root@jossibox) (gcc version 4.7.3 (Ubuntu/Linaro 4.7.3-1ubuntu1) ) #1 Fri May 10 16:46:40 EDT 2013
+CPU: ARMv6-compatible processor [410fb767] revision 7 (ARMv7), cr=00c5387d
+CPU: VIPT aliasing data cache, unknown instruction cache
+Machine: ARM-Versatile PB
+Memory policy: ECC disabled, Data cache writeback
+sched_clock: 32 bits at 24MHz, resolution 41ns, wraps every 178956ms
+Built 1 zonelists in Zone order, mobility grouping on.  Total pages: 65024
+Kernel command line: root=/dev/sda2 panic=1 console=ttyAMA0
+PID hash table entries: 1024 (order: 0, 4096 bytes)
+Dentry cache hash table entries: 32768 (order: 5, 131072 bytes)
+Inode-cache hash table entries: 16384 (order: 4, 65536 bytes)
+Memory: 256MB = 256MB total
+Memory: 255388k/255388k available, 6756k reserved, 0K highmem
+Virtual kernel memory layout:
+    vector  : 0xffff0000 - 0xffff1000   (   4 kB)
+    fixmap  : 0xfff00000 - 0xfffe0000   ( 896 kB)
+    vmalloc : 0xd0800000 - 0xff000000   ( 744 MB)
+    lowmem  : 0xc0000000 - 0xd0000000   ( 256 MB)
+    modules : 0xbf000000 - 0xc0000000   (  16 MB)
+      .text : 0xc0008000 - 0xc03f6458   (4026 kB)
+      .init : 0xc03f7000 - 0xc04162bc   ( 125 kB)
+      .data : 0xc0418000 - 0xc043fb60   ( 159 kB)
+       .bss : 0xc043fb84 - 0xc045abb0   ( 109 kB)
+NR_IRQS:192
+VIC @f1140000: id 0x00041190, vendor 0x41
+FPGA IRQ chip 0 "SIC" @ f1003000, 21 irqs
+Console: colour dummy device 80x30
+Calibrating delay loop... 626.68 BogoMIPS (lpj=3133440)
+pid_max: default: 32768 minimum: 301
+Mount-cache hash table entries: 512
+CPU: Testing write buffer coherency: ok
+Setting up static identity map for 0x305ce0 - 0x305d3c
+devtmpfs: initialized
+NET: Registered protocol family 16
+DMA: preallocated 256 KiB pool for atomic coherent allocations
+Serial: AMBA PL011 UART driver
+dev:f1: ttyAMA0 at MMIO 0x101f1000 (irq = 12) is a PL011 rev1
+console [ttyAMA0] enabled
+dev:f2: ttyAMA1 at MMIO 0x101f2000 (irq = 13) is a PL011 rev1
+dev:f3: ttyAMA2 at MMIO 0x101f3000 (irq = 14) is a PL011 rev1
+fpga:09: ttyAMA3 at MMIO 0x10009000 (irq = 38) is a PL011 rev1
+PCI core found (slot 11)
+PCI host bridge to bus 0000:00
+pci_bus 0000:00: root bus resource [io  0x0000-0xffff]
+pci_bus 0000:00: root bus resource [mem 0x50000000-0x5fffffff]
+pci_bus 0000:00: root bus resource [mem 0x60000000-0x6fffffff pref]
+pci_bus 0000:00: No busn resource found for root bus, will use [bus 00-ff]
+PCI: bus0: Fast back to back transfers disabled
+pci 0000:00:0c.0: BAR 2: assigned [mem 0x50000000-0x50001fff]
+pci 0000:00:0c.0: BAR 1: assigned [mem 0x50002000-0x500023ff]
+pci 0000:00:0c.0: BAR 0: can't assign io (size 0x100)
+bio: create slab <bio-0> at 0
+vgaarb: loaded
+SCSI subsystem initialized
+Switching to clocksource timer3
+NET: Registered protocol family 2
+TCP established hash table entries: 8192 (order: 4, 65536 bytes)
+TCP bind hash table entries: 8192 (order: 3, 32768 bytes)
+TCP: Hash tables configured (established 8192 bind 8192)
+TCP: reno registered
+UDP hash table entries: 256 (order: 0, 4096 bytes)
+UDP-Lite hash table entries: 256 (order: 0, 4096 bytes)
+NET: Registered protocol family 1
+RPC: Registered named UNIX socket transport module.
+RPC: Registered udp transport module.
+RPC: Registered tcp transport module.
+RPC: Registered tcp NFSv4.1 backchannel transport module.
+NetWinder Floating Point Emulator V0.97 (double precision)
+Installing knfsd (copyright (C) 1996 <email address hidden>).
+jffs2: version 2.2. (NAND) © 2001-2006 Red Hat, Inc.
+ROMFS MTD (C) 2007 Red Hat, Inc.
+fuse init (API version 7.20)
+msgmni has been set to 498
+Block layer SCSI generic (bsg) driver version 0.4 loaded (major 254)
+io scheduler noop registered
+io scheduler deadline registered
+io scheduler cfq registered (default)
+clcd-pl11x dev:20: PL110 rev0 at 0x10120000
+clcd-pl11x dev:20: Versatile hardware, VGA display
+Console: switching to colour frame buffer device 80x30
+brd: module loaded
+PCI: enabling device 0000:00:0c.0 (0100 -> 0102)
+sym0: <895a> rev 0x0 at pci 0000:00:0c.0 irq 27
+sym0: No NVRAM, ID 7, Fast-40, LVD, parity checking
+sym0: SCSI BUS has been reset.
+scsi0 : sym-2.2.3
+sym0: unknown interrupt(s) ignored, ISTAT=0x5 DSTAT=0x80 SIST=0x0
+scsi 0:0:0:0: Direct-Access     QEMU     QEMU HARDDISK    1.4. PQ: 0 ANSI: 5
+scsi target0:0:0: tagged command queuing enabled, command queue depth 16.
+scsi target0:0:0: Beginning Domain Validation
+scsi target0:0:0: Domain Validation skipping write tests
+scsi target0:0:0: Ending Domain Validation
+scsi 0:0:2:0: CD-ROM            QEMU     QEMU CD-ROM      1.4. PQ: 0 ANSI: 5
+scsi target0:0:2: tagged command queuing enabled, command queue depth 16.
+scsi target0:0:2: Beginning Domain Validation
+scsi target0:0:2: Domain Validation skipping write tests
+scsi target0:0:2: Ending Domain Validation
+sr0: scsi3-mmc drive: 16x/50x cd/rw xa/form2 cdda tray
+cdrom: Uniform CD-ROM driver Revision: 3.20
+sd 0:0:0:0: [sda] 8388608 512-byte logical blocks: (4.29 GB/4.00 GiB)
+sd 0:0:0:0: [sda] Write Protect is off
+sd 0:0:0:0: [sda] Write cache: enabled, read cache: enabled, doesn't support DPO or FUA
+physmap platform flash device: 04000000 at 34000000
+physmap-flash.0: Found 1 x32 devices at 0x0 in 32-bit bank. Manufacturer ID 0x000000 Chip ID 0x000000
+Intel/Sharp Extended Query Table at 0x0031
+Using buffer write method
+ sda: sda1 sda2 sda3 sda4
+smc91x.c: v1.1, sep 22 2004 by Nicolas Pitre <email address hidden>
+eth0: SMC91C11xFD (rev 1) at d09ca000 IRQ 25 [nowait]
+eth0: Ethernet addr: 52:54:00:12:34:56
+sd 0:0:0:0: [sda] Attached SCSI disk
+mousedev: PS/2 mouse device common for all mice
+TCP: cubic registered
+NET: Registered protocol family 17
+VFP support v0.3: implementor 41 architecture 1 part 20 variant b rev 5
+input: AT Raw Set 2 keyboard as /devices/fpga:06/serio0/input/input0
+input: ImExPS/2 Generic Explorer Mouse as /devices/fpga:07/serio1/input/input1
+EXT3-fs (sda2): error: couldn't mount because of unsupported optional features (240)
+EXT2-fs (sda2): error: couldn't mount because of unsupported optional features (240)
+EXT4-fs (sda2): mounted filesystem with ordered data mode. Opts: (null)
+VFS: Mounted root (ext4 filesystem) readonly on device 8:2.
+devtmpfs: mounted
+Freeing init memory: 124K
+sd 0:0:0:0: [sda] ABORT operation started
+scsi target0:0:0: control msgout:
+ 80 20 51 d.
+sd 0:0:0:0: ABORT operation complete.
+Unable to handle kernel NULL pointer dereference at virtual address 00000358
+pgd = c0004000
+[00000358] *pgd=00000000
+Internal error: Oops: 5 [#1] ARM
+Modules linked in:
+CPU: 0    Not tainted  (3.6.11+ #1)
+PC is at sym_interrupt+0x7c8/0x1b88
+LR is at sym53c8xx_intr+0x40/0x7c
+pc : [<c02193a0>]    lr : [<c0214e0c>]    psr: 80000193
+sp : c0419e30  ip : cf844800  fp : 00000001
+r10: cf935400  r9 : c043fb00  r8 : d0804084
+r7 : 00000012  r6 : c045588c  r5 : 00000000  r4 : d0804000
+r3 : 00000008  r2 : 0000000d  r1 : 00000000  r0 : 00000000
+Flags: Nzcv  IRQs off  FIQs on  Mode SVC_32  ISA ARM  Segment kernel
+Control: 00c5387d  Table: 0fb40008  DAC: 00000017
+Process swapper (pid: 0, stack limit = 0xc0418268)
+Stack: (0xc0419e30 to 0xc041a000)
+9e20:                                     1be06241 00000000 00000001 00200200
+9e40: cf997af0 c004256c cf997ac0 cf844800 c0427898 c043fae4 c0418000 00000100
+9e60: c0419e7c cf9cbca0 c045587c 00000000 00000000 0000001b c043fb00 c0428e54
+9e80: 00000001 c0214e0c 00000001 00000080 0000001b cf9cbca0 0000001b c0054620
+9ea0: c0445420 c0419ec0 00000000 c0428e54 0000001b 00000000 c043fee8 00000000
+9ec0: cf997ac0 c0307e44 c0419f74 c00547a8 c0428e54 c0056860 c04321e8 c0053fe4
+9ee0: 000000c0 c001470c c043fee8 c0419f10 00000000 c00084f8 c003f840 20000013
+9f00: ffffffff c0419f44 c04223d8 c00134c0 00000000 00000000 00000002 cfb20c8c
+9f20: cfb20c60 cf997ac0 00000001 c0427898 c04223d8 cf997ac0 c0307e44 c0419f74
+9f40: 00000000 c0419f58 c030536c c003f840 20000013 ffffffff 00000000 00000000
+9f60: c0427898 c0418000 c0427898 c04223d8 c0419fa4 c030536c c04230c0 cfb20c60
+9f80: c0423348 c0418000 c0418000 c043fc68 c0418000 c04230c0 410fb767 c0423348
+9fa0: 00000000 c0014a18 c0425fbc c04200d0 ffffffff c04123fc c065b880 00004008
+9fc0: 00410e7c c03f771c ffffffff ffffffff c03f728c 00000000 00000000 c04123fc
+9fe0: 00000000 00c5387d c042004c c04123f8 c04230b4 00008040 00000000 00000000
+[<c02193a0>] (sym_interrupt+0x7c8/0x1b88) from [<c0214e0c>] (sym53c8xx_intr+0x40/0x7c)
+[<c0214e0c>] (sym53c8xx_intr+0x40/0x7c) from [<c0054620>] (handle_irq_event_percpu+0x50/0x1b0)
+[<c0054620>] (handle_irq_event_percpu+0x50/0x1b0) from [<c00547a8>] (handle_irq_event+0x28/0x38)
+[<c00547a8>] (handle_irq_event+0x28/0x38) from [<c0056860>] (handle_level_irq+0x80/0xd4)
+[<c0056860>] (handle_level_irq+0x80/0xd4) from [<c0053fe4>] (generic_handle_irq+0x24/0x38)
+[<c0053fe4>] (generic_handle_irq+0x24/0x38) from [<c001470c>] (handle_IRQ+0x30/0x84)
+[<c001470c>] (handle_IRQ+0x30/0x84) from [<c00084f8>] (vic_handle_irq+0x58/0x98)
+[<c00084f8>] (vic_handle_irq+0x58/0x98) from [<c00134c0>] (__irq_svc+0x40/0x54)
+Exception stack(0xc0419f10 to 0xc0419f58)
+9f00:                                     00000000 00000000 00000002 cfb20c8c
+9f20: cfb20c60 cf997ac0 00000001 c0427898 c04223d8 cf997ac0 c0307e44 c0419f74
+9f40: 00000000 c0419f58 c030536c c003f840 20000013 ffffffff
+[<c00134c0>] (__irq_svc+0x40/0x54) from [<c003f840>] (finish_task_switch.constprop.68+0x78/0xec)
+[<c003f840>] (finish_task_switch.constprop.68+0x78/0xec) from [<c030536c>] (__schedule+0x1a0/0x3bc)
+[<c030536c>] (__schedule+0x1a0/0x3bc) from [<c0014a18>] (cpu_idle+0xa4/0xc0)
+[<c0014a18>] (cpu_idle+0xa4/0xc0) from [<c03f771c>] (start_kernel+0x26c/0x2bc)
+Code: e5d42540 e3a03008 e5c43540 e5842550 (e5951358) 
+---[ end trace 25ce2cfc77dea57b ]---
+Kernel panic - not syncing: Fatal exception in interrupt
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+On May 14, 2013, at 6:58 AM, Peter Maydell <email address hidden> wrote:
+
+> It's very unlikely to be the patch you mention, since that's for SD card
+> emulation and you're not using SD card emulation. It's probably just a
+> regression between 1.4 and 1.5, and I'm fairly sure it's in some changes
+> I made to the versatilepb PCI controller model -- I will investigate.
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1094564
+> 
+> Title:
+>  images used as scsi disks not readable (qemu-system-arm, macos 10.8)
+> 
+> Status in The MacPorts Project:
+>  New
+> Status in QEMU:
+>  New
+> 
+> Bug description:
+>  Using a arm1176 kernel and the raspbian image (10-28 or 12-16) as my
+>  disk, I get as far as mounting root and then get SCSI errors with
+>  1.3.0 and the current origin/master. git bisect says the issue is
+> 
+>  commit f563a5d7a820424756f358e747238f03e866838a
+>  Merge: a273652 aee0bf7
+>  Author: Paolo Bonzini <email address hidden>
+>  Date:   Wed Oct 31 10:42:51 2012 +0100
+> 
+>      Merge remote-tracking branch 'origin/master' into threadpool
+> 
+>      Signed-off-by: Paolo Bonzini <email address hidden>
+> 
+> 
+>  I am using:
+>  qemu-system-arm -no-reboot -M versatilepb -cpu arm1176 -m 256 -hda 2012-12-16-wheezy-raspbian.img -kernel kernel-qemu -append "root=/dev/sda2 rootfstype=ext4 elevator=deadline rootwait panic=1" -serial stdio -usbdevice tablet -net nic -net user,hostfwd=tcp::40022-:22
+> 
+>  Configured on MacOS 10.8.2 with current Xcode and MacPorts installed, thus:
+>  CPATH=/opt/local/include CFLAGS="-pipe -O2 -arch x86_64" CPPFLAGS="-I/opt/local/include" CXXFLAGS="-pipe -O2 -arch x86_64" LIBRARY_PATH="/opt/local/lib" MACOSX_DEPLOYMENT_TARGET="10.8" CXX="/usr/bin/clang++" LDFLAGS="-L/opt/local/lib -arch x86_64" OBJC=/usr/bin/clang FCFLAGS="-pipe -O2 -m64" INSTALL="/usr/bin/install -c" OBJCFLAGS="-pipe -O2 -arch x86_64" CC="/usr/bin/clang"  ./configure --prefix=/opt/local --cpu=x86_64 --cc=/usr/bin/clang --objcc=/usr/bin/clang --host-cc=/usr/bin/clang --python=/opt/local/bin/python2.7 --target-list=arm-softmmu
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/macports/+bug/1094564/+subscriptions
+
+
+
+On 15 May 2013 19:02, Joss Reeves <email address hidden> wrote:
+> Thanks so much for the patch and including me on the thread. I can
+> confirm that it did fix the problem running on a Linux host, but the OS
+> X bug cited by myself and the OP still remains elusive. It's rather
+> puzzling as I pulled from HEAD and built using the same options on both.
+
+QEMU itself actually hangs in my tests (the main loop is waiting
+to lock the iothread but it never does; the cpu thread seems to
+be stuck trying to do a bdrv_aio_cancel for the scsi device model).
+This should never happen, regardless of what the guest does...
+
+I suspect that if you configure on linux with --with-coroutine=sigaltstack
+you might then find they both behave the same (MacOSX can't do the
+ucontext coroutines we default to on linux). OTOH it might also
+involve some of MacOSX's slightly different signal behaviour.
+
+I'll continue to prod, though past experience is that MacOSX
+gdb is weirdly broken and things behave differently when run
+under it, which doesn't help :-(
+
+-- PMM
+
+
+On 15 May 2013 21:18, Peter Maydell <email address hidden> wrote:
+> I suspect that if you configure on linux with --with-coroutine=sigaltstack
+> you might then find they both behave the same (MacOSX can't do the
+> ucontext coroutines we default to on linux).
+
+They don't, so it's a MacOSX specific issue of some kind.
+PS: you don't need "-global versatile_pci.broken-irq-mapping=1"
+in the command line because we do correctly autodetect and
+handle your kernel now.
+
+thanks
+-- PMM
+
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+

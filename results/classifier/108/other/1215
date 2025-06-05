@@ -1,0 +1,87 @@
+KVM: 0.626
+other: 0.615
+device: 0.614
+debug: 0.614
+permissions: 0.611
+graphic: 0.593
+vnc: 0.589
+semantic: 0.587
+PID: 0.566
+socket: 0.565
+performance: 0.554
+files: 0.552
+boot: 0.545
+network: 0.540
+
+block-stream qmp command regression in 7.1.0
+Description of problem:
+After `block-stream` qmp commands, guest was hanged when using `iothread` option.  
+According to b1e1af3, there are some change at drain blockdev subtree and strong reference to base node.  
+We couldn't produce this issue when we reverted the commit.  
+It seems to be raised by racing acquiring aio_lock between iothread and main thread.
+Steps to reproduce:
+1. Start Guest with upper command.
+2. After started, operate `block-stream` command to qmp socket
+```
+echo '{"execute":"qmp_capabilities"}{
+   "execute":"block-stream",
+   "arguments":{
+      "job-id":"hangTest", 
+      "device":"vdaFile"    
+   }
+}' | sudo nc -U /var/run/monitor_a9b43742-9117-4aae-8887-24bdb017ec20 -N
+```
+Additional information:
+- gdb debug stack
+```
+Thread 1 (Thread 0x7fcfaed84600 (LWP 162409) "qemu-system-x86"):
+#0  0x00007fcfaf108e7e in __ppoll (fds=0x5634a9b6b240, nfds=1, timeout=<optimized out>, timeout@entry=0x0, sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:42
+#1  0x00005634a7be22dd in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>) at /usr/include/x86_64-linux-gnu/bits/poll2.h:64
+#2  0x00005634a7bc02c9 in fdmon_poll_wait (ctx=0x5634a990eec0, ready_list=0x7ffcb2ce4fb8, timeout=-1) at ../util/fdmon-poll.c:80
+#3  0x00005634a7bbf9c9 in aio_poll (ctx=ctx@entry=0x5634a990eec0, blocking=blocking@entry=true) at ../util/aio-posix.c:660
+#4  0x00005634a7ac849d in bdrv_parent_drained_end_single (c=c@entry=0x5634a9b4bb30) at ../block/io.c:76
+#5  0x00005634a7a98240 in bdrv_replace_child_noperm (childp=0x5634a9b61240, new_bs=0x0, free_empty_child=<optimized out>) at ../block.c:2910
+#6  0x00005634a7a987fe in bdrv_replace_child_tran (childp=<optimized out>, new_bs=<optimized out>, tran=<optimized out>, free_empty_child=<optimized out>) at ../block.c:2444
+#7  0x00005634a7a988bc in bdrv_remove_file_or_backing_child (bs=bs@entry=0x5634a9b5d1f0, child=child@entry=0x5634a9b4bb30, tran=tran@entry=0x5634aa415fc0) at ../block.c:5155
+#8  0x00005634a7a9fac6 in bdrv_remove_file_or_backing_child (tran=0x5634aa415fc0, child=0x5634a9b4bb30, bs=0x5634a9b5d1f0) at ../block.c:5133
+#9  bdrv_set_file_or_backing_noperm (parent_bs=parent_bs@entry=0x5634a9b5d1f0, child_bs=child_bs@entry=0x0, is_backing=is_backing@entry=true, tran=tran@entry=0x5634aa415fc0, errp=errp@entry=0x7ffcb2ce5150) at ../block.c:3412
+#10 0x00005634a7a9fd04 in bdrv_set_backing_noperm (errp=0x7ffcb2ce5150, tran=0x5634aa415fc0, backing_hd=0x0, bs=0x5634a9b5d1f0) at ../block.c:3449
+#11 bdrv_set_backing_hd (bs=bs@entry=0x5634a9b5d1f0, backing_hd=backing_hd@entry=0x0, errp=errp@entry=0x7ffcb2ce5150) at ../block.c:3461
+#12 0x00005634a7b25e19 in stream_prepare (job=0x5634a9e83da0) at ../block/stream.c:85
+#13 0x00005634a7aa922e in job_prepare (job=0x5634a9e83da0) at ../job.c:837
+#14 job_txn_apply (fn=<optimized out>, job=0x5634a9e83da0) at ../job.c:158
+#15 job_do_finalize (job=0x5634a9e83da0) at ../job.c:854
+#16 0x00005634a7aa9726 in job_exit (opaque=0x5634a9e83da0) at ../job.c:941
+#17 0x00005634a7bd26b4 in aio_bh_call (bh=0x7fcfa0824010) at ../util/async.c:150
+#18 aio_bh_poll (ctx=ctx@entry=0x5634a990eec0) at ../util/async.c:178
+#19 0x00005634a7bbf602 in aio_dispatch (ctx=0x5634a990eec0) at ../util/aio-posix.c:421
+#20 0x00005634a7bd22f2 in aio_ctx_dispatch (source=<optimized out>, callback=<optimized out>, user_data=<optimized out>) at ../util/async.c:320
+#21 0x00007fcfaf3c0d1b in g_main_context_dispatch () at /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#22 0x00005634a7bde7c0 in glib_pollfds_poll () at ../util/main-loop.c:297
+#23 os_host_main_loop_wait (timeout=114194793) at ../util/main-loop.c:320
+#24 main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:596
+#25 0x00005634a784fdc3 in qemu_main_loop () at ../softmmu/runstate.c:734
+#26 0x00005634a769f9e0 in qemu_main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at ../softmmu/main.c:38
+--Type <RET> for more, q to quit, c to continue without paging--
+#27 0x00007fcfaf019d90 in __libc_start_call_main (main=main@entry=0x5634a769b0c0 <main>, argc=argc@entry=56, argv=argv@entry=0x7ffcb2ce54c8) at ../sysdeps/nptl/libc_start_call_main.h:58
+#28 0x00007fcfaf019e40 in __libc_start_main_impl (main=0x5634a769b0c0 <main>, argc=56, argv=0x7ffcb2ce54c8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffcb2ce54b8) at ../csu/libc-start.c:392
+#29 0x00005634a769f905 in _start ()
+```
+- iothread gdb stack
+```
+Thread 3 (Thread 0x7fcfae47e640 (LWP 162411) "IO iothread1"):
+#0  futex_wait (private=0, expected=2, futex_word=0x5634a9b49620) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x5634a9b49620, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007fcfaf0880dd in lll_mutex_lock_optimized (mutex=0x5634a9b49620) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x5634a9b49620) at ./nptl/pthread_mutex_lock.c:128
+#4  0x00005634a7bc25b8 in qemu_mutex_lock_impl (mutex=0x5634a9b49620, file=0x5634a7da2997 "../util/async.c", line=682) at ../util/qemu-thread-posix.c:88
+#5  0x00005634a7bd24a5 in aio_context_acquire (ctx=0x5634a9b495c0) at ../util/async.c:682
+#6  co_schedule_bh_cb (opaque=0x5634a9b495c0) at ../util/async.c:520
+#7  0x00005634a7bd26b4 in aio_bh_call (bh=0x5634a9b494a0) at ../util/async.c:150
+#8  aio_bh_poll (ctx=ctx@entry=0x5634a9b495c0) at ../util/async.c:178
+#9  0x00005634a7bbf754 in aio_poll (ctx=0x5634a9b495c0, blocking=blocking@entry=true) at ../util/aio-posix.c:712
+#10 0x00005634a7a9392a in iothread_run (opaque=opaque@entry=0x5634a9998700) at ../iothread.c:67
+#11 0x00005634a7bc21d1 in qemu_thread_start (args=<optimized out>) at ../util/qemu-thread-posix.c:504
+#12 0x00007fcfaf084b43 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:442
+#13 0x00007fcfaf116a00 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```

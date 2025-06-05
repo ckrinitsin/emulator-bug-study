@@ -1,0 +1,125 @@
+debug: 0.978
+semantic: 0.977
+graphic: 0.976
+permissions: 0.976
+performance: 0.970
+other: 0.961
+device: 0.960
+vnc: 0.957
+PID: 0.946
+socket: 0.935
+network: 0.929
+KVM: 0.925
+files: 0.925
+boot: 0.919
+
+file(1) fails with "Invalid argument" on qemu-sh4-user
+
+We recently discovered that file(1) fails on qemu-sh4-user when running on an ELF file:
+
+(sid_sh4)root@vs94:/# file /bin/bash
+/bin/bash: ERROR: ELF 32-bit LSB executable, Renesas SH, version 1 (SYSV) error reading (Invalid argument)
+(sid_sh4)root@vs94:/#
+
+Running with "-d" yields more output:
+
+(sid_sh4)root@vs94:/# file -d /bin/bash 2>&1 | tail
+322: >> 7 byte&,=97,"(ARM)"]
+0 == 97 = 0
+mget(type=1, flag=0, offset=7, o=0, nbytes=863324, il=0, nc=1)
+mget/96 @7: \000\000\000\000\000\000\000\000\000\002\000*\000\001\000\000\000\250\317A\0004\000\000\000L(\r\000\027\000\000\0004\000 \000\n\000(\000\032\000\031\000\006\000\000\0004\000\000\0004\000@\0004\000@\000@\001\000\000@\001\000\000\005\000\000\000\004\000\000\000\003\000\000\000t\001\000\000t\001@\000t\001@\000\023\000\000
+
+323: >> 7 byte&,=-1,"(embedded)"]
+0 == 18446744073709551615 = 0
+[try softmagic 1]
+[try elf -1]
+/bin/bash: ERROR: ELF 32-bit LSB executable, Renesas SH, version 1 (SYSV) error reading (Invalid argument)
+(sid_sh4)root@vs94:/#
+
+It seems that the comparison above has a bogus (overflown?) value.
+
+On actual hardware, it works:
+
+root@tirpitz:~> file /bin/bash
+/bin/bash: ELF 32-bit LSB executable, Renesas SH, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux.so.2, BuildID[sha1]=4dd0e4281755827d8bb6686fd481f8c80ea73e9a, for GNU/Linux 3.2.0, stripped
+root@tirpitz:~>
+
+I have uploaded a chroot with Debian unstable which allows to reproduce the issue:
+
+> https://people.debian.org/~glaubitz/sid-sh4-sbuild.tar.gz
+
+The "0 == 18446744073709551615 = 0" is actually fine, it's just printing "-1" as a 64-bit unsigned integer. Could you please upload the fill output of `file -d /bin/bash 2>&1`?
+
+On 09/12/2017 11:18 PM, James Clarke wrote:
+> The "0 == 18446744073709551615 = 0" is actually fine, it's just printing
+> "-1" as a 64-bit unsigned integer.
+
+Yeah, I noticed that output was the same on amd64.
+
+> Could you please upload the fill
+> output of `file -d /bin/bash 2>&1`?
+
+> https://people.debian.org/~glaubitz/file-sh4-qemu.txt
+
+-- 
+ .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+  `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+I just ran it myself inside and outside the sh4 chroot. The logging output is the same, with the exception of the final line. Something is happening once it's decided it's elf; looking at file_tryelf, my guess is the fstat call is failing[0].
+
+[0] http://sources.debian.net/src/file/1:5.31-1/src/readelf.c/#L1609
+
+On 12 September 2017 at 22:47, James Clarke <email address hidden> wrote:
+> I just ran it myself inside and outside the sh4 chroot. The logging
+> output is the same, with the exception of the final line. Something is
+> happening once it's decided it's elf; looking at file_tryelf, my guess
+> is the fstat call is failing[0].
+
+strace could probably confirm or deny that. I would be unsurprised
+if the linux-user definitions for the structure layouts for the
+various stat structs were wrong for sh4.
+
+thanks
+-- PMM
+
+
+Ok, I was wrong, there's a whole load of code being included inside the function from a header. The issue seems to be the pread:
+
+20771@1505254578.940000:guest_user_syscall cpu=0x62850620 num=0x00000000000000b4 arg1=0x0000000000000003 arg2=0xfffffffff6fe6798 arg3=0x0000000000000020 arg4=0x0000000000000000 arg5=0x0000000000000034 arg6=0x0000000000000000 arg7=0x0000000000000000 arg8=0x0000000000000000
+20771@1505254578.940005:guest_user_syscall_ret cpu=0x62850620 num=0x00000000000000b4 ret=0x0000000000000000
+
+0xb4 (180) is pread(64) on SH, which goes via a special wrapper[0] with a dummy argument that gets stripped. This dummy argument ensures that the 64-bit offset is aligned. However, linux-user doesn't know about this, and so takes (arg4, arg5) as the 64-bit value, rather than (arg5, arg6), leading to the host kernel trying to read 0x340000000000000000 bytes (and rightly returning 0 for EOF).
+
+[0] https://github.com/torvalds/linux/blob/e0d072250a54669dce876d8ade70e417356aae74/arch/sh/kernel/sys_sh32.c#L38
+
+(Currently regpairs_aligned gets checked, but this, rightly, returns false for SH; alignment is not a requirement of the SH ABI, but p{read,write}64 are an exception for it.)
+
+Bah, and that's "read *from an offset of* 0x340000000000000000 bytes"; I got confused between count and pos midway through that paragraph.
+
+With the attached patch, qemu-sh4-static now works for file:
+
+root@debian:/# /usr/bin/qemu-sh4-static.new2 /usr/bin/file /bin/bash
+/bin/bash: ELF 32-bit LSB executable, Renesas SH, version 1 (SYSV), dynamically linked, interpreter /lib/ld-linux.so.2, BuildID[sha1]=579b7ca73585e30c022e6dec83666ecc746f7499, for GNU/Linux 3.2.0, stripped
+
+On 09/13/2017 08:37 PM, James Clarke wrote:
+> With the attached patch, qemu-sh4-static now works for file:
+
+I can also confirm that the patch fixes the problem for me.
+
+Would be great if it could get merged in one form or another.
+
+-- 
+ .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+  `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+Please post patches to the qemu-devel mailing list for discussion instead of attaching them to the bugtracker. Thanks!
+
+Fix has been released with QEMU 2.11:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=8bf8e9df4a7d82c7a47cc9
+

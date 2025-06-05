@@ -1,0 +1,154 @@
+graphic: 0.843
+PID: 0.823
+debug: 0.814
+boot: 0.811
+device: 0.807
+semantic: 0.805
+network: 0.803
+other: 0.776
+permissions: 0.772
+vnc: 0.754
+performance: 0.750
+KVM: 0.726
+socket: 0.711
+files: 0.612
+
+[ARMv5] Integrator/CP regression when reading FPSID register
+
+There seems to be a regression in QEMU 2.1.0 which demonstrates itself
+when running the attached HelenOS Integrator/CP (i.e. ARMv5) image. The
+offending instruction seems to be:
+
+  vmrs r0, fpsid
+
+Upon its execution, HelenOS kernel receives an Undefined instruction
+exception (which it does not anticipate at that point) and crashes.
+
+QEMU 2.0.0 was not affected by this issue.
+
+Command line to reproduce with QEMU 2.1.0:
+
+$ qemu-system-arm -M integratorcp -kernel image.boot -s -S &
+$ /usr/local/cross/arm32/bin/arm-linux-gnueabi-gdb 
+...
+(gdb) target remote localhost:1234
+Remote debugging using localhost:1234
+warning: Can not parse XML target description; XML support was disabled at compile time
+0x00000000 in ?? ()
+(gdb) symbol-file kernel/kernel.raw
+Reading symbols from /home/jermar/software/HelenOS.mainline/kernel/kernel.raw...done.
+(gdb) break ras_check
+Breakpoint 1 at 0x80a021bc: file arch/arm32/src/ras.c, line 67.
+(gdb) c
+Continuing.
+
+Breakpoint 1, ras_check (n=1, istate=0x813e7f70) at arch/arm32/src/ras.c:67
+67	{
+(gdb) set radix 16
+Input and output radices now set to decimal 16, hex 10, octal 20.
+(gdb) print istate->pc
+$1 = 0x80a02458
+(gdb) disassemble 0x80a02458
+Dump of assembler code for function fpsid_read:
+   0x80a02454 <+0>:	vmrs	r0, fpsid                           <======= UNDEFINED EXCEPTION INSTRUCTION
+   0x80a02458 <+4>:	mov	pc, lr
+End of assembler dump.
+
+
+The Undefined instruction exception is not expected at this point when executing the VMRS r0,fpsid instruction.
+
+
+
+Here is the respective HelenOS kernel with debug symbols.
+
+Hi Jakub,
+
+Thanks for the test case. I've just done a git bisect using your test image above and it seems as if the offending commit is this:
+
+
+commit 2c7ffc414d8591018248b5487757e45f7bb6bd3c
+Author: Peter Maydell <email address hidden>
+Date:   Tue Apr 15 19:18:40 2014 +0100
+
+    target-arm: Fix VFP enables for AArch32 EL0 under AArch64 EL1
+    
+    The current A32/T32 decoder bases its "is VFP/Neon enabled?" check
+    on the FPSCR.EN bit. This is correct if EL1 is AArch32, but for
+    an AArch64 EL1 the logic is different: it must act as if FPSCR.EN
+    is always set. Instead, trapping must happen according to CPACR
+    bits for cp10/cp11; these cover all of FP/Neon, including the
+    FPSCR/FPSID/MVFR register accesses which FPSCR.EN does not affect.
+    Add support for CPACR checks (which are also required for ARMv7,
+    but were unimplemented because Linux happens not to use them)
+    and make sure they generate exceptions with the correct syndrome.
+    
+    We actually return incorrect syndrome information for cases
+    where FP is disabled but the specific instruction bit pattern
+    is unallocated: strictly these should be the Uncategorized
+    exception, not a "SIMD disabled" exception. This should be
+    mostly harmless, and the structure of the A32/T32 VFP/Neon
+    decoder makes it painful to put the 'FP disabled?' checks in
+    the right places.
+    
+    Signed-off-by: Peter Maydell <email address hidden>
+    Reviewed-by: Peter Crosthwaite <email address hidden>
+
+
+(Diff is viewable at http://git.qemu.org/?p=qemu.git;a=commitdiff;h=2c7ffc414d8591018248b5487757e45f7bb6bd3c)
+
+
+HTH,
+
+Mark.
+
+
+On 22 August 2014 12:17, Mark Cave-Ayland <email address hidden> wrote:
+> Hi Jakub,
+>
+> Thanks for the test case. I've just done a git bisect using your test
+> image above and it seems as if the offending commit is this:
+>
+>
+> commit 2c7ffc414d8591018248b5487757e45f7bb6bd3c
+> Author: Peter Maydell <email address hidden>
+> Date:   Tue Apr 15 19:18:40 2014 +0100
+>
+>     target-arm: Fix VFP enables for AArch32 EL0 under AArch64 EL1
+>
+>     The current A32/T32 decoder bases its "is VFP/Neon enabled?" check
+>     on the FPSCR.EN bit. This is correct if EL1 is AArch32, but for
+>     an AArch64 EL1 the logic is different: it must act as if FPSCR.EN
+>     is always set. Instead, trapping must happen according to CPACR
+>     bits for cp10/cp11; these cover all of FP/Neon, including the
+>     FPSCR/FPSID/MVFR register accesses which FPSCR.EN does not affect.
+>     Add support for CPACR checks (which are also required for ARMv7,
+>     but were unimplemented because Linux happens not to use them)
+>     and make sure they generate exceptions with the correct syndrome.
+
+Thanks for the bisect; this was actually my primary suspect
+for the offending commit but I hadn't got round to looking at it.
+We're trapping based on the CPACR (c1_coproc) bits being zero,
+but that register only appears in ARMv6 and later, so we
+accidentally disabled VFP in ARMv5 CPUs.
+
+Probably the best fix is to mak cpu_get_tb_cpu_state() do
+
+   if (arm_feature(env, ARM_FEATURE_V6)) {
+       fpen = extract32(env->cp15.c1_coproc, 20, 2);
+   } else {
+       /* CPACR doesn't exist before v6 so VFP always accessible */
+       fpen = 3;
+   }
+
+-- PMM
+
+
+Patch which implements my suggestion of comment #4 and seems to fix this regression:
+http://patchwork.ozlabs.org/patch/382215/
+
+
+Yes, the patch fixes the problem for me. Thank you.
+
+Patch had been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=ed1f13d607e2c64c66bea49d
+

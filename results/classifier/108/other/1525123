@@ -1,0 +1,145 @@
+other: 0.966
+permissions: 0.963
+graphic: 0.960
+debug: 0.959
+semantic: 0.954
+performance: 0.937
+device: 0.935
+files: 0.935
+socket: 0.922
+PID: 0.919
+KVM: 0.912
+vnc: 0.894
+network: 0.885
+boot: 0.860
+
+USB assert failure on hcd-uhci.c
+
+When inserting the attached kernel moudle in the guest OS, QEMU quits with therse assert failure:
+
+
+[insert kernel module in guest root shell]
+root@qemu:~# insmod mymod.ko
+root@qemu:~# 
+Connection closed by foreign host.
+
+[host message]
+qemu-system-x86_64: hw/usb/core.c:718: usb_ep_get: Assertion `pid == 0x69 || pid == 0xe1' failed.
+Aborted
+
+The cause of this bug is due to misimplementation of UHCI.
+According to Intel's UHCI design guide, packet identification in transfer descriptor should have one of these three value : IN (69h), OUT (E1h), and SETUP (2Dh). Any other value in this field shoudl cause HALT OF only HOST CONTROLLER.
+However, due to misimplementation in QEMU, not only host controller halts, but QEMU itself exits with assertion failure.
+This kind of assert failure can be misused by malwares to avoid being analyzed by terminating only in the virtual environments and still execute the malicious code in real machines.
+
+[How to run exploit code]
+Prepare linux kernel's source header, then type these lines in root shell.
+# make
+# insmod mymod.ko
+
+It needs uhci-hcd.h from linux kernel source.
+I attached linux 3.18.24's uhci-hcd.h for tempory measure; You should get proper version of uhci-hcd.h.
+In the following envrionment, this exploit worked, exiting whole QEMU, not only USB.
+
+QEMU was running on these environment :
+[CPU model] Intel(R) Core(TM) i5-4590 CPU @ 3.30GHz
+[qemu version] QEMU 2.5.0-rc3 (compiled from source, gcc 4.8.4)
+[host info] Ubuntu 14.04.3, x86_64, 3.19.0-32-generic
+[guest info] Ubuntu 14.04.3, x86_64, 3.19.0-28-generic
+[QEMU argument]
+x86_64-softmmu/qemu-system-x86_64 -hda /media/hdd/img/ubuntu1404.qcow2 \
+ -m 512 \
+ --usbdevice disk:format=qcow2:../usb.img \
+ --enable-kvm
+
+
+
+Triaging old bug tickets ... can you still reproduce this issue with the latest version of QEMU (version 2.8)?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Hello,
+While fuzzing, I found an input that triggers this assertion-failure in usb_ep_get
+
+/home/alxndr/Development/qemu/hw/usb/core.c:723: struct USBEndpoint *usb_ep_get(USBDevice *, int, int): Assertion `pid == USB_TOKEN_IN || pid == USB_TOKEN_OUT' failed.
+#3  0x00007ffff6866092 in __GI___assert_fail (assertion=0x555557fd2c60 <str> "pid == USB_TOKEN_IN || pid == USB_TOKEN_OUT", file=0x555557fd1ec0 <str> "/home/alxndr/Development/qemu/hw/usb/core.c", line=0x2d3, function=0x555557fd2c00 <__PRETTY_FUNCTION__.usb_ep_get> "struct USBEndpoint *usb_ep_get(USBDevice *, int, int)") at assert.c:101
+#4  0x000055555724690a in usb_ep_get (dev=0x623000001d00, pid=0x0, ep=0x2) at /home/alxndr/Development/qemu/hw/usb/core.c:723
+#5  0x00005555572bdd8e in ehci_execute (p=0x611000048480, action=0x555557fdd860 <str> "process") at /home/alxndr/Development/qemu/hw/usb/hcd-ehci.c:1366
+#6  0x00005555572b74a3 in ehci_state_execute (q=0x60d000004f10) at /home/alxndr/Development/qemu/hw/usb/hcd-ehci.c:1942
+#7  0x00005555572b3510 in ehci_advance_state (ehci=0x62100002d9f0, async=0x1) at /home/alxndr/Development/qemu/hw/usb/hcd-ehci.c:2083
+#8  0x00005555572b2db9 in ehci_advance_async_state (ehci=0x62100002d9f0) at /home/alxndr/Development/qemu/hw/usb/hcd-ehci.c:2152
+#9  0x00005555572a29c3 in ehci_work_bh (opaque=0x62100002d9f0) at /home/alxndr/Development/qemu/hw/usb/hcd-ehci.c:2320
+#10 0x0000555557bfba60 in aio_bh_call (bh=0x60400001cd90) at /home/alxndr/Development/qemu/util/async.c:136
+#11 0x0000555557bfc1fe in aio_bh_poll (ctx=0x61300008fa00) at /home/alxndr/Development/qemu/util/async.c:164
+#12 0x0000555557c149e8 in aio_dispatch (ctx=0x61300008fa00) at /home/alxndr/Development/qemu/util/aio-posix.c:380
+#13 0x0000555557c00455 in aio_ctx_dispatch (source=0x61300008fa00, callback=0x0, user_data=0x0) at /home/alxndr/Development/qemu/util/async.c:306
+#14 0x00007ffff7ca89ee in g_main_context_dispatch () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+
+
+I can reproduce it in qemu 5.0 using:
+
+cat << EOF | ~/Development/qemu/build/i386-softmmu/qemu-system-i386 \
+-qtest stdio -nographic -monitor none -serial none \
+-M pc-q35-5.0 -machine q35 \
+-device ich9-usb-ehci1,bus=pcie.0,addr=1d.7,multifunction=on,id=ich9-ehci-1 \
+-drive if=none,id=usbcdrom,media=cdrom \
+-device usb-storage,bus=ich9-ehci-1.0,port=2,drive=usbcdrom \
+-display none -nodefaults -nographic
+outl 0xcf8 0x8000ef10
+outl 0xcfc 0xe0000000
+outl 0xcf8 0x8000ef14
+outl 0xcf8 0x8000ef04
+outw 0xcfc 0x7
+outl 0xcf8 0x8000fa20
+write 0xe0000020 0x4b 0x21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe00695501ff21fe006955
+write 0x5 0x1 0x92
+write 0x15 0x3 0x92ab01
+write 0x1b 0x1 0xab
+write 0x1ab9208 0x2 0x92ab
+EOF
+
+I also attached the commands to this launchpad report, in case the formatting
+is broken:
+
+qemu-system-i386 \
+-qtest stdio -nographic -monitor none -serial none \
+-M pc-q35-5.0 -machine q35 \
+-device ich9-usb-ehci1,bus=pcie.0,addr=1d.7,multifunction=on,id=ich9-ehci-1 \
+-drive if=none,id=usbcdrom,media=cdrom \
+-device usb-storage,bus=ich9-ehci-1.0,port=2,drive=usbcdrom \
+-display none -nodefaults -nographic < attachment
+
+Please let me know if I can provide any further info.
+-Alex
+
+
+We can reproduce this bug in QEMU 5.0.0
+
+```
+qemu-system-x86_64: hw/usb/core.c:723: usb_ep_get: Assertion `pid == USB_TOKEN_IN || pid == USB_TOKEN_OUT' failed.
+```
+
+To reproduce run the QEMU with the following command line:
+```
+qemu-system-x86_64 -cdrom hypertrash.iso -nographic -m 100 -enable-kvm -net none -device ich9-usb-ehci1 -device usb-tablet
+```
+
+QEMU Version:
+```
+# qemu-5.0.0
+$ ./configure --target-list=x86_64-softmmu --enable-sanitizers; make
+$ x86_64-softmmu/qemu-system-x86_64 --version
+QEMU emulator version 5.0.0
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+```
+
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/119
+
+

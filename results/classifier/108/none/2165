@@ -1,0 +1,83 @@
+KVM: 0.527
+other: 0.483
+vnc: 0.468
+graphic: 0.458
+boot: 0.448
+permissions: 0.442
+device: 0.439
+performance: 0.427
+debug: 0.413
+semantic: 0.408
+network: 0.404
+files: 0.393
+socket: 0.388
+PID: 0.387
+
+m68k: 68000 strict alignment requirements not emulated correctly
+Description of problem:
+Unaligned accesses should cause an address error on the 68000 but apparently currently don't.
+Steps to reproduce:
+1. Create a 68000 based QEMU machine to port u-boot/linux
+2. Get u-boot/linux working perfectly on your QEMU machine
+3. Copy kernel over to your real 68000 hardware
+4. Notice that the kernel doesn't work
+5. Spend a day adding inline assembly all over the kernel to work out where the real hardware is locking up
+6. Find that the issue is probably memmove() being called with an unaligned src pointer:
+
+C level..
+
+```
+Breakpoint 1, memmove (n=215, src=0x2059df <printk_shared_pbufs+215>, dest=0x2059ee <printk_shared_pbufs+230>) at ../arch/m68k/lib/memmove.c:152
+152                             *--sdest = *--ssrc;
+(gdb) bt
+#0  memmove (n=215, src=0x2059df <printk_shared_pbufs+215>, dest=0x2059ee <printk_shared_pbufs+230>) at ../arch/m68k/lib/memmove.c:152
+#1  memmove (dest=<optimized out>, src=<optimized out>, n=<optimized out>) at ../arch/m68k/lib/memmove.c:10
+#2  0x000265b6 in record_print_text (r=<optimized out>, syslog=<optimized out>, time=<optimized out>) at ../kernel/printk/printk.c:1472
+#3  0x00027be6 in printk_get_next_message (pmsg=<optimized out>, seq=<optimized out>, is_extended=<optimized out>, may_suppress=<optimized out>) at ../kernel/printk/printk.c:2952
+#4  0x00027e5a in console_emit_next_record (cookie=0, handover=0x1d9e37, con=0x1edf14 <early_con>) at ../kernel/printk/printk.c:3019
+#5  console_flush_all (do_cond_resched=false, next_seq=0x1d9e38, handover=0x1d9e37) at ../kernel/printk/printk.c:3118
+#6  0x00027fc8 in console_unlock () at ../kernel/printk/printk.c:3187
+#7  0x00028a04 in vprintk_emit (facility=0, level=<optimized out>, dev_info=0x0, fmt=0x1bd051 "\0016printk: %s%sconsole [%s%d] enabled\n", args=0x1d9e98) at ../kernel/printk/printk.c:2359
+#8  0x00028a26 in vprintk_default (fmt=0x1bd051 "\0016printk: %s%sconsole [%s%d] enabled\n", args=0x1d9e98) at ../kernel/printk/printk.c:2374
+#9  0x00028c22 in vprintk (fmt=0x1bd051 "\0016printk: %s%sconsole [%s%d] enabled\n", args=0x1d9e98) at ../kernel/printk/printk_safe.c:45
+#10 0x0019d016 in _printk (fmt=0x1bd051 "\0016printk: %s%sconsole [%s%d] enabled\n") at ../kernel/printk/printk.c:2384
+#11 0x0002857e in register_console (newcon=<optimized out>) at ../kernel/printk/printk.c:3693
+#12 0x001fbf1e in register_earlycon (match=<optimized out>, buf=0x0) at ../drivers/tty/serial/earlycon.c:161
+#13 setup_earlycon (buf=<optimized out>) at ../drivers/tty/serial/earlycon.c:212
+#14 0x001fbf72 in param_setup_earlycon (buf=0x2009e9 <tmp_cmdline+9> "mc68ez328,0xfffff900") at ../drivers/tty/serial/earlycon.c:244
+#15 0x001f1102 in do_early_param (param=0x2009e0 <tmp_cmdline> "earlycon", val=0x2009e9 <tmp_cmdline+9> "mc68ez328,0xfffff900", unused=0x1b96c6 "early options", arg=0x0)
+    at ../init/main.c:744
+#16 0x00017eac in parse_one (handle_unknown=<optimized out>, arg=<optimized out>, max_level=<optimized out>, min_level=<optimized out>, num_params=<optimized out>, params=<optimized out>, 
+    doing=0x1b96c6 "early options", val=0x2009e9 <tmp_cmdline+9> "mc68ez328,0xfffff900", param=0x2009e0 <tmp_cmdline> "earlycon") at ../kernel/params.c:154
+#17 parse_args (doing=<optimized out>, args=0x2009fe <tmp_cmdline+30> "console=ttyDB0 root=/dev/mmcblk0p2 rootfstype=squashfs rootwait", params=<optimized out>, num=<optimized out>, 
+    min_level=<optimized out>, max_level=<optimized out>, arg=<optimized out>, unknown=<optimized out>) at ../kernel/params.c:189
+#18 0x001f13ea in parse_early_options (cmdline=0x2009e0 <tmp_cmdline> "earlycon") at ../init/main.c:754
+#19 0x001f1420 in parse_early_param () at ../init/main.c:769
+#20 0x001f1570 in start_kernel () at ../init/main.c:908
+#21 0x000004b8 in _clear_bss () at ../arch/m68k/dt/head.S:95
+#22 0x00000000 in ?? ()
+```
+
+Asm level:
+
+```
+152                             *--sdest = *--ssrc;
+   0x0019bed8 <+324>:   movel %a1,%d2
+   0x0019beda <+326>:   subql #2,%d2
+   0x0019bedc <+328>:   movel %a2,%d1
+   0x0019bede <+330>:   subql #2,%d1
+=> 0x0019bee0 <+332>:   movew %a1@(-2),%a2@(-2)
+```
+
+This is a word store so needs to be aligned but a1 isn't aligned so we should get an address error:
+
+```
+(gdb) print/x $a1
+$3 = 0x2059df
+(gdb) print/x $a2
+$4 = 0x2059ee
+```
+
+
+7. Check QEMU source code to work out why it doesn't crash the cpu at the same place.
+8. Notice it doesn't seem to check the alignment.

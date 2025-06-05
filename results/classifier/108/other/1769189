@@ -1,0 +1,144 @@
+KVM: 0.892
+permissions: 0.882
+other: 0.877
+performance: 0.875
+debug: 0.871
+device: 0.867
+boot: 0.861
+vnc: 0.859
+files: 0.853
+PID: 0.838
+semantic: 0.832
+network: 0.792
+graphic: 0.791
+socket: 0.700
+
+Issue with qemu 2.12.0 + SATA
+
+(first reported here: https://bugzilla.tianocore.org/show_bug.cgi?id=949 )
+
+I had a Windows 10 VM running perfectly fine with OVMF UEFI, since I upgraded to qemu 2.12, the guests hangs for a couple of minutes, works for a few seconds, and hangs again, etc. By "hang" I mean it doesn't freeze, but it looks like it's waiting on IO or something, I can move the mouse but everything needing disk access is unresponsive.
+
+What doesn't work: qemu 2.12 with OVMF
+What works: using BIOS or downgrading qemu to 2.11.1.
+
+Platform is arch linux 4.16.7 on skylake, I have attached the vm xml file.
+
+
+
+I'm seeing the same Win10 I/O stall problem with qemu 2.12, but with a vm with BIOS, not UEFI.
+The solution for me is only dowgrading for now.
+
+I have the same issue. When I open the task manager on the virtualized Windows 10 VM I see the HDD time is at 100% but the data transfer rate is actual 0b/s. 
+I've tried any combination of the options below and the issue was always reproducible with qemu-2.12.0-1 and never with qemu-2.11.1-2.
+
+Linux kernels:
+- 4.14.5-1
+- 4.16.7
+
+Windows 10 Verson (for the VM) 
+- 1709
+- 1803
+
+Boot HDD for VM
+- Actual SSD (/dev/sda)
+- QCOW2 Image
+
+QEMU 
+- qemu-2.11.1-2
+- qemu-2.12.0-1
+
+
+I also use ARCH Linux and have also downgraded to pre 2.12 QEMU
+
+
+I have done some further tests and the problem seems to be SATA, not UEFI, I have updated the bug description to reflect this.
+
+François: Would it be possible for you to try a bisect build to try and figure out which change in qemu caused the problem?
+
+
+For me it is hangs with SATA, but IDE is fine.
+
+Windows 7 Version (for the VM)
+- SP1
+
+Boot HDD for VM
+- Actual HDD (/dev/sda)
+- QCOW2 Image
+
+QEMU
+- qemu-2.12.0-1 
+
+I've tried bisecting a few times, but since my reproducer wasn't reliable enough, I didn't identify the issue. (I see a bisect reported on qemu ML which seems like a bogus result, similar to mine).
+
+In my case, after the "hang", Windows 10 resets the ahci device after 2 minutes and it continues on until another hang happens. Seems fairly random. I increased the number of vcpu's assigned which seemed to increase the likelihood of the hang.
+
+I also went so far as to instrument an injection of the ahci interrupt via the monitor (total kludge, I know), and the guest did get out of the hung condition right away when I did that.
+
+I tried bisecting as well, and I wound up at:
+
+1a423896 -- five out of five boot attempts succeeded.
+d759c951 -- five out of five boot attempts failed.
+
+
+
+d759c951f3287fad04210a52f2dc93f94cf58c7f is the first bad commit
+commit d759c951f3287fad04210a52f2dc93f94cf58c7f
+Author: Alex Bennée <email address hidden>
+Date:   Tue Feb 27 12:52:48 2018 +0300
+
+    replay: push replay_mutex_lock up the call tree
+
+
+
+
+My methodology was to boot QEMU like this:
+
+./x86_64-softmmu/qemu-system-x86_64 -m 4096 -cpu host -M q35 -enable-kvm -smp 4 -drive id=sda,if=none,file=/home/bos/jhuston/windows_10.qcow -device ide-hd,drive=sda -qmp tcp::4444,server,nowait
+
+and run it three times with -snapshot and see if it hung during boot; if it did, I marked the commit bad. If it did not, I booted and attempted to log in and run CrystalDiskMark. If it froze before I even launched CDM, I marked it bad.
+
+Interestingly enough, on a subsequent (presumably bad) commit (6dc0f529) which hangs fairly reliably on bootup (66%) I can occasionally get into Windows 10 and run CDM -- and that unfortunately does not seem to trigger the error again, so CDM doesn't look like a reliable way to trigger the hangs.
+
+
+
+
+Anyway, d759c951 definitely appears to change the odds of AHCI locking up during boot for me, and I suppose it might have something to do with how it is changing the BQL acquisition/release in main-loop.c, but I am not sure why/what yet.
+
+Before this patch, we only lock the iothread and re-lock it if there was a timeout, and after this patch we *always* lock and unlock the iothread. This is probably just exposing some latent bug in the AHCI emulator that has always existed, but now the odds of seeing it are much higher.
+
+I'll have to dig as to what the race is -- I'm not sure just yet.
+
+
+If those of you who are seeing this bug too could confirm for me that d759c951 appears to be the guilty party, that probably wouldn't hurt.
+
+Thanks!
+--js
+
+I can confirm that for me commit d759c951 does cause / expose the issue.
+
+There might be multiple issues present and I'm having difficulty reliably doing any kind of regression testing here, but I think this patch helps fix at least one of the issues I was seeing that occurs specifically during early boot. It may fix other hangs.
+
+
+
+Oughtta be fixed in current master, will be fixed in 2.12.1 and 3.0.
+
+Hi, Where can I find the fix patch at present?
+
+5694c7eacce6b263ad7497cc1bb76aad746cfd4e ahci: fix PxCI register race
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=5694c7eacce6b263ad7497cc1bb76aad746cfd4e
+
+Could this affect virtio-scsi? I'm not so sure since it's not perfectly reliable to reproduce, but v2.12.0 was hanging for me for a few minutes at a time with virtio-scsi cache=writeback showing 100% disk util%. I never had issues booting up, and didn't try SATA. v2.11.1 was fine.
+
+My first attempt to bisect didn't turn out right... had some false positives I guess. The 2nd attempt (telling git the bads from first try) got to 89e46eb477113550485bc24264d249de9fd1260a as latest good (which is 4 commits *after* the bisect by John Snow) and 7273db9d28d5e1b7a6c202a5054861c1f0bcc446 as bad.
+
+But testing with this patch, it seems to work (or false positive still... after a bunch of usage). And so I didn't finish the bisect.
+
+The fix posted exclusively changes the behavior of AHCI devices; however the locking changes that jostled the AHCI bug loose could in theory jostle loose some bugs in other devices, too.
+
+I don't think it is possible that the fix for AHCI would have any impact on virtio-scsi devices.
+
+If you're seeing issues in virtio-scsi, I'd make a new writeup in a new LP.
+--js
+

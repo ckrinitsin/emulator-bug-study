@@ -1,0 +1,128 @@
+debug: 0.962
+other: 0.945
+semantic: 0.915
+permissions: 0.888
+graphic: 0.879
+socket: 0.872
+device: 0.870
+files: 0.858
+vnc: 0.848
+performance: 0.847
+boot: 0.831
+PID: 0.813
+KVM: 0.808
+network: 0.674
+
+windows qemu-img create vpc/vhdx error
+
+On windows, using qemu-img (version 2.11.90) to create vpc/vhdx virtual disk tends to fail. Here's the way to reproduce:
+
+1. Install qemu-w64-setup-20180321.exe
+
+2. Use `qemu-img create -f vhdx -o subformat=fixed disk.vhdx 512M` to create a vhdx:
+   Formatting 'disk.vhdx', fmt=vhdx size=536870912 log_size=1048576 block_size=0 subformat=fixed
+
+3. Execute `qemu-img info disk.vhdx` gives the result, (note the `disk size` is incorrect):
+   image: disk.vhdx
+   file format: vhdx
+   virtual size: 512M (536870912 bytes)
+   disk size: 1.4M
+   cluster_size: 8388608
+
+4. On Windows 10 (V1709), double click disk.vhdx gives an error:
+   Make sure the file is in an NTFS volume and isn't in a compressed folder or volume.
+
+   Using Disk Management -> Action -> Attach VHD gives an error:
+   The requested operation could not be completed due to a virtual disk system limitation. Virtual hard disk files must be uncompressed and uneccrypted and must not be sparse.
+
+Comparison with Windows 10 created VHDX:
+
+1. Using Disk Management -> Action -> Create VHD:
+   File name: win.vhdx
+   Virtual hard disk size: 512MB
+   Virtual hard disk format: VHDX
+   Virtual hard disk type: Fixed size
+
+2. Detach VHDX
+
+3. Execute `qemu-img info win.vhdx` gives the result:
+   image: win.vhdx
+   file format: vhdx
+   virtual size: 512M (536870912 bytes)
+   disk size: 516M
+   cluster_size: 33554432
+
+Comparison with qemu-img under Ubuntu:
+
+1. Version: qemu-img version 2.5.0 (Debian 1:2.5+dfsg-5ubuntu10.16), Copyright (c) 2004-2008 Fabrice Bellard
+
+2. qemu-img create -f vhdx -o subformat=fixed lin.vhdx 512M
+   Formatting 'lin.vhdx', fmt=vhdx size=536870912 log_size=1048576 block_size=0 subformat=fixed
+
+3. qemu-img info lin.vhdx
+   image: lin.vhdx
+   file format: vhdx
+   virtual size: 512M (536870912 bytes)
+   disk size: 520M
+   cluster_size: 8388608
+
+4. Load lin.vhdx under Windows 10 is ok
+
+The same thing happens on `vpc` format with or without `oformat=fixed`, it seems that windows version of qemu-img has some incorrect operation? My guess is that windows version of qemu-img doesn't handle the description field of vpc/vhdx, which leads to an incorrect `disk size` field.
+
+Also, `force_size` suboption of `vpc` doesn't work on win version of qemu-img.
+
+Can confirm this is still an issue with 4.1.0.
+
+?field.comment=Can confirm this is still an issue with 4.1.0.
+
+
+
+I confirm this is still exists using qemu-4.2.0.
+
+I remembered asking a QEMU developer about this. He suggested me to send an email to the developer mailing list, or send messages to IRC channel.
+
+I don't have time to do this right now, but if someone else finds this bug report and wants to get the help, please email them instead.
+
+I also discovered just a few days ago the problem that sparse VHD/VHDX image files are not being accepted by Windows.
+
+It appears that qemu-img on Windows always tries to create images as sparse files. Only in some cases (e.g. when operating on a NTFS file system) will the file actually be a sparse file.
+
+Being a sparse file seems to be no issue when using these file with QEMU itself. Most file formats that qemu-img is able to create will be unknown to Windows own tools, but the one exception are VHD/VHDX files.
+
+As long as a file carries the sparse attribute it will be "un-acceptable" to the Windows tools (e.g. diskpart/diskmgmt). As a crude work-around I've noticed that a copy of such a file will have "lost" the sparse attribute, and therefore can be mounted. Likewise any copy of a file created on a different system will not be a sparse file (and hence the issue does not arise).
+
+I'm attaching a log file (with a few comments) of some steps that demonstrate the problem, and how I worked around it. The test was done with qemu-img v4.1.0, but I'm fairly certain that this issue has been present since "forever" (and a quick re-test with v4.2.0 confirmed that it has not "gone away").
+
+So, a simple work-around exists, but I see myself unable to suggest a patch. I guess the patch should be specific to prevent the creation of sparse VHD/VHDX files on Windows. But from the superficial reading I did I could not work out whether the image format information would be available in 'raw_co_create()' (of: 'block/file-win32.c').
+
+I noticed the cloudbase version does NOT have this issue. https://cloudbase.it/qemu-img-windows/
+The weilnetz version DOES have this issue. https://qemu.weilnetz.de/w64/
+
+So, I found the source code for each release and compared them.
+
+cloudbase https://repo.or.cz/w/qemu/ar7.git/
+weilnetz https://github.com/cloudbase/qemu
+
+git remote add origin git://repo.or.cz/qemu/ar7.git
+git remote add cloudbase https://github.com/cloudbase/qemu.git
+git fetch --all
+git diff v2.3.0 cloudbase/v2.3.0-cloudbase
+
+And I see that the cloudbase version comments out set_sparse(fd).
+
+I think the solution is to remove set_sparse.
+You can find it in block/file-win32.c
+
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/136
+
+

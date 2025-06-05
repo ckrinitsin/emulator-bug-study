@@ -1,0 +1,167 @@
+vnc: 0.945
+debug: 0.942
+performance: 0.933
+PID: 0.928
+permissions: 0.922
+device: 0.911
+files: 0.910
+socket: 0.907
+graphic: 0.903
+other: 0.899
+KVM: 0.881
+semantic: 0.876
+boot: 0.852
+network: 0.844
+
+Hardfault when accessing FPSCR register
+
+QEMU release version: v6.0.0-rc2
+
+command line:
+qemu-system-arm -machine mps3-an547 -nographic -kernel <my_project>.elf -semihosting -semihosting-config enable=on,target=native
+
+host operating system: Linux ISCNR90TMR1S 5.4.72-microsoft-standard-WSL2 #1 SMP Wed Oct 28 23:40:43 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
+
+guest operating system: none (bare metal)
+
+Observation:
+I am simulating embedded firmware for a Cortex-M55 device, using MPS3-AN547 machine. In the startup code I am accessing the FPSCR core register:
+
+    unsigned int fpscr =__get_FPSCR();
+    fpscr = fpscr & (~FPU_FPDSCR_AHP_Msk);
+    __set_FPSCR(fpscr);
+
+where the register access functions __get_FPSCR() and __set_FPSCR(fpscr) are taken from CMSIS_5 at ./CMSIS/Core/include/cmsis_gcc.h
+
+I observe hardfaults upon __get_FPSCR() and __set_FPSCR(fpscr). The same startup code works fine on the Arm Corstone-300 FVP.
+
+Does your code enable the FPU (via the CPACR and, if running in NonSecure) the NSACR? If not then a fault is exactly what you should expect. (I believe the FVP has a non-standard behaviour where it will enable the FPU by default even though real hardware does not behave that way.)
+
+
+Yes, I think I did:
+
+    SCB->NSACR |= (3U << 10U);                /* enable Non-secure access to CP10 and CP11 coprocessors */
+    __DSB();
+    __ISB();
+
+    SCB->CPACR |= ((3U << 10U*2U) |           /* enable CP10 Full Access */
+                   (3U << 11U*2U)  );         /* enable CP11 Full Access */
+    __DSB();
+    __ISB();
+
+But I get a NOCP (no coprocessor) hard fault.
+
+Does the qemu mps3-an547 model contain the FPU by default or do I have to select it via the command line?
+Is there an example code / test case included in the qemu database where I can lookup the usage of mps3-an547 + FPU? 
+
+Do you have a guest binary and QEMU commandline I can use to reproduce the issue ?
+
+
+Command line is
+qemu-system-arm -machine mps3-an547 -nographic -kernel test.elf -semihosting -semihosting-config enable=on,target=native
+
+Binary is attached. It does
+
+int main(int argc, char* argv[])
+{
+    SCB->NSACR |= (3U << 10U);                /* enable Non-secure access to CP10 and CP11 coprocessors */
+    __DSB();
+    __ISB();
+
+    SCB->CPACR |= ((3U << 10U*2U) |           /* enable CP10 Full Access */
+                   (3U << 11U*2U)  );         /* enable CP11 Full Access */
+    __DSB();
+    __ISB();
+
+//   enable DL branch cache
+    #define CCR      (*((volatile unsigned int *)0xE000ED14))
+    #define CCR_DL   (1 << 19)
+      CCR |= CCR_DL;
+    __ISB();
+
+   uint32_t result;
+    __asm volatile ("VMRS %0, fpscr" : "=r" (result) );           // <-- NOCP hardfault
+    printf("fpscr = 0x%08lx\r\n", result);
+    __asm volatile ("VMRS %0, mvfr0" : "=r" (result) );
+    printf("mvfr0 = 0x%08lx\r\n", result);
+    __asm volatile ("VMRS %0, mvfr1" : "=r" (result) );
+    printf("mvfr1 = 0x%08lx\r\n", result);
+    __asm volatile ("VMRS %0, mvfr2" : "=r" (result) );
+    printf("mvfr2 = 0x%08lx\r\n", result);
+
+    exit(0);
+}
+
+Thank you for your help!
+
+
+Thanks. This is a bug in the AN547 model -- we were accidentally turning off the FPU. I'll write a patch.
+
+NB that with that bug fixed your code then hits an UNDEF trying to do:
+  0x00000996:  eef7 1a10  vmrs     r1, mvfr0
+
+Only A-profile CPUs have MVFR0 accessible via the vmrs instruction. For M-profile this register is memory-mapped, at 0xE000EF40.
+
+
+The bug fix for the QEMU part of this is
+https://<email address hidden>/
+
+
+Thanks for the fix. I applied it and
+1. yes, the hard fault when reading FPSCR is gone.
+2. yes, I also see the UNDEF. Note that on the Corstone-300 MPS3-AN547 FVP I can access mvfr0 via vmrs.
+
+I changed the vmrs to ldr. Now I can read the registers. The values differ from what the FVP tells me:
+fpscr = 0x00000000 (qemu-system-arm) - 0x00040000 (Corstone FVP)
+mvfr0 = 0x10110021                   - 0x10110221
+mvfr1 = 0x11000011                   - 0x12100211
+mvfr2 = 0x00000040                   - 0x00000040
+
+Using the FPU for some simple calculations
+
+    volatile int nom_i, den_i;
+    nom_i = 7;
+    den_i = 3;
+    volatile float nom_f, den_f, div_f;
+    nom_f = (float)nom_i;
+    den_f = (float)den_i;
+    div_f = nom_f / den_f;
+    printf("%e / %f = %f\r\n", nom_f, den_f, div_f);
+
+I run into another UNDEF when executing 
+    vcvt.f64.f32    d6, s12
+
+Again, the FVP can execute the same elf. I attached it. Maybe you can have another look.
+
+Some of those ID register differences are expected; some I'm surprised by. The differences are:
+ * no MVE (expected, we don't implement it yet)
+ * no double-precision
+ * no FP16
+
+So the missing double-precision is why your vcvt UNDEFs. Those last two ought to be present, but something is squashing them; I will investigate.
+
+The FPSCR difference is that we aren't reporting FPSCR.LTPSIZE for some reason -- that's a bug too.
+
+
+I changed the compile options to single precision, only. Then, my small FP example works. Ok for my purposes, I don't need double.
+
+But I would need MVE. Are there any plans to implement MVE?
+
+Oops -- we were giving the AN547 a Cortex-M33 rather than the -M55 it ought to have :-(
+
+Yes, MVE is next on my todo list; it will probably be in 6.2, or maybe 7.0 depending how long it takes to implement it all.
+
+
+https://<email address hidden>/ should fix the "not actually an M55" bug which will then give you the double-precision and FP16 (and the right FPSCR value).
+
+
+I tried your fix. Yes, the fpscr and mvfr0/1/2 values do match the FVP, now (except for the MVE bit which is explained above).
+
+Thx for the updates.
+
+These fixes are now in master and will be in rc4 and the eventual 6.0 release.
+
+
+https://gitlab.com/qemu-project/qemu/-/commit/330ef14e6e749919c5c
+https://gitlab.com/qemu-project/qemu/-/commit/1df0878cff267128393
+

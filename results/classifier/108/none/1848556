@@ -1,0 +1,240 @@
+semantic: 0.373
+graphic: 0.341
+device: 0.301
+PID: 0.273
+debug: 0.260
+permissions: 0.235
+performance: 0.231
+other: 0.194
+network: 0.181
+boot: 0.163
+vnc: 0.150
+KVM: 0.135
+socket: 0.126
+files: 0.123
+
+qemu-img check failing on remote image in Eoan
+
+The "qemu-img check" function is failing on remote (HTTP-hosted) images, beginning with Ubuntu 19.10 (qemu-utils version 1:4.0+dfsg-0ubuntu9). With previous versions, through Ubuntu 19.04/qemu-utils version 1:3.1+dfsg-2ubuntu3.5, the following worked:
+
+$ /usr/bin/qemu-img check  http://10.193.37.117/cloud/eoan-server-cloudimg-amd64.img
+No errors were found on the image.
+19778/36032 = 54.89% allocated, 90.34% fragmented, 89.90% compressed clusters
+Image end offset: 514064384
+
+The 10.193.37.117 server holds an Apache server that hosts the cloud images on a LAN. Beginning with Ubuntu 19.10/qemu-utils 1:4.0+dfsg-0ubuntu9, the same command never returns. (I've left it for up to an hour with no change.) I'm able to wget the image from the same server and installation on which qemu-img check fails. I've tried several .img files on the server, ranging from Bionic to Eoan, with the same results with all of them.
+
+Oh, there's no problem checking the file once it's on the local filesystem:
+
+$ wget http://10.193.37.117/cloud/bionic-server-cloudimg-amd64.img
+--2019-10-17 17:51:33--  http://10.193.37.117/cloud/bionic-server-cloudimg-amd64.img
+Connecting to 10.193.37.117:80... connected.
+HTTP request sent, awaiting response... 200 OK
+Length: 344195072 (328M)
+Saving to: ‘bionic-server-cloudimg-amd64.img’
+
+bionic-server-cloud 100%[===================>] 328.25M   105MB/s    in 3.1s    
+
+2019-10-17 17:51:37 (105 MB/s) - ‘bionic-server-cloudimg-amd64.img’ saved [344195072/344195072]
+
+$ qemu-img check bionic-server-cloudimg-amd64.img 
+No errors were found on the image.
+16651/36032 = 46.21% allocated, 98.92% fragmented, 98.49% compressed clusters
+Image end offset: 344195072
+
+Hi Rod,
+I did try to recreate with the qemu version that you have.
+
+$ apt install apache2 qemu-system-x86
+$ qemu-img create -f qcow2 /var/www/html/test.img 1G
+# local
+$ qemu-img check test.img
+No errors were found on the image.
+# remote
+$ qemu-img check http://localhost:80/test.img                                                                                                                                         
+No errors were found on the image.                                                                                                                                                            
+Image end offset: 262144
+
+Local check and remote check both work just fine.
+
+I recognized the image that you have there and then did:
+$ cd /var/www/html/
+$ wget https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
+# local
+$ qemu-img check bionic-server-cloudimg-amd64.img
+No errors were found on the image.
+16651/36032 = 46.21% allocated, 98.92% fragmented, 98.49% compressed clusters
+Image end offset: 344195072
+# remote
+$ qemu-img check http://localhost:80/bionic-server-cloudimg-amd64.img
+<hangs>
+
+Therefore I can confirm the behavior you described.
+
+
+
+The stuck poll is at:
+#0  0x00007fafb935ad26 in __GI_ppoll (fds=0x560dba615670, nfds=1, timeout=<optimized out>, timeout@entry=0x0, sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:39
+#1  0x0000560db89550b9 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>) at /usr/include/x86_64-linux-gnu/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>) at ./util/qemu-timer.c:322
+#3  0x0000560db89570eb in aio_poll (ctx=ctx@entry=0x560dba5e83b0, blocking=blocking@entry=true) at ./util/aio-posix.c:666
+#4  0x0000560db888c21d in bdrv_check (bs=<optimized out>, res=<optimized out>, fix=<optimized out>) at ./block.c:4149
+#5  0x0000560db887e6ab in collect_image_check (bs=0x560dba5ed680, check=0x560dba6143d0, filename=0x7ffe3d7c48d7 "http://localhost:80/bionic-server-cloudimg-amd64.img", fix=<optimized out>, 
+    fmt=<optimized out>) at ./qemu-img.c:615
+#6  0x0000560db88825e1 in img_check (argc=<optimized out>, argv=<optimized out>) at ./qemu-img.c:774
+#7  0x0000560db887bd2e in main (argc=2, argv=<optimized out>) at ./qemu-img.c:4987
+
+And from strace we know that the FD is from
+260 [pid 20469]      0.000067 eventfd2(0, EFD_CLOEXEC|EFD_NONBLOCK) = 8 <0.000041>   
+
+
+Quick checks:
+- does not depend on the exact image, e.g. https://cloud-images.ubuntu.com/eoan/current/eoan-server-cloudimg-amd64.img or https://download.fedoraproject.org/pub/fedora/linux/releases/30/Cloud/x86_64/images/Fedora-Cloud-Base-30-1.2.x86_64.qcow2 hang as well
+- the former qemu 3.1 based qemu-utils work fine
+
+Maybe that helps to identify a known patch that might already exist.
+Even it if doesn't the simple repro in comment #2 should still help.
+
+If there is no immediate idea out of the data we have let me know, this seems bisectable to me.
+
+Since it seemed so easy, while bisecting I found that it hangs with v4.0.0 and v3.1.0 from git and even v3.0.0.
+
+Since the reported good version was 3.1 I began to wonder if I might have overlooked something.
+I wondered if it might be e.g. the apache version providing a different behavior on http.
+
+
+I was trying to access the same apache server with 4.0 and 3.1 and ran it against the download target:
+$ qemu-img check https://download.fedoraproject.org/pub/fedora/linux/releases/30/Cloud/x86_64/images/Fedora-Cloud-Base-30-1.2.x86_64.qcow2
+
+3.1 ran into a segfault and 4.0 seems to hang on that.
+Maybe I should take a break and revisit that later, as people might have an idea already what this might be about.
+
+Hi,
+
+Could you try the qemu’s master branch?  bfb23b480a49114315877aacf700b49453e0f9d9 has fixed an issue that sounds very much like this.  The problem in that case is that libcurl 7.59.0 changed behavior, so bisecting qemu will not produce results.
+
+Max
+
+I tried qemu from git, but I get an "unknown protocol" error when I try to access an image via HTTP:
+
+$ ./qemu-img check http://10.193.37.117/cloud/eoan-server-cloudimg-amd64.img
+qemu-img: Could not open 'http://10.193.37.117/cloud/eoan-server-cloudimg-amd64.img': Unknown protocol 'http'
+
+Is there a development library or ./configure option I need to use to add this support? I didn't see anything obvious in the ./configure output.
+
+Hi Max,
+libcurl 7.65.3-1ubuntu3 and was >7.59 for several releases (more than a year at least) - so there must be something else going on that this triggers now.
+
+But never the less with the fix from [1] I can again get it to work successfully.
+
+I think I should backport that to our qemu 4.0 in Ubunutu.
+It seems to apply fine (just offset -3, no fuzz)
+The former seem not affected e.g. qemu 3.1 along libcurl 7.64.0-2ubuntu1 does not expose the behavior.
+
+@Max - As the Author, just to check, do you see any issue backporting that to qemu 4.0
+
+[1]: https://git.qemu.org/?p=qemu.git;a=commit;h=bfb23b480a49114315877aacf700b49453e0f9d9
+
+Hi Christian,
+
+I don’t see any issue but the fact that the whole series should be backported (0487861685294660b23bc146e1ebd5304aa8bbe0 through bfb23b480a49114315877aacf700b49453e0f9d9, maybe also c34dc07f9f01cf686, but that isn’t strictly necessary).
+
+Max
+
+Hi Rod,
+
+You don’t need to add anything, but maybe there’s some library missing.  --enable-curl should force support and then tell you whether there’s something missing.
+
+Max
+
+@Rod: Your self built issue seems like at config/make time there were not all build deps available. I have put a test build in PPA [1], could you give that one a try on your end as well?
+
+[1]: https://launchpad.net/~paelzer/+archive/ubuntu/bug-1848556-qemu-img-curl-hang-eoan
+
+For me with the version from the PPA works fine on local as well as remote http connections.
+Thanks @Max for the fix.
+
+@Rod:
+Waiting for you to test and verify based on the PPA.
+
+
+I managed to check the PPA version just now, and it's working fine. Thanks for the quick fix!
+
+Now that Focal is open I have opened proper Focal MP replacing the old one and also an Eoan SRU MP right away.
+=> https://code.launchpad.net/~paelzer/ubuntu/+source/qemu/+git/qemu/+merge/374770
+=> https://code.launchpad.net/~paelzer/ubuntu/+source/qemu/+git/qemu/+merge/374771
+
+FYI: uploaded to 20.04 Focal, considering SRUs (Eoan) after this completes
+
+This bug was fixed in the package qemu - 1:4.0+dfsg-0ubuntu10
+
+---------------
+qemu (1:4.0+dfsg-0ubuntu10) focal; urgency=medium
+
+  * d/p/ubuntu/lp-1848556-curl-Handle-success-in-multi_check_completion.patch:
+    fix a potential hang when qemu or qemu-img where accessing http backed
+    disks via libcurl (LP: #1848556)
+  * d/p/u/lp-1848497-virtio-balloon-fix-QEMU-4.0-config-size-migration-in.patch:
+    fix migration issue from qemu <4.0 when using virtio-balloon (LP: #1848497)
+
+ -- Christian Ehrhardt <email address hidden>  Mon, 21 Oct 2019 14:51:45 +0200
+
+Focal is complete the MPs reviewed, SRU Teamplates ready and pre-tests done.
+Uploading to E-unapproved for the SRU Teams consideration.
+
+This was tonight first accepted and then immediately rejected as it was surpassed by a security fix.
+
+=> Rebased and uploaded 1:4.0+dfsg-0ubuntu9.2 to eoan-unapproved again.
+
+Hello Rod, or anyone else affected,
+
+Accepted qemu into eoan-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:4.0+dfsg-0ubuntu9.2 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested and change the tag from verification-needed-eoan to verification-done-eoan. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-eoan. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+All autopkgtests for the newly accepted qemu (1:4.0+dfsg-0ubuntu9.2) for eoan have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+ganeti/2.16.0-5ubuntu1 (ppc64el)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/eoan/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+Eoan - without fix -> hang
+
+With fix:
+qemu-img check http://10.193.37.117/cloud/eoan-server-cloudimg-amd64.img                                                                                                            
+No errors were found on the image.                                                                                                                                                            
+19778/36032 = 54.89% allocated, 90.34% fragmented, 89.90% compressed clusters                                                                                                                 
+Image end offset: 514064384
+
+Setting verified
+
+This bug was fixed in the package qemu - 1:4.0+dfsg-0ubuntu9.2
+
+---------------
+qemu (1:4.0+dfsg-0ubuntu9.2) eoan; urgency=medium
+
+  * d/p/ubuntu/lp-1848556-curl-Handle-success-in-multi_check_completion.patch:
+    fix a potential hang when qemu or qemu-img where accessing http backed
+    disks via libcurl (LP: #1848556)
+  * d/p/u/lp-1848497-virtio-balloon-fix-QEMU-4.0-config-size-migration-in.patch:
+    fix migration issue from qemu <4.0 when using virtio-balloon (LP: #1848497)
+
+ -- Christian Ehrhardt <email address hidden>  Mon, 21 Oct 2019 14:51:45 +0200
+
+The verification of the Stable Release Update for qemu has completed successfully and the package is now being released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+

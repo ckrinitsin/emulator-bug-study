@@ -1,0 +1,148 @@
+permissions: 0.946
+other: 0.941
+KVM: 0.936
+boot: 0.931
+device: 0.931
+files: 0.918
+performance: 0.918
+debug: 0.916
+socket: 0.915
+vnc: 0.913
+graphic: 0.912
+network: 0.908
+semantic: 0.902
+PID: 0.898
+
+system_powerdown causes SMP OpenBSD guest to freeze
+
+system_powerdown causes an SMP OpenBSD guest to freeze. I can reproduce it with the following systems/versions:
+
+  - Debian 6: QEMU PC emulator version 0.12.5 (qemu-kvm-0.12.5)
+  - Fedora 20:
+     qemu-system-x86-1.6.1 (from Fedora repository)
+     qemu-1.7.0 (latest release version)
+     qemu-1.7.50 (latest development snapshot, "git cloned" today, 20140212)
+
+all of the above hosts are running x86_64 linux.
+
+The first OpenBSD version that I ran as a VM, v5.1, experienced the problem. All subsequent versions experience the problem. The above tests were performed using OpenBSD v5.4 (amd64).
+
+I will open an OpenBSD bug report for this problem as well, and update this report with the OpenBSD bug ID.
+
+There's an interesting RedHat bug report concerning this problem:
+  URL: https://bugzilla.redhat.com/show_bug.cgi?id=508801#c34
+
+Here an excerpt:
+-snip-
+Gleb Natapov 2009-12-23 10:37:44 EST
+
+I posted patch to provide correct PCI irq routing info in mptable to kvm 
+mailing list. It works for all devices except for SCI interrupt. BIOS
+programs SCI interrupt to be 9 as spec requires, but OpenBSD thinks that
+it is smarter and moves it to interrupts 10. Qemu will still send it on
+vector 9 and OpenBSD will enter the same infinity recursion. This can
+be triggered by issuing system_powerdown on qemu monitor.
+-snip-
+
+Michael Tokarev reported this problem on the kvm mailing list in 2011:
+  URL: http://www.spinics.net/lists/kvm/msg51311.html
+
+I compiled qemu as follows:
+-snip-
+cd qemu-src-dir
+mkdir -p bin/native
+cd bin/native
+../../configure \
+	--prefix=/usr/local/qemu-dev-snapshot-20140212 \
+	--target-list=x86_64-softmmu \
+	--enable-kvm \
+	--enable-spice \
+	--with-gtkabi="3.0" \
+	--audio-drv-list=pa,sdl,alsa,oss \
+	--extra-cflags='-I/usr/include/SDL'
+-snip-
+
+I'm running OpenBSD with the following command:
+-snip-
+#!/bin/bash
+
+DEF=/usr/bin/qemu-system-x86_64
+QEMU_LATEST=/usr/local/qemu-1.7.0/bin/qemu-system-x86_64
+QEMU_DEV=/usr/local/qemu-dev-snapshot-20140212/bin/qemu-system-x86_64
+
+$QEMU_DEV \
+	-machine accel=kvm \
+	-name obsdtest-v54 \
+	-S \
+	-machine pc-i440fx-1.6,accel=kvm,usb=off \
+	-boot c \
+	-m 2048 \
+	-realtime mlock=off \
+	-smp 2,sockets=2,cores=1,threads=1 \
+	-uuid 8b685793-2510-473e-b97e-822a4cf2fbca \
+	-no-user-config \
+	-monitor stdio \
+	-rtc base=utc,driftfix=slew \
+	-global kvm-pit.lost_tick_policy=discard \
+	-no-hpet \
+	-drive file=/guest_images/obsdtest_v54.raw,if=none,id=drive-virtio-disk0,format=raw,cache=none \
+	-device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 \
+	-drive if=none,id=drive-ide0-0-0,readonly=on,format=raw \
+	-device ide-cd,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0 \
+	-chardev pty,id=charserial0 \
+	-device isa-serial,chardev=charserial0,id=serial0 \
+	-k en-us \
+	-device cirrus-vga,id=video0,bus=pci.0,addr=0x3 \
+	-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5 \
+	-net nic \
+	-net user
+-snip-
+
+The OpenBSD disk image I used for testing is 143MB compressed, 10G uncompressed. It can be found here:
+
+  http://www.spielwiese.de/OpenBSD/obsd54.raw.7z
+
+The root password is "x".
+
+Rob Urban
+
+I opened an OpenBSD bug. OpenBSD does not use a bug-tracking database, AFAICT, but rather the mailing-list <email address hidden>. I will post any replies to the OpenBSD bug report in comments here.
+
+hoping to increase the OpenBSD developers' inclination to investigate this bug, I reproduced it using OpenBSD 5.4 as the host.
+
+I used the stock qemu-1.5.1 that is available as an OpenBSD package. Booting the GENERIC.MP kernel in the VM was painfully slow, but it eventually came up to multi-user mode.
+
+The script to run the OpenBSD 5.4 guest on the OpenBSD 5.4 host:
+-snip-
+#!/bin/sh
+
+qemu-system-x86_64 \
+        -S \
+        -m 2048 \
+        -smp 2,sockets=2,cores=1,threads=1 \
+        -monitor stdio \
+        -vnc :0 \
+        -no-fd-bootchk \
+        -net nic \
+        -net user \
+        -cdrom /space/install54.iso \
+        -drive file=/space/obsd54test.raw,index=0,media=disk,cache=none,format=raw
+-snip-
+
+As usual, issuing the "system_powerdown" command in the monitor caused the guest to freeze totally.
+
+Rob Urban
+
+If someone needs to coordinate with someone from the OpenBSD team, please talk to Mike Larkin <email address hidden>. He expressed an intention to look into this problem from the OpenBSD side. I would be delighted if I could supply Mike with a qemu contact person, of if someone could contact him directly (and copy me, please), as I think he wanted to investigate shortly.
+
+Also worth mentioning: the problem can be reproduced using the OpenBSD uniprocessor kernel in the guest, as long as mpbios(4) is enabled, which is the default. Thus, a VM configured with a single CPU is sufficient to reproduce.
+
+To boot the uniprocessor kernel from my guest image, at the OpenBSD boot prompt, type "boot /bsd". To make it permanent, edit /etc/boot.conf and change "bsd.mp" to "bsd", or remove boot.conf entirely.
+
+Rob Urban
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU and OpenBSD? Or could we close this ticket nowadays?
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

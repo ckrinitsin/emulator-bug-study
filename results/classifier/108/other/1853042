@@ -1,0 +1,352 @@
+debug: 0.883
+other: 0.873
+graphic: 0.868
+semantic: 0.866
+performance: 0.860
+device: 0.839
+permissions: 0.816
+vnc: 0.816
+socket: 0.807
+PID: 0.797
+files: 0.780
+network: 0.778
+KVM: 0.777
+boot: 0.752
+
+Ubuntu 18.04 - vm disk i/o performance issue when using file system passthrough
+
+== Comment: #0 - I-HSIN CHUNG <email address hidden> - 2019-11-15 12:35:05 ==
+---Problem Description---
+Ubuntu 18.04 - vm disk i/o performance issue when using file system passthrough
+ 
+Contact Information = <email address hidden> 
+ 
+---uname output---
+Linux css-host-22 4.15.0-1039-ibm-gt #41-Ubuntu SMP Wed Oct 2 10:52:25 UTC 2019 ppc64le ppc64le ppc64le GNU/Linux (host) Linux ubuntu 4.15.0-65-generic #74-Ubuntu SMP Tue Sep 17 17:08:54 UTC 2019 ppc64le ppc64le ppc64le GNU/Linux (vm)
+ 
+Machine Type = p9/ac922 
+ 
+---Debugger---
+A debugger is not configured
+ 
+---Steps to Reproduce---
+ 1. Env: Ubuntu 18.04.3 LTS?Genesis kernel linux-ibm-gt - 4.15.0-1039.41?qemu 1:2.11+dfsg-1ubuntu7.18 ibmcloud0.3 or 1:2.11+dfsg-1ubuntu7.19 ibm-cloud1?fio-3.15-4-g029b
+
+2. execute run.sh to run fio benchmark:
+
+2.1) run.sh:
+#!/bin/bash
+  
+for bs in  4k 16m
+do
+
+for rwmixread in 0 25 50 75 100
+do
+
+for numjobs in 1 4 16 64
+do
+echo ./fio j1.txt --bs=$bs --rwmixread=$rwmixread --numjobs=$numjobs
+./fio j1.txt --bs=$bs --rwmixread=$rwmixread --numjobs=$numjobs
+
+done
+done
+done
+
+2.2) j1.txt:
+
+[global]
+direct=1
+rw=randrw
+refill_buffers
+norandommap
+randrepeat=0
+ioengine=libaio
+iodepth=64
+runtime=60
+
+allow_mounted_write=1
+
+[job2]
+new_group
+filename=/dev/vdb
+filesize=1000g
+cpus_allowed=0-63
+numa_cpu_nodes=0
+numa_mem_policy=bind:0
+
+3. performance profile:
+device passthrough performance for the nvme: 
+http://css-host-22.watson.ibm.com/rundir/nvme_vm_perf_vm/20191011-112156/html/#/measurement/vm/ubuntu (I/O bandwidth achieved inside VM in GB/s range)
+
+file system passthrough
+http://css-host-22.watson.ibm.com/rundir/nvme_vm_perf_vm/20191106-123613/html/#/measurement/vm/ubuntu (I/o bandwidth achieved inside the VM is very low)
+
+desired performance when using file system passthrough should be similar to the device passthrough
+ 
+Userspace tool common name: fio 
+ 
+The userspace tool has the following bit modes: should be 64 bit 
+
+Userspace rpm: ? 
+
+Userspace tool obtained from project website:  na 
+ 
+*Additional Instructions for <email address hidden>: 
+-Post a private note with access information to the machine that the bug is occuring on.
+-Attach ltrace and strace of userspace application.
+
+Hi,
+Let me provide my expectations (which are different):
+You said "desired performance when using file system passthrough should be similar to the device passthrough"
+IMHO that isn’t right - it might be "desired" but unrealistic to "be expected"
+
+Usually you have a hierarchy:
+1. device passthrough
+2. using block devices
+3. using images on Host Filesystem
+4. using images on semi-remote cluster filesystems
+(and a few special cases in between)
+
+Those usually from 1->4 are decreasing performance but increasing flexibility and manageability.
+
+So I wanted to give a heads up based on the initial report that eventually this might end up as "please adjust expectations"
+
+---
+
+That said, let’s focus on what your setup actually looks like and if there are obvious improvements or hidden bugs.
+Unfortunately "file system passthrough" isn't a clearly defined thing.
+Could you:
+1) outline which disk storage you attached to the host
+2) which filesystem is on that storage
+3) how you are passing files and/or images to the guest
+
+Please explain the questions above and attach libvirts guest xml of both of your test cases.
+
+P.S. nvme passthrough will soon become even faster on ppc64el due to the fix for bug LP 1847948
+
+------- Comment From <email address hidden> 2019-11-19 10:40 EDT-------
+1) nvme installed inside p9/ac992
+2) File system pass through
+# cd /nvme0
+# qemu-img create -f qcow2 nvme1.img 3GFormatting ?nvme1.img?, fmt=qcow2 size=3221225472 cluster_size=65536 lazy_refcounts=off refcount_bits=16
+# virsh attach-disk test_vm /nvme0/nvme1.img vdb --driver qemu --subdriver qcow2 --targetbus virtio --persistentDisk attached successfully
+
+# virsh detach-disk test_vm /nvme0/nvme1.imgDisk detached successfully
+
+Thanks for confirming the setup that I already have assumed.
+
+This will naturally be slower for having:
+a) overhead by the host filesystem
+b) overhead by qcow metadata handling
+c) exits to the host for the I/O (biggest single element of these)
+d) less concurrency as the defaults for queue count and depths
+e) with the PT case you do real direct I/O write, while the other probably caches in the host which most of the time is bad.
+
+I can help you to optimize the tunables for the image that you attach if you want that.
+That will make it slightly better than it is, but clearly it will never reach the performance of the nvme-passthrough.
+
+Let me know if you want some general tuning guidance on those or not.
+
+Hi, Christian.
+
+It would be great if you could share your knowledge on this.
+
+Thank you!
+
+Murilo
+
+Hi,
+a little personal disclaimer.
+This might not be perfect as I don't know your case in detail enough.
+And also in general there is always "one more tuning" that you can tune :-)
+
+An example of an alternative might be to partition the nvme and pass the partitions as block devices => less flexible for live cycle management, but usually much faster - it is up to your needs entirely.
+All these things will come at a tradeoff like overhead / features / affecting different workload patterns differently.
+
+For now my suggestion here tries to stick to the qcow2 image on FS option that you have chosen and just tune that one.
+
+Lets summarize the benefits of NVME passthrough to images on host FS
+- lower latency
+- more and deeper queues
+- no host caching adding overhead
+- features
+- less overhead
+- ...
+
+Lets take care about a few of those ...
+A disk by default will start like:
+
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/uvtool/libvirt/images/yourdisk.qcow'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+
+Your's will most likely look very similar.
+Note I prefer an XML compared to the command line options as there are more features and it is more easy to document and audit later on (even if generated).
+
+
+#1 Queues
+By default a virtio block device has only one queue which is enough in many cases.
+But on huge systems with massively parallel work the might not be.
+Add something like - queues='8' - to your driver section.
+
+example:
+<driver name='qemu' type='qcow2' queues='8'/>
+
+#2 Caching
+Not always, but often for high speed I/O host caching is a drawback.
+You can disable that via - cache='none' - in your driver section.
+
+example:
+<driver name='qemu' type='qcow2' queues='8' cache='none'/>
+
+#3 Features
+NVME disks after all are flash and you'd want to make sure that it learns about freed space (discard) in the long run. virtio-blk won't transfer those, but virtio-scsi will.
+  <controller type='scsi' index='0' model='virtio-scsi'>
+    <address type='pci' domain='0x0000' bus='0x00' slot='0x0b' function='0x0'/>
+  </controller>
+
+Combining that with the above needs to adapt slightly as with virtio-scsi the controller has the queues, so queues='x' moves here.
+E.g. read https://mpolednik.github.io/2017/01/23/virtio-blk-vs-virtio-scsi/ and links from there.
+
+
+#4 IOThreads
+By default your VM might have not enough I/O threads.
+If you have multiple high performing elements you might want to assign them an individual one.
+You'll need to allocate more and then assign more to your disk(controller).
+Again this depends on your setup, and here I only outline how to unblock multiple disks from each others iothread.
+1. in the domain section the threads
+   <iothreads>4</iothreads>
+2. if you use virtio-scsi as above you assign iothreads at the controller level and might therefore want one controller per disk (in other cases you might assign the disk)
+
+(assign separate threads to each controller and have each disk have its own controller)
+
+
+
+--- 
+
+Overall modified from the initial example:
+
+  <domain>
+  ...
+  <iothreads>4</iothreads>
+  <devices>
+  ...
+    <controller type='scsi' index='0' model='virtio-scsi'>
+      <driver queues='8' iothread='3'/>
+    </controller>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' cache='none'/>
+      <source file='/var/lib/uvtool/libvirt/images/yourdisk.qcow'/>
+      <target dev='sda' bus='scsi'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+
+---
+
+Some choices of the setup e.g. using qcow files - will limit some of the benefits above.
+At least in the past emulation limited the concurrency of actions here as well as passthrough of discard might be less effective.
+Raw files and even more so partitions will be much faster - but as I said all is up to your specific needs.
+
+You might need to evaluate all the alternatives between qcow files and NVME-passthrough (which are like polar opposite) and rethink what you need in terms of features/performance and then pick YOUR tradeoff.
+
+
+You'll find generic documentation about what I used above at:
+https://libvirt.org/formatdomain.html#elementsDisks
+https://libvirt.org/formatdomain.html#elementsIOThreadsAllocation
+
+As you see this is only the tip of the iceberg :-)
+
+------- Comment From <email address hidden> 2019-11-20 10:28 EDT-------
+Hello,
+
+Thanks very much for the advice. I will try those settings as suggested.
+
+Our high-level goal is to provide a solution to enable NVMe as the local storage in the cloud node shared by multiple VMs. This would require 1) allocated storage space for different VMs with (security) isolation 2) I/O bandwidth performance with QoS.
+
+For high overhead of file system passthrough, is it possible to profile the performance overhead?
+
+Thanks again.
+
+I-Hsin
+
+As I said, you have to make your own tradeoff choices.
+I still don't know enough of your needs, but from the bit I heard you can run e.g. an LVM on the NVME in the host and provision "disks" from the volume group on it (on many) which will be less flexible (but hey, still even has snapshots) but faster than images-on-FS while at the same time being more flexible than "just" partitions.
+
+Disk PT <-> partitions <-> LVM <-> images on FS
+Speed              <->                Features
+(many suboptions in between)
+
+Sorry, but from here those are decisions you have to make :-/
+
+About profiling, that is possible, but not helpful and in the worst case will add additional latency. Your initial decision which block architecture to use will make 95% of the perf/feature tradeoff. Later tuning profiling can usually only gain the remaining 5%, so I'd recommend to not focus on that part.
+
+P.S. This bug turns into consulting which I sometimes like (performance :-) ) but looking at my todo list I have other important things to do - sorry. I hope my guidance helped you to make better choices!
+
+Closing based on the assumption that Christian's response in comment #7 answered the relevant questions.
+
+------- Comment From <email address hidden> 2019-12-16 15:02 EDT-------
+some summary we have so far
+
+css-host-22 is p9/ac922 and css-host-130 is x86/hgx1
+
+1. Device pass through
+
+P9/x86 similar performance
+Bare metal / VM similar performance
+0.5GB/s to 1 GB/s for writes
+Up to 4-5 GB/s for reads
+Millions of int/csw per seconds for 4k page size and much smaller for 16 MB page size
+
+profiles
+
+Bare Metal
+http://css-host-22.watson.ibm.com/rundir/nvme_bm_perf_on_bm/20191004-103224/html/#/measurement/nvme_bm_perf_bm/css-host-22
+http://css-host-130.watson.ibm.com/rundir/nvme_bm_perf_on_bm/20191210-132738/html/#/measurement/nvme_bm_perf_bm/css-host-130
+Virtual Machine
+http://css-host-22.watson.ibm.com/rundir/nvme_vm_perf_vm/20191011-112156/html/#/measurement/vm/ubuntu
+http://css-host-130.watson.ibm.com/rundir/nvme_vm_perf_vm/20191210-223913/html/#/measurement/vm/ubuntu
+
+2. file system pass through
+
+P9/x86 similar performance
+I/O bw achieved with 16MB page size, but very low I/O bw achieved with 4k page size
+CPU utilization is much lower on P9/AC922
+On x86, CPU is waiting for some process to get to it (50% for qcow2 and 35% for raw)
+Int/csw
+Higher on x86
+Higher with 4k page size
+Higher with raw
+
+profiles
+
+qcow2
+http://css-host-130.watson.ibm.com/rundir/nvme_vm_perf_vm_qcow2/20191211-232233/html/#/measurement/vm/ubuntu
+http://css-host-22.watson.ibm.com/rundir/nvme_vm_perf_vm_qcow2/20191211-233729/html/#/measurement/vm/ubuntu
+raw
+http://css-host-130.watson.ibm.com/rundir/nvme_vm_perf_vm_raw/20191212-082717/html/#/measurement/vm/ubuntu
+http://css-host-22.watson.ibm.com/rundir/nvme_vm_perf_vm_raw/20191212-082810/html/#/measurement/vm/ubuntu
+
+3. questions
+
+a. what is the diff between qcow2 and raw? how is that contributing to the cpu utilization?
+
+b. I have trouble configure scsci controller when I try to following the instructions:
+
+<controller type='scsi' index='0' model='virtio-scsi'>
+<address type='pci' domain='0x0000' bus='0x00' slot='0x0b' function='0x0'/>
+</controller>
+
+it gave me the argument is not available error
+
+c. for file system pass through, How to get better 4k performance?
+
+@IBM
+
+this bug report is closed as invalid in Launchpad, as it is a discussion / perf tuning, rather than a bug report. And we have provided extension consultation about it.
+
+Can you please turn off bugproxy comment syncing, if you wish to continue commenting on this LTC ticket internally?
+
+Please note in Launchpad this bug report, and comments are open and public.
+

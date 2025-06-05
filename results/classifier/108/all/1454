@@ -1,0 +1,77 @@
+semantic: 0.994
+vnc: 0.993
+debug: 0.993
+device: 0.993
+permissions: 0.993
+graphic: 0.992
+performance: 0.991
+other: 0.991
+KVM: 0.991
+boot: 0.990
+socket: 0.988
+PID: 0.988
+files: 0.985
+network: 0.983
+
+QEMU TCG s390x fails an assertion while dispatching an FIXPT_DIVIDE exception on DR when compiled with LTO
+Description of problem:
+When running the attached minimal reproducer, with qemu-system-s390x version 7.2.0 compiled with LTO (`--enable-lto`) with GCC v12.2.1, QEMU fails an assertion and crashes:
+```
+qemu-system-s390x: ../target/s390x/tcg/excp_helper.c:215: do_program_interrupt: Assertion `ilen == 2 || ilen == 4 || ilen == 6' failed.
+Aborted (core dumped)
+```
+Steps to reproduce:
+1. Compile QEMU v7.2.0 for s390x with LTO enabled:
+   ```
+   ../configure --target-list=s390x-softmmu --enable-lto
+   ```
+2. Compile the given reproducer assembler [lpswe-to-pgm.S](/uploads/200fb0e777ddd0ed26f51009e81c26ea/lpswe-to-pgm.S):
+   ```
+   s390x-linux-gnu-gcc -march=z13 -m64 -nostdlib -nostartfiles -static -Wl,-Ttext=0 -Wl,--build-id=none lpswe-to-pgm.S -o lpswe-to-pgm
+   ```
+3. Execute QEMU on the reproducer:
+   ```
+   ./qemu-system-s390x -kernel lpswe-to-pgm
+   ```
+Additional information:
+I have debugged QEMU to try to find the root cause, and I believe I found it, but I'm not sure what the most appropriate way to fix it would be:
+
+QEMU executes the `DR` instruction by executing the `divs32` helper.
+
+When the helper sees that the final division result does not fit in 32 bits, it generates a program interrupt for fixed point divide by calling the `tcg_s390_program_interrupt` function, with the final parameter being the TCG host PC, which is found by calling `GETPC`.
+
+`tcg_s390_program_interrupt` then calls `cpu_restore_state`, and then as long as the host PC is valid, `cpu_restore_state` eventually calls `s390x_restore_state_to_opc` through a long chain of calls, which sets `CPUS390XState::int_pgm_ilen` to a valid value.
+
+Unfortunately when compiling with LTO, the host PC is not valid, which means we don't update `int_pgm_ilen`, resulting in the failed assertion.
+
+The reason the host PC is not valid when compiling with LTO, is that GCC decides to split `helper_divs32` into 2 parts, the actual div logic being the first part, and the call to `GETPC` & `tcg_s390_program_interrupt` being the second part. The way GCC implements it is by turning the second part into a separate function, which the first part calls - see disassembly below. (GCC then re-uses the second part in other similar TCG helpers)
+
+Because we now called the second part before calling `GETPC`, we have a new return address, and `GETPC` returns the address of the first part, instead of the TCG host PC.
+
+```
+000000000022c870 <helper_divs32>:
+  22c870:       48 83 ec 08             sub    rsp,0x8
+  22c874:       85 d2                   test   edx,edx
+  22c876:       74 22                   je     22c89a <helper_divs32+0x2a>
+  22c878:       48 89 f0                mov    rax,rsi
+  22c87b:       48 63 ca                movsxd rcx,edx
+  22c87e:       48 99                   cqo    
+  22c880:       48 f7 f9                idiv   rcx
+  22c883:       4c 63 c0                movsxd r8,eax
+  22c886:       48 89 97 10 03 00 00    mov    QWORD PTR [rdi+0x310],rdx
+  22c88d:       49 39 c0                cmp    r8,rax
+  22c890:       75 17                   jne    22c8a9 <helper_divs32+0x39>
+  22c892:       4c 89 c0                mov    rax,r8
+  22c895:       48 83 c4 08             add    rsp,0x8
+  22c899:       c3                      ret    
+  22c89a:       48 8b 54 24 08          mov    rdx,QWORD PTR [rsp+0x8]
+  22c89f:       be 09 00 00 00          mov    esi,0x9
+  22c8a4:       e8 47 e5 ff ff          call   22adf0 <tcg_s390_program_interrupt>
+  22c8a9:       e8 b2 fe ff ff          call   22c760 <helper_divs32.part.0>
+
+000000000022c760 <helper_divs32.part.0>:
+  22c760:       48 83 ec 08             sub    rsp,0x8
+  22c764:       be 09 00 00 00          mov    esi,0x9
+  22c769:       48 8b 54 24 08          mov    rdx,QWORD PTR [rsp+0x8]
+  22c76e:       e8 7d e6 ff ff          call   22adf0 <tcg_s390_program_interrupt>
+```

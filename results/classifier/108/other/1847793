@@ -1,0 +1,267 @@
+PID: 0.775
+device: 0.754
+debug: 0.697
+KVM: 0.686
+boot: 0.680
+other: 0.651
+files: 0.643
+permissions: 0.618
+graphic: 0.608
+vnc: 0.590
+performance: 0.568
+socket: 0.567
+network: 0.538
+semantic: 0.520
+
+qemu 4.1.0 - Corrupt guest filesystem after new vm install
+
+When I install a new vm with qemu 4.1.0 all the guest filesystems are corrupt. The first boot from the install dvd iso is ok and the installer work fine. But the guest system hangs after the installer finishes and I reboot the guest. I can see the grub boot menue but the system cannot load the initramfs.
+
+Testet with:
+- RedHat Enterprise Linux 7.5, 7.6 and 7.7 (RedHat uses xfs for the /boot and / partition)
+Guided install with the graphical installer, no lvm selected.
+- Debian Stable/Buster (Debian uses ext4 for / and /home partition)
+Guidet install with the graphical installer and default options.
+
+Used commandline to create the vm disk image:
+qemu-img create -f qcow2 /volumes/disk2-part2/vmdisks/vmtest10-1.qcow2 20G
+
+Used qemu commandline for vm installation:
+#!/bin/sh
+# vmtest10 Installation
+#
+/usr/bin/qemu-system-x86_64  -cpu SandyBridge-IBRS \
+    -soundhw hda \
+    -M q35 \
+    -k de \
+    -vga qxl \
+    -machine accel=kvm \
+    -m 4096 \
+    -display gtk \
+    -drive file=/volumes/disk2-part2/images/debian-10.0.0-amd64-DVD-1.iso,if=ide,media=cdrom \
+    -drive file=/volumes/disk2-part2/images/vmtest10-1.qcow2,if=virtio,media=disk,cache=writeback \
+    -boot once=d,menu=off \
+    -device virtio-net-pci,mac=52:54:00:2c:02:6c,netdev=vlan0 \
+    -netdev bridge,br=br0,id=vlan0 \
+    -rtc base=localtime \
+    -name "vmtest10" \
+    -usb -device usb-tablet \
+    -spice disable-ticketing \
+    -device virtio-serial-pci \
+    -device virtserialport,chardev=spicechannel0,name=com.redhat.spice.0 \
+    -chardev spicevmc,id=spicechannel0,name=vdagent $*
+
+Host OS:
+Archlinux (last updated at 10.10.2019)
+Linux testing 5.3.5-arch1-1-ARCH #1 SMP PREEMPT Mon Oct 7 19:03:08 UTC 2019 x86_64 GNU/Linux
+No libvirt in use.
+
+
+With qemu 4.0.0 it works fine without any errors.
+
+Hi Claus,
+  Some things to try:
+
+  a) after you quit qemu can you try qemu-img check on the qcow2 file to see if it's happy?
+  b) If you repeat your test using a raw image file rather than a qcow2 is it any happier?
+  c) How repeatable is it? If it's very repeatable it would be great if you could perform a git bisect to find which commit breaks it;  we can walk you through it if you've not done it before.
+
+Hi David,
+
+a)
+> qemu-img check /volumes/disk2-part2/images/vmtest10-1.qcow2
+No errors were found on the image.
+24794/327680 = 7.57% allocated, 9.28% fragmented, 0.00% compressed clusters
+Image end offset: 1625751552
+
+> qemu-img info /volumes/disk2-part2/images/vmtest10-1.qcow2
+image: vmtest10-1.qcow2
+file format: qcow2
+virtual size: 20 GiB (21474836480 bytes)
+disk size: 1.29 GiB
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+
+b)
+The raw image file works without any errors after install and reboot.
+I created the image file with:
+qemu-img create -f raw /volumes/disk2-part2/images/vmtest10-1.img 20G
+Changes to the qemu commandline:
+-drive format=raw,file=/volumes/disk2-part2/images/vmtest10-1.img,if=virtio,media=disk,cache=writeback \
+
+c)
+I can always repeat this behavior since 4.1.0 is out.
+I could perform a git bisect. But I need help, I've never done that before.
+
+OK, thanks.
+  This might be the same problem as https://bugs.launchpad.net/qemu/+bug/1846427
+but we'll have to see.
+
+For a bisect; first of all, check out qemu from git and build 4.1.0;
+check to make sure this breaks.
+Now, see the git bisect instructions at:
+https://git-scm.com/docs/git-bisect
+
+do:
+git bisect start
+git bisect bad
+git bisect good v4.0.0
+
+it'll then checkout a commit somewhere in between for you; build it, and then do either
+
+git bisect good    or    git bisect bad
+
+and it'll pick another commit
+
+It'll probably take 13 builds to nail the offending commit.
+
+Hi Claus,
+
+Do you use XFS on the host?
+
+Max
+
+I can confirm exactly the same issue on Arch linux with ext4 filesystem (qemu-4.1.0).
+
+After downgrading from 4.1.0 => 4.0.0 everything is running normal again, no corruption detected and all qcow2 images stays healthy.
+
+Hi Max, from my <https://bugs.launchpad.net/qemu/+bug/1846427/comments/8>: I've seen corruption on ext4.
+
+The bug reported here is not about qcow2 metadata corruption, but about guest data corruption (qemu-img check reports a clean image).  It’s entirely possible (and I would even say likely) that there are two different causes.
+
+We know about two guest data corruptions already (which appeared in 4.1), and both seem to only appear on XFS.  We have fixed one, the other we don’t quite know yet.
+
+Therefore, I’m wondering whether this is a guest data corruption that we probably already know about (because it’s on XFS), or whether we don’t (because it isn’t).
+
+In any case, I would separate these two bug reports on the basis that this one here is about guest data corruption, whereas 1846427 is about qcow2 metadata corruption.
+
+Max
+
+i've seen guest data corruption and qcow2 corruption on ext4.
+
+i've seen one case where the guest (win10) reports corruption but qemu-img check does not, but that's the outlier, usually both guest and qemu-img report corruption.
+
+for me the issue seems to only be win10 guests using virtio-scsi, i've not seen it on any of 25+ linux/solaris/macos/win2019 guests no matter what device driver/cache/trim i use.
+
+current workaround is convert from qcow2 to raw, everything else stays the same and i have no issues.
+
+I suppose that the problem described in bug 1846427 can also affect guest data, so I think it makes sense to divide based on whether there are only data corruptions or both data and metadata corruptions.
+
+So far, I don’t know of a report of pure guest data corruptions (without qcow2 metadata being affected) that didn’t happen on XFS, so I assume there is an issue that affects both data and metadata on all filesystems (described by 1846427; Kevin has sent a patch series upstream ot address it), and another one that only affects guest data and only occurs on XFS (this one).
+
+Actually, there are two problems we know of on XFS:
+
+The first one was a bug in qemu that has been fixed upstream by b2c6f23f4a9f6d8f1b648705cd46d3713b78d6a2.  People that don’t use master but the 4.1 release instead are likely to hit that problem instead of the other one.
+
+The second one seems to be a kernel bug.  When fallocating (writing zeroes in our case) and writing to a file in parallel, the write is discarded if:
+- The fallocated area begins at or after the EOF,
+- The written area begins after the fallocated area,
+- The write is submitted through the AIO interface (io_submit()),
+- The write and the fallocate operation are submitted before either one finishes (i.e. concurrently),
+- The fallocate operation finishes after the write.
+
+In qemu, this happens only with aio=native, and then most of the time when an FALLOC_FL_ZERO_RANGE happens after the EOF while a write after that range is ongoing.
+
+
+Claus as the reporter didn’t use aio=native, so if he’s indeed on XFS, he can’t have hit this second bug.  If he’s on XFS, he will most likely have hit the first one that’s already fixed in master.
+
+
+Still, we need to fix the second bug.  As for how…  It looks to me like a kernel bug, so in qemu we can’t do anything to fix it.  But we should probably work around it.  Kevin has proposed making zero-writes on XFS serializing until infinity, basically (i.e. UINT64_MAX in practice).  That gives us some layering problems (either the file-posix block driver needs access to the TrackedRequest to extend its length, or the generic block layer needs to know whether a file-posix node is on XFS), and it yields the question of how to detect whether the bug has been fixed in the kernel.
+
+Max
+
+I have the same (related?) issue and wanted to add my experience with it. I had 3 qemu qcow2 VM running on ArchLinux. I never used snapshots or something like it. Just normal start&shutdown. 2 of these VMs were also ArchLinux running on ext4. Both of these VMs had a data corruption inside the quest. The data being corrupted were files I had not touched in month (large tar archives). One guest was running on a SSD with discard, the other VM was running on a normal hard drive without any discard.
+The last VM was a Windows 10 VM. While the VM was running fine, after "fixing" the image issues with qemu-img -r all hdd.qcow2 the Windows 10 installation was unbootable and beyond repair with normal Windows tools.
+
+While the VMs are running I saw these lines printed by qemu (for all VMs in question):
+
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+
+I recreated my VMs and I now chose btrfs as a filesystem. No issues yet on the image. I also recreated the Windows 10 VM. It worked fine a couple of days. Today I checked the image, after I saw the free_clusters lines above again:
+
+Many many lines like this:
+Leaked cluster 260703 refcount=1 reference=0                                                   
+ERROR cluster 260739 refcount=0 reference=1 
+ERROR OFLAG_COPIED data cluster: l2_entry=800000038ec10000 refcount=0
+
+638 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+339 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+314734/4096000 = 7.68% allocated, 26.70% fragmented, 0.00% compressed clusters
+Image end offset: 21138374656
+
+The installation itself still works but I don't know if there are any silently corrupted files in there.
+
+QEMU 4.1.0 from ArchLinux
+Host-Filesystem is ext4
+Start-Parameter (the same on all VMs):
+
+qemu-system-x86_64 -cpu Haswell-noTSX -M q35 -enable-kvm -smp 4,cores=4,threads=1,sockets=1 -net nic,model=virtio -net user,hostname=WindowsKVM.local -drive if=none,id=hd,file=hdd.qcow2,discard=unmap -device virtio-scsi-pci,id=scsi --enable-kvm -device scsi-hd,drive=hd -m 4096 -drive if=pflash,format=raw,readonly,file=/usr/share/ovmf/x64/OVMF_CODE.fd -drive if=pflash,format=raw,file=./OVMF_VARS.fd -vga std -drive file=Windows10ISO/Windows.iso,index=0,media=cdrom -drive file=virtio-win-0.1.173.iso,index=1,media=cdrom -no-quit
+
+There is a patch for the XFS kernel driver to fix the bug: https://www.spinics.net/lists/linux-xfs/msg33429.html
+
+On the qemu side, we’re still discussing on how to work around the bug in the 4.2 release.
+
+Max
+
+Sorry for the delay,I was busy doing my job the last two weeks.
+
+I use XFS V5 on both main host (5.3.7-arch1-2-ARCH) and backup host (5.3.5-arch1-1-ARCH).
+
+It seems I ran in the first bug that has been fixed upstream.
+With git master (git clone at 18.10.) I could not reproduce the failure on my backup host.
+I installed an RedHat 7.6 VM as always and the VM works without any errors. The only thing I noticed was, the first boot after installation lasts longer as with qemu 4.0.0.
+
+After this I checked the archlinux repositories an found in AUR the qemu-git package. I removed the official qemu packages from my main host and installed this (qemu-git 8:v4.1.0.r1699.gf9bec78137-1).
+The behavior is the same as on the backup host, the VM installation works without any errors as well as additional tasks (i. e. complete the basic installation to an full desktop installation).
+The last days I used the main hosts with this package for my daily work. At the end of the day I checked the filesystems from the used existing, or new created VMs and didn't found any errors.
+
+May be for archlinux user who needs the 4.1.0 qemu version the qemu-git package from AUR is a possible workaround.
+
+Claus
+
+
+Which filesystems does this apply to? Excludes ZFS?
+
+
+Hi Claus,
+
+Thanks for the info!  By now we know that the XFS bug can only be triggered with aio=native (for -drive), and since you aren’t using that, you won’t hit that.
+
+I suppose using git master works in the meantime, but in general of course it isn’t advisable for stability.  (Yes, yes, I know, right now the released version is the broken one... :()
+
+4.1.1 and 4.2.0 will be released soon, which fix the qemu bug.
+
+
+Hi Wayne,
+
+It applies only to XFS.  There are two bugs, one in qemu 4.1.0 (will be fixed in 4.1.1 and 4.2.0), and one in XFS (we will have a workaround in 4.2.0, and I hope in 4.1.1, too).
+
+
+Max
+
+Can we close this ticket now?
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

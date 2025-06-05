@@ -1,0 +1,127 @@
+graphic: 0.892
+other: 0.891
+boot: 0.885
+KVM: 0.879
+device: 0.878
+semantic: 0.868
+debug: 0.868
+PID: 0.862
+vnc: 0.862
+socket: 0.854
+performance: 0.840
+network: 0.826
+permissions: 0.814
+files: 0.768
+
+win98se floppy fails to boot with isapc machine
+
+QEMU emulator version 4.1.50 (commit 50d69ee0d)
+
+floppy image from:
+https://winworldpc.com/download/417d71c2-ae18-c39a-11c3-a4e284a2c3a5
+
+$ qemu-system-i386 -M isapc -fda Windows\ 98\ Second\ Edition\ Boot.img
+SeaBIOS (version rel-1.12.1-0...)
+Booting from Floppy...
+Boot failed: could not read the boot disk
+
+Bisected following note from http://gunkies.org/wiki/I386-softmmu:
+
+the isapc configuration no longer works... So legacy systems must resort to Qemu 0.9.0 or Qemu 0.10.0 
+
+I get:
+
+fd646122418ecefcde228d43821d07da79dd99bb is the first bad commit
+commit fd646122418ecefcde228d43821d07da79dd99bb
+Author: Anthony Liguori <email address hidden>
+Date:   Fri Oct 30 09:06:09 2009 -0500
+
+    Switch pc bios from pc-bios to seabios
+    
+    SeaBIOS is a port of pc-bios to GCC.  Besides using a more modern tool chain,
+    SeaBIOS introduces a number of new features including PMM support, better
+    BEV and BCV support, and better PnP support.
+
+Apparently the bisection result from comment #1 comes from a different issue, the VGA display stays blank, can not test the floppy drive.
+
+Bisecting using the pcbios.bin from fd646122418~, the VGA display stops working at:
+
+345c22aa80d1f6ddfe7898f721fd1be3bccb08f1 is the first bad commit
+commit 345c22aa80d1f6ddfe7898f721fd1be3bccb08f1
+Author: Gerd Hoffmann <email address hidden>
+Date:   Fri Dec 18 12:01:12 2009 +0100
+
+    roms: remove option rom packing logic
+    
+    Now that we load the option roms via fw_cfg, we can stop copying
+    them to the 0xc000 -> 0xe000.  The patch does just that.
+    
+    Also the rom loader gets simplified as all remaining users of the
+    rom loader load the bits at a fixed address so the packing and
+    aligning logic can go away.
+
+So finally, the commit that introduced this regression is not directly related to QEMU:
+
+0b8f74488e50f98b04e63157f85fde8a13f8d6aa is the first bad commit
+commit 0b8f74488e50f98b04e63157f85fde8a13f8d6aa
+Author: Gerd Hoffmann <email address hidden>
+Date:   Tue Nov 6 12:23:53 2018 +0100
+
+    update seabios to master snapshot
+    
+    seabios 1.12 release is planned for november.
+    
+    update seabios to a master branch snapshot so it gets more testing
+    and to make the delta smaller when updating to -final during freeze.
+
+And the (SeaBIOS) winner is...
+
+4a6dbcea3e412fe12effa2f812f50dd7eae90955 is the first bad commit
+commit 4a6dbcea3e412fe12effa2f812f50dd7eae90955
+Author: Nikolay Nikolov <email address hidden>
+Date:   Sun Feb 4 17:27:01 2018 +0200
+
+    floppy: Use timer_check() in floppy_wait_irq()
+    
+    Use timer_check() instead of using floppy_motor_counter in BDA for the
+    timeout check in floppy_wait_irq().
+    
+    The problem with using floppy_motor_counter was that, after it reaches
+    0, it immediately stops the floppy motors, which is not what is
+    supposed to happen on real hardware. Instead, after a timeout (like in
+    the end of every floppy operation, regardless of the result - success,
+    timeout or error), the floppy motors must be kept spinning for
+    additional 2 seconds (the FLOPPY_MOTOR_TICKS). So, now the
+    floppy_motor_counter is initialized to 255 (the max value) in the
+    beginning of the floppy operation. For IRQ timeouts, a different
+    timeout is used, specified by the new FLOPPY_IRQ_TIMEOUT constant
+    (currently set to 5 seconds - a fairly conservative value, but should
+    work reliably on most floppies).
+    
+    After the floppy operation, floppy_drive_pio() resets the
+    floppy_motor_counter to 2 seconds (FLOPPY_MOTOR_TICKS).
+    
+    This is also consistent with what other PC BIOSes do.
+
+I'm not sure if it's related to SeaBIOS because SeaBIOS configuration is stored in QEMU.
+So I think CONFIG_TSC_TIMER should be disabled in seabios-128k.config and the 128k variant of SeaBIOS should be used for isapc.
+
+Please see the thread for details: 
+
+  https://lists.gnu.org/archive/html/qemu-devel/2019-08/msg03924.html
+
+If I disable TSC in SeaBIOS (i.e. CONFIG_TSC_TIMER=n) the floppy can't be booted with or without TSC-capable CPU. So, it can't be fixed on QEMU side.
+
+Fun thing, that if I set CONFIG_TSC_TIMER=n and start it with isa-debugcon, it works:
+$QEMU -cpu 486 -M isapc,accel=hvf -fda ~/win98-fe-boot-floppy.img -chardev file,id=debugcon,path=seabios.log -device isa-debugcon,iobase=0x402,chardev=debugcon
+
+This one doesn't work:
+$QEMU -cpu 486 -M isapc,accel=hvf -fda ~/win98-fe-boot-floppy.img
+
+The ticket should be closed as soon as SeaBIOS gets updated in QEMU. A patch has been posted to SeaBIOS mailing list:
+https://<email address hidden>/thread/XPKQNLVWZX55TSLSXZVY5S5DMFYS4CNO/
+
+The commit fixes the issue in master branch: https://git.qemu.org/?p=qemu.git;a=commit;h=de15df5ead400b7c3d0cf21c8164a7686dc81933
+
+The fix is going to be released in 5.1
+

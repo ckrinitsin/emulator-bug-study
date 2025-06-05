@@ -1,0 +1,398 @@
+permissions: 0.313
+network: 0.294
+graphic: 0.290
+performance: 0.250
+debug: 0.249
+other: 0.242
+files: 0.220
+device: 0.217
+KVM: 0.217
+semantic: 0.190
+vnc: 0.188
+boot: 0.165
+socket: 0.147
+PID: 0.125
+
+"go install" command fails while running inside s390x docker container on x86_64 host using qemu
+
+Steps to reproduce the issue:
+
+Register x86_64 host with the latest qemu-user-static.
+docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+Build the following Docker Image using following Dockerfile.s390x using command docker build -t test/crossbuild:latest-s390x -f Dockerfile.s390x .
+
+Dockerfile.s390x
+
+FROM alpine:3.11 as qemu
+
+ARG QEMU_VERSION=5.0.0-2
+ARG QEMU_ARCHS="s390x"
+
+RUN apk --update add curl
+
+#Enable non-native runs on amd64 architecture hosts
+RUN for i in ${QEMU_ARCHS}; do curl -L https://github.com/multiarch/qemu-user-static/releases/download/v${QEMU_VERSION}/qemu-${i}-static.tar.gz | tar zxvf - -C /usr/bin; done
+RUN chmod +x /usr/bin/qemu-*
+
+FROM s390x/golang:1.14.2-alpine3.11
+MAINTAINER LoZ Open Source Ecosystem (https://www.ibm.com/developerworks/community/groups/community/lozopensource)
+
+ARG MANIFEST_TOOL_VERSION=v1.0.2
+
+#Enable non-native builds of this image on an amd64 hosts.
+#This must be the first RUN command in this file!
+COPY --from=qemu /usr/bin/qemu-*-static /usr/bin/
+
+#Install su-exec for use in the entrypoint.sh (so processes run as the right user)
+#Install bash for the entry script (and because it's generally useful)
+#Install curl to download glide
+#Install git for fetching Go dependencies
+#Install ssh for fetching Go dependencies
+#Install mercurial for fetching go dependencies
+#Install wget since it's useful for fetching
+#Install make for building things
+#Install util-linux for column command (used for output formatting).
+#Install grep and sed for use in some Makefiles (e.g. pulling versions out of glide.yaml)
+#Install shadow for useradd (it allows to use big UID)
+RUN apk update && apk add --no-cache su-exec curl bash git openssh mercurial make wget util-linux tini file grep sed shadow
+RUN apk upgrade --no-cache
+
+#Disable ssh host key checking
+RUN echo 'Host *' >> /etc/ssh/ssh_config \
+  && echo '    StrictHostKeyChecking no' >> /etc/ssh/ssh_config
+
+#Disable cgo so that binaries we build will be fully static.
+ENV CGO_ENABLED=0
+
+#Recompile the standard library with cgo disabled.  This prevents the standard library from being
+#marked stale, causing full rebuilds every time.
+RUN go install -v std
+
+#Install glide
+RUN go get github.com/Masterminds/glide
+ENV GLIDE_HOME /home/user/.glide
+
+#Install dep
+RUN go get github.com/golang/dep/cmd/dep
+
+#Install ginkgo CLI tool for running tests
+RUN go get github.com/onsi/ginkgo/ginkgo
+
+#Install linting tools.
+RUN wget -O - -q https://install.goreleaser.com/github.com/golangci/golangci-lint.sh | sh -s v1.20.0
+RUN golangci-lint --version
+
+#Install license checking tool.
+RUN go get github.com/pmezard/licenses
+
+#Install tool to merge coverage reports.
+RUN go get github.com/wadey/gocovmerge
+
+#Install CLI tool for working with yaml files
+RUN go get github.com/mikefarah/yaml
+
+#Delete all the Go sources that were downloaded, we only rely on the binaries
+RUN rm -rf /go/src/*
+
+#Install vgo (should be removed once we take Go 1.11)
+RUN go get -u golang.org/x/vgo
+
+#Ensure that everything under the GOPATH is writable by everyone
+RUN chmod -R 777 $GOPATH
+
+RUN curl -sSL https://github.com/estesp/manifest-tool/releases/download/${MANIFEST_TOOL_VERSION}/manifest-tool-linux-s390x > manifest-tool && \
+    chmod +x manifest-tool && \
+    mv manifest-tool /usr/bin/
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/entrypoint.sh"]
+
+
+
+
+The build just hangs at RUN go install -v std
+
+
+
+Also, while running the same command inside s390x container on x86_64 host, error Illegal instruction (core dumped) is thrown.
+Register x86_64 host with the latest qemu-user-static.
+docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+docker run -it -v /home/test/qemu-s390x-static:/usr/bin/qemu-s390x-static s390x/golang:1.14.2-alpine3.11
+
+Inside s390x container:
+
+apk update && apk add --no-cache su-exec curl bash git openssh mercurial make wget util-linux tini file grep sed shadow
+apk upgrade --no-cache
+
+#Disable ssh host key checking
+echo 'Host *' >> /etc/ssh/ssh_config
+echo '    StrictHostKeyChecking no' >> /etc/ssh/ssh_config
+
+#Disable cgo so that binaries we build will be fully static.
+export CGO_ENABLED=0
+
+#Recompile the standard library with cgo disabled.  This prevents the standard library from being
+#marked stale, causing full rebuilds every time.
+go install -v std
+Describe the results you re
+This gives the following error:
+Illegal instruction (core dumped)
+
+
+
+Environment:
+x86_64 Ub18.04 4.15.0-101-generic Ubuntu SMP x86_64 GNU/Linux
+
+QEMU user static version: 5.0.0-2
+
+Container application: Docker
+
+Client: Docker Engine - Community
+ Version:           19.03.11
+ API version:       1.40
+ Go version:        go1.13.10
+ Git commit:        42e35e61f3
+ Built:             Mon Jun  1 09:12:22 2020
+ OS/Arch:           linux/amd64
+ Experimental:      false
+
+Server: Docker Engine - Community
+ Engine:
+  Version:          19.03.11
+  API version:      1.40 (minimum version 1.12)
+  Go version:       go1.13.10
+  Git commit:       42e35e61f3
+  Built:            Mon Jun  1 09:10:54 2020
+  OS/Arch:          linux/amd64
+  Experimental:     false
+ containerd:
+  Version:          1.2.13
+  GitCommit:        7ad184331fa3e55e52b890ea95e65ba581ae3429
+ runc:
+  Version:          1.0.0-rc10
+  GitCommit:        dc9208a3303feef5b3839f4323d9beb36df0a9dd
+ docker-init:
+  Version:          0.18.0
+  GitCommit:        fec3683
+
+Additional information optionally:
+When I build the same Dockerfile.s390x on an s390x machine, it is built successfully.
+
+One more thing which I tried:
+I installed qemu on x86 Ubuntu host with apt-get install.
+Extracted s390x go 1.14.2 binaries on the same. Ran the following commands:
+
+root:~ wget -q https://storage.googleapis.com/golang/go1.14.2.linux-s390x.tar.gz
+root@:~# chmod ugo+r go1.14.2.linux-s390x.tar.gz
+root@:~# rm -rf /usr/local/go /usr/bin/go
+root@:~#  tar -C /usr/local -xzf go1.14.2.linux-s390x.tar.gz
+root@:~# ln -sf /usr/local/go/bin/go /usr/bin/
+root@:~# ln -sf /usr/local/go/bin/gofmt /usr/bin/
+root@:~# ln -sf /usr/bin/gcc /usr/bin/s390x-linux-gnu-gcc
+root@:~# go version
+/lib/ld64.so.1: No such file or directory
+root@:~# qemu-s390x /usr/bin/go version
+/lib/ld64.so.1: No such file or directory
+
+Could you try to reproduce the problem with the latest version of QEMU from git repo?
+
+Cloned qemu source code, checked out latest tag v5.0.0, built and installed the same on x86 Ubuntu host using "make" and "make install".
+
+root:~# qemu-s390x --version
+qemu-s390x version 5.0.0 (v5.0.0-dirty)
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+
+
+root:~# wget -q https://storage.googleapis.com/golang/go1.14.2.linux-s390x.tar.gz
+root:~# chmod ugo+r go1.14.2.linux-s390x.tar.gz
+root:~# rm -rf /usr/local/go /usr/bin/go
+root:~# tar -C /usr/local -xzf go1.14.2.linux-s390x.tar.gz
+root:~# ln -sf /usr/local/go/bin/go /usr/bin/
+root:~# ln -sf /usr/local/go/bin/gofmt /usr/bin/
+root:~# ln -sf /usr/bin/gcc /usr/bin/s390x-linux-gnu-gcc
+root:~# go version
+-bash: /usr/bin/go: cannot execute binary file: Exec format error
+root:~# qemu-s390x /usr/bin/go version
+/lib/ld64.so.1: No such file or directory
+
+
+If you install go directly in your host system you must also install the libraries of s390x somewhere (except if it statically linked).
+
+The easiest way to test this is to install debian chroot, with something like:
+
+Check binftm_misc is configured:
+
+# cat /proc/sys/fs/binfmt_misc/qemu-s390x 
+enabled
+interpreter //qemu-s390x
+flags: OC
+offset 0
+magic 7f454c4602020100000000000000000000020016
+mask ffffffffffffff00fffffffffffffffffffeffff
+
+Then you can install a debian sid system into a directory:
+
+# debootstrap  --arch=s390x --foreign sid chroot-s390x/
+# cp .../qemu-s390x chroot-s390x/
+# sudo chroot chroot-s390x/ /debootstrap/debootstrap --second-stage
+
+And then you can use it with:
+
+# sudo chroot s390x-chroot/
+# uname -m
+s390x
+# apt install golang-go
+...
+
+I will try the same and will report here soon.
+
+What about the issue with getting a go s390x environment inside and s390x container running on x86 host using qemu-user-static? (This problem is also mentioned in the main issue above. This is the ultimate target which needs to be achieved, I want to be able to build an s390x docker image with go installations inside on an x86 host, rest of the stuff I did for debugging purposes only)
+
+I ran the following commands:
+
+#apt install debootstrap
+#debootstrap_dir=debootstrap
+#debootstrap --arch=s390x --foreign sid "$debootstrap_dir"
+#sudo mkdir -p "${debootstrap_dir}/usr/bin"
+#sudo cp "$(which qemu-s390x-static)" "${debootstrap_dir}/usr/bin"
+#sudo cp "$(which qemu-s390x)" "${debootstrap_dir}/usr/bin"
+
+All commands above were successful except below one:
+
+#sudo chroot "$debootstrap_dir" /debootstrap/debootstrap --second-stage
+Gave following error:
+W: Failure trying to run:  dpkg --force-depends --install /var/cache/apt/archives/base-passwd_3.5.47_s390x.deb
+W: See //debootstrap/debootstrap.log for details (possibly the package libgcc1 is at fault)
+
+Anyway, I proceeded:
+# uname -m
+s390x
+
+# apt install golang-go
+Reading package lists... Done
+Building dependency tree... Done
+You might want to run 'apt --fix-broken install' to correct these.
+The following packages have unmet dependencies:
+ dpkg : Conflicts: dpkg:none
+ dpkg:none : Conflicts: dpkg but 1.20.5 is to be installed
+ golang-go : Depends: golang-1.14-go but it is not going to be installed
+             Depends: golang-src (>= 2:1.14~2) but it is not going to be installed
+ libgcc1 : Depends: gcc-10-base (= 10.1.0-1) but 10.1.0-6+b1 is to be installed
+E: Unmet dependencies. Try 'apt --fix-broken install' with no packages (or specify a solution).
+
+# apt --fix-broken install
+Reading package lists... Done
+Building dependency tree... Done
+Correcting dependencies... Done
+The following packages will be REMOVED:
+  dpkg:none libgcc1
+0 upgraded, 0 newly installed, 2 to remove and 0 not upgraded.
+1 not fully installed or removed.
+After this operation, 85.0 kB disk space will be freed.
+Do you want to continue? [Y/n] y
+perl: warning: Setting locale failed.
+perl: warning: Please check that your locale settings:
+        LANGUAGE = (unset),
+        LC_ALL = (unset),
+        LANG = "en_US.UTF-8"
+    are supported and installed on your system.
+perl: warning: Falling back to the standard locale ("C").
+/usr/bin/locale: Cannot set LC_CTYPE to default locale: No such file or directory
+/usr/bin/locale: Cannot set LC_MESSAGES to default locale: No such file or directory
+/usr/bin/locale: Cannot set LC_ALL to default locale: No such file or directory
+dpkg: error: parsing file '/var/lib/dpkg/status' near line 3918 package 'dpkg':
+ duplicate value for 'Package' field
+E: Sub-process dpkg --set-selections returned an error code (2)
+E: Couldn't record the approved state changes as dpkg selection states
+
+
+
+Any update on this?
+I tried the latest version of qemu-user-static, it still fails with the same error.
+
+Le 23/11/2020 à 12:03, Nirman Narang a écrit :
+> Any update on this?
+> I tried the latest version of qemu-user-static, it still fails with the same error.
+> 
+
+It works fine for me. Perhaps your chroot has been corrupted by your
+previous attempts
+
+
+Let me try again using the following commands on a fresh x86 host.
+
+#apt install debootstrap
+#debootstrap_dir=debootstrap
+#debootstrap --arch=s390x --foreign sid "$debootstrap_dir"
+#sudo mkdir -p "${debootstrap_dir}/usr/bin"
+#sudo cp "$(which qemu-s390x-static)" "${debootstrap_dir}/usr/bin"
+#sudo cp "$(which qemu-s390x)" "${debootstrap_dir}/usr/bin"#sudo chroot "$debootstrap_dir" /debootstrap/debootstrap --second-stage
+
+Here is the output of the steps I tried:
+
+root@11:~# cat /proc/sys/fs/binfmt_misc/qemu-s390x
+enabled
+interpreter /usr/bin/qemu-s390x-static
+flags: F
+offset 0
+magic 7f454c4602020100000000000000000000020016
+mask ffffffffffffff00fffffffffffffffffffeffff
+
+
+debootstrap --arch=s390x --foreign sid chroot-s390x_dir
+
+cp -f /usr/bin/qemu-s390x-static /root/chroot-s390x_dir/usr/bin/
+
+chmod +x /root/chroot-s390x_dir/usr/bin/qemu-s390x-static
+
+chroot chroot-s390x_dir /debootstrap/debootstrap --second-stage --verbose
+
+chroot chroot-s390x_dir/
+
+
+root@11:/# uname -a
+Linux 4.15.0-123-generic #126-Ubuntu SMP Wed Oct 21 09:40:11 UTC 2020 s390x GNU/Linux
+
+Then tried to install the golang version mentioned below:
+golang |   2:1.15~1 | http://deb.debian.org/debian sid/main s390x Packages
+
+
+root@11:/# go version
+Illegal instruction (core dumped)
+
+root@11:/# go version -v
+Segmentation fault (core dumped)
+
+The error is the same as the one faced while implementing the s390x container using qemu-user-static on x86 machine with go install commands as mentioned in the main issue above.
+
+Any update on this? 
+Tried on fresh env, Illegal instruction (core dumped), and Segmentation fault (core dumped) errors are still thrown with go commands.
+
+Which qemu version do you end up using? "/usr/bin/qemu-s390x-static" *usually* refers to the one provided by your distro, not your custom build.
+
+FWIW, I just installed go under Fedora 32 (which uses a slightly older version of go):
+
+[root@atomic-00 ~]# uname -a
+Linux atomic-00 5.8.11-200.fc32.s390x #1 SMP Wed Sep 23 13:36:15 UTC 2020 s390x s390x s390x GNU/Linux
+
+[root@atomic-00 ~]# go version
+go version go1.14.13 linux/s390x
+[root@atomic-00 ~]# go version -v
+go version go1.14.13 linux/s390x
+
+
+As Laurent also cannot reproduce, maybe double check the QEMU you end up using is the right one?
+
+Using latest greatest go from https://golang.org/dl/
+
+[root@atomic-00 hello]# /usr/local/go/bin/go version
+go version go1.15.7 linux/s390x
+
+
+I used the command "docker run --rm --privileged multiarch/qemu-user-static --reset -p yes".
+This pulls the latest one automatically.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,244 @@
+other: 0.977
+permissions: 0.965
+device: 0.962
+semantic: 0.960
+PID: 0.945
+graphic: 0.940
+network: 0.934
+socket: 0.933
+debug: 0.927
+vnc: 0.916
+performance: 0.905
+boot: 0.905
+files: 0.865
+KVM: 0.819
+
+Migration failing in qemu-2.10.1 but working qemu-2.9.1 and earlier with same options
+
+
+Qemu-2.10.1 migration failing with the following error:
+Receiving block device images
+qemu-system-x86_64: error while loading section id 2(block)
+qemu-system-x86_64: load of migration failed: Input/output error
+
+Migration is setup on the destination system of the migration using:
+-incoming tcp:0:4444
+
+Migration is initiated from the source using the following commands in its qemu monitor:
+migrate -b "tcp:localhost:4444"
+
+The command-line used in both the source and destination is:
+qemu-system-x86_64 \
+        -nodefaults \
+        -pidfile vm0.pid \
+        -enable-kvm \
+        -machine q35 \
+        -cpu host -smp 2 \
+        -m 4096M \
+        -drive if=pflash,format=raw,unit=0,file=OVMF_CODE.fd,readonly \
+        -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd \
+        -drive file=${HDRIVE},format=qcow2 \
+        -drive media=cdrom \
+        -usb -device usb-tablet \
+        -vga std -vnc :0 \
+        -net nic,macaddr=${TAPMACADDR} -net user,net=192.168.2.0/24,dhcpstart=192.168.2.10 \
+        -serial stdio \
+        -monitor unix:${MONITORSOCKET},server,nowait
+
+Interesting; As a test could you try removing the cdrom entry (I doubt that'll help but it's worth a go).
+Also, is it possible for you to try a bisection?
+
+If I was to guess, I'd bet it's something relating to the pflash, but I don't know; it's unfortunate the block migration doesn't say what it got upset by.
+
+Are there no errors on the source side?
+
+Assuming there are no errors on the source side, I'd have to suggest taking a printf to migration/block.c block_load to find out which exit it's falling out of in there (at least I think that's what would cause that error)
+
+Hi David,
+
+Please let me know if you have preferred name.
+
+I am an AMD employee.
+
+Including my colleagues to this thread ...
+
+The only error on the source side is the migration failure reported on
+the source monitor when doing "info migration" .
+
+It was indeed something related to the pflash, because migration will
+work when removing the following entries:
+-drive if=pflash,format=raw,unit=0,file=OVMF_CODE.fd,readonly
+-drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd
+
+I will take a look at the migration/block.c block_load code as you suggested.
+
+Sincerely,
+William Tambe
+
+
+On Thu, Oct 12, 2017 at 2:24 PM, Dr. David Alan Gilbert
+<email address hidden> wrote:
+> Interesting; As a test could you try removing the cdrom entry (I doubt that'll help but it's worth a go).
+> Also, is it possible for you to try a bisection?
+>
+> If I was to guess, I'd bet it's something relating to the pflash, but I
+> don't know; it's unfortunate the block migration doesn't say what it got
+> upset by.
+>
+> Are there no errors on the source side?
+>
+> Assuming there are no errors on the source side, I'd have to suggest
+> taking a printf to migration/block.c block_load to find out which exit
+> it's falling out of in there (at least I think that's what would cause
+> that error)
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1723161
+>
+> Title:
+>   Migration failing in qemu-2.10.1 but working qemu-2.9.1 and earlier
+>   with same options
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>
+>   Qemu-2.10.1 migration failing with the following error:
+>   Receiving block device images
+>   qemu-system-x86_64: error while loading section id 2(block)
+>   qemu-system-x86_64: load of migration failed: Input/output error
+>
+>   Migration is setup on the destination system of the migration using:
+>   -incoming tcp:0:4444
+>
+>   Migration is initiated from the source using the following commands in its qemu monitor:
+>   migrate -b "tcp:localhost:4444"
+>
+>   The command-line used in both the source and destination is:
+>   qemu-system-x86_64 \
+>           -nodefaults \
+>           -pidfile vm0.pid \
+>           -enable-kvm \
+>           -machine q35 \
+>           -cpu host -smp 2 \
+>           -m 4096M \
+>           -drive if=pflash,format=raw,unit=0,file=OVMF_CODE.fd,readonly \
+>           -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd \
+>           -drive file=${HDRIVE},format=qcow2 \
+>           -drive media=cdrom \
+>           -usb -device usb-tablet \
+>           -vga std -vnc :0 \
+>           -net nic,macaddr=${TAPMACADDR} -net user,net=192.168.2.0/24,dhcpstart=192.168.2.10 \
+>           -serial stdio \
+>           -monitor unix:${MONITORSOCKET},server,nowait
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1723161/+subscriptions
+
+
+Hi William,
+  David's fine (I'm from Red Hat)
+
+OK, so it is the pflash;  if you get some debug, please add it to this bug, I'll ask some colleagues on the block side if they have any ideas.
+
+Dave
+
+Hi William,
+
+Just to confirm: are both src and dest on the same host, using the same command line options? Then I'm confused why you need block migration because they share the same image files (for OVMF pflash and ${HDRIVE}).
+
+I can reproduce this:
+
+./x86_64-softmmu/qemu-system-x86_64 -nographic -M q35 -drive id=d,file=/home/vmimages/dummy1,if=none,readonly -device virtio-blk,id=vb1,drive=d -drive if=pflash,format=raw,unit=0,file=/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd,readonly -drive if=pflash,format=raw,unit=1,file=vars1.fd
+
+to:
+./x86_64-softmmu/qemu-system-x86_64 -M q35 -nographic -drive id=d,file=/home/vmimages/dummy2,if=none,readonly -device virtio-blk,id=vb1,drive=d -drive if=pflash,format=raw,unit=0,file=romfile,readonly -drive if=pflash,format=raw,unit=1,file=vars2.fd -incoming tcp::4444
+
+then
+migrate -d -b tcp:0:4444
+
+note I copied the vars file and rom file  separately so it's not a locking issue
+
+i added some debug, and I'm seeing:
+
+blk_pwrite failed for pflash1 0 @ 0 cluster_size=1048576 ret=-5
+
+so that's an EIO.
+
+The EIO is coming from blk_check_byte_request  because it's trying to write a 1MB cluster size chunk, yet the var file is only ~128k
+
+Hi Fam,
+
+We used the same host for both src and dest for testing purposes;
+ideally it should work regardless of whether src and dst are the same
+host.
+
+When we tested it, src and dest were NOT using the same vars file and
+rom file; they each had their own copy.
+
+Please, can you keep us updated when a fix is pushed upstream ?
+
+On Fri, Oct 13, 2017 at 5:18 AM, Fam Zheng <email address hidden> wrote:
+> Hi William,
+>
+> Just to confirm: are both src and dest on the same host, using the same
+> command line options? Then I'm confused why you need block migration
+> because they share the same image files (for OVMF pflash and ${HDRIVE}).
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1723161
+>
+> Title:
+>   Migration failing in qemu-2.10.1 but working qemu-2.9.1 and earlier
+>   with same options
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>
+>   Qemu-2.10.1 migration failing with the following error:
+>   Receiving block device images
+>   qemu-system-x86_64: error while loading section id 2(block)
+>   qemu-system-x86_64: load of migration failed: Input/output error
+>
+>   Migration is setup on the destination system of the migration using:
+>   -incoming tcp:0:4444
+>
+>   Migration is initiated from the source using the following commands in its qemu monitor:
+>   migrate -b "tcp:localhost:4444"
+>
+>   The command-line used in both the source and destination is:
+>   qemu-system-x86_64 \
+>           -nodefaults \
+>           -pidfile vm0.pid \
+>           -enable-kvm \
+>           -machine q35 \
+>           -cpu host -smp 2 \
+>           -m 4096M \
+>           -drive if=pflash,format=raw,unit=0,file=OVMF_CODE.fd,readonly \
+>           -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd \
+>           -drive file=${HDRIVE},format=qcow2 \
+>           -drive media=cdrom \
+>           -usb -device usb-tablet \
+>           -vga std -vnc :0 \
+>           -net nic,macaddr=${TAPMACADDR} -net user,net=192.168.2.0/24,dhcpstart=192.168.2.10 \
+>           -serial stdio \
+>           -monitor unix:${MONITORSOCKET},server,nowait
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1723161/+subscriptions
+
+
+This still seems to be present on current head
+
+Looking through old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

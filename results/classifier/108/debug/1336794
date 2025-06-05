@@ -1,0 +1,654 @@
+debug: 0.978
+device: 0.966
+PID: 0.966
+other: 0.947
+performance: 0.943
+permissions: 0.927
+files: 0.927
+KVM: 0.923
+semantic: 0.918
+socket: 0.916
+vnc: 0.909
+boot: 0.899
+graphic: 0.889
+network: 0.807
+
+9pfs does not honor open file handles on unlinked files
+
+This was originally filed over here: https://bugzilla.redhat.com/show_bug.cgi?id=1114221
+
+The open-unlink-fstat idiom used in some places to create an anonymous private temporary file does not work in a QEMU guest over a virtio-9p filesystem.
+
+Version-Release number of selected component (if applicable):
+
+qemu-kvm-1.6.2-6.fc20.x86_64
+qemu-system-x86-1.6.2-6.fc20.x86_64
+(those are fedora RPMs)
+
+How reproducible:
+
+Always. See this example C program:
+
+https://bugzilla.redhat.com/attachment.cgi?id=913069
+
+Steps to Reproduce:
+1. Export a filesystem with virt-manager for the guest.
+      (type: mount, driver: default, mode: passthrough)
+2. Start guest and mount that filesystem
+      (mount -t 9p -o trans=virtio,version=9p2000.L  ...)
+3. Run a program that uses open-unlink-fstat
+      (in my case it was trying to compile Perl 5.20)
+
+Actual results:
+
+fstat fails:
+
+open("/home/tst/filename", O_RDWR|O_CREAT|O_EXCL, 0600) = 3
+unlink("/home/tst/filename")            = 0
+fstat(3, 0x23aa1a8)                     = -1 ENOENT (No such file or directory)
+close(3)
+
+Expected results:
+
+open("/home/tst/filename", O_RDWR|O_CREAT|O_EXCL, 0600) = 3
+unlink("/home/tst/filename")            = 0
+fstat(3, {st_mode=S_IFREG|0600, st_size=0, ...}) = 0
+fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+close(3) 
+
+Additional info:
+
+There was a patch put into the kernel back in '07 to handle this very problem for other filesystems; maybe its helpful:
+
+      http://lwn.net/Articles/251228/
+
+There is also a thread on LKML from last December specifically about this very problem:
+
+      https://lkml.org/lkml/2013/12/31/163
+
+There was a discussion on the QEMU list back in '11 that doesn't seem to have come to a conclusion, but did provide the test program that i've attached to this report:
+
+      http://marc.info/?l=qemu-devel&m=130443605720648&w=2
+
+This bug makes it difficult to run a Debian Jessie guest with a 9pfs root filesystem, because "apt-get update" uses the open-unlink-fstat idiom.  With this bug present, apt dies with the following error:
+
+E: Unable to determine file size for fd 7 - fstat (2: No such file or directory)
+
+
+I've done some digging from the client side.  As is mentioned in Miklos'
+original patch (which appears to have been shot down) the higher level
+implementation appear to be broken for this.  Here's what the code looks
+like for fstat in fs/stat.c:
+
+int vfs_fstat(unsigned int fd, struct kstat *stat)
+{
+        struct fd f = fdget_raw(fd);
+        int error = -EBADF;
+
+        if (f.file) {
+                error = vfs_getattr(&f.file->f_path, stat);
+                fdput(f);
+        }
+        return error;
+}
+
+In other words, it only uses the open fd to derrive a path and then
+executes the getattr off of that path.  If that path no longer exists
+(because of unlink or remove) then you are hosed.  In my understanding, the
+"work around" I suppose is the so-called 'silly renaming' where
+remove/unlink simply does a rename until all open instances are closed.
+
+The frustrating thing is that the 9p protocol is setup to work off of the
+fid, which maps to the fd -- so its perfectly capable of the original
+semantic but the high level code in fs/stat.c only wants to give a path.
+
+I can do a work around on the client where a getattr "favors" open fids for
+the operation or I can do the sillyrename hack that NFS and CIFS has used
+but both of those look god-awful.
+
+     -eric
+
+
+
+
+On Fri, Apr 10, 2015 at 7:30 AM, Mark Glines <email address hidden> wrote:
+
+> This bug makes it difficult to run a Debian Jessie guest with a 9pfs
+> root filesystem, because "apt-get update" uses the open-unlink-fstat
+> idiom.  With this bug present, apt dies with the following error:
+>
+> E: Unable to determine file size for fd 7 - fstat (2: No such file or
+> directory)
+>
+> --
+> You received this bug notification because you are a member of qemu-
+> devel-ml, which is subscribed to QEMU.
+> https://bugs.launchpad.net/bugs/1336794
+>
+> Title:
+>   9pfs does not honor open file handles on unlinked files
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   This was originally filed over here:
+>   https://bugzilla.redhat.com/show_bug.cgi?id=1114221
+>
+>   The open-unlink-fstat idiom used in some places to create an anonymous
+>   private temporary file does not work in a QEMU guest over a virtio-9p
+>   filesystem.
+>
+>   Version-Release number of selected component (if applicable):
+>
+>   qemu-kvm-1.6.2-6.fc20.x86_64
+>   qemu-system-x86-1.6.2-6.fc20.x86_64
+>   (those are fedora RPMs)
+>
+>   How reproducible:
+>
+>   Always. See this example C program:
+>
+>   https://bugzilla.redhat.com/attachment.cgi?id=913069
+>
+>   Steps to Reproduce:
+>   1. Export a filesystem with virt-manager for the guest.
+>         (type: mount, driver: default, mode: passthrough)
+>   2. Start guest and mount that filesystem
+>         (mount -t 9p -o trans=virtio,version=9p2000.L  ...)
+>   3. Run a program that uses open-unlink-fstat
+>         (in my case it was trying to compile Perl 5.20)
+>
+>   Actual results:
+>
+>   fstat fails:
+>
+>   open("/home/tst/filename", O_RDWR|O_CREAT|O_EXCL, 0600) = 3
+>   unlink("/home/tst/filename")            = 0
+>   fstat(3, 0x23aa1a8)                     = -1 ENOENT (No such file or
+> directory)
+>   close(3)
+>
+>   Expected results:
+>
+>   open("/home/tst/filename", O_RDWR|O_CREAT|O_EXCL, 0600) = 3
+>   unlink("/home/tst/filename")            = 0
+>   fstat(3, {st_mode=S_IFREG|0600, st_size=0, ...}) = 0
+>   fcntl(3, F_SETFD, FD_CLOEXEC)           = 0
+>   close(3)
+>
+>   Additional info:
+>
+>   There was a patch put into the kernel back in '07 to handle this very
+>   problem for other filesystems; maybe its helpful:
+>
+>         http://lwn.net/Articles/251228/
+>
+>   There is also a thread on LKML from last December specifically about
+>   this very problem:
+>
+>         https://lkml.org/lkml/2013/12/31/163
+>
+>   There was a discussion on the QEMU list back in '11 that doesn't seem
+>   to have come to a conclusion, but did provide the test program that
+>   i've attached to this report:
+>
+>         http://marc.info/?l=qemu-devel&m=130443605720648&w=2
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1336794/+subscriptions
+>
+>
+
+
+On Sun, Apr 12, 2015 at 9:09 AM, Al Viro <email address hidden> wrote:
+
+> On Sun, Apr 12, 2015 at 12:42:35PM -0000, Eric Van Hensbergen wrote:
+>
+> > In other words, it only uses the open fd to derrive a path and then
+> > executes the getattr off of that path.  If that path no longer exists
+> > (because of unlink or remove) then you are hosed.  In my understanding,
+> the
+> > "work around" I suppose is the so-called 'silly renaming' where
+> > remove/unlink simply does a rename until all open instances are closed.
+>
+> What do you mean, "no longer exists"?  Don't confuse path with pathname -
+> it's a mount,dentry pair.  And dentry in question bloody well ought to
+> still
+> have the FID associated with it - you shouldn't use the same FID for
+> TREMOVE and for TREAD/TWRITE.
+
+
+Quite right, the fid is still there, I just don't have an easy way to get
+at it.  vfs_file operations have a direct notion of the fid because they
+cache it in the struct file private data.  dentries have several fids
+associated with them and stored in thier private data, so I've got to
+"guess" the right one.  In most cases this probably won't cause a problem,
+but it just feels a bit off.
+
+There was a thread a few years back where Miklos was arguing for fstat to
+pass through struct file information since the the fd given the fstat had a
+file structure associated with it (which in 9p's case has a direct pointer
+to the "right" fid):
+    http://lwn.net/Articles/251228/
+
+In any case, I've drafted a quick patch which takes the approach of
+searching the dentry fid list for the fid, but it doesn't feel like the
+right answer and I'm fairly certain I need to iterate on it a few times to
+make sure I haven't hosed something up.
+
+
+> TREMOVE clunks the FID passed to it; on
+> some servers you really have no choice - server discards the file
+> completely
+> and on any FID that used to refer to it you get an error from that point
+> on.
+> On those you'd really have to do something like sillyrename - the only
+> way to keep IO going for a file sitting on such server is to have it
+> visible somewhere.  Normal fs(4) is that way; e.g. u9fs(4) isn't - there
+> FID maps to opened file descriptor on host and TREMOVE on another FID
+> doesn't break it, as long as host supports IO on opened-but-unlinked files.
+> I don't remember where qemu 9pfs falls in that respect, but I'd expect it
+> to be more like u9fs...
+>
+>
+Sort of, the servers in kvmtool and qemu (and diod) have a fid with the
+open handle.  However, all of them seem to implement getattr assuming they
+have to re-walk to the file.  In order to test my aforementioned changes to
+the client, I also did a quick patch to kvmtool which checks and sees if
+the fid it receives has an fd and just uses fstat instead of lstat.  Patch
+is here at the moment, I'll send upstream once I'm happy with the client
+side changes and look into creating a patch for qemu/diod:
+
+https://github.com/ericvh/linux-kvm/commit/2fa2f7e728ac08a7d9006516870db1a986aa6acc
+
+
+> Which FID are you passing to server on unlink()?
+>
+>
+Unlink/remove look to be getting a proper fid (in other words, not using
+the one that is open).  The problem is that getattr is using a reference
+fid (an open fid that's already walked to the name).  From a protocol
+semantics perspective the fixes mentioned above probably don't help that we
+may have some dangling unopen fids pointing at a name that is no longer
+valid, but that is just a consequence of the imperfect nature of the
+mapping of dentries to fids and I'm not sure it does any harm.  A trace
+from the original problem on diod (which appears to not implement unlink
+and is falling back to remove).
+
+diod: P9_TWALK tag 1 fid 1 newfid 2 nwname 1 'foobar'
+
+diod: P9_RLERROR tag 1 ecode 2
+
+diod: P9_TWALK tag 1 fid 1 newfid 2 nwname 0
+
+diod: P9_RWALK tag 1 nwqid 0e
+
+diod: P9_TLCREATE tag 1 fid 2 name 'foobar' flags 0x8042 mode 0100644 gid 0
+
+diod: P9_RLCREATE tag 1 qid (000000000012524b 0 '') iounit 0
+
+diod: P9_TWALK tag 1 fid 1 newfid 3 nwname 1 'foobar'
+
+diod: P9_RWALK tag 1 nwqid 1 (000000000012524b 0 '')
+
+diod: P9_TGETATTR tag 1 fid 3 request_mask 0x17ff
+
+diod: P9_RGETATTR tag 1 valid 0x17ff qid (000000000012524b 0 '') mode
+0100644 uid 0 gid 0 nlink 1 rdev 0 size 0 blksize 4096 blocks 0 atime Mon
+Apr  6 11:11:08 2015 mtime Mon Apr  6 11:11:08 2015 ctime Mon Apr  6
+11:11:08 2015 btime X gen 0 data_version X
+
+diod: P9_TUNLINKAT tag 1 dirfid 1 name 'foobar' flags 0
+
+diod: P9_RLERROR tag 1 ecode 95
+
+diod: P9_TWALK tag 1 fid 3 newfid 4 nwname 0
+
+diod: P9_RWALK tag 1 nwqid 0
+
+diod: P9_TREMOVE tag 1 fid 4
+
+diod: P9_RREMOVE tag 1
+
+diod: P9_TGETATTR tag 1 fid 3 request_mask 0x3fff
+
+diod: P9_RLERROR tag 1 ecode 2
+
+diod: P9_TCLUNK tag 1 fid 2
+
+diod: P9_RCLUNK tag 1
+
+diod: P9_TCLUNK tag 1 fid 3
+
+diod: P9_RCLUNK tag 1
+
+The client cloning 3 to 4 before the remove seems a bit unnecessary, but is
+probably done in the case that the remove fails on the server so that we
+still have a dentry reference.
+
+
+Well, technically fid 3 isn't 'open', only fid 2 is open - at least
+according to the protocol.  fid 3 and fid 2 are both clones of fid 1.
+However, thanks for the alternative workaround.  If you get a chance, can
+you check that my change to the client to partially fix this for the other
+servers doesn't break nfs-ganesha:
+
+https://github.com/ericvh/linux/commit/fddc7721d6d19e4e6be4905f37ade5b0521f4ed5
+
+On Mon, Apr 13, 2015 at 3:27 AM, Dominique Martinet <
+<email address hidden>> wrote:
+
+> Hi,
+>
+> for what it's worth, the sample code given works with nfs-ganesha
+> server, so I'm not sure what's not working here.
+>
+> Here's the server traces:
+> TATTACH: tag=1 fid=0 afid=-1 uname='nobody' aname='/export' n_uname=-1
+> RATTACH: tag=1 fid=0 qid=(type=128,version=0,path=1)
+> TGETATTR: tag=1 fid=0 request_mask=0x7ff
+> RGETATTR: tag=1 valid=0x7ff qid=(type=128,version=0,path=1) mode=040755
+> uid=0 gid=0 nlink=3 rdev=192 size=4096 blksize=4096 blocks=8
+> atime=(1428909387,0) mtime=(1428909389,0) ctime=(1428909389,0) btime=(0,0)
+> gen=0, data_version=0
+> TATTACH: tag=1 fid=1 afid=-1 uname='' aname='/export' n_uname=0
+> RATTACH: tag=1 fid=1 qid=(type=128,version=0,path=1)
+> TGETATTR: tag=1 fid=1 request_mask=0x3fff
+> RGETATTR: tag=1 valid=0x7ff qid=(type=128,version=0,path=1) mode=040755
+> uid=0 gid=0 nlink=3 rdev=192 size=4096 blksize=4096 blocks=8
+> atime=(1428909387,0) mtime=(1428909389,0) ctime=(1428909389,0) btime=(0,0)
+> gen=0, data_version=0
+> TWALK: tag=1 fid=1 newfid=2 nwname=1 (component 1/1 :test.txt)
+> RERROR(_9P_TWALK) tag=1 err=(2|No such file or directory)
+> TWALK: tag=1 fid=1 newfid=2 nwname=0
+> RWALK: tag=1 fid=1 newfid=2 nwqid=0 fileid=1 pentry=0x8278c0 refcount=4
+> TLCREATE: tag=1 fid=2 name=test.txt flags=0100102 mode=0100644 gid=0
+> RLCREATE: tag=1 fid=2 name=test.txt
+> qid=(type=0,version=0,path=144115205255725065) iounit=0
+> pentry=0x7fffc0000d00
+> TWALK: tag=1 fid=1 newfid=3 nwname=1 (component 1/1 :test.txt)
+> RWALK: tag=1 fid=1 newfid=3 nwqid=1 fileid=144115205255725065
+> pentry=0x7fffc0000d00 refcount=3
+> TGETATTR: tag=1 fid=3 request_mask=0x17ff
+> RGETATTR: tag=1 valid=0x7ff qid=(type=0,version=0,path=144115205255725065)
+> mode=0100644 uid=0 gid=0 nlink=1 rdev=192 size=0 blksize=4096 blocks=0
+> atime=(1428909674,0) mtime=(1428909674,0) ctime=(1428909674,0) btime=(0,0)
+> gen=0, data_version=0
+> TWRITE: tag=1 fid=2 offset=0 count=6
+> RWRITE: tag=1 fid=2 offset=0 input count=6 output count=6
+> TUNLINKAT: tag=1 dfid=1 name=test.txt
+> TUNLINKAT: tag=1 dfid=1 name=test.txt
+> TGETATTR: tag=1 fid=3 request_mask=0x3fff
+> RGETATTR: tag=1 valid=0x7ff qid=(type=0,version=0,path=144115205255725065)
+> mode=0100644 uid=0 gid=0 nlink=0 rdev=192 size=6 blksize=4096 blocks=0
+> atime=(1428909674,0) mtime=(1428909674,0) ctime=(1428909674,0) btime=(0,0)
+> gen=0, data_version=0
+> TCLUNK: tag=1 fid=2
+> RCLUNK: tag=1 fid=2
+> TCLUNK: tag=1 fid=3
+> RCLUNK: tag=1 fid=3
+>
+> (if you're not familiar with 9P, ATTACH = mount, WALK = create a new
+> 'fid' either clone of current file (nwname = 0) or lookup, CLUNK ~=
+> close. Rest is obvious enough)
+>
+>
+> There's no lookup between the unlink and the getattr, so what I think is
+> missing is that both qemu and diod do not understand that fids 2 and 3
+> refer to the same open file ?
+> It's a bit of a weird behavior that the client will open a new fid
+> through lookup walk for a first stat, but I'm mounting with cache=none
+> here so you should be having the same.
+>
+> --
+> Dominique
+>
+
+
+That patch looks fine by me.  Happy to put it in the queue.  Thanks Al.
+
+On Tue, Apr 14, 2015 at 11:07 AM Al Viro <email address hidden> wrote:
+
+> On Mon, Apr 13, 2015 at 04:05:28PM +0000, Eric Van Hensbergen wrote:
+> > Well, technically fid 3 isn't 'open', only fid 2 is open - at least
+> > according to the protocol.  fid 3 and fid 2 are both clones of fid 1.
+> > However, thanks for the alternative workaround.  If you get a chance, can
+> > you check that my change to the client to partially fix this for the
+> other
+> > servers doesn't break nfs-ganesha:
+> >
+> >
+> https://github.com/ericvh/linux/commit/fddc7721d6d19e4e6be4905f37ade5b0521f4ed5
+>
+> BTW, what the hell is going on in v9fs_vfs_mknod() and v9fs_vfs_link()?
+> You allocate 4Kb buffer, sprintf into it ("b %u %u", "c %u %u", or "%d\n")
+> feed it to v9fs_vfs_mkspecial() and immediately free it.  What's wrong with
+> a local array of char?  In the worst case it needs to be char name[24] -
+> surely, we are not so tight on stack that extra 16 bytes (that array
+> instead
+> of a pointer) would drive us over the cliff?
+>
+> IOW, do you have any problem with this:
+> diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+> index 703342e..cda68f7 100644
+> --- a/fs/9p/vfs_inode.c
+> +++ b/fs/9p/vfs_inode.c
+> @@ -1370,6 +1370,8 @@ v9fs_vfs_symlink(struct inode *dir, struct dentry
+> *dentry, const char *symname)
+>         return v9fs_vfs_mkspecial(dir, dentry, P9_DMSYMLINK, symname);
+>  }
+>
+> +#define U32_MAX_DIGITS 10
+> +
+>  /**
+>   * v9fs_vfs_link - create a hardlink
+>   * @old_dentry: dentry for file to link to
+> @@ -1383,7 +1385,7 @@ v9fs_vfs_link(struct dentry *old_dentry, struct
+> inode *dir,
+>               struct dentry *dentry)
+>  {
+>         int retval;
+> -       char *name;
+> +       char name[1 + U32_MAX_DIGITS + 2]; /* sign + number + \n + \0 */
+>         struct p9_fid *oldfid;
+>
+>         p9_debug(P9_DEBUG_VFS, " %lu,%pd,%pd\n",
+> @@ -1393,20 +1395,12 @@ v9fs_vfs_link(struct dentry *old_dentry, struct
+> inode *dir,
+>         if (IS_ERR(oldfid))
+>                 return PTR_ERR(oldfid);
+>
+> -       name = __getname();
+> -       if (unlikely(!name)) {
+> -               retval = -ENOMEM;
+> -               goto clunk_fid;
+> -       }
+> -
+>         sprintf(name, "%d\n", oldfid->fid);
+>         retval = v9fs_vfs_mkspecial(dir, dentry, P9_DMLINK, name);
+> -       __putname(name);
+>         if (!retval) {
+>                 v9fs_refresh_inode(oldfid, d_inode(old_dentry));
+>                 v9fs_invalidate_inode_attr(dir);
+>         }
+> -clunk_fid:
+>         p9_client_clunk(oldfid);
+>         return retval;
+>  }
+> @@ -1425,7 +1419,7 @@ v9fs_vfs_mknod(struct inode *dir, struct dentry
+> *dentry, umode_t mode, dev_t rde
+>  {
+>         struct v9fs_session_info *v9ses = v9fs_inode2v9ses(dir);
+>         int retval;
+> -       char *name;
+> +       char name[2 + U32_MAX_DIGITS + 1 + U32_MAX_DIGITS + 1];
+>         u32 perm;
+>
+>         p9_debug(P9_DEBUG_VFS, " %lu,%pd mode: %hx MAJOR: %u MINOR: %u\n",
+> @@ -1435,26 +1429,16 @@ v9fs_vfs_mknod(struct inode *dir, struct dentry
+> *dentry, umode_t mode, dev_t rde
+>         if (!new_valid_dev(rdev))
+>                 return -EINVAL;
+>
+> -       name = __getname();
+> -       if (!name)
+> -               return -ENOMEM;
+>         /* build extension */
+>         if (S_ISBLK(mode))
+>                 sprintf(name, "b %u %u", MAJOR(rdev), MINOR(rdev));
+>         else if (S_ISCHR(mode))
+>                 sprintf(name, "c %u %u", MAJOR(rdev), MINOR(rdev));
+> -       else if (S_ISFIFO(mode))
+> -               *name = 0;
+> -       else if (S_ISSOCK(mode))
+> +       else
+>                 *name = 0;
+> -       else {
+> -               __putname(name);
+> -               return -EINVAL;
+> -       }
+>
+>         perm = unixmode2p9mode(v9ses, mode);
+>         retval = v9fs_vfs_mkspecial(dir, dentry, perm, name);
+> -       __putname(name);
+>
+>         return retval;
+>  }
+>
+
+
+good to know, thanks dominique.  I gave it a sniff test with FSX and a few
+other benchmarks, but I need to hit it with some multithreaded
+regressions.  Any pointers to reproducible failure cases would be
+beneficial.
+
+On Wed, Apr 15, 2015 at 6:28 AM Dominique Martinet <
+<email address hidden>> wrote:
+
+> Eric Van Hensbergen wrote on Mon, Apr 13, 2015 at 04:05:28PM +0000:
+> > Well, technically fid 3 isn't 'open', only fid 2 is open - at least
+> > according to the protocol.  fid 3 and fid 2 are both clones of fid 1.
+>
+> Right, they're clone fids, but nothing in the protocol says what should
+> happen to non-open fids when you unlink the file either - I guess both
+> behaviours are OK as long as the client can handle it, so it would make
+> sense to at least call fstat() on the fid matching the fd, but while
+> I think this is how the kernel currently behaves the kernel doesn't HAVE
+> to make one open, separate fid per open file descriptor either.
+>
+> > However, thanks for the alternative workaround.  If you get a chance, can
+> > you check that my change to the client to partially fix this for the
+> other
+> > servers doesn't break nfs-ganesha:
+> >
+> >
+> https://github.com/ericvh/linux/commit/fddc7721d6d19e4e6be4905f37ade5b0521f4ed5
+>
+> I'm afraid I haven't had much time lately, but while fstat-after-unlink
+> still works I'm getting some Oops with my basic test suite (create empty
+> files and rm -rf, kernel compilation, etc - nothing fancy) to the point
+> of locking myself out of my test box pretty quickly.
+>
+> I'll try to debug patches a bit more individually (trying everything at
+> once isn't helping), but at the very least something is fishy
+>
+> --
+> Dominique Martinet
+>
+
+
+I would appreciate this patch being committed as I *think* it's affecting a system i'm building now.
+
+I have a backup host with 2 VMs. For business reasons they need to be network isolated from each other and the host, so each is passed through a physical NIC. Each VM does need access to a variable size datastore on the host so I am using virtfs /9p to expose a mountpoint to each VM.
+
+The VMs each backup servers to  their respective mountpoint to this virtfs mount using rsync. Just backing up one server with ~4000 files and 3 large sparse VM images saw the open files on the backup host increase to over *800000* and the rsync progressively get slower.  Shutting down these VMs then takes hours as it can't unlock the files it has open on the backup host.
+
+I understand rsync does use open-unlink-fstat extensively, hence why I think this is the issue.
+
+This is a deal breaker for any production use of virtfs. Does anybody know if this is fixed in other builds of qemu?
+
+tl;dr - to recreate this on 16.04 - create a VM with a virtfs/9p mount to the host. Do lots of rsyncs to this mount within the VM, watch 'lsof | wc -l' go higher and higher on the host.
+
+Thanks,
+
+/Sean
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+Latest work on the subject seems to be:
+
+https://github.com/ericvh/linux/commit/eaf70223eac094291169f5a6de580351890162a2
+
+I could verify that this patch still applies to the upstream kernel tree and fixes the issue.
+
+The fix was verified with upstream QEMU + the following patch:
+
+http://patchwork.ozlabs.org/patch/626194/
+
+I have pinged kernel v9fs maintainers but I have not received any answer yet.
+
+I intend to push the QEMU patch to upstream soon.
+
+
+Hi Greg,
+
+Did you push the qemu patch upstream, and now it is a matter of fixing the kernel?
+
+Hi Maxim,
+
+No I didn't...
+
+
+hi,
+i am probably trying to ride a dead horse here, but is there any chance this patch will make its way into master?
+
+thanks,
+alex
+
+Hi Alex,
+
+Well... it's slightly more than one patch in QEMU, and this also requires some linux kernel side changes. And I really can't^W^Wdon't want to invest more time there if no one helps. This being said, I see more and more activity on 9p since Dominique Martinet has taken maintainership. Maybe worth to resurrect the discussion on <email address hidden> ? If it gets enough momentum there, I'll be happy to go forward with the QEMU changes.
+
+Cheers,
+
+--
+Greg
+
+
+hi greg,
+
+thanks very much for you answer. i saw the proposed kernel patch from eric van hensbergen - even tried to build my own kernel with the patch applied, i was ready to run this on a custom kernel with a custom built qemu, but although the patch can be applied, there have been too many changes in the surrounding code for it to be able to work.
+the idea of the 9p file sharing in qemu is really nice (and fast). i am (was) trying to use it as a persistent storage on a kubernetes cluster and it is much better than nfs (performance wise) locking works just dandy.
+with 9p i thought i was golden, unfortunately no cigar.
+since there are different parties involved (and to get something into the linux kernel requires - from what i have read - the patience of a buddhist monk) i think it will be very hard to get this picked up.
+because of the time frame this will probably not be a solution for me, but i am nonetheless willing to invest some time to bringing this forward.
+how is a good way to proceed? (sorry, this question might sound dumb, but despite being a software developer for most of my working life the ways of the open source community have never revealed themselves to me).
+
+-alex
+
+I haven't worked on this topic in years.
+
+For the records.
+
+QEMU patches:
+
+https://lists.nongnu.org/archive/html/qemu-devel/2016-06/msg07586.html
+
+Linux patches:
+
+https://sourceforge.net/p/v9fs/mailman/message/35175775/
+
+
+Released with QEMU v5.2.0.
+
+Closed by accident, Christian just told me that this is not fixed yet. Sorry for the inconvenience.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/103
+
+

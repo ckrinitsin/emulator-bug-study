@@ -1,0 +1,937 @@
+other: 0.654
+device: 0.586
+KVM: 0.575
+performance: 0.549
+debug: 0.518
+graphic: 0.514
+files: 0.490
+vnc: 0.473
+boot: 0.457
+permissions: 0.448
+semantic: 0.412
+PID: 0.391
+network: 0.374
+socket: 0.337
+
+qemu-user: mmap should return failure (MAP_FAILED, -1) instead of success (NULL, 0) when len==0
+
+As shown in https://github.com/beehive-lab/mambo/issues/19#issuecomment-407420602, with len==0 mmap returns success (NULL, 0) instead of failure (MAP_FAILED, -1) in a x86_64 host executing a ELF 64-bit LSB executable, ARM aarch64 binary.
+
+Steps to reproduce the bug:
+
+- (cross-)compile the attached source file:
+
+$ aarch64-linux-gnu-gcc -static -std=gnu99 -lpthread test/mmap_qemu.c -o mmap_qemu
+
+- Execute in a x86_64 host with qemu-user and qemu-user-binfmt:
+
+$ ./mmap_qemu
+alloc: 0
+MAP_FAILED: -1
+errno: 0
+mmap_qemu: test/mmap_qemu.c:15: main: Assertion `alloc == MAP_FAILED' failed.
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted (core dumped)
+
+- Execute in a ARM host without any additional dependecy:
+
+$ ./mmap_qemu
+alloc: -1
+MAP_FAILED: -1
+errno: 22
+
+The bug is present in Fedora:
+
+$ qemu-aarch64 --version
+qemu-aarch64 version 2.11.2(qemu-2.11.2-1.fc28)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+$ uname -r
+4.17.7-200.fc28.x86_64
+
+And also in Ubuntu:
+
+$ qemu-aarch64 --version
+qemu-aarch64 version 2.12.0 (Debian 1:2.12+dfsg-3ubuntu3)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+$ uname -r
+4.15.0-23-generic
+
+Possibly related to:
+
+- https://lists.freebsd.org/pipermail/freebsd-hackers/2009-July/029109.html
+- https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=203852
+
+
+
+I did some research and found that this bug is present since 2003:
+
+- 2003/05/13: https://github.com/qemu/qemu/commit/54936004fddc52c321cb3f9a9a51140e782bed5d#diff-2bf4728e0473404c39c97190bd02b2f8
+  - https://github.com/qemu/qemu/blob/54936004fddc52c321cb3f9a9a51140e782bed5d/linux-user/mmap.c#L182-L183
+- 2008/06/02: https://github.com/qemu/qemu/commit/c8a706fe6242a553960ccc3071a4e75ceba6f3d2#diff-2bf4728e0473404c39c97190bd02b2f8
+  - https://github.com/qemu/qemu/blob/c8a706fe6242a553960ccc3071a4e75ceba6f3d2/linux-user/mmap.c#L284-L285
+  - https://github.com/qemu/qemu/blob/c8a706fe6242a553960ccc3071a4e75ceba6f3d2/linux-user/mmap.c#L400-L410
+
+It is present in versions 2.11.2, 2.12.0 and master:
+
+- https://github.com/qemu/qemu/blob/v2.11.2/linux-user/mmap.c#L401-L402
+- https://github.com/qemu/qemu/blob/v2.12.0/linux-user/mmap.c#L401-L402
+- https://github.com/qemu/qemu/blob/master/linux-user/mmap.c#L400-L401
+
+I think that a possible fix is:
+
+@@ -397,8 +397,10 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+     }
+ 
+     len = TARGET_PAGE_ALIGN(len);
+-    if (len == 0)
+-        goto the_end;
++    if (len == 0) {
++        errno = EINVAL;
++        goto fail;
++    }
+     real_start = start & qemu_host_page_mask;
+     host_offset = offset & qemu_host_page_mask;
+
+Following https://wiki.qemu.org/Contribute/SubmitAPatch#Make_code_motion_patches_easy_to_review:
+
+@@ -1,5 +1,5 @@
+---
+--- a/linux-user/mmap.c
+-    if (len == 0)
+-        goto the_end;
+-- 
++++ b/linux-user/mmap.c
++    if (len == 0) {
++        errno = EINVAL;
++        goto fail;
++    }
+
+
+I've slightly re-organised the check to more closely match the
+sequence that the kernel uses in do_mmap().
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: umarcor <email address hidden>
+---
+ linux-user/mmap.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index d0c50e4888..3ef69fa2d0 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -391,14 +391,22 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+     }
+ #endif
+ 
+-    if (offset & ~TARGET_PAGE_MASK) {
++    if (!len) {
+         errno = EINVAL;
+         goto fail;
+     }
+ 
+     len = TARGET_PAGE_ALIGN(len);
+-    if (len == 0)
+-        goto the_end;
++    if (!len) {
++        errno = EINVAL;
++        goto fail;
++    }
++
++    if (offset & ~TARGET_PAGE_MASK) {
++        errno = EINVAL;
++        goto fail;
++    }
++
+     real_start = start & qemu_host_page_mask;
+     host_offset = offset & qemu_host_page_mask;
+ 
+-- 
+2.17.1
+
+
+
+This adds a test to make sure we fail properly for a 0 length mmap.
+There are most likely other failure conditions we should also check.
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: umarcor <email address hidden>
+---
+ tests/tcg/multiarch/test-mmap.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tcg/multiarch/test-mmap.c b/tests/tcg/multiarch/test-mmap.c
+index 5c0afe6e49..7f62eba4e9 100644
+--- a/tests/tcg/multiarch/test-mmap.c
++++ b/tests/tcg/multiarch/test-mmap.c
+@@ -27,7 +27,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ #include <unistd.h>
+-
++#include <errno.h>
+ #include <sys/mman.h>
+ 
+ #define D(x)
+@@ -435,6 +435,19 @@ void checked_write(int fd, const void *buf, size_t count)
+     fail_unless(rc == count);
+ }
+ 
++void check_invalid_mmaps(void)
++{
++    unsigned char *addr;
++
++    /* Attempt to map a zero length page.  */
++    addr = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
++    fail_unless(addr == MAP_FAILED);
++    fail_unless(errno == EINVAL);
++
++    fprintf(stdout, " passed\n");
++}
++
+ int main(int argc, char **argv)
+ {
+ 	char tempname[] = "/tmp/.cmmapXXXXXX";
+@@ -476,6 +489,7 @@ int main(int argc, char **argv)
+ 	check_file_fixed_mmaps();
+ 	check_file_fixed_eof_mmaps();
+ 	check_file_unfixed_eof_mmaps();
++	check_invalid_mmaps();
+ 
+ 	/* Fails at the moment.  */
+ 	/* check_aligned_anonymous_fixed_mmaps_collide_with_host(); */
+-- 
+2.17.1
+
+
+
+Le 26/07/2018 à 15:29, Alex Bennée a écrit :
+> I've slightly re-organised the check to more closely match the
+> sequence that the kernel uses in do_mmap().
+> 
+> Signed-off-by: Alex Bennée <email address hidden>
+> Cc: umarcor <email address hidden>
+> ---
+>  linux-user/mmap.c | 14 +++++++++++---
+>  1 file changed, 11 insertions(+), 3 deletions(-)
+> 
+> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+> index d0c50e4888..3ef69fa2d0 100644
+> --- a/linux-user/mmap.c
+> +++ b/linux-user/mmap.c
+> @@ -391,14 +391,22 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>      }
+>  #endif
+>  
+> -    if (offset & ~TARGET_PAGE_MASK) {
+> +    if (!len) {
+>          errno = EINVAL;
+>          goto fail;
+>      }
+>  
+>      len = TARGET_PAGE_ALIGN(len);
+> -    if (len == 0)
+> -        goto the_end;
+> +    if (!len) {
+> +        errno = EINVAL;
+> +        goto fail;
+> +    }
+
+Why do you check twice len?
+TARGET_PAGE_ALIGN() rounds up the value, so if it was not 0, it cannot
+be now.
+
+Thanks,
+Laurent
+
+
+
+Laurent Vivier <email address hidden> writes:
+
+> Le 26/07/2018 à 15:29, Alex Bennée a écrit:
+>> I've slightly re-organised the check to more closely match the
+>> sequence that the kernel uses in do_mmap().
+>>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> Cc: umarcor <email address hidden>
+>> ---
+>>  linux-user/mmap.c | 14 +++++++++++---
+>>  1 file changed, 11 insertions(+), 3 deletions(-)
+>>
+>> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+>> index d0c50e4888..3ef69fa2d0 100644
+>> --- a/linux-user/mmap.c
+>> +++ b/linux-user/mmap.c
+>> @@ -391,14 +391,22 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>>      }
+>>  #endif
+>>
+>> -    if (offset & ~TARGET_PAGE_MASK) {
+>> +    if (!len) {
+>>          errno = EINVAL;
+>>          goto fail;
+>>      }
+>>
+>>      len = TARGET_PAGE_ALIGN(len);
+>> -    if (len == 0)
+>> -        goto the_end;
+>> +    if (!len) {
+>> +        errno = EINVAL;
+>> +        goto fail;
+>> +    }
+>
+> Why do you check twice len?
+> TARGET_PAGE_ALIGN() rounds up the value, so if it was not 0, it cannot
+> be now.
+
+I was trying to follow the kernel style but I realise TARGET_PAGE_ALIGN
+might be a different test compared to the kernel's PAGE_ALIGN(len) for
+overflows:
+
+	if (!len)
+		return -EINVAL;
+
+	/*
+	 * Does the application expect PROT_READ to imply PROT_EXEC?
+	 *
+	 * (the exception is when the underlying filesystem is noexec
+	 *  mounted, in which case we dont add PROT_EXEC.)
+	 */
+	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+		if (!(file && path_noexec(&file->f_path)))
+			prot |= PROT_EXEC;
+
+	/* force arch specific MAP_FIXED handling in get_unmapped_area */
+	if (flags & MAP_FIXED_NOREPLACE)
+		flags |= MAP_FIXED;
+
+	if (!(flags & MAP_FIXED))
+		addr = round_hint_to_min(addr);
+
+	/* Careful about overflows.. */
+	len = PAGE_ALIGN(len);
+	if (!len)
+		return -ENOMEM;
+
+
+>
+> Thanks,
+> Laurent
+
+
+--
+Alex Bennée
+
+
+Le 26/07/2018 à 19:58, Alex Bennée a écrit :
+> 
+> Laurent Vivier <email address hidden> writes:
+> 
+>> Le 26/07/2018 à 15:29, Alex Bennée a écrit:
+>>> I've slightly re-organised the check to more closely match the
+>>> sequence that the kernel uses in do_mmap().
+>>>
+>>> Signed-off-by: Alex Bennée <email address hidden>
+>>> Cc: umarcor <email address hidden>
+>>> ---
+>>>  linux-user/mmap.c | 14 +++++++++++---
+>>>  1 file changed, 11 insertions(+), 3 deletions(-)
+>>>
+>>> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+>>> index d0c50e4888..3ef69fa2d0 100644
+>>> --- a/linux-user/mmap.c
+>>> +++ b/linux-user/mmap.c
+>>> @@ -391,14 +391,22 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>>>      }
+>>>  #endif
+>>>
+>>> -    if (offset & ~TARGET_PAGE_MASK) {
+>>> +    if (!len) {
+>>>          errno = EINVAL;
+>>>          goto fail;
+>>>      }
+>>>
+>>>      len = TARGET_PAGE_ALIGN(len);
+>>> -    if (len == 0)
+>>> -        goto the_end;
+>>> +    if (!len) {
+>>> +        errno = EINVAL;
+>>> +        goto fail;
+>>> +    }
+>>
+>> Why do you check twice len?
+>> TARGET_PAGE_ALIGN() rounds up the value, so if it was not 0, it cannot
+>> be now.
+> 
+> I was trying to follow the kernel style but I realise TARGET_PAGE_ALIGN
+> might be a different test compared to the kernel's PAGE_ALIGN(len) for
+> overflows:
+...
+> 	/* Careful about overflows.. */
+> 	len = PAGE_ALIGN(len);
+> 	if (!len)
+> 		return -ENOMEM;
+> 
+
+
+OK, so keep it but you should use ENOMEM, not EINVAL (and add a comment :) )
+
+Thanks,
+Laurent
+
+
+Will do, thanks!
+
+On Thu, 26 Jul 2018 at 19:12, Laurent Vivier <email address hidden> wrote:
+
+> Le 26/07/2018 à 19:58, Alex Bennée a écrit :
+> >
+> > Laurent Vivier <email address hidden> writes:
+> >
+> >> Le 26/07/2018 à 15:29, Alex Bennée a écrit:
+> >>> I've slightly re-organised the check to more closely match the
+> >>> sequence that the kernel uses in do_mmap().
+> >>>
+> >>> Signed-off-by: Alex Bennée <email address hidden>
+> >>> Cc: umarcor <email address hidden>
+> >>> ---
+> >>>  linux-user/mmap.c | 14 +++++++++++---
+> >>>  1 file changed, 11 insertions(+), 3 deletions(-)
+> >>>
+> >>> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+> >>> index d0c50e4888..3ef69fa2d0 100644
+> >>> --- a/linux-user/mmap.c
+> >>> +++ b/linux-user/mmap.c
+> >>> @@ -391,14 +391,22 @@ abi_long target_mmap(abi_ulong start, abi_ulong
+> len, int prot,
+> >>>      }
+> >>>  #endif
+> >>>
+> >>> -    if (offset & ~TARGET_PAGE_MASK) {
+> >>> +    if (!len) {
+> >>>          errno = EINVAL;
+> >>>          goto fail;
+> >>>      }
+> >>>
+> >>>      len = TARGET_PAGE_ALIGN(len);
+> >>> -    if (len == 0)
+> >>> -        goto the_end;
+> >>> +    if (!len) {
+> >>> +        errno = EINVAL;
+> >>> +        goto fail;
+> >>> +    }
+> >>
+> >> Why do you check twice len?
+> >> TARGET_PAGE_ALIGN() rounds up the value, so if it was not 0, it cannot
+> >> be now.
+> >
+> > I was trying to follow the kernel style but I realise TARGET_PAGE_ALIGN
+> > might be a different test compared to the kernel's PAGE_ALIGN(len) for
+> > overflows:
+> ...
+> >       /* Careful about overflows.. */
+> >       len = PAGE_ALIGN(len);
+> >       if (!len)
+> >               return -ENOMEM;
+> >
+>
+>
+> OK, so keep it but you should use ENOMEM, not EINVAL (and add a comment :)
+> )
+>
+> Thanks,
+> Laurent
+>
+
+
+-- 
+Alex Bennée
+KVM/QEMU Hacker for Linaro
+
+
+Hi,
+
+Updated to cover the overflow case properly as well.
+
+Alex Bennée (2):
+  linux-user/mmap.c: handle invalid len maps correctly
+  tests: add check_invalid_maps to test-mmap
+
+ linux-user/mmap.c               | 15 ++++++++++++---
+ tests/tcg/multiarch/test-mmap.c | 22 +++++++++++++++++++++-
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+-- 
+2.17.1
+
+
+
+I've slightly re-organised the check to more closely match the
+sequence that the kernel uses in do_mmap(). We check for both the zero
+case (EINVAL) and the overflow length case (ENOMEM).
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: umarcor <email address hidden>
+
+---
+v2
+  - add comment on overflow
+---
+ linux-user/mmap.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index d0c50e4888..41e0983ce8 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -391,14 +391,23 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+     }
+ #endif
+ 
+-    if (offset & ~TARGET_PAGE_MASK) {
++    if (!len) {
+         errno = EINVAL;
+         goto fail;
+     }
+ 
++    /* Also check for overflows... */
+     len = TARGET_PAGE_ALIGN(len);
+-    if (len == 0)
+-        goto the_end;
++    if (!len) {
++        errno = ENOMEM;
++        goto fail;
++    }
++
++    if (offset & ~TARGET_PAGE_MASK) {
++        errno = EINVAL;
++        goto fail;
++    }
++
+     real_start = start & qemu_host_page_mask;
+     host_offset = offset & qemu_host_page_mask;
+ 
+-- 
+2.17.1
+
+
+
+This adds a test to make sure we fail properly for a 0 length mmap.
+There are most likely other failure conditions we should also check.
+
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Richard Henderson <email address hidden>
+Cc: umarcor <email address hidden>
+
+---
+v2
+  - add test for overflow
+---
+ tests/tcg/multiarch/test-mmap.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tcg/multiarch/test-mmap.c b/tests/tcg/multiarch/test-mmap.c
+index 5c0afe6e49..11d0e777b1 100644
+--- a/tests/tcg/multiarch/test-mmap.c
++++ b/tests/tcg/multiarch/test-mmap.c
+@@ -27,7 +27,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ #include <unistd.h>
+-
++#include <errno.h>
+ #include <sys/mman.h>
+ 
+ #define D(x)
+@@ -435,6 +435,25 @@ void checked_write(int fd, const void *buf, size_t count)
+     fail_unless(rc == count);
+ }
+ 
++void check_invalid_mmaps(void)
++{
++    unsigned char *addr;
++
++    /* Attempt to map a zero length page.  */
++    addr = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
++    fail_unless(addr == MAP_FAILED);
++    fail_unless(errno == EINVAL);
++
++    /* Attempt to map a over length page.  */
++    addr = mmap(NULL, -4, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
++    fail_unless(addr == MAP_FAILED);
++    fail_unless(errno == ENOMEM);
++
++    fprintf(stdout, " passed\n");
++}
++
+ int main(int argc, char **argv)
+ {
+ 	char tempname[] = "/tmp/.cmmapXXXXXX";
+@@ -476,6 +495,7 @@ int main(int argc, char **argv)
+ 	check_file_fixed_mmaps();
+ 	check_file_fixed_eof_mmaps();
+ 	check_file_unfixed_eof_mmaps();
++	check_invalid_mmaps();
+ 
+ 	/* Fails at the moment.  */
+ 	/* check_aligned_anonymous_fixed_mmaps_collide_with_host(); */
+-- 
+2.17.1
+
+
+
+Le 30/07/2018 à 15:43, Alex Bennée a écrit :
+> I've slightly re-organised the check to more closely match the
+> sequence that the kernel uses in do_mmap(). We check for both the zero
+> case (EINVAL) and the overflow length case (ENOMEM).
+> 
+> Signed-off-by: Alex Bennée <email address hidden>
+> Cc: umarcor <email address hidden>
+> 
+> ---
+> v2
+>   - add comment on overflow
+> ---
+>  linux-user/mmap.c | 15 ++++++++++++---
+>  1 file changed, 12 insertions(+), 3 deletions(-)
+> 
+> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+> index d0c50e4888..41e0983ce8 100644
+> --- a/linux-user/mmap.c
+> +++ b/linux-user/mmap.c
+> @@ -391,14 +391,23 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>      }
+>  #endif
+>  
+> -    if (offset & ~TARGET_PAGE_MASK) {
+> +    if (!len) {
+>          errno = EINVAL;
+>          goto fail;
+>      }
+>  
+> +    /* Also check for overflows... */
+>      len = TARGET_PAGE_ALIGN(len);
+> -    if (len == 0)
+> -        goto the_end;
+> +    if (!len) {
+> +        errno = ENOMEM;
+> +        goto fail;
+> +    }
+> +
+> +    if (offset & ~TARGET_PAGE_MASK) {
+> +        errno = EINVAL;
+> +        goto fail;
+> +    }
+> +
+>      real_start = start & qemu_host_page_mask;
+>      host_offset = offset & qemu_host_page_mask;
+>  
+> 
+
+Reviewed-by: Laurent Vivier <email address hidden>
+
+
+
+
+Laurent Vivier <email address hidden> writes:
+
+> Le 30/07/2018 à 15:43, Alex Bennée a écrit:
+>> I've slightly re-organised the check to more closely match the
+>> sequence that the kernel uses in do_mmap(). We check for both the zero
+>> case (EINVAL) and the overflow length case (ENOMEM).
+>>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> Cc: umarcor <email address hidden>
+>>
+>> ---
+>> v2
+>>   - add comment on overflow
+>> ---
+>>  linux-user/mmap.c | 15 ++++++++++++---
+>>  1 file changed, 12 insertions(+), 3 deletions(-)
+>>
+>> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+>> index d0c50e4888..41e0983ce8 100644
+>> --- a/linux-user/mmap.c
+>> +++ b/linux-user/mmap.c
+>> @@ -391,14 +391,23 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>>      }
+>>  #endif
+>>
+>> -    if (offset & ~TARGET_PAGE_MASK) {
+>> +    if (!len) {
+>>          errno = EINVAL;
+>>          goto fail;
+>>      }
+>>
+>> +    /* Also check for overflows... */
+>>      len = TARGET_PAGE_ALIGN(len);
+>> -    if (len == 0)
+>> -        goto the_end;
+>> +    if (!len) {
+>> +        errno = ENOMEM;
+>> +        goto fail;
+>> +    }
+>> +
+>> +    if (offset & ~TARGET_PAGE_MASK) {
+>> +        errno = EINVAL;
+>> +        goto fail;
+>> +    }
+>> +
+>>      real_start = start & qemu_host_page_mask;
+>>      host_offset = offset & qemu_host_page_mask;
+>>
+>>
+>
+> Reviewed-by: Laurent Vivier <email address hidden>
+
+Are you going to take this via your queue or do you want me to re-post
+with the r-b?
+
+--
+Alex Bennée
+
+
+Le 30/07/2018 à 16:21, Alex Bennée a écrit :
+> 
+> Laurent Vivier <email address hidden> writes:
+> 
+>> Le 30/07/2018 à 15:43, Alex Bennée a écrit:
+>>> I've slightly re-organised the check to more closely match the
+>>> sequence that the kernel uses in do_mmap(). We check for both the zero
+>>> case (EINVAL) and the overflow length case (ENOMEM).
+>>>
+>>> Signed-off-by: Alex Bennée <email address hidden>
+>>> Cc: umarcor <email address hidden>
+>>>
+>>> ---
+>>> v2
+>>>   - add comment on overflow
+>>> ---
+>>>  linux-user/mmap.c | 15 ++++++++++++---
+>>>  1 file changed, 12 insertions(+), 3 deletions(-)
+>>>
+>>> diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+>>> index d0c50e4888..41e0983ce8 100644
+>>> --- a/linux-user/mmap.c
+>>> +++ b/linux-user/mmap.c
+>>> @@ -391,14 +391,23 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+>>>      }
+>>>  #endif
+>>>
+>>> -    if (offset & ~TARGET_PAGE_MASK) {
+>>> +    if (!len) {
+>>>          errno = EINVAL;
+>>>          goto fail;
+>>>      }
+>>>
+>>> +    /* Also check for overflows... */
+>>>      len = TARGET_PAGE_ALIGN(len);
+>>> -    if (len == 0)
+>>> -        goto the_end;
+>>> +    if (!len) {
+>>> +        errno = ENOMEM;
+>>> +        goto fail;
+>>> +    }
+>>> +
+>>> +    if (offset & ~TARGET_PAGE_MASK) {
+>>> +        errno = EINVAL;
+>>> +        goto fail;
+>>> +    }
+>>> +
+>>>      real_start = start & qemu_host_page_mask;
+>>>      host_offset = offset & qemu_host_page_mask;
+>>>
+>>>
+>>
+>> Reviewed-by: Laurent Vivier <email address hidden>
+> 
+> Are you going to take this via your queue or do you want me to re-post
+> with the r-b?
+
+I can take this via my queue.
+
+Thanks,
+Laurent
+
+
+From: Alex Bennée <email address hidden>
+
+This adds a test to make sure we fail properly for a 0 length mmap.
+There are most likely other failure conditions we should also check.
+
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Richard Henderson <email address hidden>
+Cc: umarcor <email address hidden>
+Message-Id: <email address hidden>
+Signed-off-by: Laurent Vivier <email address hidden>
+---
+ tests/tcg/multiarch/test-mmap.c | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/tests/tcg/multiarch/test-mmap.c b/tests/tcg/multiarch/test-mmap.c
+index 5c0afe6e49..11d0e777b1 100644
+--- a/tests/tcg/multiarch/test-mmap.c
++++ b/tests/tcg/multiarch/test-mmap.c
+@@ -27,7 +27,7 @@
+ #include <stdint.h>
+ #include <string.h>
+ #include <unistd.h>
+-
++#include <errno.h>
+ #include <sys/mman.h>
+ 
+ #define D(x)
+@@ -435,6 +435,25 @@ void checked_write(int fd, const void *buf, size_t count)
+     fail_unless(rc == count);
+ }
+ 
++void check_invalid_mmaps(void)
++{
++    unsigned char *addr;
++
++    /* Attempt to map a zero length page.  */
++    addr = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
++    fail_unless(addr == MAP_FAILED);
++    fail_unless(errno == EINVAL);
++
++    /* Attempt to map a over length page.  */
++    addr = mmap(NULL, -4, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
++    fail_unless(addr == MAP_FAILED);
++    fail_unless(errno == ENOMEM);
++
++    fprintf(stdout, " passed\n");
++}
++
+ int main(int argc, char **argv)
+ {
+ 	char tempname[] = "/tmp/.cmmapXXXXXX";
+@@ -476,6 +495,7 @@ int main(int argc, char **argv)
+ 	check_file_fixed_mmaps();
+ 	check_file_fixed_eof_mmaps();
+ 	check_file_unfixed_eof_mmaps();
++	check_invalid_mmaps();
+ 
+ 	/* Fails at the moment.  */
+ 	/* check_aligned_anonymous_fixed_mmaps_collide_with_host(); */
+-- 
+2.17.1
+
+
+
+From: Alex Bennée <email address hidden>
+
+I've slightly re-organised the check to more closely match the
+sequence that the kernel uses in do_mmap(). We check for both the zero
+case (EINVAL) and the overflow length case (ENOMEM).
+
+Signed-off-by: Alex Bennée <email address hidden>
+Cc: umarcor <email address hidden>
+Reviewed-by: Laurent Vivier <email address hidden>
+Message-Id: <email address hidden>
+Signed-off-by: Laurent Vivier <email address hidden>
+---
+ linux-user/mmap.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/linux-user/mmap.c b/linux-user/mmap.c
+index d0c50e4888..41e0983ce8 100644
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -391,14 +391,23 @@ abi_long target_mmap(abi_ulong start, abi_ulong len, int prot,
+     }
+ #endif
+ 
+-    if (offset & ~TARGET_PAGE_MASK) {
++    if (!len) {
+         errno = EINVAL;
+         goto fail;
+     }
+ 
++    /* Also check for overflows... */
+     len = TARGET_PAGE_ALIGN(len);
+-    if (len == 0)
+-        goto the_end;
++    if (!len) {
++        errno = ENOMEM;
++        goto fail;
++    }
++
++    if (offset & ~TARGET_PAGE_MASK) {
++        errno = EINVAL;
++        goto fail;
++    }
++
+     real_start = start & qemu_host_page_mask;
+     host_offset = offset & qemu_host_page_mask;
+ 
+-- 
+2.17.1
+
+
+
+Alex, Laurent, I'm new to this management/development system. So, first off, thanks for working on this bug.
+
+I have a few (probably silly) questions:
+
+1. What is 'the r-b' that Alex used in #14?
+2. When should I change the status of the bug? I can already see it in GitHub's mirror and in https://git.qemu.org/?p=qemu.git;a=summary. But not in the Changelog: https://wiki.qemu.org/ChangeLog/3.0#User-mode_emulation. I am not sure if it is in 'Fix Committed' or 'Fix Released' state.
+3. Where did you push these commits to before they where merge in https://git.qemu.org/?p=qemu.git;a=summary? I cannot find your personal forks/branches. Are commits automatically created from the mailing list?
+
+Le 01/08/2018 à 00:57, umarcor a écrit :
+> Alex, Laurent, I'm new to this management/development system. So, first
+> off, thanks for working on this bug.
+> 
+> I have a few (probably silly) questions:
+> 
+> 1. What is 'the r-b' that Alex used in #14?
+
+"Reviewed-By:", it's a tag I've sent in answer to his e-email to say
+I've reviewed his patch, and it is good for me.
+
+> 2. When should I change the status of the bug? I can already see it in GitHub's mirror and in https://git.qemu.org/?p=qemu.git;a=summary. But not in the Changelog: https://wiki.qemu.org/ChangeLog/3.0#User-mode_emulation. I am not sure if it is in 'Fix Committed' or 'Fix Released' state.
+
+I didn't update the Changelog, but the fix is now committed. It will be
+released soon (07/08 or 14/08). But you should test master now to check
+the commit really fixes your bug.
+
+> 3. Where did you push these commits to before they where merge in https://git.qemu.org/?p=qemu.git;a=summary? I cannot find your personal forks/branches. Are commits automatically created from the mailing list?
+
+No, sub-system maintainers collect patches from the mailing list. They
+create and send a pull request (in their own git repo) to the QEMU
+maintainers, and he merges the patches into the master.
+
+my git repo for linux-user pull request is
+git://github.com/vivier/qemu.git, and generally I prepare my pull
+request on linux-user-for-3.0 branch (the release number changes).
+
+Thanks,
+Laurent
+
+
+2018-08-01 8:25 GMT+01:00 Laurent Vivier:
+> "Reviewed-By:", it's a tag I've sent in answer to his e-email to say
+I've reviewed his patch, and it is good for me.
+
+It's clear now. Thanks.
+
+> I didn't update the Changelog, but the fix is now committed. It will be
+released soon (07/08 or 14/08). But you should test master now to check
+the commit really fixes your bug.
+
+I tested it, and it is fixed as expected. I changed the status of this bug accordingly. I'll change it again once it is released.
+
+> my git repo for linux-user pull request is
+git://github.com/vivier/qemu.git, and generally I prepare my pull
+request on linux-user-for-3.0 branch (the release number changes).
+
+Thanks again.
+
+Regards,
+umarcor
+

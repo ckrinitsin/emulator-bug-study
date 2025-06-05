@@ -1,0 +1,314 @@
+other: 0.809
+debug: 0.805
+permissions: 0.744
+device: 0.725
+graphic: 0.717
+performance: 0.714
+vnc: 0.712
+KVM: 0.702
+semantic: 0.683
+PID: 0.627
+boot: 0.624
+socket: 0.613
+files: 0.558
+network: 0.540
+
+qemu-system-x86_64 crashed with SIGABRT
+
+I've been getting this periodically since my upgrade to qemu 2.0 in trusty this morning.
+
+ProblemType: Crash
+DistroRelease: Ubuntu 14.04
+Package: qemu-system-x86 2.0.0~rc1+dfsg-0ubuntu1
+ProcVersionSignature: Ubuntu 3.13.0-23.45-generic 3.13.8
+Uname: Linux 3.13.0-23-generic x86_64
+ApportVersion: 2.14.1-0ubuntu1
+Architecture: amd64
+Date: Mon Apr  7 13:31:53 2014
+ExecutablePath: /usr/bin/qemu-system-x86_64
+InstallationDate: Installed on 2013-11-26 (131 days ago)
+InstallationMedia: Ubuntu 13.10 "Saucy Salamander" - Release amd64 (20131016.1)
+ProcEnviron: PATH=(custom, no user)
+Registers: No symbol table is loaded.  Use the "file" command.
+Signal: 6
+SourcePackage: qemu
+StacktraceTop:
+ 
+Title: qemu-system-x86_64 crashed with SIGABRT
+UpgradeStatus: Upgraded to trusty on 2014-01-17 (79 days ago)
+UserGroups:
+
+
+
+It seems to happen when my quantal i386 guest is using the VMVGA driver. Switching to Cirrus fixes it.
+Also happens to trusty amd64 guest with VMVGA driver.
+
+Stacktrace:
+ #0  0x00007f4eb7fa1f79 in ?? ()
+ No symbol table info available.
+ Cannot access memory at address 0x7fffa1617188
+StacktraceSource: #0  0x00007f4eb7fa1f79 in ?? ()
+StacktraceTop: ?? ()
+
+
+
+
+And it is not just with vnc either.
+
+2f487a3d40faff1772e14da6b921900915501f9a was ok, so bisecting right now.
+
+Hm, bisect is pointing at 6ff45f01c734e1ad051f19913449e2577c9f4b7d  which is very unlikely.  I'll have to keep playing.
+
+Pretty sure that commit b533f658a98325d0e47b36113bd9f5bcc046fdae is the first bad commit.
+
+This is interesting.  The commit is correct in that kvm_vm_ioctl() returns -errno, not -1, on error.  However, the caller, kvm_physical_sync_dirty_bitmap, on seeing the error, shortcuts some extra errors to return -1 itself, but its caller then ignores its error.
+
+An extra debug statement shows that the ioctl is getting
+
+ioctl failed: No such file or directory
+
+
+At the point when the ioctl fails, this is the backtrace:
+
+(gdb) where
+#0  kvm_physical_sync_dirty_bitmap (section=0x7fffffffd820) at /home/serge/src/qemu/kvm-all.c:446
+#1  0x000055555580e30c in kvm_log_sync (listener=<optimized out>, section=<optimized out>) at /home/serge/src/qemu/kvm-all.c:803
+#2  0x000055555581390e in memory_region_sync_dirty_bitmap (mr=mr@entry=0x555556257ca8) at /home/serge/src/qemu/memory.c:1210
+#3  0x00005555557d943f in vga_sync_dirty_bitmap (s=0x555556257c98) at /home/serge/src/qemu/hw/display/vga.c:1618
+#4  vga_draw_graphic (full_update=0, s=0x555556257c98) at /home/serge/src/qemu/hw/display/vga.c:1653
+#5  vga_update_display (opaque=0x555556257c98) at /home/serge/src/qemu/hw/display/vga.c:1913
+#6  0x0000555555780d92 in dpy_refresh (s=0x555556203690) at ui/console.c:1416
+#7  gui_update (opaque=0x555556203690) at ui/console.c:194
+#8  0x0000555555764bd9 in timerlist_run_timers (timer_list=0x5555561d2460) at qemu-timer.c:488
+#9  0x0000555555764e44 in qemu_clock_run_timers (type=<optimized out>) at qemu-timer.c:499
+#10 qemu_clock_run_all_timers () at qemu-timer.c:605
+#11 0x0000555555729dbc in main_loop_wait (nonblocking=<optimized out>) at main-loop.c:490
+#12 0x00005555555e6196 in main_loop () at vl.c:2051
+#13 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at vl.c:4506
+
+
+(which means my comment #8 is off track - the caller in this case is checking the return value, then aborting - and this is the exact same backtrace as we get anyway)
+
+Looking at arch/x86/kvm/x86.c, ENOENT (only) happens when memslot->dirty_bitmap is NULL in kvm_vm_ioctl_get_dirty_log().
+
+
+
+It seems reasonable that if we are requesting writing a dirty bitmap, and kernel says it's not dirty, we ignore that failure?  I.e. ignore ENOENT?
+
+ENOENT (iiuc) means the kernel has an empty dirty bitmap for this
+slot.  Don't abort in that case.  This appears to solve the bug
+reported at
+
+https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1303926
+
+which first showed up with commit b533f658a98325d: fix return check for
+KVM_GET_DIRTY_LOG ioctl
+
+Signed-off-by: Serge Hallyn <email address hidden>
+---
+ kvm-all.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/kvm-all.c b/kvm-all.c
+index 82a9119..7b7ea8d 100644
+--- a/kvm-all.c
++++ b/kvm-all.c
+@@ -441,10 +441,13 @@ static int kvm_physical_sync_dirty_bitmap(MemoryRegionSection *section)
+ 
+         d.slot = mem->slot;
+ 
+-        if (kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d) == -1) {
++        ret = kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d);
++        if (ret < 0 && ret != -ENOENT) {
+             DPRINTF("ioctl failed %d\n", errno);
+             ret = -1;
+             break;
++        } else if (ret < 0) {
++            ret = 0;
+         }
+ 
+         kvm_get_dirty_pages_log_range(section, d.dirty_bitmap);
+-- 
+1.9.1
+
+
+
+This bug was fixed in the package qemu - 2.0.0~rc1+dfsg-0ubuntu3
+
+---------------
+qemu (2.0.0~rc1+dfsg-0ubuntu3) trusty; urgency=medium
+
+  * d/p/ubuntu/kvm_physical_sync_dirty_bitmap-ignore-ENOENT-from-kv.patch
+    don't abort() just because the kernel has no dirty bitmap.
+    (LP: #1303926)
+ -- Serge Hallyn <email address hidden>   Tue, 08 Apr 2014 22:32:00 -0500
+
+Quoting Michael Tokarev (<email address hidden>):
+> 09.04.2014 07:21, Serge Hallyn wrote:
+> > ENOENT (iiuc) means the kernel has an empty dirty bitmap for this
+> > slot.  Don't abort in that case.  This appears to solve the bug
+> > reported at
+> > 
+> > https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1303926
+> > 
+> > which first showed up with commit b533f658a98325d: fix return check for
+> > KVM_GET_DIRTY_LOG ioctl
+> > 
+> > Signed-off-by: Serge Hallyn <email address hidden>
+> > ---
+> >  kvm-all.c | 5 ++++-
+> >  1 file changed, 4 insertions(+), 1 deletion(-)
+> > 
+> > diff --git a/kvm-all.c b/kvm-all.c
+> > index 82a9119..7b7ea8d 100644
+> > --- a/kvm-all.c
+> > +++ b/kvm-all.c
+> > @@ -441,10 +441,13 @@ static int kvm_physical_sync_dirty_bitmap(MemoryRegionSection *section)
+> >  
+> >          d.slot = mem->slot;
+> >  
+> > -        if (kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d) == -1) {
+> > +        ret = kvm_vm_ioctl(s, KVM_GET_DIRTY_LOG, &d);
+> > +        if (ret < 0 && ret != -ENOENT) {
+> >              DPRINTF("ioctl failed %d\n", errno);
+> >              ret = -1;
+> >              break;
+> > +        } else if (ret < 0) {
+> > +            ret = 0;
+> >          }
+> >  
+> >          kvm_get_dirty_pages_log_range(section, d.dirty_bitmap);
+> 
+> Should we omit calling kvm_get_dirty_pages_log_range() if there's
+> no bitmap from kernel?
+
+If that's something we can know then certainly that'll be better.
+It'll save an ioctl and copy_from_user of the whole of &d.
+
+> In particular, do we trust kernel to not
+> touch d.dirty_bitmap when it returns ENOENT?
+
+Seems ok, kvm_vm_ioctl_get_dirty_log() doesn't change anything
+in *log before returning when it finds no dirty_mapslot.
+
+-serge
+
+
+Hi Serge,
+
+I keep getting the crash notification due to kvm crashes with the same bug title as this one. I see that the status is Fix Released, I'm on precise and fully up-to-date.
+
+
+My package is:
+
+ii  qemu-kvm                               1.0+noroms-0ubuntu14.14                     Full virtualization on i386 and amd64 hardware
+
+which seems the correct one.
+
+
+However, from the changelog I cannot see anything that seems related to this bug fix:
+
+qemu-kvm (1.0+noroms-0ubuntu14.14) precise-security; urgency=medium
+
+  * SECURITY UPDATE: arbitrary code execution via MAC address table update
+    - debian/patches/CVE-2014-0150.patch: fix overflow in hw/virtio-net.c.
+    - CVE-2014-0150
+  * SECURITY UPDATE: denial of service and possible code execution via
+    smart self test counter
+    - debian/patches/CVE-2014-2894.patch: correct self-test count in
+      hw/ide/core.c.
+    - CVE-2014-2894
+
+ -- Marc Deslauriers <email address hidden>  Fri, 25 Apr 2014 17:37:13 -0400
+
+qemu-kvm (1.0+noroms-0ubuntu14.13) precise-security; urgency=medium
+
+  * SECURITY UPDATE: privilege escalation via REPORT LUNS
+    - debian/patches/CVE-2013-4344.patch: support more than 256 LUNS in
+      hw/scsi-bus.c, hw/scsi.h.
+    - CVE-2013-4344
+
+ -- Marc Deslauriers <email address hidden>  Tue, 28 Jan 2014 09:08:09 -0500
+
+
+(the other entries are older than these ones)
+
+
+Has this fix really been released to precise?
+
+
+
+Thank you!
+
+Hi,
+
+the cause of this particular bug was introduced during 2014, so could not have been present in precise.  We definately will want to figure out the cause of your bug, so please open a new bug report using 'ubuntu-bug qemu-kvm' immediately after a crash has happened.
+
+Thanks!
+
+Hi Serge,
+
+
+I think I have already reported the required information a number of times with the Ubuntu built-in bug reporting facility (apport?), which asked me to report the crash information to developers.
+
+Are you able to find it out or do I need to manually open a new bug?
+
+
+Thanks you.
+
+Unfortunately the only bug launchpad shows me when I search for bugs reported
+by you is https://bugs.launchpad.net/ubuntu/+source/qemu-kvm/+bug/1180777
+
+If you can give me a bug# that would be great, otherwise please do file a
+new bug.
+
+
+Hi Serge,
+
+I have opened this new bug:
+
+https://bugs.launchpad.net/ubuntu/+source/qemu-kvm/+bug/1320144
+
+I have the similar issue, the KVM 2.0 keeps crashing, here is the stack I captured with GDB
+
+(gdb) c
+Continuing.
+
+Program received signal SIGABRT, Aborted.
+[Switching to Thread 0x7ffede1f9700 (LWP 5555)]
+0x00007ffeee4d4f79 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+56      ../nptl/sysdeps/unix/sysv/linux/raise.c: No such file or directory.
+(gdb) bt
+#0  0x00007ffeee4d4f79 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007ffeee4d8388 in __GI_abort () at abort.c:89
+#2  0x00007ffeee4cde36 in __assert_fail_base (fmt=0x7ffeee61f718 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n",
+    assertion=assertion@entry=0x7ffef45f1c1e "s->current",
+    file=file@entry=0x7ffef45f17e0 "/build/buildd/qemu-2.0.0~rc1+dfsg/hw/scsi/lsi53c895a.c", line=line@entry=541,
+    function=function@entry=0x7ffef45f275b "lsi_do_dma") at assert.c:92
+#3  0x00007ffeee4cdee2 in __GI___assert_fail (assertion=0x7ffef45f1c1e "s->current",
+    file=0x7ffef45f17e0 "/build/buildd/qemu-2.0.0~rc1+dfsg/hw/scsi/lsi53c895a.c", line=541,
+    function=0x7ffef45f275b "lsi_do_dma") at assert.c:101
+#4  0x00007ffef43de87d in ?? ()
+#5  0x00007ffef43dca97 in ?? ()
+#6  0x00007ffef4507631 in ?? ()
+#7  0x00007ffef450c776 in ?? ()
+#8  0x00007ffef44b1933 in ?? ()
+#9  0x00007ffef4506615 in ?? ()
+#10 0x00007ffef44a6f42 in ?? ()
+#11 0x00007ffeee86c182 in start_thread (arg=0x7ffede1f9700) at pthread_create.c:312
+#12 0x00007ffeee59930d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+(gdb)
+
+My KVM command line
+==================
+
+qemu-system-x86_64 -enable-kvm -name 015-win2k3-32bit-dev-target -S -machine pc-i440fx-trusty,accel=kvm,usb=off -m 4096 -realtime mlock=off -smp 4,sockets=4,cores=1,threads=1 -uuid 2af25570-37cd-a3af-e157-0d85cf31d47d -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/015-win2k3-32bit-dev-target.monitor,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=localtime -no-shutdown -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -device lsi,id=scsi0,bus=pci.0,addr=0x4 -drive file=/home/vm/015-win2k3-32bit-dev-target/disk.qcow2,if=none,id=drive-ide0-0-0,format=qcow2,cache=writeback -device ide-hd,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0,bootindex=1 -drive file=/home/vm/015-win2k3-32bit-dev-target/zhe_test.qcow2,if=none,id=drive-scsi0-0-0,format=qcow2,cache=writeback -device scsi-hd,bus=scsi0.0,scsi-id=0,drive=drive-scsi0-0-0,id=scsi0-0-0 -netdev tap,fd=25,id=hostnet0 -device e1000,netdev=hostnet0,id=net0,mac=e0:db:55:04:dd:0f,bus=pci.0,addr=0x3 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -device usb-tablet,id=input0 -vnc 0.0.0.0:115 -device VGA,id=video0,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5
+
+
+
+Anyone works on the crash now?  The above back trace shows it crashed at assert(s->current) ?
+
+Do you still have this problem with the latest released version of QEMU (see http://wiki.qemu-project.org/Download)?
+
+OK, since there hasn't been a reply within 6 months, I assume this is now fixed. So closing this ticket now.
+

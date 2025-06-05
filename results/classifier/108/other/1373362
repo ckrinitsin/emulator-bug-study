@@ -1,0 +1,164 @@
+permissions: 0.878
+other: 0.863
+semantic: 0.817
+graphic: 0.808
+debug: 0.806
+device: 0.764
+files: 0.752
+PID: 0.744
+vnc: 0.739
+socket: 0.734
+performance: 0.734
+KVM: 0.724
+network: 0.711
+boot: 0.690
+
+qemu-2.1.1 i386-softmmu compile error: q35_dsdt_applesmc_sta undeclared
+
+I try to compile qemu-2.1.1 (Gentoo/x86), but the i386-softmmu fails to compile:
+
+  CPP i386-softmmu/q35-acpi-dsdt.dsl.i.orig
+  ACPI_PREPROCESS i386-softmmu/q35-acpi-dsdt.dsl.i
+  IASL i386-softmmu/q35-acpi-dsdt.dsl.i
+  ACPI_EXTRACT i386-softmmu/q35-acpi-dsdt.off
+  CAT i386-softmmu/hw/i386/q35-acpi-dsdt.hex
+  CC    i386-softmmu/hw/i386/acpi-build.o
+/tmp/portage/app-emulation/qemu-2.1.1/work/qemu-2.1.1/hw/i386/acpi-build.c: In function 'acpi_get_dsdt':
+/tmp/portage/app-emulation/qemu-2.1.1/work/qemu-2.1.1/hw/i386/acpi-build.c:119:24: error: 'q35_dsdt_applesmc_sta' undeclared (first use in this function)
+         applesmc_sta = q35_dsdt_applesmc_sta;
+                        ^
+/tmp/portage/app-emulation/qemu-2.1.1/work/qemu-2.1.1/hw/i386/acpi-build.c:119:24: note: each undeclared identifier is reported only once for each function it appears in
+make[1]: *** [hw/i386/acpi-build.o] Error 1
+make: *** [subdir-i386-softmmu] Error 2
+
+Something seems to go wrong when generating the file i386-softmmu/hw/i386/q35-acpi-dsdt.hex:
+
+# grep -r q35_dsdt_applesmc_sta ../
+../softmmu-build/x86_64-softmmu/q35-acpi-dsdt.dsl.i:/* ACPI_EXTRACT_NAME_BYTE_CONST q35_dsdt_applesmc_sta */
+../softmmu-build/x86_64-softmmu/q35-acpi-dsdt.dsl.i.orig:        ACPI_EXTRACT_NAME_BYTE_CONST q35_dsdt_applesmc_sta
+../softmmu-build/i386-softmmu/q35-acpi-dsdt.dsl.i:/* ACPI_EXTRACT_NAME_BYTE_CONST q35_dsdt_applesmc_sta */
+../softmmu-build/i386-softmmu/q35-acpi-dsdt.dsl.i.orig:        ACPI_EXTRACT_NAME_BYTE_CONST q35_dsdt_applesmc_sta
+../hw/i386/acpi-build.c:        applesmc_sta = q35_dsdt_applesmc_sta;
+../hw/i386/q35-acpi-dsdt.dsl:#define DSDT_APPLESMC_STA q35_dsdt_applesmc_sta
+
+The .orig file in there makes me think that Gentoo is applying some patches before building.
+
+You should open a bug with them and they can open a bug if there really is a problem upstream (which I believe is general practice with Gentoo anyways).
+
+sorry, but this has nothing to do with gentoo patches.
+Just to prove it, I did the following:
+
+cd /var/tmp
+git clone git://git.qemu.org/qemu.git
+mkdir qemu-build
+cd qemu-build
+../qemu/configure --target-list=i386-softmmu
+make 2>&1 | tee ../qemu-build.log
+xz ../qemu-build.log
+
+rm -Rf *
+../qemu/configure --target-list=i386-softmmu
+make -d 2>&1 | tee ../qemu-build-debug.log
+xz ../qemu-build-debug.log
+
+
+
+
+
+Works fine here. Even made sure the resulting binary runs okay (which it does). Maybe try in a clean chroot or something?
+
+I retried it on another machine, running Kubuntu 14.10 (x86_64) -> fails at exactly the same point !
+
+update: I found out that the latest version on the stable-1.7 branch builds fine, but all stable-2.0 and later fail.
+I did some binary search on all versions on the stable-2.0 branch and found out that the problem occurs after this commit:
+
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=15bce1b7c55c69f47e13c9eb2a4b80f41da26581
+
+Unfortunately this is not so much surprising, as this is the first commit that introduced a reference to that symbol. So the question is: where is that symbol defined in *your* version?
+
+Just to track this down: could you please do a "grep" in your source to see where it is defined on your side?
+(grep -r q35_dsdt_applesmc_sta ../)
+I expect there is some slight difference to the hits that I get here (see my initial post)
+
+My guess is that it is defined in some "generated" file and that there is a problem with the generator/converter that produces it.
+
+On 27 September 2014 10:28, Thomas Eschenbacher
+<email address hidden> wrote:
+> update: I found out that the latest version on the stable-1.7 branch builds fine, but all stable-2.0 and later fail.
+> I did some binary search on all versions on the stable-2.0 branch and found out that the problem occurs after this commit:
+>
+> http://git.qemu.org/?p=qemu.git;a=commitdiff;h=15bce1b7c55c69f47e13c9eb2a4b80f41da26581
+
+Do you also see this compile failure on git master, or is
+it only a problem on the stable branch?
+
+> Unfortunately this is not so much surprising, as this is the first
+> commit that introduced a reference to that symbol. So the question is:
+> where is that symbol defined in *your* version?
+>
+> Just to track this down: could you please do a "grep" in your source to see where it is defined on your side?
+> (grep -r q35_dsdt_applesmc_sta ../)
+> I expect there is some slight difference to the hits that I get here (see my initial post)
+>
+> My guess is that it is defined in some "generated" file and that there
+> is a problem with the generator/converter that produces it.
+
+Note that there are two different possible paths here:
+ * if configure finds you have iasl it will build the
+   q35-acpi-dsdt.hex files from the dsl source files
+ * otherwise, we just copy hw/i386/q35-acpi-dsdt.hex.generated
+   into the build tree as the .hex file
+(at least, this is how master is doing it.)
+
+Some things that might be useful for debugging:
+ * if you add "V=1" to your make command line it will print the
+   full commands being run rather than the pretty "IASL/CPP/CC"
+   short progress info
+ * you could look at whether the .hex file you've generated
+   matches the .hex.generated file we ship at all
+
+My guess is that your system has a busted iasl of some kind,
+in which case you can work around this by passing '--iasl=none'
+to configure, but it would be good to identify what's actually
+going wrong here.
+
+thanks
+-- PMM
+
+
+Hi Peter,
+
+thanks for the hints! Indeed there was an outdated version of iasl on my system, which I have manually installed in /usr/local/bin many years ago... (on both machines, on the gentoo as well as the kubuntu box) - sorry for that!!!
+
+That produced an error message during build (see below), but for some reason the make system did not recognize that and continued with broken files (not only here, all other files were affected too). 
+
+------------------------------------------------------------------------------------
+iasl  -vs -l -tc -p q35-acpi-dsdt q35-acpi-dsdt.dsl.i   2>&1 
+q35-acpi-dsdt.dsl.i    48:                 If (LEqual(Arg0, ToUUID("33DB4D5B-1FF7-401C-9657-7441C03DD766"))) {
+Error    1037 -                                                  ^ syntax error, unexpected PARSEOP_NAMESEG, expecting ')'
+
+q35-acpi-dsdt.dsl.i    61:                 } Else {
+Error    1037 -                                 ^ syntax error, unexpected PARSEOP_ELSE
+
+ASL Input:  q35-acpi-dsdt.dsl.i - 308 lines, 22112 bytes, 47 keywords
+Compilation complete. 2 Errors, 0 Warnings, 0 Remarks, 5 Optimizations
+------------------------------------------------------------------------------------
+
+The bad old version of iasl that produced the trouble was:
+-------------------------------------------------------------------
+Intel ACPI Component Architecture
+ASL Optimizing Compiler / AML Disassembler version 20040715 [Oct 11 2004]
+Copyright (C) 2000 - 2004 Intel Corporation
+Supports ACPI Specification Revision 2.0c
+-------------------------------------------------------------------
+
+Now I checked with iasl-20130117-32 (Gentoo) and iasl-20140214-64 (Kubuntu), both worked fine and both understand the command line parameter "-v" to get their version (which is not the case for the old one). Maybe it is worth writing some version check in the configure script ?
+
+IMO we can close this bug.
+
+thanks a lot for your help,
+   Thomas
+
+
+Closing according to the last comment.
+

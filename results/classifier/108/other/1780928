@@ -1,0 +1,72 @@
+debug: 0.885
+permissions: 0.877
+other: 0.867
+semantic: 0.862
+graphic: 0.847
+performance: 0.827
+PID: 0.824
+network: 0.815
+files: 0.815
+device: 0.805
+socket: 0.768
+boot: 0.750
+KVM: 0.686
+vnc: 0.657
+
+v2.12.0-2321-gb34181056c: vcpu hotplug crashes qemu-kvm with segfault
+
+vcpu hotplug crashes upstream qemu(v2.12.0-2321-gb34181056c), vcpu hotplug works fine in v2.12.0-rc4.
+
+Host: Power8, kernel: 4.18.0-rc2-00037-g6f0d349d922b
+Guest: Power8, kernel: 4.18.0-rc3-00183-gc42c12a90545 (base image: fedora27 ppc64le)
+
+/usr/share/avocado-plugins-vt/build/qemu/ppc64-softmmu/qemu-system-ppc64 -M pseries,accel=kvm,max-cpu-compat=power8 -m 8192 -device virtio-scsi-pci,id=scsi0,bus=pci.0,addr=0x2 -drive file=/var/lib/avocado/data/avocado-vt/images/jeos-27-ppc64le.qcow2,format=qcow2,if=none,id=drive1 -device scsi-hd,drive=drive1,bus=scsi0.0 -smp 1,cores=1,threads=1,sockets=1,maxcpus=8 -serial /dev/pts/0 -monitor stdio -vga none -nographic -kernel /home/kvmci/linux/vmlinux -append 'root=/dev/sda2 rw console=tty0 console=ttyS0,115200 init=/sbin/init initcall_debug' -nic user,model=virtio-net-pci 
+QEMU 2.12.50 monitor - type 'help' for more information
+(qemu) device_add host-spapr-cpu-core,id=core1,core-id=1
+Segmentation fault (core dumped)
+
+
+Guest initial cpu:
+# lscpu
+Architecture:        ppc64le
+Byte Order:          Little Endian
+CPU(s):              1
+On-line CPU(s) list: 0
+Thread(s) per core:  1
+Core(s) per socket:  1
+Socket(s):           1
+NUMA node(s):        1
+Model:               2.1 (pvr 004b 0201)
+Model name:          POWER8 (architected), altivec supported
+Hypervisor vendor:   KVM
+Virtualization type: para
+L1d cache:           64K
+L1i cache:           32K
+NUMA node0 CPU(s):   0
+
+Reverting the below comment makes CPU hotplug work again:
+
+commit a028dd423ee6dfd091a8c63028240832bf10f671
+
+    ppc/xics: introduce ICP DeviceRealize and DeviceReset handlers
+    
+    This changes the ICP realize and reset handlers in DeviceRealize and
+    DeviceReset handlers. parent handlers are now called from the
+    inheriting classes which is a cleaner object pattern.
+   
+
+
+The parent class (ie, TYPE_ICP) doesn't implement DeviceClass::reset(). It directly registers a reset handler with qemu_register_reset() instead. This is needed for cold plugged ICPs to be reset during machine reset since they're not SysBus devices.
+
+Cedric's patch missed that, but rather than reverting it, I'd rather go forward and:
+- introduce an abstract TYPE_ICP_BASE class that implements DeviceClass::reset()
+- have the current TYPE_ICP and all other specialized ICP types to derive from TYPE_ICP_BASE
+- have all specialized ICP types to register reset handlers with qemu_register_reset()
+
+This would match what was recently done with the ICS types.
+
+
+Fixed by:
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=b585395b655a6c1f9d9ebf1f0890e76d0708eed6
+

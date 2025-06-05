@@ -1,0 +1,611 @@
+semantic: 0.938
+other: 0.937
+boot: 0.927
+permissions: 0.926
+debug: 0.915
+graphic: 0.912
+performance: 0.909
+PID: 0.895
+vnc: 0.889
+device: 0.883
+KVM: 0.879
+network: 0.845
+socket: 0.831
+files: 0.773
+
+dma_blk_cb leaks memory map handles on misaligned IO
+
+Since upgrading to QEMU 2.8.0, my Windows 7 64-bit virtual machines
+started crashing due to the assertion quoted in the summary failing.
+The assertion in question was added by commit 9972354856 ("block: add
+BDS field to count in-flight requests").  My tests show that setting
+discard=unmap is needed to reproduce the issue.  Speaking of
+reproduction, it is a bit flaky, because I have been unable to come up
+with specific instructions that would allow the issue to be triggered
+outside of my environment, but I do have a semi-sane way of testing that
+appears to depend on a specific initial state of data on the underlying
+storage volume, actions taken within the VM and waiting for about 20
+minutes.
+
+Here is the shortest QEMU command line that I managed to reproduce the
+bug with:
+
+    qemu-system-x86_64 \
+        -machine pc-i440fx-2.7,accel=kvm \
+        -m 3072 \
+        -drive file=/dev/lvm/qemu,format=raw,if=ide,discard=unmap \
+	-netdev tap,id=hostnet0,ifname=tap0,script=no,downscript=no,vhost=on \
+        -device virtio-net-pci,netdev=hostnet0 \
+	-vnc :0
+
+The underlying storage (/dev/lvm/qemu) is a thin LVM snapshot.
+
+QEMU was compiled using:
+
+    ./configure --python=/usr/bin/python2.7 --target-list=x86_64-softmmu
+    make -j3
+
+My virtualization environment is not really a critical one and
+reproduction is not that much of a hassle, so if you need me to gather
+further diagnostic information or test patches, I will be happy to help.
+
+Just to clarify: the issue appeared in 2.8.0, but it is still present in
+current master.  Commit c2b6428d38 ("block: quiesce AioContext when
+detaching from it") does not solve this issue, even though it contains
+the following tag:
+
+    Fixes: 99723548561978da8ef44cf804fb7912698f5d88
+
+
+I don't think the assert you are talking about in the subject is added by 9972354856. That assertion was added by 86698a12f and has been present since QEMU 2.6. I don't see the relation immediately to AioContext patches.
+
+Is this only during boot/shutdown? If not, it looks like there might be some other errors occurring that aggravate the device state and cause a reset by the guest.
+
+Anyway, what should happen is something like this:
+
+- Guest issues a reset request (ide_exec_cmd -> cmd_device_reset)
+- The device should now be "busy" and cannot accept any more requests (see the conditional early in ide_exec_cmd)
+- cmd_device_reset drains any existing requests.
+- we assert that there are no handles to BH routines that have yet to return
+
+Normally I'd say this is enough; because:
+
+Although blk_drain does not prohibit future DMA transfers, it is being called after an explicit reset request from the guest, and so the device should be unable to service any further requests. After existing DMA commands are drained we should be unable to add any further requests.
+
+It generally shouldn't be possible to see new requests show up here, unless;
+
+(A) We are not guarding ide_exec_cmd properly and a new command is sneaking in while we are trying to reset the device, or
+(B) blk_drain is not in fact doing what we expect it to (draining all pending DMA from an outstanding IDE command we are servicing.)
+
+Since you mentioned that you need to enable TRIM support in order to see the behavior, perhaps this is a function of a TRIM command being improperly implemented and causing the guest to panic, and we are indeed not draining TRIM requests properly.
+
+That's my best wild guess, anyway. If you can't reproduce this elsewhere, can you run some debug version of this to see under which codepath we are invoking reset, and what the running command that we are failing to terminate is?
+
+--js
+
+
+> I don't think the assert you are talking about in the subject is added
+> by 9972354856. That assertion was added by 86698a12f and has been
+> present since QEMU 2.6. I don't see the relation immediately to
+> AioContext patches.
+
+You are right, of course.  Sorry for misleading you about this.  What I
+meant to write was that git bisect pinpoints commit 9972354856 as the
+likely culprit ("likely" because of the makeshift testing methodology
+used).
+
+> Is this only during boot/shutdown? If not, it looks like there might be
+> some other errors occurring that aggravate the device state and cause a
+> reset by the guest.
+
+In fact this has never happened to me upon boot or shutdown.  I believe
+the operating system installed on the storage volume I am testing this
+with has some kind of disk-intensive activity scheduled to run about
+twenty minutes after booting.  That is why I have to wait that long
+after booting the VM to determine whether the issue appears.
+
+> Anyway, what should happen is something like this:
+> 
+> - Guest issues a reset request (ide_exec_cmd -> cmd_device_reset)
+> - The device should now be "busy" and cannot accept any more requests (see the conditional early in ide_exec_cmd)
+> - cmd_device_reset drains any existing requests.
+> - we assert that there are no handles to BH routines that have yet to return
+> 
+> Normally I'd say this is enough; because:
+> 
+> Although blk_drain does not prohibit future DMA transfers, it is being
+> called after an explicit reset request from the guest, and so the device
+> should be unable to service any further requests. After existing DMA
+> commands are drained we should be unable to add any further requests.
+> 
+> It generally shouldn't be possible to see new requests show up here,
+> unless;
+> 
+> (A) We are not guarding ide_exec_cmd properly and a new command is sneaking in while we are trying to reset the device, or
+> (B) blk_drain is not in fact doing what we expect it to (draining all pending DMA from an outstanding IDE command we are servicing.)
+
+ide_cancel_dma_sync() is also invoked from bmdma_cmd_writeb() and this
+is in fact the code path taken when the assertion fails.
+
+> Since you mentioned that you need to enable TRIM support in order to see
+> the behavior, perhaps this is a function of a TRIM command being
+> improperly implemented and causing the guest to panic, and we are indeed
+> not draining TRIM requests properly.
+
+I am not sure what the relation of TRIM to BMDMA is, but I still cannot
+reproduce the issue without TRIM being enabled.
+
+> That's my best wild guess, anyway. If you can't reproduce this
+> elsewhere, can you run some debug version of this to see under which
+> codepath we are invoking reset, and what the running command that we are
+> failing to terminate is?
+
+I recompiled QEMU with --enable-debug --extra-cflags="-ggdb -O0" and
+attached the output of "bt full".  If this is not enough, please let me
+know.
+
+
+
+
+On 04/11/2017 03:45 AM, Michał Kępień wrote:
+>> I don't think the assert you are talking about in the subject is added
+>> by 9972354856. That assertion was added by 86698a12f and has been
+>> present since QEMU 2.6. I don't see the relation immediately to
+>> AioContext patches.
+> 
+> You are right, of course.  Sorry for misleading you about this.  What I
+> meant to write was that git bisect pinpoints commit 9972354856 as the
+> likely culprit ("likely" because of the makeshift testing methodology
+> used).
+> 
+>> Is this only during boot/shutdown? If not, it looks like there might be
+>> some other errors occurring that aggravate the device state and cause a
+>> reset by the guest.
+> 
+> In fact this has never happened to me upon boot or shutdown.  I believe
+> the operating system installed on the storage volume I am testing this
+> with has some kind of disk-intensive activity scheduled to run about
+> twenty minutes after booting.  That is why I have to wait that long
+> after booting the VM to determine whether the issue appears.
+> 
+
+When you're gonna fail, fail loudly, I suppose.
+
+>> Anyway, what should happen is something like this:
+>>
+>> - Guest issues a reset request (ide_exec_cmd -> cmd_device_reset)
+>> - The device should now be "busy" and cannot accept any more requests (see the conditional early in ide_exec_cmd)
+>> - cmd_device_reset drains any existing requests.
+>> - we assert that there are no handles to BH routines that have yet to return
+>>
+>> Normally I'd say this is enough; because:
+>>
+>> Although blk_drain does not prohibit future DMA transfers, it is being
+>> called after an explicit reset request from the guest, and so the device
+>> should be unable to service any further requests. After existing DMA
+>> commands are drained we should be unable to add any further requests.
+>>
+>> It generally shouldn't be possible to see new requests show up here,
+>> unless;
+>>
+>> (A) We are not guarding ide_exec_cmd properly and a new command is sneaking in while we are trying to reset the device, or
+>> (B) blk_drain is not in fact doing what we expect it to (draining all pending DMA from an outstanding IDE command we are servicing.)
+> 
+> ide_cancel_dma_sync() is also invoked from bmdma_cmd_writeb() and this
+> is in fact the code path taken when the assertion fails.
+> 
+
+Yep, I wonder why your guest is trying to cancel DMA, though? Something
+else is probably going wrong first.
+
+>> Since you mentioned that you need to enable TRIM support in order to see
+>> the behavior, perhaps this is a function of a TRIM command being
+>> improperly implemented and causing the guest to panic, and we are indeed
+>> not draining TRIM requests properly.
+> 
+> I am not sure what the relation of TRIM to BMDMA is, but I still cannot
+> reproduce the issue without TRIM being enabled.
+> 
+
+I suspect there isn't one necessarily, just bad interaction between how
+TRIM is implemented and how BMDMA works (or allows guests to cancel
+DMA.) My hunch is that this doesn't happen with AHCI because the reset
+mechanism and command handling are implemented differently.
+
+Always room to be wrong, though.
+
+>> That's my best wild guess, anyway. If you can't reproduce this
+>> elsewhere, can you run some debug version of this to see under which
+>> codepath we are invoking reset, and what the running command that we are
+>> failing to terminate is?
+> 
+> I recompiled QEMU with --enable-debug --extra-cflags="-ggdb -O0" and
+> attached the output of "bt full".  If this is not enough, please let me
+> know.
+> 
+> 
+> ** Attachment added: "Output of "bt full" when the assertion fails"
+>    https://bugs.launchpad.net/qemu/+bug/1681439/+attachment/4860013/+files/bt-full.log
+> 
+
+Can you compile QEMU from a branch and let me know what kind of info it
+barfs out when it dies?
+
+https://github.com/jnsnow/qemu/commit/2baa57a58bba00a45151d8544cfd457197ecfa39
+
+Please make backups of your data as appropriate as this is a development
+branch not suitable for production use (etc etc etc!)
+
+It's just some dumb printfs so I can see what the device was up to when
+it decided to reset itself. I'm hoping that if I can see what command it
+is trying to cancel I can work out why it isn't getting canceled correctly.
+
+--js
+
+
+> > ide_cancel_dma_sync() is also invoked from bmdma_cmd_writeb() and this
+> > is in fact the code path taken when the assertion fails.
+> > 
+> 
+> Yep, I wonder why your guest is trying to cancel DMA, though? Something
+> else is probably going wrong first.
+
+Beats me.
+
+> Can you compile QEMU from a branch and let me know what kind of info it
+> barfs out when it dies?
+> 
+> https://github.com/jnsnow/qemu/commit/2baa57a58bba00a45151d8544cfd457197ecfa39
+> 
+> Please make backups of your data as appropriate as this is a development
+> branch not suitable for production use (etc etc etc!)
+> 
+> It's just some dumb printfs so I can see what the device was up to when
+> it decided to reset itself. I'm hoping that if I can see what command it
+> is trying to cancel I can work out why it isn't getting canceled correctly.
+
+It looks like the command being canceled when the assertion fails is
+DSM, which explains why it does not happen with TRIM disabled (I retried
+the test twice to make sure the canceled command is consistent; it is):
+
+    $ tail -20 qemu.log
+    
+    == ide_cancel_dma_sync ==
+    
+    ATA Registers:
+    cmd	0x06
+    feature	0x01
+    error	0x00
+    nsector	0x00000001
+    sector	0x00
+    lcyl	0x00
+    hcyl	0x00
+    hob_feature	0x00
+    hob_nsector	0x00
+    hob_sector	0x00
+    hob_lcyl	0x00
+    hob_hcyl	0x00
+    select	0x60
+    status	0x58
+    lba48	0x00000000
+    qemu-system-x86_64: hw/ide/core.c:704: ide_cancel_dma_sync: Assertion `s->bus->dma->aiocb == NULL' failed.
+    $ grep ^cmd qemu.log | sort | uniq -c
+        128 cmd	0x06
+     151854 cmd	0xc8
+     217496 cmd	0xca
+
+I am happy to help if any further debugging is required.
+
+
+
+
+On 04/12/2017 03:51 AM, Michał Kępień wrote:
+
+>     $ tail -20 qemu.log
+>     
+>     == ide_cancel_dma_sync ==
+>     
+>     ATA Registers:
+>     cmd	0x06
+>     feature	0x01
+>     error	0x00
+>     nsector	0x00000001
+>     sector	0x00
+>     lcyl	0x00
+>     hcyl	0x00
+>     hob_feature	0x00
+>     hob_nsector	0x00
+>     hob_sector	0x00
+>     hob_lcyl	0x00
+>     hob_hcyl	0x00
+>     select	0x60
+>     status	0x58
+>     lba48	0x00000000
+>     qemu-system-x86_64: hw/ide/core.c:704: ide_cancel_dma_sync: Assertion `s->bus->dma->aiocb == NULL' failed.
+>     $ grep ^cmd qemu.log | sort | uniq -c
+>         128 cmd	0x06
+>      151854 cmd	0xc8
+>      217496 cmd	0xca
+> 
+> I am happy to help if any further debugging is required.
+> 
+
+Whoops, I misunderstood exactly how often cancel would be invoked here,
+sorry about that. It looks like when DMA is finished and the guest
+signals that it's over, we cancel any outstanding DMA just to be safe,
+and that'd explain the nearly 400,000 calls in your logs.
+
+However, this looks like it might legitimately be trying to cancel a
+TRIM command (I don't know why ...) but we don't clean up after those
+properly.
+
+Let's try and see if this doesn't fix your problem:
+https://github.com/jnsnow/qemu/commit/57bf2ccdfe8dd35838c1e6642bf9bd76dc9ad1a9
+
+Optionally, you can delete the printf from the last patch if you want.
+I'm still a little concerned that your guest is trying to cancel
+in-flight commands which I didn't think would happen under normal
+circumstances unless some other problem arose, but I think this will
+clear up the assert for us.
+
+Thanks,
+-John
+
+
+> Let's try and see if this doesn't fix your problem:
+> https://github.com/jnsnow/qemu/commit/57bf2ccdfe8dd35838c1e6642bf9bd76dc9ad1a9
+
+Sadly, no, it still crashes.  Same assertion, same canceled command,
+same time to reproduce.
+
+
+I cannot reproduce this any more with QEMU 2.9.0.  As I do not really
+have time right now to determine which commit fixed this, feel free to
+close this bug.  I will reopen it in case the issue resurfaces.  Thanks
+for your assistance.
+
+
+Sorry that I wasn't able to narrow it down. Please report back if it occurs again.
+
+Ok, I'm setting the state to "incomplete" so this will expire in 60 days. If you hit the problem again, please change the state of the ticket back to "New".
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+We found a reproducer during fuzzing:
+
+```
+qemu-system-x86_64: hw/ide/core.c:724: ide_cancel_dma_sync: Assertion `s->bus->dma->aiocb == NULL' failed.
+```
+
+To reproduce run the QEMU with the following command line:
+```
+qemu-system-x86_64 -cdrom hypertrash.iso -nographic -m 100 -enable-kvm -net none -hda hda.img
+```
+
+QEMU Version:
+```
+# qemu-5.0.0
+$ ./configure --target-list=x86_64-softmmu --enable-sanitizers; make
+$ x86_64-softmmu/qemu-system-x86_64 --version
+QEMU emulator version 5.0.0
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+```
+
+To create disk image run:
+```
+qemu-img create hda.img 10M
+```
+
+
+Here's a qtest reproducer
+
+cat << EOF | ./i386-softmmu/qemu-system-i386 \
+-M pc,accel=qtest -qtest null -nographic -vga qxl -qtest stdio -nodefaults \
+-drive if=none,id=drive0,file=null-co://,file.read-zeroes=on,format=raw \
+-drive if=none,id=drive1,file=null-co://,file.read-zeroes=on,format=raw  \
+-device ide-cd,drive=drive0 -device ide-hd,drive=drive1 
+writel 0x0 0xffffffff
+outw 0x171 0x32a
+outw 0x176 0x3570
+outl 0xcf8 0x80000903
+outl 0xcfc 0x4e002700
+outl 0xcf8 0x80000920
+outb 0xcfc 0x5e
+outb 0x58 0xe1
+outw 0x57 0x0
+EOF
+
+With -trace ide\*:
+[I 1594492439.431181] OPENED
+8666@1594492439.441003:ide_reset IDEstate 0x557f44953598
+8666@1594492439.441084:ide_reset IDEstate 0x557f44953968
+8666@1594492439.441407:ide_reset IDEstate 0x557f44953e88
+8666@1594492439.441484:ide_reset IDEstate 0x557f44954258
+8666@1594492439.442483:ide_reset IDEstate 0x557f44953e88
+8666@1594492439.442548:ide_reset IDEstate 0x557f44954258
+8666@1594492439.444817:ide_reset IDEstate 0x557f44953598
+8666@1594492439.444822:ide_reset IDEstate 0x557f44953968
+8666@1594492439.444824:ide_reset IDEstate 0x557f44953e88
+8666@1594492439.444825:ide_reset IDEstate 0x557f44954258
+[R +0.015229] writel 0x0 0xffffffff
+OK
+[S +0.015321] OK
+[R +0.015328] outw 0x171 0x32a
+8666@1594492439.446534:ide_ioport_write IDE PIO wr @ 0x171 (Features); val 0x2a; bus 0x557f44953e00 IDEState 0x557f44953e88
+8666@1594492439.446537:ide_ioport_write IDE PIO wr @ 0x172 (Sector Count); val 0x03; bus 0x557f44953e00 IDEState 0x557f44953e88
+OK
+[S +0.015360] OK
+[R +0.015377] outw 0x176 0x3570
+8666@1594492439.446561:ide_ioport_write IDE PIO wr @ 0x176 (Device/Head); val 0x70; bus 0x557f44953e00 IDEState 0x557f44953e88
+8666@1594492439.446564:ide_ioport_write IDE PIO wr @ 0x177 (Command); val 0x35; bus 0x557f44953e00 IDEState 0x557f44954258
+8666@1594492439.446581:ide_exec_cmd IDE exec cmd: bus 0x557f44953e00; state 0x557f44954258; cmd 0x35
+OK
+[S +0.015404] OK
+[R +0.015410] outl 0xcf8 0x80000903
+OK
+[S +0.015413] OK
+[R +0.015429] outl 0xcfc 0x4e002700
+OK
+[S +0.015555] OK
+[R +0.015559] outl 0xcf8 0x80000920
+OK
+[S +0.015561] OK
+[R +0.015563] outb 0xcfc 0x5e
+OK
+[S +0.015663] OK
+[R +0.015667] outb 0x58 0xe1
+8666@1594492439.446896:ide_dma_cb IDEState 0x557f44954258; sector_num=1 n=259 cmd=DMA WRITE
+OK
+[S +0.015801] OK
+[R +0.015806] outw 0x57 0x0
+8666@1594492439.447006:ide_cancel_dma_sync_remaining draining all remaining requests
+qemu-system-i386: /home/alxndr/Development/qemu/hw/ide/core.c:724: void ide_cancel_dma_sync(IDEState *): Assertion `s->bus->dma->aiocb == NULL' failed.
+Aborted
+
+
+The qtest reproducers are so nice.
+
+writel 0x0 0xffffffff
+
+outw 0x171 0x32a
+  features := 0x2a    b8cb
+  count := 0x03;      b8cb
+outw 0x176 0x3570
+  device := 0x70     (select device1)   b8cb
+  command := 0x35    (DMA WRITE EXT)    8f98
+
+outl 0xcf8 0x80000903
+outl 0xcfc 0x4e002700
+outl 0xcf8 0x80000920
+outb 0xcfc 0x5e
+
+outb 0x58 0xe1
+  bmdma_cmd_writeb val = 0xe1 [1110 0001]
+                           DMA READ ^  ^ DMA Start
+outw 0x57 0x0
+  bmdma_cmd_writeb val = 0x00 [0000 0000]
+                                       ^ DMA Cancel
+EOF
+
+
+This should be a straightforward DMA cancel. I added some more traces;
+
+# After the 0x35 command write:
+ide_exec_cmd IDE exec cmd: bus 0x561808b0ecc0; state 0x561808b0f118; cmd 0x35
+ide_sector_start_dma IDEState 0x561808b0f118;
+ide_start_dma IDEState 0x561808b0f118;
+
+# After the 0xe1 bmdma kick:
+ide_dma_cb_entry IDEState 0x561808b0f118; ret 0;
+ide_dma_cb IDEState 0x561808b0f118; sector_num=1 n=259 cmd=DMA WRITE
+ide_dma_cb_next IDEState 0x561808b0f118;
+
+So far, pretty normal. IDE calls the HBA's DMA start, but the HBA doesn't have DMA enabled, so it stalls. Later, when we turn on DMA, the HBA engages the DMA callback and sets up the first transfer. This sets s->bus->dma->aiocb.
+
+Then, we try to cancel DMA:
+
+ide_cancel_dma_sync IDEState 0x561808b0f118;
+ide_cancel_dma_sync_remaining draining all remaining requests
+1343877@1595891049.469050:dma_blk_cb dbs=0x55baededdc50 ret=0
+1343877@1595891049.469054:dma_map_wait dbs=0x55baededdc50
+qemu-system-i386: /home/jsnow/src/qemu/hw/ide/core.c:732: void ide_cancel_dma_sync(IDEState *): Assertion `s->bus->dma->aiocb == NULL' failed.
+
+We still have a DMA callback out, so we try to synchronously cancel it; but the blk_drain doesn't appear to be effective!
+
+We apparently wind up here:
+
+    if (dbs->iov.size == 0) {
+        trace_dma_map_wait(dbs);
+        dbs->bh = aio_bh_new(dbs->ctx, reschedule_dma, dbs);
+        cpu_register_map_client(dbs->bh);
+        return;
+    }
+
+
+... The DMA simply re-schedules itself (?) when iov.size is zero. unfortunately for us, that means that the original point of scheduling the drain doesn't work, because the DMA never returns all the way to the IDE device emulation code.
+
+
+
+TLDR: I am not actively working on this, because the problem extends well below IDE and I don't have the bandwidth to take point on this at the moment.
+
+Here's a writeup I sent to qemu-devel on 2020-07-30:
+
+
+First, the (partially bogus, fuzzer-generated) IDE command wants to:
+
+1. dma write 259 sectors starting at sector 1
+
+2. Provides a PRDT at addr 0x00 whose first PRDT describes a data buffer at 0xffffffff of length 0x10000. [a]
+
+3. The remaining 8,191 PRD entries are uninitialized memory that all wind up describing the same data buffer at 0x00 of length 0x10000.
+
+Generally, the entire PRDT is going to be read, but truncated into an SGList that's exactly as long as the IDE command. Here, that's 0x20600 bytes.
+
+Yadda, yadda, yadda, that winds up turning into these map requests:
+
+addr 0xffffffff; len 0x10000
+  -- mapped length: 0x01 (normal map return)
+
+addr 0x100000000; len 0xffff
+  -- mapped length: 0x1000 (bounce buffer return)
+
+addr 0x100001000; len 0xefff
+  -- bounce buffer is busy, cannot map
+
+Then it proceeds and calls the iofunc. We return to dma_blk_cb and then:
+
+unmap 0xffffffff; len 0x01; access_len 0x01;
+
+... That unmaps the "direct" one, but we seemingly fail to unmap the indirect one.
+
+Uh, cool. When we build the IOV, we build it with two entries; but qemu_iovec_discard_back discards the second entry entirely without unmapping it.
+
+IDE asks for an alignment of BDRV_SECTOR_SIZE (512 bytes). The IDE state machine transfers an entire sector or nothing at all. The total IOV size we have build thus far is 0x1001 bytes, which is not aligned as you might have noticed.
+
+So, we try to align it:
+
+qemu_iovec_discard_back(&dbs->iov, QEMU_ALIGN_DOWN(4097, 512))
+
+... I think we probably wanted to ask to shave off one byte instead of asking to shave off 4096 bytes.
+
+
+So, a few perceived problems with dma_blk_cb:
+
+1. Our alignment math is wrong. discard_back takes as an argument the number of bytes to discard, not the number of bytes you want to have afterwards.
+
+2. qemu_iovec_discard_back will happily unwind entire IO vectors that we would need to unmap and have now lost. Worse, whenever we do any kind of truncating at all, those bytes are not re-added to the source SGList, so subsequent transfers will have skipped some bytes in the guest SGList.
+
+3. the dma_blk_io interfaces don't ever check to see if the sg list is an even multiple of the alignment. They don't return synchronous error and no callers check for an error case. (Though BMDMA does carefully prepare the SGList such that it is aligned in this way. AHCI does too, IIRC.) This means we might have an unaligned tail that we will just drop or ignore, leading to another partial DMA.
+
+4. There's no guarantee that any given individual IO vector will have an entire sector's worth of data in it. It is theoretically valid to describe a series of vectors of two bytes each. If we can only map 1-2 vectors at a time, depending, we're never going to be able to scrounge up enough buffer real estate to transfer an entire sector.
+
+
+
+[a] This is against the BMDMA spec. The address must be aligned to 0x02 and cannot cross a 64K boundary. bit0 is documented as always being zero, but it's not clear what should happen if the boundary constraint is violated. Absent other concerns, it might just be easiest to fulfill the transfer if it's possible.
+
+
+Three points stand out:
+
+1. The alignment code is buggy, as mentioned in comment 15.
+
+2. The iov_discard_undo() API has been added to "qemu/iov.h" to undo the effect of iov_discard_front/back_undoable() calls before unmapping. You can use this API to restore the originally mapped iovecs.
+
+3. The device must follow the spec when handling invalid inputs. If the spec is unclear then it's necessary to check actual hardware or infer the behavior from code that is considered reference material (Linux drivers, emulation code in BOCHS, etc).
+
+OK, I can probably fix the alignment and use the new undo function to at least improve the characteristics of this failure considerably. Thanks for the pointer on the new iov function.
+
+I see two potential problems still:
+
+(1) The IDE device will allow partial transfers to succeed, by doing partial sector writes. AFAIUI the IDE state machine is supposed to do full sector or nothing at all, but maybe I am wrong about that being a requirement. It is at least not a regression, exactly. I can file a separate bug for this.
+
+(2) The invalid device inputs are just completely unknown to me right now, and I don't have any hardware in my own house to test this, so I have to deprioritize that until I can get back into the office and regain access to more testing equipment. HELP WANTED, if anyone has a PCI BMDMA that they can orchestrate in a virtual environment to prod it for how it handles certain errant inputs.
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/259
+
+

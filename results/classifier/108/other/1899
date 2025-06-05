@@ -1,0 +1,56 @@
+graphic: 0.749
+other: 0.604
+device: 0.598
+semantic: 0.571
+performance: 0.570
+boot: 0.508
+PID: 0.503
+socket: 0.422
+network: 0.370
+debug: 0.357
+permissions: 0.351
+vnc: 0.260
+files: 0.213
+KVM: 0.209
+
+AArch64: Wrong SCR_EL3 after turning on secondary cores via PSCI
+Description of problem:
+The system fails to boot when using "direct kernel boot" with EL3 enabled. After the guest OS enables secondary cores via PSCI, those have an incorrectly set up `SCR_EL3`. When the OS then executes an intruction which traps into (QEMU provided fake) EL3, the core ends up in an endless loop of "Undefined Instruction" exceptions.
+
+This is nicely visible with `-serial stdio -append "earlycon=pl011,0x9000000 console=/dev/ttyAMA0" -d int`:
+
+```plaintext
+[    0.173173][    T1] smp: Bringing up secondary CPUs ...
+(...)
+Taking exception 11 [Hypervisor Call] on CPU 0
+...from EL1 to EL2
+...with ESR 0x16/0x5a000000
+...handled as PSCI call
+Taking exception 5 [IRQ] on CPU 0
+...from EL1 to EL1
+...with ESR 0x16/0x5a000000
+...with ELR 0xffffa9ff8b593438
+...to EL1 PC 0xffffa9ff8aa11280 PSTATE 0x3c5
+Exception return from AArch64 EL1 to AArch64 EL1 PC 0xffffa9ff8b593438
+Exception return from AArch64 EL1 to AArch64 EL1 PC 0x41f7832c
+Taking exception 1 [Undefined Instruction] on CPU 1
+...from EL1 to EL3
+...with ESR 0x18/0x62300882
+...with ELR 0xffffa9ff8aa3d0d8
+...to EL3 PC 0x400 PSTATE 0x3cd
+Taking exception 1 [Undefined Instruction] on CPU 1
+...from EL3 to EL3
+...with ESR 0x0/0x2000000
+...with ELR 0x400
+...to EL3 PC 0x200 PSTATE 0x3cd
+(repeats forever, CPU 1 is stuck)
+```
+Steps to reproduce:
+1. `qemu-system-aarch64 -M virt,secure=on -cpu max -smp 1 -kernel linux` works
+2. `qemu-system-aarch64 -M virt,secure=on -cpu max -smp 2 -kernel linux` does not
+Additional information:
+The setup for `SCR_EL3` is done by `do_cpu_reset` in hw/arm/boot.c, but this is only called on full system reset. The PSCI call ends up in `arm_set_cpu_on_async_work` (target/arm/arm-powerctl.c) which calls `cpu_reset`. This clears `SCR_EL3` to the architectural reset value, not the one needed for direct kernel boot.
+
+`arm_set_cpu_on_async_work` has code for `SCR_HCE`, but none of the other flags handled by `do_cpu_reset`. It would probably work after copying all of `do_cpu_reset` into `arm_set_cpu_on_async_work`, but that seems wrong. I prepared a patch which makes `do_cpu_reset` public such that `arm_set_cpu_on_async_work` can call it (works here), but I'm not sure whether that's the right way.
+
+CC @pm215

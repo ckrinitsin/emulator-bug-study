@@ -1,0 +1,225 @@
+permissions: 0.927
+other: 0.883
+vnc: 0.881
+graphic: 0.881
+network: 0.880
+boot: 0.879
+performance: 0.863
+socket: 0.854
+PID: 0.840
+files: 0.840
+debug: 0.838
+device: 0.837
+semantic: 0.820
+KVM: 0.816
+
+W64 build referenced to by https://www.qemu.org/download/#windows fails to run with GTK and 3D but cross-build for W64 works ok with GTK and 3d
+Description of problem:
+Qemu W64 build referenced to by https://www.qemu.org/download/#windows (https://qemu.weilnetz.de/w64/qemu-w64-setup-20240903.exe) crashes with aforementioned command line, leaving 0xc0000005 exception in Windows event log. But a custom cross-compiled build at least boots into default qemu BIOS. See steps below to cross-compile qemu with GTK + OpenGL +VirGL support.
+Steps to reproduce:
+1. `wget https://qemu.weilnetz.de/w64/qemu-w64-setup-20240903.exe`, install it, run `qemu-system-x86_64.exe -display gtk,gl=on -device virtio-vga-gl` and watch immediate qemu crash.
+ 2. Prepare cross-compilation build of qemu 9.1.0 using following steps:
+ 3. Download official Fedora workstation 40 x86_64 ISO and install it to a virtual disk and boot that disk.
+ 4. `wget https://download.qemu.org/qemu-9.1.0.tar.xz`\
+    `tar xvJf qemu-9.1.0.tar.xz`\
+    `cd qemu-9.1.0`
+ 5. Run `sudo yum install git meson ninja-build python3-sphinx python3-sphinx_rtd_theme gcc mingw64-gcc mingw64-glib2 mingw64-pkg-config mingw64-pixman mingw64-gtk3 mingw64-SDL2 mingw64-libepoxy mingw64-librsvg2` in virtual Fedora. `mingw64-librsvg2` is optional, see step #14
+ 6. `git clone https://gitlab.freedesktop.org/slirp/libslirp.git` (e61dbd45 as of 04 August 2024) `git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git` (3d82ed86 as of 03 September 2024)
+ 7. create file x86_64-w64-mingw32.txt in qemu-9.1.0 directory with the content as follows:\
+    `[binaries]`\
+    `c = '/usr/bin/x86_64-w64-mingw32-gcc'`\
+    `cpp = '/usr/bin/x86_64-w64-mingw32-g++'`\
+    `ar = '/usr/bin/x86_64-w64-mingw32-ar'`\
+    `strip = '/usr/bin/x86_64-w64-mingw32-strip'`\
+    `pkg-config = '/usr/bin/x86_64-w64-mingw32-pkg-config'`\
+    `exe_wrapper = 'wine'`\
+    \
+    `[host_machine]`\
+    `system = 'windows'`\
+    `cpu_family = 'x86_64'`\
+    `cpu = 'i686'`\
+    `endian = 'little'`
+ 8. Make a directory to which QEMU dependencies will be installed after compilation from git: `export CROSS_QEMU_DEPS="/home/cross-qemu-deps"`\
+    `sudo mkdir -p $CROSS_QEMU_DEPS`
+ 9. Install libslirp so that future qemu binaries can have internet access via -netdev user\
+    `    cd libslirp`\
+    \
+    `    meson setup --cross-file ../x86_64-w64-mingw32.txt --prefix "$CROSS_QEMU_DEPS" build-mingw/`\
+    `    meson compile -C build-mingw`\
+    `    cd build-mingw`\
+    `    ninja install`
+10. Install virgl to have 3D hardware acceleration\
+    `    cd ../../`\
+    `    cd virglrenderer`\
+    \
+    `    meson setup --cross-file ../x86_64-w64-mingw32.txt --prefix "$CROSS_QEMU_DEPS" build-mingw/`\
+    `    meson compile -C build-mingw`\
+    `    cd build-mingw`\
+    `    ninja install`
+11. Set three environment variables for cross-compilation:
+
+    `sudo find / -type f -name '*.pc'` and make sure all mingw \*.pc files live in `/usr/x86_64-w64-mingw32/sys-root/mingw/share/pkgconfig/` and `/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/`. Correct these paths in PKG_CONFIG_PATH if you see they were altered by mingw or package contributors.\
+    \
+    `export PKG_CONFIG_PATH="/usr/x86_64-w64-mingw32/sys-root/mingw/share/pkgconfig/:/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/:$PKG_CONFIG_PATH"`
+
+    \
+    `export PKG_CONFIG_LIBDIR="${CROSS_QEMU_DEPS}/lib/pkgconfig/:$PKG_CONFIG_LIBDIR"`
+
+    \
+    `export PKG_CONFIG_SYSROOT_DIR=""`
+12. <span dir="">Configure Qemu makefile:</span>
+
+    `cd ../../`
+
+    `./configure --cross-prefix=x86_64-w64-mingw32- --enable-gtk --enable-sdl --enable-opengl --enable-virglrenderer --enable-slirp --enable-debug`
+
+    and make sure you see this in the output of configure:
+
+    `Compilation`\
+    `host CPU : x86_64`\
+    `host endianness : little`\
+    `C compiler : x86_64-w64-mingw32-gcc -m64`\
+    `Host C compiler : cc`
+
+    and this one:
+
+    `Checking whether type "struct virgl_renderer_resource_info_ext" has member "d3d_tex2d" with dependency virglrenderer: YES`
+13. Cross-compile qemu: `` make -j`nproc` ``
+14. \[optional step to get rid of "**Gtk-WARNING \*\*: 19:22:02.461: Could not load a pixbuf**"\]
+
+    **Copy gdk-pixbuf-query-loaders.exe** from `/usr/x86_64-w64-mingw32/sys-root/mingw/bin/`\
+    to\
+    `./qemu-9.1.0/build/qemu-bundle/qemu`**\
+    \
+    `mkdir -p ./qemu-9.1.0/build/qemu-bundle/qemu/lib`\
+    \
+    copy recursively /usr/x86_64-w64-mingw32/sys-root/mingw/lib/gdk-pixbuf-2.0** to `./qemu-9.1.0/build/qemu-bundle/qemu/lib`
+
+    **`mkdir -p ./qemu-9.1.0/build/qemu-bundle/qemu/share`**\
+    \
+    **copy recursively /usr/x86_64-w64-mingw32/sys-root/mingw/share/icons** to `./qemu-9.1.0/build/qemu-bundle/qemu/share`
+
+    **copy recursively /usr/x86_64-w64-mingw32/sys-root/mingw/share/themes** to `./qemu-9.1.0/build/qemu-bundle/qemu/share`
+
+    Run `gdk-pixbuf-query-loaders.exe --update-cache` on host right before step 17.
+15. Copy all dll files from
+
+    `/usr/x86_64-w64-mingw32/sys-root/mingw/bin/`\
+    to\
+    `./qemu-9.1.0/build/qemu-bundle/`**`qemu`**
+
+    Copy libvirglrenderer-1.dll and libslirp-0.dll from `$CROSS_QEMU_DEPS` directory exported above to
+
+    `./qemu-9.1.0/build/qemu-bundle/`**`qemu`**
+16. Copy this **`qemu`** folder from the previous step to Windows machine using ssh or whatever else\
+    E.g. by doing\
+    `    sudo yum install openssh-server`\
+    `    sudo systemctl start sshd`\
+    `    sudo systemctl status sshd`\
+    on guest OS (provided you have launched guest Fedora qemu with `-nic user,hostfwd=tcp::8888-:22` command line parameter for ssh)
+
+    and then
+
+    `scp.exe -P 8888 -r virtual_machine_user@127.0.0.1:/home/virtual_machine_user/qemu-9.1.0/build/qemu-bundle/qemu C:\downloads\qemu`\
+    on host OS
+17. `cd` to that `qemu` folder and run `qemu-system-x86_64.exe -display gtk,gl=on -device virtio-vga-gl` and watch qemu booting into BIOS.
+
+<details>
+<summary>Previous version</summary>
+
+1\. \`wget https://qemu.weilnetz.de/w64/qemu-w64-setup-20240903.exe\\\\\\\\\\\\\\\`, install it, run \`qemu-system-x86_64.exe -display gtk,gl=on -device virtio-vga-gl\` and watch immediate qemu crash. 2. Prepare cross-compilation build of qemu 9.1.0 using following steps: 3. Download official Fedora workstation 40 x86_64 ISO and install it to a virtual disk and boot that disk. 4. Run \`sudo yum install meson ninja-build python3-sphinx python3-sphinx_rtd_theme gcc mingw64-gcc mingw64-glib2 mingw64-pkg-config mingw64-pixman mingw64-gtk3 mingw64-SDL2 mingw64-libepoxy\` in virtual Fedora. 5. \`wget https://download.qemu.org/qemu-9.1.0.tar.xz\\\\\\\\\\\\\\\\\\\\\\\`
+
+```
+`tar xvJf qemu-9.1.0.tar.xz`\
+`cd qemu-9.1.0`
+```
+
+ 6. `git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git` (3d82ed86 as of 03 September 2024)\
+    `cd virglrenderer`
+ 7. create file x86_64-w64-mingw32.txt in virglrenderer directory with the content as follows:\
+    `[binaries]`\
+    `c = '/usr/bin/x86_64-w64-mingw32-gcc'`\
+    `cpp = '/usr/bin/x86_64-w64-mingw32-g++'`\
+    `ar = '/usr/bin/x86_64-w64-mingw32-ar'`\
+    `strip = '/usr/bin/x86_64-w64-mingw32-strip'`\
+    `pkg-config = '/usr/bin/x86_64-w64-mingw32-pkg-config'`\
+    `exe_wrapper = 'wine'`\
+    \
+    `[host_machine]`\
+    `system = 'windows'`\
+    `cpu_family = 'x86_64'`\
+    `cpu = 'i686'`\
+    `endian = 'little'`
+ 8. Run `meson setup --cross-file x86_64-w64-mingw32.txt build-mingw`\
+    `meson compile -C build-mingw`\
+    `cd build-mingw`\
+    `ninja install`
+ 9. Set pkgconfig for virglrenderer: `export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:/home/your_user/virglrenderer/build-mingw/meson-private`\
+    (replace /home/your_user/virglrenderer/build-mingw/meson-private with path containing virglrenderer.pc file from output of `sudo find / -type f -name 'virglrenderer.pc'` command)
+10. Run confugure: \
+    `cd ../../`\
+    `./configure --cross-prefix=x86_64-w64-mingw32- --enable-gtk --enable-sdl --enable-opengl --enable-virglrenderer --enable-debug`\
+    \
+    and make sure you see this in the output of configure:\
+    `Compilation`\
+    `host CPU : x86_64`\
+    `host endianness : little`\
+    `C compiler : x86_64-w64-mingw32-gcc -m64`\
+    `Host C compiler : cc`\
+    \
+    run\
+    `export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig"`
+11. Run this command to see where x86_64-w64-mingw32-pkg-config will look for virglrenderer.h:
+
+    `/usr/bin/x86_64-w64-mingw32-pkg-config --cflags virglrenderer`\
+    \> -I/usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/virgl (possible result)
+12. Copy folder containing virglrenderer.h to that one to satisfy mingw expectations:
+
+    `sudo mkdir -p /usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/`\
+    `sudo cp -r /usr/local/include/virgl /usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/`
+13. Run search `sudo find / -type f -name 'libvirglrenderer.dll.a'` and satisfy mingw's expectation for libvirglrenderer.dll.a:\
+    `sudo mkdir -p /usr/x86_64-w64-mingw32/sys-root/usr/local/lib/`\
+    `sudo ln -s /usr/local/lib/libvirglrenderer.dll.a /usr/x86_64-w64-mingw32/sys-root/usr/local/lib/libvirglrenderer.dll.a`
+14. Cross-compile qemu: \
+    `make -j4`\
+    \* if you see "/usr/lib/gcc/x86_64-w64-mingw32/14.1.1/../../../../x86_64-w64-mingw32/bin/ld: cannot find -lvirglrenderer: No such file or directory" then most likely Qemu's makefile was confused by libvirglrenderer.dll.a path; check `/usr/x86_64-w64-mingw32/bin/ld -lvirglrenderer --verbose` output to find out path of libvirglrenderer.dll.a file it cannot find
+15. copy all dll files from \
+    /usr/x86_64-w64-mingw32/sys-root/mingw/bin/\
+    to\
+    ./qemu-9.1.0-rc4/**build**
+16. copy libvirglrenderer-1.dll from /usr/local/bin to\
+    ./qemu-9.1.0-rc4/**build**
+17. copy this **build** folder to Windows machine using ssh or whatever else
+18. `cd` to that **build** folder and run `qemu-system-x86_64.exe -display gtk,gl=on -device virtio-vga-gl` and watch qemu booting into BIOS.
+
+</details>
+Additional information:
+P.S. Cross-compilation on Fedora build machine for Windows target usually requires installing pre-compiled binary packages along with libslirp and libvirglrenderer from git. Almost all of them include \*.pc files (pkg-config files) needed by mingw to find .h headers and .dll.a library files. Normally, it's not necessarry to add extra include paths using something like CFLAGS="-I/include_headers_path" or LDFLAGS="-L/path_to_dll_a_lib". The commands from above must produce a fully working windows build. But, just in case someone damages packages in Fedora repository or libslirp or virglrenderer in their git, here are some ideas how to fix broken links between files:
+
+- First, make sure you have enumerated all .pc folders from Fedora repository packages in PKG_CONFIG_PATH= and all .pc folders built from source in PKG_CONFIG_LIBDIR=, as it was shown at Step 11. If you see a message saying something like "virglrenderer.h not found", run this command to see where x86_64-w64-mingw32-pkg-config will look for virglrenderer.h: `/usr/bin/x86_64-w64-mingw32-pkg-config --cflags virglrenderer`
+
+> \-I/usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/virgl (possible result)
+
+- Then copy folder containing virglrenderer.h (for example, /usr/local/include/virgl) to that one to satisfy mingw expectations:
+
+  `sudo mkdir -p /usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/` `sudo cp -r /usr/local/include/virgl /usr/x86_64-w64-mingw32/sys-root/mingw/usr/local/include/`
+- If you see "/usr/lib/gcc/x86_64-w64-mingw32/14.1.1/../../../../x86_64-w64-mingw32/bin/ld: cannot find -lvirglrenderer: No such file or directory" then most likely Qemu's makefile was confused by libvirglrenderer.dll.a path; check `/usr/x86_64-w64-mingw32/bin/ld -lvirglrenderer --verbose` output to find out path of libvirglrenderer.dll.a file it cannot find
+- For example, `/usr/x86_64-w64-mingw32/bin/ld -lvirglrenderer --verbose` shows that build script tries to find .dll.a file under /usr/x86_64-w64-mingw32/sys-root/usr/local/lib/libvirglrenderer.dll.a and `find / -type f -name 'libvirglrenderer.dll.a'` shows that file is in /usr/local/lib/libvirglrenderer.dll.a
+- Then satisfy mingw's expectation for libvirglrenderer.dll.a: `sudo mkdir -p /usr/x86_64-w64-mingw32/sys-root/usr/local/lib/`\
+  `sudo ln -s /usr/local/lib/libvirglrenderer.dll.a /usr/x86_64-w64-mingw32/sys-root/usr/local/lib/libvirglrenderer.dll.a`
+
+Upd: I was able to refine instructions on how to cross-compile Qemu's dependencies thanks to these references:
+
+https://gitlab.freedesktop.org/pkg-config/pkg-config/-/issues/52:
+
+> PKG_CONFIG_SYSROOT_DIR blindly prepend the sysroot to all paths. I made a MR that add PKG_CONFIG_SYSROOT_MAP to get smarter mapping from pcfiledir-\>sysroot. !7. I generally discontinued the use of PKG_CONFIG_SYSROOT_DIR and switched to merely using PKG_CONFIG_LIBDIR. That way I got absolute paths everyehere which at least was consistent and could be postprocessed if needed.
+
+https://forum.qt.io/topic/88946/qt5-10-1-cross-compile-configure-errors/9:
+
+> WARNING: Disabling pkg-config since PKG_CONFIG_LIBDIR is not set and the host's .pc files would be used (even if you set PKG_CONFIG_PATH). Set this variable to the directory that contains target .pc files for pkg-config to function correctly when cross-compiling or use -pkg-config to override this test.
+
+https://cmake.org/pipermail/cmake/2008-November/025050.html:
+
+> The situation is as follows: PKG_CONFIG_PATH is searched before PKG_CONFIG_LIBDIR for the desired \*.pc file. (The man page doesn't say which is searched first, but my tests reveal that is the order at least for the present version of pkg-config.) Cross-compiling users should avoid using native paths in PKG_CONFIG_PATH and PKG_CONFIG_LIBDIR. Furthermore, cross-compiling users should always specify PKG_CONFIG_LIBDIR (with or without PKG_CONFIG_PATH) since use of PKG_CONFIG_LIBDIR supresses appending default native paths to whatever is specified in PKG_CONFIG_PATH and PKG_CONFIG_LIBDIR.
+>
+> In sum, for cross-compilation purposes you should always use PKG_CONFIG_LIBDIR (with or without PKG_CONFIG_PATH) and make sure there are no native paths in it (or in PKG_CONFIG_PATH). If you follow those rules you should get a good cross-compilation result, otherwise not.

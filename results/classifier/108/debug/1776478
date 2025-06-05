@@ -1,0 +1,330 @@
+debug: 0.954
+other: 0.943
+permissions: 0.936
+device: 0.927
+vnc: 0.921
+files: 0.909
+graphic: 0.898
+semantic: 0.898
+network: 0.895
+KVM: 0.882
+performance: 0.879
+PID: 0.878
+socket: 0.873
+boot: 0.811
+
+Getting qemu: uncaught target signal 6 when running  lv2 plugin cross-compilation
+
+Hey,
+I am part of the Zynthian team and we use qemu-arm-static to cross compile lv2 audio plugins.
+
+When running a compilation of DISTRHO-Ports we get:
+
+lv2_ttl_generator: pthread_mutex_lock.c:81: __pthread_mutex_lock: Assertion `mutex->__data.__owner == 0' failed.
+qemu: uncaught target signal 6 (Aborted) - core dumped
+./scripts/generate-ttl.sh: line 27: 16524 Aborted                 $GEN ./$FILE
+Makefile:62: recipe for target 'gen_lv2' failed
+make[1]: *** [gen_lv2] Error 134
+make[1]: Leaving directory '/home/pi/zynthian-sw/plugins/DISTRHO-Ports'
+Makefile:104: recipe for target 'lv2' failed
+make: *** [lv2] Error 2
+
+
+lv2_ttl_generator source is here:
+https://github.com/DISTRHO/DISTRHO-Ports/tree/master/libs/lv2-ttl-generator
+
+The command that is ruining is
+lv2_ttl_generator ./TAL-Filter-2.so 
+
+And ./TAL-Filter-2.so source is here:
+https://github.com/DISTRHO/DISTRHO-Ports/tree/master/ports/tal-filter-2/source
+
+
+
+Is there a way to debug what is going on?
+This runs fine on a Raspberrypi which is armv7
+
+A workaround would also help.
+
+
+Bug in Zynthian:
+https://github.com/zynthian/zynthian-sys/issues/59
+Bug in DISTRHO-Ports:
+https://github.com/DISTRHO/DISTRHO-Ports/issues/29
+
+Using qemu-arm-static version from master from two days ago:
+qemu-arm version 2.12.50 (v2.12.0-1182-ga7a7309ca5-dirty), commit: a7a7309ca52c327c6603d60db90ae4feeae719f7
+
+Also saw this in qemu-arm version 2.12.0 (Debian 1:2.12+dfsg-3)
+
+Thanks,
+Guy
+
+Could you provide repro instructions?
+
+Hey,
+Not sure how to boil it down (yet). But this would reproduce it for you:
+
+cd /tmp
+wget https://downloads.raspberrypi.org/raspbian_lite/images/raspbian_lite-2018-04-19/2018-04-18-raspbian-stretch-lite.zip
+unzip 2018-04-18-raspbian-stretch-lite.zip
+wget https://raw.githubusercontent.com/guysoft/CustomPiOS/devel/src/common.sh
+source ./common
+mkdir ./mount
+
+mount_image ./2018-04-18-raspbian-stretch-lite.img 2 ./mount
+cd mount
+sudo bash -c "$(declare -f fixLd); fixLd"
+sudo cp $(which qemu-arm-static) ./usr/bin/
+sudo chroot .
+apt-get update
+
+apt-get install -y git premake libfreetype6-dev libgl1-mesa-dev libx11-dev libasound2-dev
+git clone https://github.com/DISTRHO/DISTRHO-Ports.git --depth=1
+
+cd DISTRHO-Ports/
+
+export RASPPI=true
+export LINUX_EMBED=true
+
+./scripts/premake-update.sh linux
+
+make lv2 -j4
+
+
+
+once you have it all running you can just run again 
+
+./libs/lv2_ttl_generator ./bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+
+
+
+
+my bad, the line should be :
+source ./common.sh
+
+not "source ./common"
+
+@pmaydell Is there anything I can do to help speed this up? I can run tests or make reproduction easier if that helps. But I need direction what actually helps you.
+
+Thanks for the repro case; it's on my list of things to look at, but the gating factor there is that my todo list is several miles long. If you want to look at it yourself, the first step is probably to run the program under qemu with qemu's -g option to enable the gdbstub, connect an arm-aware gdb to it and see if you can get a backtrace out of it.
+
+
+Hey,
+So how do I enable -g option?
+The command that activates qemu is:
+
+sudo chroot .
+
+How do I set -g?
+
+Also minor update - the new rasbian image (aka updated g++ libs) makes lv2_ttl_generator hang on:
+
+Writing drowaudio-flanger.ttl... done!
+Generate ttl data for './drowaudio-tremolo.so', basename: 'drowaudio-tremolo'
+
+So definitely something is strange with how lv2_ttl_generator runs the .so files provided to it.
+
+You want to execute a single program in the chroot (whatever the binary that is failing is):
+
+sudo chroot . usr/bin/qemu-arm-static -g program/to/run arguments
+
+
+Ok, got it to run with (had to septate arguments with --):
+
+sudo chroot . usr/bin/qemu-arm-static -g -- DISTRHO-Ports/libs/lv2_ttl_generator DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+
+When running I can see two processes:
+
+root     31993  0.0  0.0  86556  4696 pts/9    S+   15:06   0:00 sudo chroot . usr/bin/qemu-arm-static -g -- DISTRHO-Ports/libs/lv2_ttl_generator DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+root     31994  0.0  0.0 4240444 9592 pts/9    Rl+  15:06   0:00 usr/bin/qemu-arm-static -g -- DISTRHO-Ports/libs/lv2_ttl_generator DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+
+
+I can attach to the pid using something like this:
+
+sudo gdb -p $(ps aux | grep usr/bin/qemu-arm-static | grep -v grep | grep -v chroot | awk '{  print $2 }')
+
+
+When I continue I get:
+Attaching to process 32519
+[New LWP 32520]
+0x00000000607a0973 in ?? ()
+(gdb) c
+Continuing.
+
+Thread 1 "qemu-arm-static" received signal SIGABRT, Aborted.
+0x00000000601786cd in ?? ()
+
+
+
+The other process I can get with removing "-v" chroot so:
+
+...
+
+sudo gdb -p $(ps aux | grep usr/bin/qemu-arm-static | grep -v grep | grep chroot | awk '{  print $2 }')
+
+Reading symbols from /lib/x86_64-linux-gnu/libsystemd.so.0...(no debugging symbols found)...done.
+Reading symbols from /lib/x86_64-linux-gnu/liblzma.so.5...(no debugging symbols found)...done.
+Reading symbols from /usr/lib/x86_64-linux-gnu/liblz4.so.1...(no debugging symbols found)...done.
+Reading symbols from /lib/x86_64-linux-gnu/libgcrypt.so.20...(no debugging symbols found)...done.
+Reading symbols from /lib/x86_64-linux-gnu/libgpg-error.so.0...(no debugging symbols found)...done.
+0x00007f65cfd51bc4 in __GI___poll (fds=0x560bc6fe3040, nfds=2, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+29      ../sysdeps/unix/sysv/linux/poll.c: No such file or directory.
+(gdb) 
+
+
+I think the first one is the interesting run, but being verbose.
+
+Any tips on adding symbols?
+
+
+
+You want to attach with an Arm-aware gdb to the QEMU debug stub, not connect an x86 gdb to the x86 QEMU process. On Debian/Ubuntu the gdb in the 'gdb-multiarch' package will do.
+
+Also, I gave you a wrong command line by mistake: you need "-g 1234", not "-g -" (-g wants the TCP port as an option).
+
+So you run the chroot/qemu command; QEMU should then sit waiting for a connection on port 1234 from gdb. In another terminal run
+
+$ gdb-multiarch
+[...]
+(gdb) set arch arm
+The target architecture is assumed to be arm
+(gdb) target remote :1234
+Remote debugging using :1234
+0x00008880 in ?? ()
+
+You can then tell gdb 'c' to continue. You should also be able to tell gdb the arm binary filename so it can pick up symbols, but I forget how.
+
+
+Hey,
+
+So all I got was this now:
+
+gdb-multiarch target remote :1234
+Excess command line arguments ignored. (:1234)
+GNU gdb (Ubuntu 8.1-0ubuntu3) 8.1.0.20180409-git
+Copyright (C) 2018 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+target: No such file or directory.
+/tmp/mount/remote: No such file or directory.
+(gdb) set arch arm
+The target architecture is assumed to be arm
+(gdb) target remote :1234
+Remote debugging using :1234
+warning: No executable has been specified and target does not support
+determining executable automatically.  Try using the "file" command.
+0xff7bd9e0 in ?? ()
+(gdb) c
+Continuing.
+
+Program received signal SIGABRT, Aborted.
+0xff49645c in ?? ()
+(gdb) 
+
+
+
+Do I need qemu-arm-static to have some debug symbols or something like that?
+
+
+It wants debug symbols for the guest binary, not for QEMU. As it suggests, the "file" command pointed at the guest binary ought to help.
+
+This commandline isn't right, incidentally:
+  gdb-multiarch target remote :1234
+
+"target remote :1234" is a command for the gdb prompt, not a set of command line arguments (gdb tells you it's harmlessly ignored these arguments).
+
+
+http://tinkering-is-fun.blogspot.com/2009/12/debugging-non-native-programs-with-qemu.html looks like a plausible tutorial for what you need to do with "file" (and has some other commands that might help for dynamically linked libraries). What you want to do when you get to the SIGABRT is tell gdb "bt" to get a backtrace, which if you have the symbol info will give a backtrace of where the guest was.
+
+
+target: No such file or directory.
+/tmp/mount/remote: No such file or directory.
+(gdb) file DISTRHO-Ports/libs/lv2_ttl_generator
+Reading symbols from DISTRHO-Ports/libs/lv2_ttl_generator...(no debugging symbols found)...done.
+(gdb) file DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+Reading symbols from DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so...(no debugging symbols found)...done.
+(gdb) c
+The program is not being run.
+(gdb) set arch arm
+The target architecture is assumed to be arm
+(gdb) target remote :1234
+Remote debugging using :1234
+0xff7bd9e0 in ?? ()
+(gdb) c
+Continuing.
+
+Program received signal SIGABRT, Aborted.
+0xff49645c in ?? ()
+(gdb) bt
+#0  0xff49645c in ?? ()
+#1  0xfffffffe in ?? ()
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+(gdb) 
+
+
+I am not sure at this point - am I debugging qemu or the binary I am running? Should I compile lv2_ttl_generator and TAL-Filter-2.so differently now?
+
+On 25 July 2018 at 18:11, guysoft <email address hidden> wrote:
+> target: No such file or directory.
+> /tmp/mount/remote: No such file or directory.
+> (gdb) file DISTRHO-Ports/libs/lv2_ttl_generator
+> Reading symbols from DISTRHO-Ports/libs/lv2_ttl_generator...(no debugging symbols found)...done.
+> (gdb) file DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so
+> Reading symbols from DISTRHO-Ports/bin/lv2/TAL-Filter-2.lv2/TAL-Filter-2.so...(no debugging symbols found)...done.
+
+These files seem to have no debug symbols. Compiling them
+with debug might help (or might not).
+
+thanks
+-- PMM
+
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+I am not currently actively building this. However since this has not been fixed we moved to pre-compiling this in order to avoid using QEMU. It means building needed dedcated hardware.
+
+See resolution at:
+https://github.com/zynthian/zynthian-sys/issues/59
+
+Which QEMU version did you re-test with?
+
+
+Hello,
+
+I believe I experienced the same bug in a similar context: using QEMU Linux user emulation for continuous integration on GitHub Actions. As a workaround, I did run the chroot script with taskset -c 0 to limit execution on a single CPU which has been solving the problem for more than 10 successive runs. @guysoft does taskset fixes your problem?
+
+This was with qemu 4.2 as packaged by Ubuntu. The environment (automated CI) makes it difficult to plug gdb.
+
+In my case, the crash happens with PostgreSQL.
+https://www.postgresql.org/message-id/86C24765-95F7-464F-9677-B09A396A5F69%40kallisys.net
+
+It may be related to the way QEMU acquires a global lock to ensure memory barrier semantic on ARM or to the way QEMU interprets RaspberryPi Zero (armv6l) memory barrier cp15 instruction which is different from newer cores. I have yet to find where this is implemented in qemu source code to investigate. @pmaydell could you please provide any pointer?
+
+Well, first try with QEMU 6.0 and see if it's still present...
+
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

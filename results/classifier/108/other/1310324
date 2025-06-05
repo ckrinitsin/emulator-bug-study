@@ -1,0 +1,95 @@
+permissions: 0.872
+debug: 0.841
+semantic: 0.820
+boot: 0.816
+PID: 0.785
+other: 0.785
+device: 0.783
+performance: 0.772
+socket: 0.745
+network: 0.734
+graphic: 0.726
+files: 0.699
+vnc: 0.699
+KVM: 0.615
+
+Commit 0f842f8a introduces regression when using tcg-interpreter
+
+Hi.
+
+Commit 0f842f8a246f2b5b51a11c13f933bf7a90ae8e96 apparently introduces a regression when using --enable-tcg-interpreter. The regression is manifested as follows:
+
+ 1. Checkout any qemu commit later or equal that the one said above. Beside that one, I tested v1.7.1, v2.0.0 and a few other commits suggested to my by git bisect.
+ 2. Possibly cherry-pick commit a32b12741bf45bf3f46bffe5a79cb2548a060cd8, which fixes a compilation bug with --enable-tcg-interpreter.
+ 3. Compile with: ./configure --target-list=i386-softmmu --enable-tcg-interpreter && make -j8
+ 4. Create an empty virtual disk and try to install Windows XP on it booting from Windows CD-ROM. After the loading program, the installer immediately crashes with blue screen (it should instead show the installation confirmation dialog and then the EULA acceptance dialog, if it worked correctly).
+
+I'm mentioning Windows XP because it is the problem I found. Probably other operating systems would fail as well. I can test others, if you think it would be helpful. I can also give you access to the very exact CD-ROM image I'm using.
+
+The exact command line I'm using is:
+build_location/i386-softmmu/qemu-system-i386 -m 512 -drive file=winxp_test.img -cdrom wipxp_cdrom.iso
+
+Attached is the blue screen that I see (unfortunately it is Italian, but that's a standard error message and I hope this is not a problem).
+
+I'm not able to understand the nature of the commit to identify what could be the problem. My nose tells me that it may be some stupid mistake, for example in some offset constant, that nobody ever saw because tcg-interpreter is not much used.
+
+Thanks, Giovanni.
+
+
+
+I forgot: winxp_test.img is just an empty 15 GB (sparse) file.
+
+On 04/21/2014 06:14 AM, Stefan Weil wrote:
+> That commit changed the use of the GETPC macro. I just tried to debug
+> the tci.c code and noticed that cputlb.c no longer works as expected:
+
+Ouch, yes, I see that.
+
+> This is not specific for the TCG interpreter, but I don't know how the
+> normal TCG is affected.
+
+I believe that normal TCG is not affected, because the value returned for the
+return address is outside the code_buffer, so tb_find_pc returns NULL, so
+cpu_restore_state does nothing.  Whereas the interpreter continues to produce
+the address of the last opcode executed.
+
+To solve this, I believe you need to clear tci_tb_ptr on all exits from the
+interpreter loop.  That is, both on normal exit (return from tcg_qemu_tb_exec)
+as well as exceptional exit (longjmp landing in cpu_exec; see the Reload env
+after longjmp section).
+
+Only setting tci_tb_ptr at the places it's needed, calls and qemu_ld/st calls,
+is a good optimization of memory traffic, but is unrelated to this bug.
+
+> I also noticed that other code like target-i386/seg_helper.c which
+> includes exec/softmmu_template.h also results in undefined usage of the
+> GETRA macro.
+
+Huh?  That's the normal backend expansion of its load/store helpers.
+
+
+
+r~
+
+
+I can reproduce a similar problem when running the latest ReactOS live CD from http://downloads.sourceforge.net/reactos/ReactOS-0.3.16-REL-live.zip and see the regression caused by the same commit.
+
+It can be fixed by a small modification in cputlb.c: replace GETPC by GETRA in these two lines
+
+cputlb.c:#undef GETPC
+cputlb.c:#define GETPC() ((uintptr_t)0)
+
+Giovanni, could you please try your XP image with this modification, so we can confirm that it fixes the regression?
+Richard suggested a modification which would be even more safe, but we did not need it before commit
+0f842f8a246f2b5b51a11c13f933bf7a90ae8e96, so for a first fix, replacing GETPC by GETRA might be sufficient.
+
+Regards
+Stefan
+
+
+I can confirm that your change fixes my problem as well. Thank you very much!
+
+The fix mentioned in comment #4 has been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=7e4e88656c1e6192e9e47
+==> Setting status to "Fix released".
+

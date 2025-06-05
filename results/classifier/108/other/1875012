@@ -1,0 +1,140 @@
+permissions: 0.906
+graphic: 0.900
+semantic: 0.899
+debug: 0.876
+PID: 0.866
+device: 0.853
+boot: 0.846
+other: 0.842
+KVM: 0.822
+vnc: 0.808
+performance: 0.765
+files: 0.764
+socket: 0.737
+network: 0.721
+
+UC20 running in OVMF triggers qemu emulation error (cloudimage works fine on the same)
+
+Trying to boot a core20 amd64 image on an amd64 Eoan or Focal host via libvirt leads to:
+
+KVM internal error. Suberror: 1
+emulation failure
+RAX=0000000000000000 RBX=000000003bdcd5c0 RCX=000000003ff1d030 RDX=00000000000019a0
+RSI=00000000000000ff RDI=000000003bd73ee0 RBP=000000003bd73e40 RSP=000000003ff1d1f8
+R8 =000000003df52168 R9 =0000000000000000 R10=ffffffffffffffff R11=000000003bd44c40
+R12=000000003bd76500 R13=000000003bd73e00 R14=0000000000020002 R15=000000003df4b483
+RIP=00000000000b0000 RFL=00210246 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0030 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+CS =0038 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0030 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0030 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+FS =0030 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+GS =0030 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+LDT=0000 0000000000000000 0000ffff 00008200 DPL=0 LDT
+TR =0000 0000000000000000 0000ffff 00008b00 DPL=0 TSS64-busy
+GDT=     000000003fbee698 00000047
+IDT=     000000003f2d8018 00000fff
+CR0=80010033 CR2=0000000000000000 CR3=000000003fc01000 CR4=00000668
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d00
+Code=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 <ff> ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+
+
+
+
+
+Core20 image: http://cdimage.ubuntu.com/ubuntu-core/20/beta/pending/ubuntu-core-20-amd64.img.xz
+
+
+Hmm,
+we had a similar issue but that would not affect things back until Bionic as you reported it.
+That was in bug 1866870 and fixed by a change in seabios. Also you reported Focal as affected wherer I fixed this particular one for sure.
+
+In general the error messages we have so far are not usually very helpful. That is more of a "class of errors" than a specific one to look at. Thanks for attaching the XML and image right away.
+
+In the past this also was dependent on the reporters CPU, so let's see if we can reproduce this for debugging.
+
+Ok I can reproduce
+
+One sees just quickly the bootloader flying by:
+  BdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00005 " from 
+  PciRoot(0x0)/Pci(0x4,0x0)/Sata(0x0,0xFFFF,0x0)
+  BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00005 " from 
+  PciRoot(0x0)/Pci(0x4,0x0)/Sata(0x0,0xFFFF,0x0)
+  error: no such device: ubuntu-boot.
+... and then it crashes.
+
+I was probing the major conditions to trigger - it seems to be only happening with the efi / ovmf boot.
+
+Changing the machine= or cpu model= had no impact, neither had a i440fx/q35 change.
+But dropping from Efi to the default loader avoided the crash. There it also only worked to some extend - I mean it starts and does not crash. But the guest seems to insist/require UEFI as it doesn't go much further. I first thought the ovmf build might have a similar problem to what we have had in seabios, but then I tested non UC20.
+
+I also wanted to know if there is anything special in the UC20 image that is needed to trigger this and therefore booted a cloud image with OVMF.
+
+So I took a usual cloud-image based focal guest and added:
+  <loader readonly='yes' type='pflash'>/usr/share/OVMF/OVMF_CODE.fd</loader>
+  <nvram template='/usr/share/OVMF/OVMF_VARS.fd'/>
+
+And that works like a charm. So the issues seems to be triggered by something set up int hat UC20 image that you linked. It must do/trigger something that a cloud-image would not do on the same setup.
+
+The early boot messages differ - but that might be a red herring.
+BdsDxe: loading Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x2,0x3)/Pci(0x0,0x0)
+BdsDxe: starting Boot0001 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x2,0x3)/Pci(0x0,0x0)
+error: can't find command `hwmatch'.
+
+I don't even see the UC20 kernel initializing.
+The next step is to know/learn what this image does differently.
+How is this UC20 image special, what does it do special on init that other images don't do?
+@Juergh do you now or do we need to reach out to mvo and others?
+
+Can someone help to dissect the UC20 image and what it does differently here?
+The cloud-image boots with the same OVMF/Uefi based config, but UC20 runs into a crash.
+
+Understanding what the UC20 boot does differently and any chance to build that piece by piece (e.g. be able to skip some steps until we find the trigger) would be awesome.
+
+I subscribed MVO to help, but feel free to pull in others as you see fit.
+
+Until we got any further on this side I'm unsure what to do about Ubuntu unless you already know much more to help getting this forward. For now this is a bit like "I throw in this blob and it crashes", so helping to un-blobify seems to be the next step to me. Marking qemu task incomplete until we got a hold on this.
+
+The first thing that grub does when booting is:
+loopback /snaps/pc-kernel_461.snap
+which kills QEMU.
+
+In core20 that snap is on an 'EFI System' partition (vfat) whereas in core18 it's on a regular Linux (ext4) partition.
+
+
+That should be:
+loopback loop /snaps/pc-kernel_461.snap
+in the previous commit #7.
+
+Ok it seems the kernel snap is causing this. Core20 grub can loopmount pc-kernel_455.snap (from a core18 image) just fine but kills QEMU when loopmounting pc-kernel_461.snap (the original core20 snap).
+
+Hrm. The core20 kernel snap is bigger than the core18 snap and increasing the VM memory to 2G seems to 'fix' this. I guess the question is is there a way to handle this more gracefully than killing QEMU?
+
+
+I can confirm that with 2G the guest seems to start up now.
+
+I agree that this should be more graceful, but it has to be triggered by the guest.
+So might the error path in the guest run into a dead-end if unable to load the kernel that then is like a illegal instruction to the host or something like that?
+
+Right now we don't know yet if it unpacks and then execute garbage OR fails even earlier.
+We discussed this on IRC if grub might be placing it at a wrong offset making it need more memory, or some padding, or at unsquashing already ...
+
+We ended for now with:
+[09:55] <juergh> cpaelzer, will dig into some more and let you know/update the ticket.
+[09:56] <juergh> cpaelzer, maybe it's the unsquashing that kills it already
+
+Thanks in advance @Juergh for that!
+
+Maybe adding a bug task for the kernel snap and/or grub would be right, but let us find out more first.
+
+I've setup a UEFI core18 VM and dialed the memory all the way down to 256M but the loop mounting and loading of the kernel still works fine.
+
+Then I've copied grubx64.efi from the core18 image to the core20 image and now QEMU no longer crashes. So it looks like a change in grub between 2.02 and 2.04 in combination with UEFI and 'low' memory is causing this issue.
+
+
+The Eoan Ermine has reached end of life, so this bug will not be fixed for that release
+
+The Eoan Ermine has reached end of life, so this bug will not be fixed for that release
+

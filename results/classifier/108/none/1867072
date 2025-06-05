@@ -1,0 +1,91 @@
+graphic: 0.395
+semantic: 0.304
+device: 0.297
+performance: 0.292
+other: 0.284
+network: 0.239
+socket: 0.185
+permissions: 0.180
+vnc: 0.175
+PID: 0.150
+debug: 0.141
+files: 0.131
+boot: 0.127
+KVM: 0.114
+
+ARM: tag bits cleared in FAR_EL1
+
+The ARM Architecture Reference Manual provides the following for FAR_EL1:
+
+"For a Data Abort or Watchpoint exception, if address tagging is enabled for the address accessed by the data access that caused the exception, then this field includes the tag."
+
+However, I have found that the tag bits in FAR_EL1 are always clear, even if the tag bits were set in the original access.
+
+I can reproduce the problem on both 4.1.1 and master (6e8a73e911f066527e775e04b98f31ebd19db600).
+
+As it happens, I posted some cleanups for this last week:
+https://<email address hidden>/
+
+Some of them have been queued to Peter's target-arm.next branch,
+but that hasn't made it to master yet.
+
+Actually, I take that back: Peter has merged my TBI patch set,
+and is included in 6e8a73e911f066.
+
+Do you have a test case?
+
+Ho hum, I must have been asleep last night.
+Peter only merged 7 of 9 patches.  The final 2 were re-posted:
+https://<email address hidden>/
+
+which includes the critical change that affects FAR_ELx.
+
+With those two patches applied I can no longer reproduce the problem, thanks!
+
+For posterity, this is how I've been reproducing the problem:
+
+1. Build a Linux kernel with this patch applied: https://patchwork.kernel.org/patch/11435077/
+2. Run this program under the kernel:
+
+#include <stdint.h>
+#include <stdio.h>
+#include <signal.h>
+
+void handler(int signo, siginfo_t *siginfo, void *context) {
+  uint32_t *begin = (uint32_t *)context;
+  uint32_t *end = ((uint32_t *)context) + (sizeof(ucontext_t)/4);
+  for (uint32_t *i = begin; i != end; ++i) {
+    printf("%08p %08x\n", i, *i);
+  }
+  _exit(0);
+}
+
+int main() {
+  struct sigaction sa;
+  sa.sa_sigaction = handler;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, 0);
+
+  return *(int *)((1ULL << 56) + 0x123456);
+}
+
+I would expect this program's output to include something like the following:
+
+0xffffd5869bd0 46415201
+0xffffd5869bd4 00000010
+0xffffd5869bd8 00123456
+0xffffd5869bdc 01000000
+
+But the output that I was seeing with the bad qemu looked like this:
+
+0xffffd5869bd0 46415201
+0xffffd5869bd4 00000010
+0xffffd5869bd8 00123456
+0xffffd5869bdc 00000000
+
+Fix now in master.
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=38d931687fa1
+
+

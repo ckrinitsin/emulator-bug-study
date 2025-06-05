@@ -1,0 +1,64 @@
+other: 0.650
+boot: 0.595
+graphic: 0.556
+permissions: 0.539
+KVM: 0.536
+performance: 0.518
+device: 0.501
+vnc: 0.499
+debug: 0.492
+files: 0.434
+PID: 0.430
+semantic: 0.428
+network: 0.368
+socket: 0.341
+
+SIGILL (ILL_OPC) on RISC-V Vector Operations, Bad MSTATUS_VS register
+Description of problem:
+When building AOSP Android and launching the public Cuttlefish RISC-V image, various binaries on the system will crash on boot with SIGILL, ILL_OPC. The crashes are random - binaries will crash largely at boot and then only crash infrequently after that. It is not always the case that the same binary will crash first, but if a binary crashes, it will always crash at the same location, usually the first vector instruction. At the time of writing, this is often the 'vsetvli' or 'vfirst.m' instruction.
+
+After building QEMU at head and intentionally triggering a SIGABRT prior to the ILL_OPC exception, I caught the following backtrace in gdb:
+
+```
+(gdb) bt
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0) at ./nptl/pthread_kill.c:44
+#1  0x00007f8e570bb15f in __pthread_kill_internal (signo=6, threadid=<optimized out>) at ./nptl/pthread_kill.c:78
+#2  0x00007f8e5706d472 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#3  0x00007f8e570574b2 in __GI_abort () at ./stdlib/abort.c:79
+#4  0x0000565536e817d7 in vs (env=<optimized out>, csrno=<optimized out>) at ../target/riscv/csr.c:101
+#5  vs (env=<optimized out>, csrno=<optimized out>) at ../target/riscv/csr.c:95
+#6  0x0000565536e83d5b in riscv_csrrw_check (write_mask=false, csrno=3106, env=0x7f8e4e2b0ed0) at ../target/riscv/csr.c:4286
+#7  riscv_csrrw (env=env@entry=0x7f8e4e2b0ed0, csrno=3106, ret_value=ret_value@entry=0x7f8bdedfbee0, new_value=new_value@entry=0, write_mask=write_mask@entry=0)
+    at ../target/riscv/csr.c:4366
+#8  0x0000565536e86b52 in helper_csrr (env=0x7f8e4e2b0ed0, csr=<optimized out>) at ../target/riscv/op_helper.c:54
+#9  0x00007f8de9f1af73 in code_gen_buffer ()
+#10 0x0000565536fa39cb in cpu_tb_exec (cpu=cpu@entry=0x7f8e4e2ae710, itb=itb@entry=0x7f8de9f1ab40 <code_gen_buffer+99724051>, tb_exit=tb_exit@entry=0x7f8bdedfc444)
+    at ../accel/tcg/cpu-exec.c:458
+#11 0x0000565536fa3ea1 in cpu_loop_exec_tb
+    (tb_exit=0x7f8bdedfc444, last_tb=<synthetic pointer>, pc=<optimized out>, tb=0x7f8de9f1ab40 <code_gen_buffer+99724051>, cpu=<optimized out>)
+    at ../accel/tcg/cpu-exec.c:920
+#12 cpu_exec_loop (cpu=cpu@entry=0x7f8e4e2ae710, sc=sc@entry=0x7f8bdedfc4f0) at ../accel/tcg/cpu-exec.c:1041
+#13 0x0000565536fa469d in cpu_exec_setjmp (cpu=cpu@entry=0x7f8e4e2ae710, sc=sc@entry=0x7f8bdedfc4f0) at ../accel/tcg/cpu-exec.c:1058
+#14 0x0000565536fa4c6b in cpu_exec (cpu=cpu@entry=0x7f8e4e2ae710) at ../accel/tcg/cpu-exec.c:1084
+#15 0x0000565536fbfedf in tcg_cpus_exec (cpu=cpu@entry=0x7f8e4e2ae710) at ../accel/tcg/tcg-accel-ops.c:76
+#16 0x0000565536fc0023 in mttcg_cpu_thread_fn (arg=arg@entry=0x7f8e4e2ae710) at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#17 0x0000565537144288 in qemu_thread_start (args=0x565538c01840) at ../util/qemu-thread-posix.c:541
+#18 0x00007f8e570b93ec in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:444
+#19 0x00007f8e57139a4c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+```
+
+Debugging in this path, it appears that the reason we're experiencing a SIGILL here is that when building a qemu-system-riscv64 binary (and thus !CONFIG_USER_ONLY), we check to see if 'riscv_cpu_vector_enabled(env)', which checks if `env->mstatus & MSTATUS_VS`.
+
+Interestingly, logging in this path confirms that the CPU environment of this thread does think the RVV extension is enabled (verified with `riscv_has_ext(env, RVV)`. My rough guess as to what's happening:
+
+1. We're not setting the MSTATUS_VS flag on initialization of the CPU, nor are we setting the mstatus_vs state to INITIALIZED. Without this, when a new thread is spawned for a vCPU, it's incorrectly determining that it can't handle vector instructions.
+2. It's working sometimes because in some of the 'write_*' calls in `riscv/csr.c`, we flip the MSTATUS_VS flag on, so if one of those calls occurs first, all subsequent vector operations work too. (To be honest, I'm not quite following why we make the decision to set MSTATUS in these calls, shouldn't this be configured at CPU initialization?)
+Steps to reproduce:
+Please forgive the poor reproduction case, I'm still trying to wrap my head around what's going on, so haven't been able to harden a smaller example yet that would reproduce. In theory, tip-of-tree QEMU + a stock Linux system with a program that triggers a call to QEMU's vlenb instruction ahead of all other vector instructions would be the ideal case, but I'm still figuring out how to go about doing that.
+
+My current reproduction case is as follows:
+
+1. Introduce a small hack in `target/riscv/csr.c`'s `vs` function - add an `abort` call here: https://github.com/qemu/qemu/blob/master/target/riscv/csr.c#L99
+2. Build tip-of-tree QEMU for qemu-system-riscv64.
+3. Use https://github.com/google/android-riscv64#can-i-try-it to build the Android RISC-V emulator. When launching the emulator, use the '-qemu_binary_dir' option to point to the directory containing the QEMU built in the previous step.
+4. In a few moments, the emulator will attempt to start but abort fairly quickly (I've got a 128-core machine, and it fails consistently in about 5 seconds).

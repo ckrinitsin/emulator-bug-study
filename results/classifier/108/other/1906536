@@ -1,0 +1,145 @@
+graphic: 0.647
+PID: 0.487
+other: 0.457
+permissions: 0.455
+debug: 0.408
+KVM: 0.407
+device: 0.401
+semantic: 0.385
+vnc: 0.371
+files: 0.342
+performance: 0.335
+socket: 0.330
+network: 0.297
+boot: 0.272
+
+Unable to set SVE VL to 1024 bits or above since 7b6a2198
+
+Prior to 7b6a2198e71794c851f39ac7a92d39692c786820, the QEMU option sve-max-vq could be used to set the vector length of the implementation. This is useful (among other reasons) for testing software compiled with a fixed SVE vector length. Since this commit, the vector length is capped at 512 bits.
+
+To reproduce the issue:
+
+$ cat rdvl.s
+.global _start
+_start:
+  rdvl x0, #1
+  asr x0, x0, #4
+  mov x8, #93 // exit
+  svc #0
+$ aarch64-linux-gnu-as -march=armv8.2-a+sve rdvl.s -o rdvl.o
+$ aarch64-linux-gnu-ld rdvl.o
+$ for vl in 1 2 4 8 16; do ../build-qemu/aarch64-linux-user/qemu-aarch64 -cpu max,sve-max-vq=$vl a.out; echo $?; done
+1
+2
+4
+4
+4
+
+For a QEMU built prior to the above revision, we get the output:
+1
+2
+4
+8
+16
+
+as expected. It seems that either the old behavior should be restored, or there should be an option to force a higher vector length?
+
+Hi Alex,
+
+This commit mentions:
+
+    The Linux kernel chooses the default of 64 bytes for SVE registers on
+    the basis that it is the largest size on known hardware that won't
+    grow the signal frame. We still honour the sve-max-vq property and
+    userspace can expand the number of lanes by calling PR_SVE_SET_VL.
+
+Expand the number of lanes by calling PR_SVE_SET_VL works for me:
+
+ .global _start
+_start:
+  mov x0, 50 // PR_SVE_SET_VL
+  mov x1, 256 // 16 lanes
+  mov x8, #167 // prctl
+  svc #0
+
+  rdvl x0, #1
+  asr x0, x0, #4
+  mov x8, #93 // exit
+  svc #0
+
+$ for vl in 1 2 4 8 16; do qemu-aarch64 -strace -cpu max,sve-max-vq=$vl a.out; echo $?; done
+1383321 prctl(50,256,0,0,0,0) = 16
+1383321 exit(1)
+1
+1383323 prctl(50,256,0,0,0,0) = 32
+1383323 exit(2)
+2
+1383325 prctl(50,256,0,0,0,0) = 64
+1383325 exit(4)
+4
+1383327 prctl(50,256,0,0,0,0) = 128
+1383327 exit(8)
+8
+1383329 prctl(50,256,0,0,0,0) = 256
+1383329 exit(16)
+16
+
+Hi Philippe,
+
+I'm aware of the prctl workaround.
+
+It seems to me that this is clearly a regression in functionality. Prior to the change, I could test any executable with any vector length without having to modify the executable. Now I have to insert a prctl to test with 1024 or 2048-bit SVE vectors?
+
+Moreover, with this change, it's no longer possible to have the wider VL inherited across exec() to another QEMU instance.
+
+Yes, we should by default do what the Linux kernel does, but we should also provide a mechanism for allowing guest software to use a higher vector length than that kernel default. On a real kernel you can do that by either setting the /proc/sys/abi/sve_default_vector_length, or by having process A make the prctl() to change vector length and then exec process B that inherits that increased vector length. Neither of those mechanisms work for QEMU linux-user, so we should provide some other mechanism instead.
+
+
+Are there any other examples of where linux-user tries to preserve execution environment details over an execve? 
+
+I don't think we currently do have anything else we try to preserve over execve-to-maybe-another-QEMU-emulated-process, no. The other approach of "provide a config knob equivalent to /proc/sys/abi/sve_default_vector_length" is probably simpler.
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Whoops, this shouldn't have got expired.
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/482
+
+

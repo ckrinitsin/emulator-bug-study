@@ -1,0 +1,132 @@
+permissions: 0.969
+debug: 0.954
+semantic: 0.937
+device: 0.936
+performance: 0.934
+graphic: 0.931
+other: 0.929
+boot: 0.920
+PID: 0.918
+files: 0.893
+KVM: 0.885
+vnc: 0.879
+socket: 0.829
+network: 0.778
+
+High CPU usage in Host (revisited)
+
+Hi,
+
+last time QEMU(KVM) was working for us flawlessly was 2.6.35 kernel.
+
+Actually it still works flawlessly on that one single machine, that still has this kernel. Qemu version is meanwhile 1.0-r3, so the problem seems to be dependent on kernel version and not qemu version.
+
+We have several other machines, where the "high CPU usage in host" problem is present in various degrees of annoyingness.
+
+Both host and guest are Gentoo linux, at least that's what we test with. Several tested systems with other linux distributions and FreeBSD show similar - if not worse - behaviour. I will talk about 3 hosts, machine A, machine B and machine C
+
+A:
+
+2.6.35-gentoo-r9 #2 SMP Sat Nov 6 22:32:28 CET 2010 x86_64 Intel(R) Xeon(R) CPU L5410 @ 2.33GHz
+32GB, runs about 15 KVM guests (all Gentoo, some 32bit, some 64bit, all SMP)
+no problems whatsoever, host CPU usage corresponds to Guest CPU usage + 1-2%, that's how we like it
+qemu 1.0-r3
+
+B:
+
+3.0.6-gentoo #1 SMP Sun Oct 16 18:57:31 CEST 2011 x86_64 Intel(R) Xeon(R) CPU L5630 @ 2.13GHz
+144GB, runs 1(!) KVM guest (Debian 6.x)
+/usr/bin/qemu-system-x86_64 --enable-kvm -daemonize -cpu host -k de -net tap -tdf -hda /data/vm/disk.raw -m 768 -smp 1 -vnc :5 -net nic,model=e1000,macaddr=...
+100% host CPU load always, therefore it got only "smp 1", if we gave it smp 2, it would have 200%, smp 4 400% and so on.
+qemu 1.0-r3
+
+C:
+
+3.1.6-gentoo #5 SMP Tue Mar 6 20:34:44 CET 2012 x86_64 Intel(R) Xeon(R) CPU 5148 @ 2.33GHz
+16GB, runs 1-4 KVM guests (mostly Gentoo machines from A, plus some SuSE, RedHat etc.)
+X00% CPU usage, where x corresponds to the smp X parameter, at startup as well as if someone "touches" the VM, like logging in, doing a "ls". If the machine is ABSOLUTELY IDLE, the process also exhibits 1-2% CPU load in host, but as soon as you do a simple ls, usage goes to - say - 400%, where it remains for some seconds, then slowly falls 280%, 120%, 60%, ... back to 1-2%
+qemu 1.0-r3
+
+
+B is no go, C tries to well-behave but ultimatively fails, A is golden.
+
+There seems to be REAL high CPU usage and not only an error in displaying it. Other processes get less CPU power and exhibit definitely a slower runtime. On B, definitely one CPU core is hogged all the time
+
+
+Some years ago we experienced something similar with ~2.6.26 and after a long and woeful period, we found out that compiling the host kernel as a tickless system caused the problem. Enabling high resolution timers made the problem go away and that is the situation on machine A until today. Since then no one dared to touch this production server. Unfortunately, this recipe didn't help with the other machines.
+
+I have scanned the net for similar problems and there are people complaining about high CPU usage. Unfortunately very often the devs or maintainers cannot reproduce it and the issue is dropped. Well - we cannot reproduce a "good behaviour"(tm) on any but one machine with any recent (read: post-2.6.35) linux kernel.
+
+Summary what we tried so far:
+
+* different linux kernels @ host, and @ guest
+
+-> no difference, especially there are guests @ A, that run newer kernels and there are Guests at B and C that run older kernels than is the host kernel
+
+* smp and non-smp, 32bit and 64bit guests
+
+-> 32/64bit in the guest makes no difference whatsoever. The smp just limits how much of the host CPU the guest hogs on non-well behaving systems (smp X -> X * 100%)
+
+* various linux guest OS, as well as FreeBSD
+
+-> no difference whatsoever
+
+* various options parameters in the host kernel (other schedulers, HRT, tickless,...)
+
+-> no difference whatsoever
+
+* various versions of qemu/kvm since 0.13
+
+-> no difference whatsoever
+
+* various qemu/kvm options, virtio and non-virtio configurations (most of the VMs @ A run blk-virtio but emulate an e1000)
+
+-> no difference whatsoever
+
+
+You could say, we've reached wits' end. We could try 2.6.35 @ machine C with the same configuration from A (they are identical except CPU and RAM size, but same RAID, mainboard, etc. plus A once had also the 5148 Xeons and an upgrade luckily made no difference in good behaviour, so I would exclude the CPU factor) but honestly that is not the way I'd like to go. The goal is to update A to something recent and not to loose it's VM-hosting well behaviour. Ideally to propagate this well beaviour to the other machines.
+
+
+Arjan Minski
+  PetaMem IT
+
+*Newsflash*
+
+We do have a "well-behaving" KVM Host with 3.2.9 kernel on machine C
+
+After again numerous attempts to find the culprit, I decided to copy the kernel 2.6.35 and modules from machine A to machine C, where it exhibited also the desired "well-behaving".
+
+I then simply copied its config to a 3.2.9 kernel and did "make oldconfig", kept all defaults offered and restarted the machine with that newly created 3.2.9 and it seems it got soem right genes from 2.6.35 config.
+
+I will now poke the config and see if something breaks. Currently the only significant difference to our unsuccessfull 3.2.9 kernel is the fact, that the bad kernel was configured with kvm and kvm_intel not as module but compiled in. Should that be the culprit... oh man...
+
+I will test that and report.
+
+
+I see similar problem when few I/Os are pumped and the VM goes non-responsive.
+The host sees nearly 100% CPU utilization.
+
+top - 08:58:57 up 18:42,  2 users,  load average: 0.99, 0.98, 0.95
+Tasks: 355 total,   1 running, 354 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  1.5 us,  2.7 sy,  0.0 ni, 95.8 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+KiB Mem:  65937388 total, 11895920 used, 54041468 free,  8163244 buffers
+KiB Swap: 67073532 total,        0 used, 67073532 free.   545132 cached Mem
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+2317 libvirt+  20   0 18.612g 2.556g   8972 S  98.8  4.1   1120:00 qemu-system-x86
+  276 root      25   5       0      0      0 S   0.7  0.0   8:21.94 ksmd
+  312 root      20   0       0      0      0 S   0.3  0.0   0:02.63 kworker/5:1
+  315 root      20   0       0      0      0 S   0.3  0.0   0:00.21 kworker/20:1
+
+Please let me know if this is fixed. I am currently using QEMU 2.0
+
+
+
+Triaging old bug tickets ... can you somehow still reproduce this problem with the latest version of QEMU (currently v2.9), or could we close this ticket nowadays?
+
+From our point of view, this ticket can be closed. KVM is running without issues on all our servers for more than 5 years now.
+
+The problem described above, was due to a weird combination of "timer" kernel parameters in the early 3.x kernels. IIRC, enabling a high-frequency timer and/or "tickless system" solved the issues we had.
+
+Ok, thanks for your confirmation!
+

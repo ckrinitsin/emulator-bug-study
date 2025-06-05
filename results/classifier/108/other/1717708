@@ -1,0 +1,183 @@
+other: 0.647
+graphic: 0.607
+semantic: 0.569
+vnc: 0.544
+performance: 0.527
+debug: 0.518
+PID: 0.517
+KVM: 0.511
+permissions: 0.507
+network: 0.503
+boot: 0.500
+files: 0.480
+device: 0.478
+socket: 0.458
+
+QEMU aarch64 can't run Windows ARM64 iso's
+
+Hi,
+recently Windows ARM64 ISOs have been posted on the internet..
+just checked with latest QEMU 2.10 release from 
+https://qemu.weilnetz.de/w64/qemu-w64-setup-20170830.exe 
+"h:\qemu\qemu-system-aarch64.exe" -boot d -cdrom h:\iso\16353.1000.170825-1423.RS_PRERELEASE_CLIENTPRO_OEMRET_ARM64FRE_ES-ES.ISO -m 2048 -cpu cortex-a57 -smp 1 -machine virt
+seems no video output..
+checked various machine options for example versatilepb (says guest has not initialized the guest)..
+
+so don't know if it's a QEMU bug or lacking feature but can support running Windows ARM64 builds (would be nice if you can add a Snapdragon835 machine type which is which first machines will be running..)
+
+
+note running a Windows x64 ISO with similar parameters works (removing -cpu and -machine as not needed)
+
+thanks..
+
+I meant: "says guest has not initialized the display"..
+
+It's expected behaviour that you don't have any video output, because by default the "virt" board has no graphics device. Most people use a serial console here. It should also be possible to set it up with a virtio gpu graphics device, but I don't know whether Windows supports that.
+
+
+"D:\Program Files\qemu\qemu-system-aarch64.exe" -device virtio-scsi-pci,id=scsi -drive if=none,id=cd,file=\path\to\iso -device scsi-cd,drive=cd,bootindex=0 -m 2048 -cpu cortex-a57 -smp 4 -machine virt -device virtio-gpu-pci -bios "QEMU_EFI .fd" -device usb-ehci -device usb-kbd -device usb-mouse -usb
+
+The QEMU_EFI .fd is downloaded from https://releases.linaro.org/reference-platform/enterprise/17.08/uefi/release/qemu64/QEMU_EFI.fd
+
+While I've tried the 16353.1000.170825-1423.RS_PRERELEASE_CLIENTENTERPRISE_VOL_ARM64FRE_ES-ES.ISO, bios could find the EFI/BOOT/BOOTAA64.EFI file, but the installer doesn't boot up.
+
+thanks Peter..
+Shannon,
+using your launch arguments seems to go as you write..
+nice progress..
+
+any info on if running QEMU on Linux will be better right now than Windows?
+
+as I thought virtio-gpu was for Linux but I'm very new to QEMU so probably bad knowledge..
+
+also don't know how mature ARM64 platform emulation is right now and how fast is progressing.. could be, that say next QEMU 2.11 could handle Windows ARM64 installation and booting correctly via some patches?
+
+thanks..
+
+
+
+
+
+The virtio-gpu is not Linux specific. If windows could include the device driver, it can be used on windows as well like other virtio devices on windows x86.
+
+I'm not sure what's the requirements for booting Windows on ARM64 virt machine since the OS is not open source. So it would be better someone from MS solves this problem or points what we missed for support Windows.
+
+virtio-gpu-pci will not work for booting Windows. 
+
+Per https://docs.microsoft.com/en-us/windows-hardware/drivers/bringup/uefi-requirements-that-apply-to-all-windows-platforms, Windows currently requires a linear framebuffer to be exposed through the UEFI Graphics Output Protocol:
+
+"Windows requires the Graphics Output Protocol (GOP). Specific frame buffer requirements are:
+
+    For integrated displays, HorizontalResolution and VerticalResoluton must be the native resolution of the panel.
+
+    For External displays, HorizontalResolution and VerticalResoluton must be the native resolution of the display, or, if this is not supported, then the highest values supported by both the video adapter and the connected display.
+
+    PixelsPerScanLine must be equal to HorizontalResolution.
+
+    PixelFormat must be PixelBlueGreenRedReserved8BitPerColor. Note that a physical frame buffer is required; PixelBltOnly is not supported.
+
+When execution is handed off to a UEFI boot application, the firmware boot manager and firmware must not use the frame buffer for any purpose. The frame buffer must continue to be scanned out after boot services have exited."
+
+The virtio-gpu driver uses PixelBltOnly, which Windows explicitly doesn't support. Also, IIRC the Gop->Blt() handler of virtio-gpu is only available while UEFI Boot Services are active (before ExitBootServices() is called, which is something the Windows boot manager does very early), so even if Microsoft tried to implement Gop->Blt() support in the MSBDA driver, it couldn't be used with virtio-gpu, as its Gop->Blt() is not available at run time.
+
+Instead, "-device VGA" is required.
+
+Mainline edk2 is currently unable to boot any Windows images due to some required features being removed as they aren't compatible with KVM (I don't quite get it - UEFI for aarch64 virt is supposed to be for qemu in general, not exclusive to KVM...), however I actually have a fork with these features restored, available at https://github.com/Googulator/edk2/releases. This is able to boot the leaked Windows Server 2016 beta builds 14282, 14324 and 14877, but not 14901 or any of the Windows 10 Insider builds, due to an exception loop very similar to that seen when trying to run SBSA-ACS.
+
+Also, the only storage option Windows can actually read and boot from is USB mass storage over EHCI - anything else is either lacking drivers (virtio-scsi and the various emulated LSI Logic adapters) or fails to start due to a resource conflict (AHCI, UAS, USB mass storage over XHCI). Detailed instructions for booting the leaked builds are available here: https://www.betaarchive.com/forum/viewtopic.php?p=426768#p426768 The same instructions cause the previously mentioned exception loop when tried with the Insider builds.
+
+Plain linear framebuffer won't work with KVM, unfortunately. The best fix is for Windows to support virtio-gpu, then it will work in KVM as well as pure emulation.
+
+
+I know it won't work in KVM. I'm arguing that something not working in KVM is not grounds for removal from the UEFI image, since qemu != KVM.
+
+If you want to argue for things being in UEFI images, you're in the wrong place, because this is the QEMU bug tracker, not a UEFI one...
+
+
+(1) See also <https://bugs.launchpad.net/qemu/+bug/1717708>.
+
+(2) One idea is (a) letting Windows use VirtioGpuDxe's GOP (blt only) until it calls ExitBootServices() -- which I have already confirmed to work with an ARM64 Windows Server variant that I was legally given access to --, and (b) once available, injecting a native ARM64 virtio-gpu-pci driver into the installer image, which Windows could start using right after ExitBootServices().
+
+(3) BTW, Gerd recently posted
+
+[Qemu-devel] [PATCH 0/4] ramfb: simple boot framebuffer, no legacy vga
+http://lists.nongnu.org/archive/html/qemu-devel/2017-11/msg03299.html
+
+which could be an alternative. (Albeit -- in my opinion! -- inferior to (2).)
+
+(4) In the above-referenced article at <https://docs.microsoft.com/en-us/windows-hardware/drivers/bringup/uefi-requirements-that-apply-to-all-windows-platforms>, Microsoft write, "Microsoft welcomes feedback and comments from implementers on this set of requirements". That sounds awesome: for a change, how about we stop reverse engineering Windows boot (off of lawfully obtained media of course) and engage in a conversation. Writing VirtioGpuDxe wasn't trivial, and I'm not amused at the thought of (a) it being a waste, (b) struggling with more and more hacks / custom devices & drivers until one set happens to work. We should stop fabricating one-sided hacks for placating Windows.
+
+(5) Can we please stop making references to leaked or otherwise unlawfully obtained Windows media, and warez sites. In the upstream QEMU bug tracker no less. Thanks.
+
+Sigh, in bullet (1) of comment #10, I obviously didn't mean to link this same LP entry. Instead I meant <https://bugzilla.tianocore.org/show_bug.cgi?id=785>. Sorry.
+
+I just noticed this bug via qemu-devel. For the record, recent QEMU (2.11-rc1 and later) can run recent arm64 Windows images using -M virt and the virtio storage/input/networking drivers in the guest. I was using older UEFI build that still includes the VGA framebuffer support. (I only just learned via this bug that it had been removed, but as PeterM pointed out this isn't the right place to discuss it.)
+
+Here's a sample invocation:
+qemu-system-aarch64 -M virt -cpu cortex-a57 -m 4G -smp 4 -bios QEMU_EFI-arm64.fd \
+  -serial stdio -device VGA -device virtio-keyboard-pci -device virtio-mouse-pci \
+  -netdev user,id=net0 -device virtio-net-pci,disable-legacy=on,netdev=net0,mac=00:11:22:33:44:55,addr=08 \
+  -drive if=none,file=myimage.vhdx,id=hd0 -device virtio-blk-pci,drive=hd0
+
+@Andrew: are you implying that you successfully rebuilt the virtio guest drivers for ARM64 Windows? If that's the case, could you please share specifics about the build setup? I'm not the one working on the virtio GPU driver for Windows, but I assume your aarch64 build steps would apply to that driver similarly. Thank you.
+
+@Laszlo, I got the binaries from someone else, but they from a parallel build system... nothing particularly special: some preprocessor rules to build against the newer WDK, and also it was just those three drivers (netkvm, vioinput, viostor). I imagine you can get the same result by tweaking the VS-based build (sln/vcxproj files), but haven't tried. Sorry that's not terribly helpful.
+
+@Andrew can you upload these three drivers somewhere for the lazy people?
+thanks..
+
+2017-11-21 0:11 GMT+01:00 Andrew Baumann <email address hidden>:
+
+> @Laszlo, I got the binaries from someone else, but they from a parallel
+> build system... nothing particularly special: some preprocessor rules to
+> build against the newer WDK, and also it was just those three drivers
+> (netkvm, vioinput, viostor). I imagine you can get the same result by
+> tweaking the VS-based build (sln/vcxproj files), but haven't tried.
+> Sorry that's not terribly helpful.
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1717708
+>
+> Title:
+>   QEMU aarch64 can't run Windows ARM64 iso's
+>
+> Status in QEMU:
+>   New
+>
+> Bug description:
+>   Hi,
+>   recently Windows ARM64 ISOs have been posted on the internet..
+>   just checked with latest QEMU 2.10 release from
+>   https://qemu.weilnetz.de/w64/qemu-w64-setup-20170830.exe
+>   "h:\qemu\qemu-system-aarch64.exe" -boot d -cdrom
+> h:\iso\16353.1000.170825-1423.RS_PRERELEASE_CLIENTPRO_OEMRET_ARM64FRE_ES-ES.ISO
+> -m 2048 -cpu cortex-a57 -smp 1 -machine virt
+>   seems no video output..
+>   checked various machine options for example versatilepb (says guest has
+> not initialized the guest)..
+>
+>   so don't know if it's a QEMU bug or lacking feature but can support
+>   running Windows ARM64 builds (would be nice if you can add a
+>   Snapdragon835 machine type which is which first machines will be
+>   running..)
+>
+>
+>   note running a Windows x64 ISO with similar parameters works (removing
+> -cpu and -machine as not needed)
+>
+>   thanks..
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1717708/+subscriptions
+>
+
+
+Has anyone been able to find a workaround to run this with KVM from an ARM64 host? What exactly is the problem with Qemu/KVM/Aarch64 that stops KVM from working - and are any efforts being made to get around it?
+
+I encountered same problem. No video output when I start win10 with kvm enabled on arm64 host.
+Is there any update?
+
+No need to keep this open any longer (no activity for 19 months). Please follow the links captured above to the past discussions. There's nothing new to add wrt. the situation.
+

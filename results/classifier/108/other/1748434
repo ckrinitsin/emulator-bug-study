@@ -1,0 +1,87 @@
+other: 0.949
+graphic: 0.933
+performance: 0.917
+semantic: 0.914
+debug: 0.906
+KVM: 0.885
+permissions: 0.884
+vnc: 0.855
+device: 0.850
+PID: 0.831
+boot: 0.807
+files: 0.784
+network: 0.770
+socket: 0.766
+
+Possibly wrong GICv3 behavior when secure enabled
+
+I an tried arm-aarch64 interrupt routing to EL3, by SCR_EL3.FIQ=1. First I am started QEMU with secure=on and GICv3 support.
+I programmed secure and non-secure timers and set-up appropriate interrupts.Secure timer to be GRP1_Secure and non-secure timer to be GRP1_NonSecure. ICC_PMR = 0xff. Then I switched CPU to EL1. 
+With that setup no interrupt was delivered to PE. GIC interface showed that non secure IRQ is pending. ICC_PMR read at EL1 returns 0 (shall return value ((PMR_(el3) << 1) & 0xff) according to GIC specification.
+Than I tried to increase interrupt priority mask  - so I set ICC_PMR = 0x7f (at EL3). Then I read at EL1 ICC_PMR=0xfe - (is shall be 0). With this setup IRQ of secure timer was taken at EL3, non secure timer didn't rise IRQ (as it is masked by PMR). 
+I dig to qemu code and see wrong condition in file arm_gicv3_cpuif.c in function  icc_pmr_read(). This behavior is opposite of ARM specification.
+
+see possible solution, in #if 0 is original code in #else see possible fix
+
+static uint64_t icc_pmr_read(CPUARMState *env, const ARMCPRegInfo *ri)
+....
+#if 0 // KIURCHER: bug - shall be opposite; see ARM specification
+        if (value & 0x80) {
+            /* Secure priorities not visible to NS */
+            value = 0;
+        } else if (value != 0xff) {
+            value = (value << 1) & 0xff;
+        }
+#else
+
+        if (value & 0x80) {
+            value = (value << 1) & 0xff;
+        } else {
+            value = 0;
+        }
+#endif
+....
+
+
+static void icc_pmr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+                          uint64_t value)
+....
+#if 0 //KIURCHER: bug
+    if (arm_feature(env, ARM_FEATURE_EL3) && !arm_is_secure(env) &&
+        (env->cp15.scr_el3 & SCR_FIQ)) {
+        /* NS access and Group 0 is inaccessible to NS: return the
+         * NS view of the current priority
+         */
+        if (!(cs->icc_pmr_el1 & 0x80)) {
+            /* Current PMR in the secure range, don't allow NS to change it */
+            return;
+        }
+        value = (value >> 1) & 0x80;
+    }
+#else
+    if (arm_feature(env, ARM_FEATURE_EL3) && !arm_is_secure(env) &&
+        (env->cp15.scr_el3 & SCR_FIQ)) {
+        /* NS access and Group 0 is inaccessible to NS: return the
+         * NS view of the current priority
+         */
+        if (!(cs->icc_pmr_el1 & 0x80)) {
+            /* Current PMR in the secure range, don't allow NS to change it */
+            return;
+        }
+        value = (value >> 1) | 0x80;
+    }
+#endif
+
+
+
+
+Whoops, yes, we have the wrong condition for ICC_PMR non-secure reads and writes. We also have the same bug in ICC_RPR reads. I'll put together a patch and send it to the mailing list.
+
+
+Patch which should fix this:
+https://lists.gnu.org/archive/html/qemu-devel/2018-03/msg04537.html
+
+
+Now fixed in master in commit a2e2d7fc46fd8be, so will be in 2.12.0.
+
+

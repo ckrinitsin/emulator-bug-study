@@ -1,0 +1,74 @@
+performance: 0.981
+graphic: 0.976
+other: 0.944
+PID: 0.935
+device: 0.921
+semantic: 0.911
+socket: 0.908
+files: 0.880
+network: 0.871
+debug: 0.860
+KVM: 0.855
+permissions: 0.843
+vnc: 0.833
+boot: 0.793
+
+Empty /proc/self/auxv (linux-user)
+
+The userspace Linux API virtualization used to fake access to /proc/self/auxv, to provide meaningful data for the guest process.
+
+For newer qemu versions, this fails: The openat() is intercepted, but there's no content: /proc/self/auxv has length zero (i.e. reading from it returns 0 bytes).
+
+Good:
+
+$ x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+256 /proc/self/auxv
+
+Bad:
+
+$ x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+0 /proc/self/auxv
+
+This worked in 2.7.1, and fails in 2.10.1.
+
+This causes e.g. any procps-ng-based tool to segfault while reading from /proc/self/auxv in an endless loop (probably worth another bug report...)
+
+Doing a "git bisect" shows that this commit: https://github.com/qemu/qemu/commit/7c4ee5bcc introduced the problem.
+
+It might be a simple logic (subtraction in the wrong direction?) or sign-ness error: Adding some logging (to v2.10.1)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9b6364a..49285f9 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7469,6 +7469,9 @@ static int open_self_auxv(void *cpu_env, int fd)
+     abi_ulong len = ts->info->auxv_len;
+     char *ptr;
+ 
++    gemu_log(TARGET_ABI_FMT_lu"\n", len);
++    gemu_log(TARGET_ABI_FMT_ld"\n", len);
++
+     /*
+      * Auxiliary vector is stored in target process stack.
+      * read in whole auxv vector and copy it to file
+
+shows this output:
+
+$  x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+18446744073709551264
+-352
+0
+
+And 352 could be the expected length.
+
+Oops, yes, commit 7c4ee5bcc82e643 broke this -- it switched the order in which we fill in the AUXV info, but forgot to adjust the calculation of the length, which as you've guessed we now get backwards.
+
+
+I've just sent this patch which fixes this bug:
+https://lists.gnu.org/archive/html/qemu-devel/2017-11/msg01199.html
+(it turns out it wasn't quite as simple as getting the sign wrong, we were subtracting two things that were totally wrong).
+
+
+Fix has been released with QEMU 2.11:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=f516511ea84d8bb3395d6e
+

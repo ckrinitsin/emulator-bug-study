@@ -1,0 +1,726 @@
+other: 0.714
+graphic: 0.694
+permissions: 0.677
+PID: 0.677
+performance: 0.673
+semantic: 0.671
+debug: 0.663
+device: 0.647
+network: 0.614
+files: 0.608
+KVM: 0.598
+socket: 0.585
+boot: 0.569
+vnc: 0.525
+
+[Qemu-devel] [BUG] VM abort after migration
+
+Hi guys,
+
+We found a qemu core in our testing environment, the assertion
+'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+the bus->irq_count[i] is '-1'.
+
+Through analysis, it was happened after VM migration and we think
+it was caused by the following sequence:
+
+*Migration Source*
+1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+2. save E1000:
+   e1000_pre_save
+    e1000_mit_timer
+     set_interrupt_cause
+      pci_set_irq --> update pci_dev->irq_state to 1 and
+                  update bus->irq_count[x] to 1 ( new )
+    the irq_state sent to dest.
+
+*Migration Dest*
+1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+  the irq_state maybe change to 0 and bus->irq_count[x] will become
+  -1 in this situation.
+3. do VM reboot then the assertion will be triggered.
+
+We also found some guys faced the similar problem:
+[1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+[2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+Is there some patches to fix this problem ?
+Can we save pcibus state after all the pci devs are saved ?
+
+Thanks,
+Longpeng(Mike)
+
+* longpeng (address@hidden) wrote:
+>
+Hi guys,
+>
+>
+We found a qemu core in our testing environment, the assertion
+>
+'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+>
+the bus->irq_count[i] is '-1'.
+>
+>
+Through analysis, it was happened after VM migration and we think
+>
+it was caused by the following sequence:
+>
+>
+*Migration Source*
+>
+1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+>
+2. save E1000:
+>
+e1000_pre_save
+>
+e1000_mit_timer
+>
+set_interrupt_cause
+>
+pci_set_irq --> update pci_dev->irq_state to 1 and
+>
+update bus->irq_count[x] to 1 ( new )
+>
+the irq_state sent to dest.
+>
+>
+*Migration Dest*
+>
+1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+>
+2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+>
+the irq_state maybe change to 0 and bus->irq_count[x] will become
+>
+-1 in this situation.
+>
+3. do VM reboot then the assertion will be triggered.
+>
+>
+We also found some guys faced the similar problem:
+>
+[1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+>
+[2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+>
+>
+Is there some patches to fix this problem ?
+I don't remember any.
+
+>
+Can we save pcibus state after all the pci devs are saved ?
+Does this problem only happen with e1000? I think so.
+If it's only e1000 I think we should fix it - I think once the VM is
+stopped for doing the device migration it shouldn't be raising
+interrupts.
+
+Dave
+
+>
+Thanks,
+>
+Longpeng(Mike)
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+* longpeng (address@hidden) wrote:
+Hi guys,
+
+We found a qemu core in our testing environment, the assertion
+'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+the bus->irq_count[i] is '-1'.
+
+Through analysis, it was happened after VM migration and we think
+it was caused by the following sequence:
+
+*Migration Source*
+1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+2. save E1000:
+    e1000_pre_save
+     e1000_mit_timer
+      set_interrupt_cause
+       pci_set_irq --> update pci_dev->irq_state to 1 and
+                   update bus->irq_count[x] to 1 ( new )
+     the irq_state sent to dest.
+
+*Migration Dest*
+1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+   the irq_state maybe change to 0 and bus->irq_count[x] will become
+   -1 in this situation.
+3. do VM reboot then the assertion will be triggered.
+
+We also found some guys faced the similar problem:
+[1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+[2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+Is there some patches to fix this problem ?
+I don't remember any.
+Can we save pcibus state after all the pci devs are saved ?
+Does this problem only happen with e1000? I think so.
+If it's only e1000 I think we should fix it - I think once the VM is
+stopped for doing the device migration it shouldn't be raising
+interrupts.
+I wonder maybe we can simply fix this by no setting ICS on pre_save()
+but scheduling mit timer unconditionally in post_load().
+Thanks
+Dave
+Thanks,
+Longpeng(Mike)
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+
+å¨ 2019/7/10 11:25, Jason Wang åé:
+>
+>
+On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+>
+> * longpeng (address@hidden) wrote:
+>
+>> Hi guys,
+>
+>>
+>
+>> We found a qemu core in our testing environment, the assertion
+>
+>> 'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+>
+>> the bus->irq_count[i] is '-1'.
+>
+>>
+>
+>> Through analysis, it was happened after VM migration and we think
+>
+>> it was caused by the following sequence:
+>
+>>
+>
+>> *Migration Source*
+>
+>> 1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+>
+>> 2. save E1000:
+>
+>> Â Â Â  e1000_pre_save
+>
+>> Â Â Â Â  e1000_mit_timer
+>
+>> Â Â Â Â Â  set_interrupt_cause
+>
+>> Â Â Â Â Â Â  pci_set_irq --> update pci_dev->irq_state to 1 and
+>
+>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  update bus->irq_count[x] to 1 ( new )
+>
+>> Â Â Â Â  the irq_state sent to dest.
+>
+>>
+>
+>> *Migration Dest*
+>
+>> 1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+>
+>> 2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+>
+>> Â Â  the irq_state maybe change to 0 and bus->irq_count[x] will become
+>
+>> Â Â  -1 in this situation.
+>
+>> 3. do VM reboot then the assertion will be triggered.
+>
+>>
+>
+>> We also found some guys faced the similar problem:
+>
+>> [1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+>
+>> [2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+>
+>>
+>
+>> Is there some patches to fix this problem ?
+>
+> I don't remember any.
+>
+>
+>
+>> Can we save pcibus state after all the pci devs are saved ?
+>
+> Does this problem only happen with e1000? I think so.
+>
+> If it's only e1000 I think we should fix it - I think once the VM is
+>
+> stopped for doing the device migration it shouldn't be raising
+>
+> interrupts.
+>
+>
+>
+I wonder maybe we can simply fix this by no setting ICS on pre_save() but
+>
+scheduling mit timer unconditionally in post_load().
+>
+I also think this is a bug of e1000 because we find more cores with the same
+frame thease days.
+
+I'm not familiar with e1000 so hope someone could fix it, thanks. :)
+
+>
+Thanks
+>
+>
+>
+>
+>
+> Dave
+>
+>
+>
+>> Thanks,
+>
+>> Longpeng(Mike)
+>
+> --
+>
+> Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>
+.
+>
+-- 
+Regards,
+Longpeng(Mike)
+
+On 2019/7/10 ä¸å11:36, Longpeng (Mike) wrote:
+å¨ 2019/7/10 11:25, Jason Wang åé:
+On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+* longpeng (address@hidden) wrote:
+Hi guys,
+
+We found a qemu core in our testing environment, the assertion
+'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+the bus->irq_count[i] is '-1'.
+
+Through analysis, it was happened after VM migration and we think
+it was caused by the following sequence:
+
+*Migration Source*
+1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+2. save E1000:
+ Â Â Â  e1000_pre_save
+ Â Â Â Â  e1000_mit_timer
+ Â Â Â Â Â  set_interrupt_cause
+ Â Â Â Â Â Â  pci_set_irq --> update pci_dev->irq_state to 1 and
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  update bus->irq_count[x] to 1 ( new )
+ Â Â Â Â  the irq_state sent to dest.
+
+*Migration Dest*
+1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+ Â Â  the irq_state maybe change to 0 and bus->irq_count[x] will become
+ Â Â  -1 in this situation.
+3. do VM reboot then the assertion will be triggered.
+
+We also found some guys faced the similar problem:
+[1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+[2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+Is there some patches to fix this problem ?
+I don't remember any.
+Can we save pcibus state after all the pci devs are saved ?
+Does this problem only happen with e1000? I think so.
+If it's only e1000 I think we should fix it - I think once the VM is
+stopped for doing the device migration it shouldn't be raising
+interrupts.
+I wonder maybe we can simply fix this by no setting ICS on pre_save() but
+scheduling mit timer unconditionally in post_load().
+I also think this is a bug of e1000 because we find more cores with the same
+frame thease days.
+
+I'm not familiar with e1000 so hope someone could fix it, thanks. :)
+Draft a path in attachment, please test.
+
+Thanks
+Thanks
+Dave
+Thanks,
+Longpeng(Mike)
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+.
+0001-e1000-don-t-raise-interrupt-in-pre_save.patch
+Description:
+Text Data
+
+å¨ 2019/7/10 11:57, Jason Wang åé:
+>
+>
+On 2019/7/10 ä¸å11:36, Longpeng (Mike) wrote:
+>
+> å¨ 2019/7/10 11:25, Jason Wang åé:
+>
+>> On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+>
+>>> * longpeng (address@hidden) wrote:
+>
+>>>> Hi guys,
+>
+>>>>
+>
+>>>> We found a qemu core in our testing environment, the assertion
+>
+>>>> 'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+>
+>>>> the bus->irq_count[i] is '-1'.
+>
+>>>>
+>
+>>>> Through analysis, it was happened after VM migration and we think
+>
+>>>> it was caused by the following sequence:
+>
+>>>>
+>
+>>>> *Migration Source*
+>
+>>>> 1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+>
+>>>> 2. save E1000:
+>
+>>>> Â Â Â Â  e1000_pre_save
+>
+>>>> Â Â Â Â Â  e1000_mit_timer
+>
+>>>> Â Â Â Â Â Â  set_interrupt_cause
+>
+>>>> Â Â Â Â Â Â Â  pci_set_irq --> update pci_dev->irq_state to 1 and
+>
+>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  update bus->irq_count[x] to 1 ( new )
+>
+>>>> Â Â Â Â Â  the irq_state sent to dest.
+>
+>>>>
+>
+>>>> *Migration Dest*
+>
+>>>> 1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is
+>
+>>>> 1.
+>
+>>>> 2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+>
+>>>> Â Â Â  the irq_state maybe change to 0 and bus->irq_count[x] will become
+>
+>>>> Â Â Â  -1 in this situation.
+>
+>>>> 3. do VM reboot then the assertion will be triggered.
+>
+>>>>
+>
+>>>> We also found some guys faced the similar problem:
+>
+>>>> [1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+>
+>>>> [2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+>
+>>>>
+>
+>>>> Is there some patches to fix this problem ?
+>
+>>> I don't remember any.
+>
+>>>
+>
+>>>> Can we save pcibus state after all the pci devs are saved ?
+>
+>>> Does this problem only happen with e1000? I think so.
+>
+>>> If it's only e1000 I think we should fix it - I think once the VM is
+>
+>>> stopped for doing the device migration it shouldn't be raising
+>
+>>> interrupts.
+>
+>>
+>
+>> I wonder maybe we can simply fix this by no setting ICS on pre_save() but
+>
+>> scheduling mit timer unconditionally in post_load().
+>
+>>
+>
+> I also think this is a bug of e1000 because we find more cores with the same
+>
+> frame thease days.
+>
+>
+>
+> I'm not familiar with e1000 so hope someone could fix it, thanks. :)
+>
+>
+>
+>
+Draft a path in attachment, please test.
+>
+Thanks. We'll test it for a few weeks and then give you the feedback. :)
+
+>
+Thanks
+>
+>
+>
+>> Thanks
+>
+>>
+>
+>>
+>
+>>> Dave
+>
+>>>
+>
+>>>> Thanks,
+>
+>>>> Longpeng(Mike)
+>
+>>> --Â
+>
+>>> Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>> .
+>
+>>
+-- 
+Regards,
+Longpeng(Mike)
+
+å¨ 2019/7/10 11:57, Jason Wang åé:
+>
+>
+On 2019/7/10 ä¸å11:36, Longpeng (Mike) wrote:
+>
+> å¨ 2019/7/10 11:25, Jason Wang åé:
+>
+>> On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+>
+>>> * longpeng (address@hidden) wrote:
+>
+>>>> Hi guys,
+>
+>>>>
+>
+>>>> We found a qemu core in our testing environment, the assertion
+>
+>>>> 'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+>
+>>>> the bus->irq_count[i] is '-1'.
+>
+>>>>
+>
+>>>> Through analysis, it was happened after VM migration and we think
+>
+>>>> it was caused by the following sequence:
+>
+>>>>
+>
+>>>> *Migration Source*
+>
+>>>> 1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+>
+>>>> 2. save E1000:
+>
+>>>> Â Â Â Â  e1000_pre_save
+>
+>>>> Â Â Â Â Â  e1000_mit_timer
+>
+>>>> Â Â Â Â Â Â  set_interrupt_cause
+>
+>>>> Â Â Â Â Â Â Â  pci_set_irq --> update pci_dev->irq_state to 1 and
+>
+>>>> Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  update bus->irq_count[x] to 1 ( new )
+>
+>>>> Â Â Â Â Â  the irq_state sent to dest.
+>
+>>>>
+>
+>>>> *Migration Dest*
+>
+>>>> 1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is
+>
+>>>> 1.
+>
+>>>> 2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+>
+>>>> Â Â Â  the irq_state maybe change to 0 and bus->irq_count[x] will become
+>
+>>>> Â Â Â  -1 in this situation.
+>
+>>>> 3. do VM reboot then the assertion will be triggered.
+>
+>>>>
+>
+>>>> We also found some guys faced the similar problem:
+>
+>>>> [1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+>
+>>>> [2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+>
+>>>>
+>
+>>>> Is there some patches to fix this problem ?
+>
+>>> I don't remember any.
+>
+>>>
+>
+>>>> Can we save pcibus state after all the pci devs are saved ?
+>
+>>> Does this problem only happen with e1000? I think so.
+>
+>>> If it's only e1000 I think we should fix it - I think once the VM is
+>
+>>> stopped for doing the device migration it shouldn't be raising
+>
+>>> interrupts.
+>
+>>
+>
+>> I wonder maybe we can simply fix this by no setting ICS on pre_save() but
+>
+>> scheduling mit timer unconditionally in post_load().
+>
+>>
+>
+> I also think this is a bug of e1000 because we find more cores with the same
+>
+> frame thease days.
+>
+>
+>
+> I'm not familiar with e1000 so hope someone could fix it, thanks. :)
+>
+>
+>
+>
+Draft a path in attachment, please test.
+>
+Hi Jason,
+
+We've tested the patch for about two weeks, everything went well, thanks!
+
+Feel free to add my:
+Reported-and-tested-by: Longpeng <address@hidden>
+
+>
+Thanks
+>
+>
+>
+>> Thanks
+>
+>>
+>
+>>
+>
+>>> Dave
+>
+>>>
+>
+>>>> Thanks,
+>
+>>>> Longpeng(Mike)
+>
+>>> --Â
+>
+>>> Dr. David Alan Gilbert / address@hidden / Manchester, UK
+>
+>> .
+>
+>>
+-- 
+Regards,
+Longpeng(Mike)
+
+On 2019/7/27 ä¸å2:10, Longpeng (Mike) wrote:
+å¨ 2019/7/10 11:57, Jason Wang åé:
+On 2019/7/10 ä¸å11:36, Longpeng (Mike) wrote:
+å¨ 2019/7/10 11:25, Jason Wang åé:
+On 2019/7/8 ä¸å5:47, Dr. David Alan Gilbert wrote:
+* longpeng (address@hidden) wrote:
+Hi guys,
+
+We found a qemu core in our testing environment, the assertion
+'assert(bus->irq_count[i] == 0)' in pcibus_reset() was triggered and
+the bus->irq_count[i] is '-1'.
+
+Through analysis, it was happened after VM migration and we think
+it was caused by the following sequence:
+
+*Migration Source*
+1. save bus pci.0 state, including irq_count[x] ( =0 , old )
+2. save E1000:
+ Â Â Â Â  e1000_pre_save
+ Â Â Â Â Â  e1000_mit_timer
+ Â Â Â Â Â Â  set_interrupt_cause
+ Â Â Â Â Â Â Â  pci_set_irq --> update pci_dev->irq_state to 1 and
+ Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â Â  update bus->irq_count[x] to 1 ( new )
+ Â Â Â Â Â  the irq_state sent to dest.
+
+*Migration Dest*
+1. Receive the irq_count[x] of pci.0 is 0 , but the irq_state of e1000 is 1.
+2. If the e1000 need change irqline , it would call to pci_irq_handler(),
+ Â Â Â  the irq_state maybe change to 0 and bus->irq_count[x] will become
+ Â Â Â  -1 in this situation.
+3. do VM reboot then the assertion will be triggered.
+
+We also found some guys faced the similar problem:
+[1]
+https://lists.gnu.org/archive/html/qemu-devel/2016-11/msg02525.html
+[2]
+https://bugs.launchpad.net/qemu/+bug/1702621
+Is there some patches to fix this problem ?
+I don't remember any.
+Can we save pcibus state after all the pci devs are saved ?
+Does this problem only happen with e1000? I think so.
+If it's only e1000 I think we should fix it - I think once the VM is
+stopped for doing the device migration it shouldn't be raising
+interrupts.
+I wonder maybe we can simply fix this by no setting ICS on pre_save() but
+scheduling mit timer unconditionally in post_load().
+I also think this is a bug of e1000 because we find more cores with the same
+frame thease days.
+
+I'm not familiar with e1000 so hope someone could fix it, thanks. :)
+Draft a path in attachment, please test.
+Hi Jason,
+
+We've tested the patch for about two weeks, everything went well, thanks!
+
+Feel free to add my:
+Reported-and-tested-by: Longpeng <address@hidden>
+Applied.
+
+Thanks
+Thanks
+Thanks
+Dave
+Thanks,
+Longpeng(Mike)
+--
+Dr. David Alan Gilbert / address@hidden / Manchester, UK
+.
+
