@@ -1,0 +1,156 @@
+semantic: 0.119
+PID: 0.104
+permissions: 0.092
+device: 0.092
+other: 0.086
+graphic: 0.072
+vnc: 0.069
+boot: 0.068
+network: 0.058
+debug: 0.057
+performance: 0.056
+socket: 0.046
+files: 0.041
+KVM: 0.040
+debug: 0.767
+PID: 0.035
+files: 0.035
+performance: 0.032
+boot: 0.027
+other: 0.027
+semantic: 0.026
+device: 0.011
+socket: 0.009
+graphic: 0.008
+network: 0.007
+KVM: 0.006
+permissions: 0.006
+vnc: 0.004
+
+qemu-system-ppc assertion "!mr->container" failed
+
+Hi,
+
+I'm trying to run the NetBSD/macppc 8.2 installer (which is 32-bit ppc) in qemu-system-ppc
+version 5.2.0, and I'm hitting this assertion failure quite a bit into the "unpacking sets" 
+part of the installation procedure, unpacking from the install iso image.
+
+Qemu is run on a NetBSD/amd64 9.1 host system.  The stack backtrace from the core file is
+
+Program terminated with signal SIGABRT, Aborted.
+#0  0x000078859a36791a in _lwp_kill () from /usr/lib/libc.so.12
+[Current thread is 1 (process 1)]
+(gdb) where
+#0  0x000078859a36791a in _lwp_kill () from /usr/lib/libc.so.12
+#1  0x000078859a3671ca in abort () from /usr/lib/libc.so.12
+#2  0x000078859a2a8507 in __assert13 () from /usr/lib/libc.so.12
+#3  0x000000015a3c19c0 in memory_region_finalize ()
+#4  0x000000015a3fef1c in object_unref ()
+#5  0x000000015a3feee6 in object_unref ()
+#6  0x000000015a374154 in address_space_unmap ()
+#7  0x000000015a276551 in pmac_ide_atapi_transfer_cb ()
+#8  0x000000015a150a59 in dma_blk_cb ()
+#9  0x000000015a46a1c7 in blk_aio_complete ()
+#10 0x000000015a5a617d in coroutine_trampoline ()
+#11 0x000078859a264150 in ?? () from /usr/lib/libc.so.12
+Backtrace stopped: Cannot access memory at address 0x7884894ff000
+(gdb) 
+
+I start qemu with this small script:
+
+---
+#!/bin/sh
+
+MEM=3g
+qemu-system-ppc \
+        -M mac99,via=pmu \
+        -m $MEM  \
+        -nographic \
+        -drive id=hda,format=raw,file=disk.img \
+        -L pc-bios \
+        -netdev user,id=net0,hostfwd=tcp::2223-:22,ipv6=off \
+        -net nic,model=rtl8139,netdev=net0 \
+        -boot d \
+        -cdrom NetBSD-8.2-macppc.iso
+---
+
+and boot the install kernel with "boot cd:ofwboot.xcf".  If someone wants
+to replicate this I can provide more detailed instructions to repeat the
+procedure I used to start the install.
+
+Any hints about what more to look for?
+
+Regards,
+
+- Håvard
+
+Hmm,
+
+it seems I need to retract this bug.  It turns out that the 32-bit macppc port
+of NetBSD only supports a maximum of 2GB of memory.  As a NetBSD developer said it:
+
+> The physical memory map on G4 Macs doesn't have room for more than 2G of RAM.
+
+So, I've set the status of this bug report to "Invalid", as that seemed to be the
+best fit.
+
+Regards,
+
+- Håvard
+
+
+If the machine can not support more than 2GB, QEMU should report an error when the user tries to assign too many memory, not crash and let it figure out.
+Setting the bug status to confirmed.
+
+Proposed fix:
+https://lists.gnu.org/archive/html/qemu-devel/2021-04/msg00570.html
+
+On 4/7/21 3:11 PM, Mark Cave-Ayland wrote:
+> On 06/04/2021 09:48, Philippe Mathieu-Daudé wrote:
+> 
+>> On Mac99 and newer machines, the Uninorth PCI host bridge maps
+>> the PCI hole region at 2GiB, so the RAM area beside 2GiB is not
+>> accessible by the CPU. Restrict the memory to 2GiB to avoid
+>> problems such the one reported in the buglink.
+>>
+>> Buglink: https://bugs.launchpad.net/qemu/+bug/1922391
+>> Reported-by: Håvard Eidnes <email address hidden>
+>> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+>> ---
+>>   hw/ppc/mac_newworld.c | 4 ++++
+>>   1 file changed, 4 insertions(+)
+>>
+>> diff --git a/hw/ppc/mac_newworld.c b/hw/ppc/mac_newworld.c
+>> index 21759628466..d88b38e9258 100644
+>> --- a/hw/ppc/mac_newworld.c
+>> +++ b/hw/ppc/mac_newworld.c
+>> @@ -157,6 +157,10 @@ static void ppc_core99_init(MachineState *machine)
+>>       }
+>>         /* allocate RAM */
+>> +    if (machine->ram_size > 2 * GiB) {
+>> +        error_report("RAM size more than 2 GiB is not supported");
+>> +        exit(1);
+>> +    }
+>>       memory_region_add_subregion(get_system_memory(), 0, machine->ram);
+>>         /* allocate and load firmware ROM */
+> 
+> I think the patch is correct, however I'm fairly sure that the default
+> g3beige machine also has the PCI hole located at 0x80000000 so the same
+> problem exists there too.
+> 
+> Also are you keen to get this merged for 6.0? It doesn't seem to solve a
+> security issue/release blocker and I'm sure the current behaviour has
+> been like this for a long time...
+
+No problem. I wanted to revisit this bug anyway, I realized during the
+night, while this patch makes QEMU exit cleanly, it hides the bug which
+is likely in TYPE_MACIO_IDE (I haven't tried Håvard's full reproducer).
+
+Regards,
+
+Phil.
+
+
+Philippe's fix has been merged here:
+https://gitlab.com/qemu-project/qemu/-/commit/03b3542ac93cb196bf6a6
+

@@ -1,0 +1,298 @@
+permissions: 0.087
+performance: 0.085
+device: 0.085
+debug: 0.081
+PID: 0.081
+graphic: 0.080
+semantic: 0.079
+other: 0.069
+boot: 0.069
+socket: 0.069
+network: 0.063
+files: 0.060
+vnc: 0.051
+KVM: 0.041
+debug: 0.381
+files: 0.150
+performance: 0.086
+semantic: 0.059
+PID: 0.057
+other: 0.046
+network: 0.040
+device: 0.034
+graphic: 0.029
+boot: 0.027
+permissions: 0.026
+socket: 0.024
+vnc: 0.021
+KVM: 0.019
+
+qemu-system-aarch64 (tcg):  cval + voff overflow not handled, causes qemu to hang
+
+The Armv8 architecture reference manual states that for any timer set (e.g. CNTP* and CNTV*), the condition for such timer to generate an interrupt (if enabled & unmasked) is:
+
+CVAL <= CNT(P/V)CT
+
+Although this is arguably sloppy coding, I have seen code that is therefore assuming it can set CVAL to a very high value (e.g. UINT64_MAX) and leave the interrupt enabled in CTL, and never get the interrupt.
+
+On latest master commit as the time of writing, there is an integer overflow in target/arm/helper.c gt_recalc_timer affecting the virtual timer when the interrupt is enabled in CTL:
+
+    /* Next transition is when we hit cval */
+    nexttick = gt->cval + offset;
+
+When this overflow happens, I notice that qemu is no longer responsive and that I have to SIGKILL the process:
+    - qemu takes nearly all the cpu time of the cores it is running on (e.g. 50% cpu usage if running on half the cores) and is completely unresponsive
+    - no guest interrupt (reported via -d int) is generated
+
+Here the minimal code example to reproduce the issue:
+
+    mov     x0, #1
+    msr     cntvoff_el2, x0
+    mov     x0, #-1
+    msr     cntv_cval_el0, x0
+    mov     x0, #1
+    msr     cntv_ctl_el0, x0 // interrupt generation enabled, not masked; qemu will start to hang here
+
+Options used:
+-nographic -machine virt,virtualization=on,gic-version=2,accel=tcg -cpu cortex-a57
+-smp 4 -m 1024 -kernel whatever.elf -d unimp,guest_errors,int -semihosting-config enable,target=native
+-serial mon:stdio
+
+Version used: 4.2
+
+Bug: https://bugs.launchpad.net/bugs/1859021
+
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ tests/tcg/aarch64/system/vtimer.c         | 48 +++++++++++++++++++++++
+ tests/tcg/aarch64/Makefile.softmmu-target |  4 ++
+ 2 files changed, 52 insertions(+)
+ create mode 100644 tests/tcg/aarch64/system/vtimer.c
+
+diff --git a/tests/tcg/aarch64/system/vtimer.c b/tests/tcg/aarch64/system/vtimer.c
+new file mode 100644
+index 00000000000..42f2f7796c7
+--- /dev/null
++++ b/tests/tcg/aarch64/system/vtimer.c
+@@ -0,0 +1,48 @@
++/*
++ * Simple Virtual Timer Test
++ *
++ * Copyright (c) 2020 Linaro Ltd
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
++#include <inttypes.h>
++#include <minilib.h>
++
++/* grabbed from Linux */
++#define __stringify_1(x...) #x
++#define __stringify(x...)   __stringify_1(x)
++
++#define read_sysreg(r) ({                                           \
++            uint64_t __val;                                         \
++            asm volatile("mrs %0, " __stringify(r) : "=r" (__val)); \
++            __val;                                                  \
++})
++
++#define write_sysreg(r, v) do {                     \
++        uint64_t __val = (uint64_t)(v);             \
++        asm volatile("msr " __stringify(r) ", %x0"  \
++                 : : "rZ" (__val));                 \
++} while (0)
++
++int main(void)
++{
++    int i;
++
++    ml_printf("VTimer Test\n");
++
++    write_sysreg(cntvoff_el2, 1);
++    write_sysreg(cntv_cval_el0, -1);
++    write_sysreg(cntv_ctl_el0, 1);
++
++    ml_printf("cntvoff_el2=%lx\n", read_sysreg(cntvoff_el2));
++    ml_printf("cntv_cval_el0=%lx\n", read_sysreg(cntv_cval_el0));
++    ml_printf("cntv_ctl_el0=%lx\n", read_sysreg(cntv_ctl_el0));
++
++    /* Now read cval a few times */
++    for (i = 0; i < 10; i++) {
++        ml_printf("%d: cntv_cval_el0=%lx\n", i, read_sysreg(cntv_cval_el0));
++    }
++
++    return 0;
++}
+diff --git a/tests/tcg/aarch64/Makefile.softmmu-target b/tests/tcg/aarch64/Makefile.softmmu-target
+index 7b4eede3f07..62cdddbb215 100644
+--- a/tests/tcg/aarch64/Makefile.softmmu-target
++++ b/tests/tcg/aarch64/Makefile.softmmu-target
+@@ -62,3 +62,7 @@ run-memory-replay: memory-replay run-memory-record
+ 	  "$< on $(TARGET_NAME)")
+ 
+ EXTRA_TESTS+=memory-record memory-replay
++
++# vtimer test
++QEMU_EL2_MACHINE=-machine virt,virtualization=on,gic-version=2 -cpu cortex-a57 -smp 4
++run-vtimer: QEMU_OPTS=$(QEMU_EL2_MACHINE) $(QEMU_SEMIHOST)  -kernel
+-- 
+2.20.1
+
+
+
+If we don't detect this we will be stuck in a busy loop as we schedule
+a timer for before now which will continually trigger gt_recalc_timer
+even though we haven't reached the state required to trigger the IRQ.
+
+Bug: https://bugs.launchpad.net/bugs/1859021
+Cc: <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ target/arm/helper.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 19a57a17da5..eb17106f7bd 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -2481,6 +2481,9 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
+         } else {
+             /* Next transition is when we hit cval */
+             nexttick = gt->cval + offset;
++            if (nexttick < gt->cval) {
++                nexttick = UINT64_MAX;
++            }
+         }
+         /* Note that the desired next expiry time might be beyond the
+          * signed-64-bit range of a QEMUTimer -- in this case we just
+-- 
+2.20.1
+
+
+
+On Fri, 10 Jan 2020 at 16:16, Alex Bennée <email address hidden> wrote:
+>
+> If we don't detect this we will be stuck in a busy loop as we schedule
+> a timer for before now which will continually trigger gt_recalc_timer
+> even though we haven't reached the state required to trigger the IRQ.
+>
+> Bug: https://bugs.launchpad.net/bugs/1859021
+> Cc: <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+>  target/arm/helper.c | 3 +++
+>  1 file changed, 3 insertions(+)
+>
+> diff --git a/target/arm/helper.c b/target/arm/helper.c
+> index 19a57a17da5..eb17106f7bd 100644
+> --- a/target/arm/helper.c
+> +++ b/target/arm/helper.c
+> @@ -2481,6 +2481,9 @@ static void gt_recalc_timer(ARMCPU *cpu, int timeridx)
+>          } else {
+>              /* Next transition is when we hit cval */
+>              nexttick = gt->cval + offset;
+> +            if (nexttick < gt->cval) {
+> +                nexttick = UINT64_MAX;
+> +            }
+>          }
+
+There's something odd going on with this code. Adding a bit of context:
+
+        uint64_t offset = timeridx == GTIMER_VIRT ?
+                                      cpu->env.cp15.cntvoff_el2 : 0;
+        uint64_t count = gt_get_countervalue(&cpu->env);
+        /* Note that this must be unsigned 64 bit arithmetic: */
+        int istatus = count - offset >= gt->cval;
+        [...]
+        if (istatus) {
+            /* Next transition is when count rolls back over to zero */
+            nexttick = UINT64_MAX;
+        } else {
+            /* Next transition is when we hit cval */
+            nexttick = gt->cval + offset;
+        }
+
+I think this patch is correct, in that the 'nexttick' values
+are all absolute and this cval/offset combination implies
+that the next timer interrupt is going to be in a future
+so distant we can't even fit the duration in a uint64_t.
+
+But the other half of the 'if' also looks wrong: that's
+for the case of "timer has fired, how long until the
+wraparound causes the interrupt line to go low again?".
+UINT64_MAX is right for the EL1 case where offset is 0,
+but the offset might actually be set such that the wrap
+around happens fairly soon. We want to calculate the
+tick when (count - offset) hits 0, saturated to
+UINT64_MAX. It's getting late here and I couldn't figure
+out what that expression should be with 15 minutes of
+fiddling around with pen and paper diagrams. I'll have another
+go tomorrow if nobody else gets there first...
+
+thanks
+-- PMM
+
+
+On Thu, 16 Jan 2020 at 18:45, Peter Maydell <email address hidden> wrote:
+> There's something odd going on with this code. Adding a bit of context:
+>
+>         uint64_t offset = timeridx == GTIMER_VIRT ?
+>                                       cpu->env.cp15.cntvoff_el2 : 0;
+>         uint64_t count = gt_get_countervalue(&cpu->env);
+>         /* Note that this must be unsigned 64 bit arithmetic: */
+>         int istatus = count - offset >= gt->cval;
+>         [...]
+>         if (istatus) {
+>             /* Next transition is when count rolls back over to zero */
+>             nexttick = UINT64_MAX;
+>         } else {
+>             /* Next transition is when we hit cval */
+>             nexttick = gt->cval + offset;
+>         }
+>
+> I think this patch is correct, in that the 'nexttick' values
+> are all absolute and this cval/offset combination implies
+> that the next timer interrupt is going to be in a future
+> so distant we can't even fit the duration in a uint64_t.
+>
+> But the other half of the 'if' also looks wrong: that's
+> for the case of "timer has fired, how long until the
+> wraparound causes the interrupt line to go low again?".
+> UINT64_MAX is right for the EL1 case where offset is 0,
+> but the offset might actually be set such that the wrap
+> around happens fairly soon. We want to calculate the
+> tick when (count - offset) hits 0, saturated to
+> UINT64_MAX. It's getting late here and I couldn't figure
+> out what that expression should be with 15 minutes of
+> fiddling around with pen and paper diagrams. I'll have another
+> go tomorrow if nobody else gets there first...
+
+With a fresher brain:
+
+For the if (istatus) branch we want the absolute tick
+when (count - offset) wraps round to 0, saturated to UINT64_MAX.
+I think this is:
+    if (offset <= count) {
+        nexttick = UINT64_MAX;
+    } else {
+        nexttick = offset;
+    }
+
+Should we consider this a separate bugfix to go in its own patch?
+
+thanks
+-- PMM
+
+
+A different approach was posted that basically elides the overflow case by not scheduling timers for IRQ events which have already happened:
+
+  https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg07915.html
+
+
+This is an automated cleanup. This bug report has been moved
+to QEMU's new bug tracker on gitlab.com and thus gets marked
+as 'expired' now. Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/60
+
+

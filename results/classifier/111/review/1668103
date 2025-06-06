@@ -1,0 +1,99 @@
+permissions: 0.116
+semantic: 0.101
+other: 0.098
+device: 0.080
+PID: 0.079
+vnc: 0.070
+socket: 0.068
+files: 0.067
+boot: 0.061
+network: 0.060
+debug: 0.052
+performance: 0.051
+graphic: 0.050
+KVM: 0.045
+debug: 0.518
+files: 0.078
+PID: 0.061
+semantic: 0.056
+device: 0.051
+network: 0.044
+other: 0.040
+socket: 0.031
+performance: 0.030
+KVM: 0.030
+vnc: 0.028
+permissions: 0.012
+graphic: 0.012
+boot: 0.009
+
+Possible off-by-one error in priority handling of hw/PL190.c
+
+I have a problem when reading back VECTADDR in my proprietary OS's interrupt handler.
+
+Example client code:
+
+ 1) Write INTENCLEAR to clear all interrupt enable bits
+ 2) Set all 16 vector control registers to zero
+ 3) Set vector address #2 to value 2
+ 4) Set vector control #2 to 0x21 (vector_interrupt_enable(0x20) | vector_interrupt_source(0x1) )
+ 5) Enable interrupt 1 by writing 0x2 to INTENABLE
+ 6) In interrupt handler: read VECTADDR [should read 0x2 (active IRQs vector address as set in step 3), reads 0x0 (active vector address index 3 instead of index 2)]
+
+Problem:
+
+So, for me, the block commented with /* Read vector address at the start of an ISR...  */ in hw/pl190.c has an off by-one error and does not return the vector address of the pending interrupt, but of the next one in the list of priorities (i.e. vector address 3).
+
+Solution:
+
+In pl190_update_vectors(), also set the priority bit for the current priority (1<<i) interrupt (if enabled) in s->prio_mask[i] in addition to those of higher priority enabled interrupts. This will cause the loop in the read handling of VECTADDR to terminate an iteration earlier and will deliver the correct interrupt priority as iteration variable i subsequently used for addressing.
+
+I'll try to provide a patch for this.
+
+From 0cd0c1346f9adb7b90df3e4e30a5904eeda33bfa Mon Sep 17 00:00:00 2001
+From: Marc Bommert <email address hidden>
+Date: Sun, 26 Feb 2017 22:08:49 +0100
+Subject: [PATCH] Fix off-by-one error in priority handling when reading
+ VECTADDR: Also, if enabled, have the "current" priority bit (1<<i) set in
+ s->prio_mask[i].
+
+Signed-off-by: Marc Bommert <email address hidden>
+---
+ hw/intc/pl190.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hw/intc/pl190.c b/hw/intc/pl190.c
+index 55ea15d..0369da8 100644
+--- a/hw/intc/pl190.c
++++ b/hw/intc/pl190.c
+@@ -80,12 +80,12 @@ static void pl190_update_vectors(PL190State *s)
+     mask = 0;
+     for (i = 0; i < 16; i++)
+       {
+-        s->prio_mask[i] = mask;
+         if (s->vect_control[i] & 0x20)
+           {
+             n = s->vect_control[i] & 0x1f;
+             mask |= 1 << n;
+           }
++        s->prio_mask[i] = mask;
+       }
+     s->prio_mask[16] = mask;
+     pl190_update(s);
+--
+2.5.0
+
+
+"Fix committed" doesn't seem right -- that's only when a patch is actually committed to QEMU's git tree...
+
+
+We do not take patches from the bug tracker, please send it to the qemu-devel mailing list instead. See http://wiki.qemu-project.org/Contribute/SubmitAPatch for details.
+
+For a one-off one-liner bugfix patch it's easier for me to grab it from the bug tracker than require the submitter to resend, though... I'll have a look at it later today.
+
+
+
+This turns out to be because Marc had a very out-of-date copy of pl190.c which was missing the fix for this bug in commit 14c126baf1c38607c5b. (Further discussion in list thread 
+https://lists.gnu.org/archive/html/qemu-devel/2017-02/msg06580.html).
+
+

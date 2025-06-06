@@ -1,0 +1,2837 @@
+other: 0.122
+permissions: 0.103
+device: 0.102
+vnc: 0.097
+PID: 0.084
+semantic: 0.078
+KVM: 0.061
+performance: 0.061
+socket: 0.060
+network: 0.056
+debug: 0.052
+graphic: 0.051
+boot: 0.040
+files: 0.034
+debug: 0.695
+PID: 0.074
+files: 0.054
+performance: 0.053
+semantic: 0.031
+other: 0.022
+device: 0.015
+KVM: 0.010
+network: 0.010
+graphic: 0.008
+socket: 0.008
+permissions: 0.007
+boot: 0.006
+vnc: 0.005
+
+qemu-img hangs on rcu_call_ready_event logic in Aarch64 when converting images
+
+On the HiSilicon D06 system - a 96 core NUMA arm64 box - qemu-img frequently hangs (~50% of the time) with this command:
+
+qemu-img convert -f qcow2 -O qcow2 /tmp/cloudimg /tmp/cloudimg2
+
+Where "cloudimg" is a standard qcow2 Ubuntu cloud image. This qcow2->qcow2 conversion happens to be something uvtool does every time it fetches images.
+
+Once hung, attaching gdb gives the following backtrace:
+
+(gdb) bt
+#0  0x0000ffffae4f8154 in __GI_ppoll (fds=0xaaaae8a67dc0, nfds=187650274213760, 
+    timeout=<optimized out>, timeout@entry=0x0, sigmask=0xffffc123b950)
+    at ../sysdeps/unix/sysv/linux/ppoll.c:39
+#1  0x0000aaaabbefaf00 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, 
+    __fds=<optimized out>) at /usr/include/aarch64-linux-gnu/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, 
+    timeout=timeout@entry=-1) at util/qemu-timer.c:322
+#3  0x0000aaaabbefbf80 in os_host_main_loop_wait (timeout=-1)
+    at util/main-loop.c:233
+#4  main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:497
+#5  0x0000aaaabbe2aa30 in convert_do_copy (s=0xffffc123bb58) at qemu-img.c:1980
+#6  img_convert (argc=<optimized out>, argv=<optimized out>) at qemu-img.c:2456
+#7  0x0000aaaabbe2333c in main (argc=7, argv=<optimized out>) at qemu-img.c:4975
+
+Reproduced w/ latest QEMU git (@ 53744e0a182)
+
+Hi, can you do a `thread apply all bt` instead? If I were to bet, we're probably waiting for some slow call like lseek to return in another thread.
+
+What filesystem/blockdevice is involved here?
+
+ext4 filesystem, SATA drive:
+
+(gdb) thread apply all bt
+
+Thread 3 (Thread 0xffff9bffc9a0 (LWP 9015)):
+#0  0x0000ffffaaa462cc in __GI___sigtimedwait (set=<optimized out>, 
+    set@entry=0xaaaae725c070, info=info@entry=0xffff9bffbf18, 
+    timeout=0x3ff0000000000001, timeout@entry=0x0)
+    at ../sysdeps/unix/sysv/linux/sigtimedwait.c:42
+#1  0x0000ffffaab7dfac in __sigwait (set=set@entry=0xaaaae725c070, 
+    sig=sig@entry=0xffff9bffbff4) at ../sysdeps/unix/sysv/linux/sigwait.c:28
+#2  0x0000aaaad998a628 in sigwait_compat (opaque=0xaaaae725c070)
+    at util/compatfd.c:36
+#3  0x0000aaaad998bce0 in qemu_thread_start (args=<optimized out>)
+    at util/qemu-thread-posix.c:498
+#4  0x0000ffffaab73088 in start_thread (arg=0xffffc528531f)
+    at pthread_create.c:463
+#5  0x0000ffffaaae34ec in thread_start ()
+    at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Thread 2 (Thread 0xffffa0e779a0 (LWP 9014)):
+#0  syscall () at ../sysdeps/unix/sysv/linux/aarch64/syscall.S:38
+#1  0x0000aaaad998c9e8 in qemu_futex_wait (val=<optimized out>, f=<optimized out>)
+    at /home/ubuntu/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0xaaaad9a091c0 <rcu_call_ready_event>)
+    at util/qemu-thread-posix.c:442
+#3  0x0000aaaad99a6834 in call_rcu_thread (opaque=<optimized out>)
+    at util/rcu.c:261
+#4  0x0000aaaad998bce0 in qemu_thread_start (args=<optimized out>)
+    at util/qemu-thread-posix.c:498
+#5  0x0000ffffaab73088 in start_thread (arg=0xffffc528542f)
+    at pthread_create.c:463
+#6  0x0000ffffaaae34ec in thread_start ()
+    at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Thread 1 (Thread 0xffffa0fa8010 (LWP 9013)):
+#0  0x0000ffffaaada154 in __GI_ppoll (fds=0xaaaae7291dc0, nfds=187650771816320, 
+    timeout=<optimized out>, timeout@entry=0x0, sigmask=0xffffc52852e0)
+    at ../sysdeps/unix/sysv/linux/ppoll.c:39
+#1  0x0000aaaad9987f00 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, 
+    __fds=<optimized out>) at /usr/include/aarch64-linux-gnu/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, 
+    timeout=timeout@entry=-1) at util/qemu-timer.c:322
+#3  0x0000aaaad9988f80 in os_host_main_loop_wait (timeout=-1)
+    at util/main-loop.c:233
+#4  main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:497
+#5  0x0000aaaad98b7a30 in convert_do_copy (s=0xffffc52854e8) at qemu-img.c:1980
+#6  img_convert (argc=<optimized out>, argv=<optimized out>) at qemu-img.c:2456
+#7  0x0000aaaad98b033c in main (argc=7, argv=<optimized out>) at qemu-img.c:4975
+
+Hi, I also found a problem that qemu-img convert hands in ARM.
+
+The convert command line is "qemu-img convert -f qcow2 -O raw disk.qcow2 disk.raw ".
+
+The bt is below:
+
+Thread 2 (Thread 0x40000b776e50 (LWP 27215)):
+#0 0x000040000a3f2994 in sigtimedwait () from /lib64/libc.so.6
+#1 0x000040000a39c60c in sigwait () from /lib64/libpthread.so.0
+#2 0x0000aaaaaae82610 in sigwait_compat (opaque=0xaaaac5163b00) at util/compatfd.c:37
+#3 0x0000aaaaaae85038 in qemu_thread_start (args=args@entry=0xaaaac5163b90) at util/qemu_thread_posix.c:496
+#4 0x000040000a3918bc in start_thread () from /lib64/libpthread.so.0
+#5 0x000040000a492b2c in thread_start () from /lib64/libc.so.6
+
+Thread 1 (Thread 0x40000b573370 (LWP 27214)):
+#0 0x000040000a489020 in ppoll () from /lib64/libc.so.6
+#1 0x0000aaaaaadaefc0 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>) at /usr/include/bits/poll2.h:77
+#2 qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>) at qemu_timer.c:391
+#3 0x0000aaaaaadae014 in os_host_main_loop_wait (timeout=<optimized out>) at main_loop.c:272
+#4 0x0000aaaaaadae190 in main_loop_wait (nonblocking=<optimized out>) at main_loop.c:534
+#5 0x0000aaaaaad97be0 in convert_do_copy (s=0xffffdc32eb48) at qemu-img.c:1923
+#6 0x0000aaaaaada2d70 in img_convert (argc=<optimized out>, argv=<optimized out>) at qemu-img.c:2414
+#7 0x0000aaaaaad99ac4 in main (argc=7, argv=<optimized out>) at qemu-img.c:5305
+
+
+Do you find the cause of the problem and fix it? Thanks for your reply!
+
+sorry, I make a spelling mistake here（"Hi, I also found a problem that qemu-img convert hands in ARM."）.The right is "I also found a problem that qemu-img convert hangs in ARM".
+
+No, sorry - this bugs still persists w/ latest upstream (@ afccfc0). I found a report of similar symptoms:
+
+  https://patchwork.kernel.org/patch/10047341/
+  https://bugzilla.redhat.com/show_bug.cgi?id=1524770#c13
+
+To be clear, ^ is already fixed upstream, so it is not the *same* issue - but perhaps related.
+
+
+Do you have any good ideas about it? Maybe somewhere lack of memeory barriers that cause it?
+
+
+frazier, Do you find the conditions that necessarily make this problem appear?
+
+I can reproduce this problem with qemu.git/matser. It still exists in qemu.git/matser. I found that when an IO return in worker threads and want to call aio_notify to wake up main_loop, but it found that ctx->notify_me is cleared to 0 by main_loop in aio_ctx_check by calling atomic_and(&ctx->notify_me, ~1) . So worker thread won't write enventfd to notify main_loop.If such a scene happens, the main_loop will hang:
+    main loop                        worker thread1                  worker thread2
+-----------------------------------------------------------------------------------------------
+    qemu_poll_ns                    aio_worker
+                            qemu_bh_schedule(pool->completion_bh)
+    glib_pollfds_poll
+    g_main_context_check
+    aio_ctx_check
+    atomic_and(&ctx->notify_me, ~1)                                aio_worker
+                                                      qemu_bh_schedule(pool->completion_bh)
+    /* do something for event */
+    qemu_poll_ns
+    /* hangs !!!*/
+
+As we known, ctx->notify_me will be visited by worker thread and main loop. I thank we should add a lock protection for ctx->notify_me to avoid this happend.what do you thank so?
+
+Hello Liz, 
+
+I'll try to reproduce this issue in a Cortex-A53 aarch64 real environment (w/ 24 HW threads) AND in a virtual environment w/ lots of vCPUs... but, if it's a barrier missing - or the lack of atomicity and/or ordering in a primitive - then, I'm afraid the context switch in between vCPUs might not be the same as in real CPUs (IPIs are sent and handled differently and host kernel delays IPI delivery because of its own callbacks, before scheduling, etc...) and I could need a qemu dump from your environment.
+
+Would that be feasible ? Can you reproduce this nowadays ? This bug has aged a little, so I'm now sure!
+
+Could you provide me the dump caused by latest package available for your Ubuntu version ? This way I have the debug symbols to work with.
+
+Meanwhile, I'll be trying to reproduce on my side.
+
+OOhh nm on the virtual environment test, as I just remembered we don't have KVM on 2nd level for aarch64 yet (at least in ARMv8 implementing virt extension). I'll try to reproduce in the real env only.
+
+Alright, I couldn't reproduce this yet, I'm running same test case in a 24 cores box and causing lots of context switches and CPU migrations in parallel (trying to exhaust the logic).
+
+Will let this running for sometime to check. 
+
+Unfortunately this can be related QEMU AIO BH locking/primitives and cache coherency in the HW in question (which I got specs from: https://en.wikichip.org/wiki/hisilicon/kunpeng/hi1616):
+
+l1$ size	8 MiB
+l1d$ size	4 MiB
+l1i$ size	4 MiB
+l2$ size	32 MiB
+l3$ size	64 MiB
+
+like for example when having 2 threads in different NUMA domains, or some other situation.
+
+I can't simulate the same since I have a SOC with:
+
+Cortex-A53 MPCore 24cores,
+
+L1 I/D=32KB/32KB
+L2 =256KB
+L3 =4MB
+
+and I'm not even close to L1/L2/L3 cache numbers from D06 =o). 
+
+Just got a note that I'll be able to reproduce this in the real HW, will get back soon with real gdb debugging.
+
+Alright, with a d06 aarch64 machine I was able to reproduce it after 8 attempts.I'll debug it today and provide feedback on my findings. 
+
+(gdb) bt full
+#0  0x0000ffffb0b2181c in __GI_ppoll (fds=0xaaaace5ab770, nfds=4, timeout=<optimized out>, timeout@entry=0x0,
+    sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:39
+        _x3tmp = 0
+        _x0tmp = 187650583213936
+        _x0 = 187650583213936
+        _x3 = 0
+        _x4tmp = 8
+        _x1tmp = 4
+        _x1 = 4
+        _x4 = 8
+        _x2tmp = <optimized out>
+        _x2 = 0
+        _x8 = 73
+        _sys_result = <optimized out>
+        _sys_result = <optimized out>
+        sc_cancel_oldtype = 0
+        sc_ret = <optimized out>
+        tval = {tv_sec = 0, tv_nsec = 187650583137792}
+#1  0x0000aaaacd2a773c in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>)
+    at /usr/include/aarch64-linux-gnu/bits/poll2.h:77
+No locals.
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=timeout@entry=-1) at ./util/qemu-timer.c:322
+No locals.
+#3  0x0000aaaacd2a8764 in os_host_main_loop_wait (timeout=-1) at ./util/main-loop.c:233
+        context = 0xaaaace599d90
+        ret = <optimized out>
+        context = <optimized out>
+        ret = <optimized out>
+#4  main_loop_wait (nonblocking=<optimized out>) at ./util/main-loop.c:497
+        ret = <optimized out>
+        timeout = 4294967295
+        timeout_ns = <optimized out>
+#5  0x0000aaaacd1df454 in convert_do_copy (s=0xfffff9b2b1d8) at ./qemu-img.c:1981
+        ret = <optimized out>
+        i = <optimized out>
+        n = <optimized out>
+        sector_num = <optimized out>
+        ret = <optimized out>
+        i = <optimized out>
+        n = <optimized out>
+        sector_num = <optimized out>
+#6  img_convert (argc=<optimized out>, argv=<optimized out>) at ./qemu-img.c:2457
+        c = <optimized out>
+        bs_i = <optimized out>
+        flags = 16898
+        src_flags = 0
+        fmt = 0xfffff9b2bad1 "qcow2"
+        out_fmt = <optimized out>
+        cache = 0xaaaacd2cb1c8 "unsafe"
+        src_cache = 0xaaaacd2ca9c0 "writeback"
+        out_baseimg = <optimized out>
+        out_filename = <optimized out>
+        out_baseimg_param = <optimized out>
+        snapshot_name = 0x0
+        drv = <optimized out>
+        proto_drv = <optimized out>
+        bdi = {cluster_size = 65536, vm_state_offset = 32212254720, is_dirty = false, unallocated_blocks_are_zero = true,
+          needs_compressed_writes = false}
+        out_bs = <optimized out>
+        opts = 0xaaaace5ab390
+        sn_opts = 0x0
+        create_opts = 0xaaaace5ab0c0
+        open_opts = <optimized out>
+        options = 0x0
+        local_err = 0x0
+        writethrough = false
+        src_writethrough = false
+        quiet = <optimized out>
+        image_opts = false
+        skip_create = false
+        progress = <optimized out>
+        tgt_image_opts = false
+        ret = <optimized out>
+        force_share = false
+        explict_min_sparse = false
+        s = {src = 0xaaaace577240, src_sectors = 0xaaaace577300, src_num = 1, total_sectors = 62914560,allocated_sectors = 9572096, allocated_done = 6541440, sector_num = 8863744, wr_offs = 8859776, status = BLK_DATA, sector_next_status = 8863744, target = 0xaaaace5bd2a0, has_zero_init = true,compressed = false, unallocated_blocks_are_zero = true, target_has_backing = false, target_backing_sectors = -1, wr_in_order = true, copy_range = false, min_sparse = 8, alignment = 8,cluster_sectors = 128, buf_sectors = 4096, num_coroutines = 8, running_coroutines = 8, co = {0xaaaace5ceda0,0xaaaace5cef50, 0xaaaace5cf100, 0xaaaace5cf2b0, 0xaaaace5cf460, 0xaaaace5cf610, 0xaaaace5cf7c0,0xaaaace5cf970, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, wait_sector_num = {-1, 8859904, 8860928, 8863360,8861952, 8862976, 8862592, 8861440, 0, 0, 0, 0, 0, 0, 0, 0}, lock = {locked = 0, ctx = 0x0, from_push = {slh_first = 0x0}, to_pop = {slh_first = 0x0}, handoff = 0, sequence = 0, holder = 0x0}, ret = -115}
+        __PRETTY_FUNCTION__ = "img_convert"
+#7  0x0000aaaacd1d8400 in main (argc=7, argv=<optimized out>) at ./qemu-img.c:4976
+        cmd = 0xaaaacd34ad78 <img_cmds+80>
+        cmdname = <optimized out>
+        local_error = 0x0
+        trace_file = 0x0
+        c = <optimized out>
+        long_options = {{name = 0xaaaacd2cbbb0 "help", has_arg = 0, flag = 0x0, val = 104}, {
+            name = 0xaaaacd2cbc78 "version", has_arg = 0, flag = 0x0, val = 86}, {name = 0xaaaacd2cbc80 "trace",
+            has_arg = 1, flag = 0x0, val = 84}, {name = 0x0, has_arg = 0, flag = 0x0, val = 0}}
+
+Alright, 
+
+I'm still investigating this but wanted to share some findings... I haven't got a kernel dump yet after the task is frozen, I have analyzed only the userland part of it (although I have checked if code was running inside kernel with perf cycles:u/cycles:k at some point).
+
+The big picture is this: Whenever qemu-img hangs, we have 3 hung tasks basically with these stacks:
+
+----
+
+TRHREAD #1
+__GI_ppoll (../sysdeps/unix/sysv/linux/ppoll.c:39)
+ppoll (/usr/include/aarch64-linux-gnu/bits/poll2.h:77)
+qemu_poll_ns (./util/qemu-timer.c:322)
+os_host_main_loop_wait (./util/main-loop.c:233)
+main_loop_wait (./util/main-loop.c:497)
+convert_do_copy (./qemu-img.c:1981)
+img_convert (./qemu-img.c:2457)
+main (./qemu-img.c:4976)
+
+got stack traces:
+
+./33293/stack                          ./33293/stack                         
+[<0>] __switch_to+0xc0/0x218           [<0>] __switch_to+0xc0/0x218          
+[<0>] ptrace_stop+0x148/0x2b0          [<0>] do_sys_poll+0x508/0x5c0         
+[<0>] get_signal+0x5a4/0x730           [<0>] __arm64_sys_ppoll+0xc0/0x118    
+[<0>] do_notify_resume+0x158/0x358     [<0>] el0_svc_common+0xa0/0x168       
+[<0>] work_pending+0x8/0x10            [<0>] el0_svc_handler+0x38/0x78       
+                                       [<0>] el0_svc+0x8/0xc  
+
+root@d06-1:~$ perf record -F 9999 -e cycles:u -p 33293 -- sleep 10
+[ perf record: Woken up 6 times to write data ]
+[ perf record: Captured and wrote 1.871 MB perf.data (48730 samples) ]
+
+root@d06-1:~$ perf report --stdio
+# Overhead  Command   Shared Object       Symbol
+# ........  ........  ..................  ......................
+#
+    37.82%  qemu-img  libc-2.29.so        [.] 0x00000000000df710
+    21.81%  qemu-img  [unknown]           [k] 0xffff000010099504
+    14.23%  qemu-img  [unknown]           [k] 0xffff000010085dc0
+     9.13%  qemu-img  [unknown]           [k] 0xffff00001008fff8
+     6.47%  qemu-img  libc-2.29.so        [.] 0x00000000000df708
+     5.69%  qemu-img  qemu-img            [.] qemu_event_reset
+     2.57%  qemu-img  libc-2.29.so        [.] 0x00000000000df678
+     0.63%  qemu-img  libc-2.29.so        [.] 0x00000000000df700
+     0.49%  qemu-img  libc-2.29.so        [.] __sigtimedwait
+     0.42%  qemu-img  libpthread-2.29.so  [.] __libc_sigwait
+
+----
+
+TRHREAD #3
+__GI___sigtimedwait (../sysdeps/unix/sysv/linux/sigtimedwait.c:29)
+__sigwait (linux/sigwait.c:28)
+qemu_thread_start (./util/qemu-thread-posix.c:498)
+start_thread (pthread_create.c:486)
+thread_start (linux/aarch64/clone.S:78)
+
+
+./33303/stack                          ./33303/stack                               
+[<0>] __switch_to+0xc0/0x218           [<0>] __switch_to+0xc0/0x218                
+[<0>] ptrace_stop+0x148/0x2b0          [<0>] do_sigtimedwait.isra.9+0x194/0x288    
+[<0>] get_signal+0x5a4/0x730           [<0>] __arm64_sys_rt_sigtimedwait+0xac/0x110
+[<0>] do_notify_resume+0x158/0x358     [<0>] el0_svc_common+0xa0/0x168             
+[<0>] work_pending+0x8/0x10            [<0>] el0_svc_handler+0x38/0x78             
+                                       [<0>] el0_svc+0x8/0xc   
+
+root@d06-1:~$ perf record -F 9999 -e cycles:u -p 33303 -- sleep 10
+[ perf record: Woken up 6 times to write data ]
+[ perf record: Captured and wrote 1.905 MB perf.data (49647 samples) ]
+
+root@d06-1:~$ perf report --stdio
+# Overhead  Command   Shared Object       Symbol
+# ........  ........  ..................  ......................
+#
+    45.37%  qemu-img  libc-2.29.so        [.] 0x00000000000df710
+    23.52%  qemu-img  [unknown]           [k] 0xffff000010099504
+     9.08%  qemu-img  [unknown]           [k] 0xffff00001008fff8
+     8.89%  qemu-img  [unknown]           [k] 0xffff000010085dc0
+     5.56%  qemu-img  libc-2.29.so        [.] 0x00000000000df708
+     3.66%  qemu-img  libc-2.29.so        [.] 0x00000000000df678
+     1.01%  qemu-img  libc-2.29.so        [.] __sigtimedwait
+     0.80%  qemu-img  libc-2.29.so        [.] 0x00000000000df700
+     0.64%  qemu-img  qemu-img            [.] qemu_event_reset
+     0.55%  qemu-img  libc-2.29.so        [.] 0x00000000000df718
+     0.52%  qemu-img  libpthread-2.29.so  [.] __libc_sigwait
+
+----
+
+TRHREAD #2
+syscall (linux/aarch64/syscall.S:38)
+qemu_futex_wait (./util/qemu-thread-posix.c:438)
+qemu_event_wait (./util/qemu-thread-posix.c:442)
+call_rcu_thread (./util/rcu.c:261)
+qemu_thread_start (./util/qemu-thread-posix.c:498)
+start_thread (pthread_create.c:486)
+thread_start (linux/aarch64/clone.S:78)
+
+./33302/stack                          ./33302/stack                       
+[<0>] __switch_to+0xc0/0x218           [<0>] __switch_to+0xc0/0x218        
+[<0>] ptrace_stop+0x148/0x2b0          [<0>] ptrace_stop+0x148/0x2b0       
+[<0>] get_signal+0x5a4/0x730           [<0>] get_signal+0x5a4/0x730        
+[<0>] do_notify_resume+0x1c4/0x358     [<0>] do_notify_resume+0x1c4/0x358  
+[<0>] work_pending+0x8/0x10            [<0>] work_pending+0x8/0x10    
+
+<stack does not change at all>
+
+root@d06-1:~$ perf report --stdio
+# Overhead  Command   Shared Object       Symbol
+# ........  ........  ..................  ......................
+#
+    50.30%  qemu-img  libc-2.29.so        [.] 0x00000000000df710
+    26.44%  qemu-img  [unknown]           [k] 0xffff000010099504
+     5.88%  qemu-img  libc-2.29.so        [.] 0x00000000000df708
+     5.26%  qemu-img  [unknown]           [k] 0xffff000010085dc0
+     5.25%  qemu-img  [unknown]           [k] 0xffff00001008fff8
+     4.25%  qemu-img  libc-2.29.so        [.] 0x00000000000df678
+     0.93%  qemu-img  libc-2.29.so        [.] __sigtimedwait
+     0.51%  qemu-img  libc-2.29.so        [.] 0x00000000000df700
+     0.35%  qemu-img  libpthread-2.29.so  [.] __libc_sigwait
+
+Their stack show those tasks are pretty much "stuck" in same userland program logic, while one of them is stuck at the same program counter address. Profiling those tasks give no much information without more debugging data and less optimizations.
+
+Although all the 0x000000dfXXX addresses seem broken as we get where libc was mapped (mid heap) and we have:
+
+(gdb) print __libc_sigwait
+$25 = {int (const sigset_t *, int *)} 0xffffbf128080 <__GI___sigwait>
+
+----
+
+Anyway, continuing.... I investigated the qemu_event_{set,reset,xxx} logic. In non Linux OSes it uses pthread primitives, but, for Linux, it uses a futex() implementation with a struct QemuEvent (rcu_call_ready_event) being the one holding values (busy, set, free, etc).
+
+I got 2 hung situations:
+
+(gdb) print (struct QemuEvent) *(0xaaaacd35fce8)
+$16 = {
+  value = 4294967295,
+  initialized = true
+}
+
+value = 4294967295 -> THIS IS A 32-bit 0xFFFF (casting vs overflow issue ?)
+
+AND
+
+a situation where value was either 0 or 1 (like expected). In this last situation I changed things by hand to make program to continue its execution:
+
+void qemu_event_wait(QemuEvent *ev)
+{
+    unsigned value;
+
+    assert(ev->initialized);
+    value = atomic_read(&ev->value);
+    smp_mb_acquire();
+    if (value != EV_SET) {
+        if (value == EV_FREE) {
+
+            if (atomic_cmpxchg(&ev->value, 
+                       EV_FREE, EV_BUSY) == EV_SET) {
+                return;
+            }
+        }
+        qemu_futex_wait(ev, EV_BUSY);
+    }
+}
+
+438     in ./util/qemu-thread-posix.c
+   0x0000aaaaaabd4174 <+44>:    mov     w1, #0xffffffff                 // #-1
+   0x0000aaaaaabd4178 <+48>:    ldaxr   w0, [x19]
+   0x0000aaaaaabd417c <+52>:    cmp     w0, #0x1
+   0x0000aaaaaabd4180 <+56>:    b.ne    0xaaaaaabd418c <qemu_event_wait+68>  // b.any
+=> 0x0000aaaaaabd4184 <+60>:    stlxr   w2, w1, [x19]
+   0x0000aaaaaabd4188 <+64>:    cbnz    w2, 0xaaaaaabd4178 <qemu_event_wait+48>
+   0x0000aaaaaabd418c <+68>:    cbz     w0, 0xaaaaaabd41cc <qemu_event_wait+132>
+   0x0000aaaaaabd4190 <+72>:    mov     w6, #0x0                        // #0
+   0x0000aaaaaabd4194 <+76>:    mov     x5, #0x0                        // #0
+   0x0000aaaaaabd4198 <+80>:    mov     x4, #0x0                        // #0
+   0x0000aaaaaabd419c <+84>:    mov     w3, #0xffffffff                 // #-1
+   0x0000aaaaaabd41a0 <+88>:    mov     w2, #0x0                        // #0
+   0x0000aaaaaabd41a4 <+92>:    mov     x1, x19
+   0x0000aaaaaabd41a8 <+96>:    mov     x0, #0x62                       // #98
+   0x0000aaaaaabd41ac <+100>:   bl      0xaaaaaaaff380 <syscall@plt>
+   
+I unblocked it by hand, setting the program counter register to outside that logic:
+
+(gdb) print qemu_event_wait+132
+$15 = (void (*)(QemuEvent *)) 0xaaaaaabd41cc <qemu_event_wait+132>
+(gdb) print rcu_call_ready_event
+$16 = {value = 1, initialized = true}
+(gdb) set rcu_call_ready_event->value=0
+(gdb) set $pc=0xaaaaaabd41cc
+
+And it got stuck again with program counter in other STLXR instruction:
+
+(gdb) thread 2
+
+[Switching to thread 2 (Thread 0xffffbec61d90 (LWP 33302))]
+#0  0x0000aaaaaabd4110 in qemu_event_reset (ev=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:414
+414     ./util/qemu-thread-posix.c: No such file or directory.
+(gdb) bt
+#0  0x0000aaaaaabd4110 in qemu_event_reset (ev=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:414
+#1  0x0000aaaaaabedff8 in call_rcu_thread (opaque=opaque@entry=0x0) at ./util/rcu.c:255
+#2  0x0000aaaaaabd34c8 in qemu_thread_start (args=<optimized out>) at ./util/qemu-thread-posix.c:498
+#3  0x0000ffffbf26a880 in start_thread (arg=0xfffffffff5bf) at pthread_create.c:486
+#4  0x0000ffffbf1c4b9c in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+(gdb) print rcu_call_ready_event
+$20 = {value = 1, initialized = true}
+
+(gdb) disassemble qemu_event_reset
+Dump of assembler code for function qemu_event_reset:
+   0x0000aaaaaabd40f0 <+0>:     ldrb    w1, [x0, #4]
+   0x0000aaaaaabd40f4 <+4>:     cbz     w1, 0xaaaaaabd411c <qemu_event_reset+44>
+   0x0000aaaaaabd40f8 <+8>:     ldr     w1, [x0]
+   0x0000aaaaaabd40fc <+12>:    dmb     ishld
+   0x0000aaaaaabd4100 <+16>:    cbz     w1, 0xaaaaaabd4108 <qemu_event_reset+24>
+   0x0000aaaaaabd4104 <+20>:    ret
+   0x0000aaaaaabd4108 <+24>:    ldaxr   w1, [x0]
+   0x0000aaaaaabd410c <+28>:    orr     w1, w1, #0x1
+=> 0x0000aaaaaabd4110 <+32>:    stlxr   w2, w1, [x0]
+   0x0000aaaaaabd4114 <+36>:    cbnz    w2, 0xaaaaaabd4108 <qemu_event_reset+24>
+   0x0000aaaaaabd4118 <+40>:    ret
+   
+And it does not matter if I continue, CPU keeps stuck in that program counter (again in a STLXR instruction)
+
+----
+
+So, initially I was afraid that the lack barriers (or not so strong ones being used) could have caused a race condition that would make one thread to depend on the other thread logic.
+
+Unfortunately it looks that instruction STLXR might not be behaving appropriately for this CPU/architecture as program counter seem to be stuck in the same instruction (which is super weird, by not throwing a general exception for some microcode issue, for example). 
+
+But this was just an initial overview, I still have to revisit this in order interpret results better (and recompile qemu with debugging data, and possible with other GCC version).
+
+Any comments are appreciated.
+
+Alright, here is what is happening:
+
+Whenever program is stuck, thread #2 backtrace is this:
+
+(gdb) bt
+#0  syscall () at ../sysdeps/unix/sysv/linux/aarch64/syscall.S:38
+#1  0x0000aaaaaabd41b0 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at ./util/qemu-thread-posix.c:438
+#2  qemu_event_wait (ev=ev@entry=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:442
+#3  0x0000aaaaaabee03c in call_rcu_thread (opaque=opaque@entry=0x0) at ./util/rcu.c:261
+#4  0x0000aaaaaabd34c8 in qemu_thread_start (args=<optimized out>) at ./util/qemu-thread-posix.c:498
+#5  0x0000ffffbf26a880 in start_thread (arg=0xfffffffff5bf) at pthread_create.c:486
+#6  0x0000ffffbf1c4b9c in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Meaning that code is waiting for a futex inside kernel.
+
+(gdb) print rcu_call_ready_event
+$4 = {value = 4294967295, initialized = true}
+
+The QemuEvent "rcu_call_ready_event->value" is set to INT_MAX and I don't know why yet.
+
+rcu_call_ready_event->value is only touched by:
+
+qemu_event_init() -> bool init ? EV_SET : EV_FREE
+qemu_event_reset() -> atomic_or(&ev->value, EV_FREE)
+qemu_event_set() -> atomic_xchg(&ev->value, EV_SET)
+qemu_event_wait() -> atomic_cmpxchg(&ev->value, EV_FREE, EV_BUSY)'
+
+And there should be no 0x7fff value for "ev->value".
+
+qemu_event_init() is the one initializing the global:
+
+    static QemuEvent rcu_call_ready_event;
+
+and it is called by "rcu_init_complete()" which is called by "rcu_init()":
+
+    static void __attribute__((__constructor__)) rcu_init(void)
+
+a constructor function.
+
+So, "fixing" this issue by:
+
+    (gdb) print rcu_call_ready_event
+    $8 = {value = 4294967295, initialized = true}
+    
+    (gdb) watch rcu_call_ready_event
+    Hardware watchpoint 1: rcu_call_ready_event
+    
+    (gdb) set rcu_call_ready_event.initialized = 1
+    
+    (gdb) set rcu_call_ready_event.value = 0
+
+and note that I added a watchpoint to rcu_call_ready_event global:
+
+<HANG>
+
+Thread 1 "qemu-img" received signal SIGINT, Interrupt.
+(gdb) thread 2
+[Switching to thread 2 (Thread 0xffffbec61d90 (LWP 33625))]
+
+(gdb) bt
+#0  0x0000aaaaaabd4110 in qemu_event_reset (ev=ev@entry=0xaaaaaac87ce8 <rcu_call_ready_event>)
+#1  0x0000aaaaaabedff8 in call_rcu_thread (opaque=opaque@entry=0x0) at ./util/rcu.c:255
+#2  0x0000aaaaaabd34c8 in qemu_thread_start (args=<optimized out>) at ./util/qemu-thread-posix.c:498
+#3  0x0000ffffbf26a880 in start_thread (arg=0xfffffffff5bf) at pthread_create.c:486
+#4  0x0000ffffbf1c4b9c in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+(gdb) print rcu_call_ready_event
+$9 = {value = 0, initialized = true}
+
+You can see I advanced in the qemu_event_{reset,set,wait} logic.
+
+    (gdb) disassemble /m 0x0000aaaaaabd4110
+    Dump of assembler code for function qemu_event_reset:
+    408     in ./util/qemu-thread-posix.c
+
+    409     in ./util/qemu-thread-posix.c
+
+    410     in ./util/qemu-thread-posix.c
+    411     in ./util/qemu-thread-posix.c
+       0x0000aaaaaabd40f0 <+0>:     ldrb    w1, [x0, #4]
+       0x0000aaaaaabd40f4 <+4>:     cbz     w1, 0xaaaaaabd411c <qemu_event_reset+44>
+       0x0000aaaaaabd411c <+44>:    stp     x29, x30, [sp, #-16]!
+       0x0000aaaaaabd4120 <+48>:    adrp    x3, 0xaaaaaac20000
+       0x0000aaaaaabd4124 <+52>:    add     x3, x3, #0x908
+       0x0000aaaaaabd4128 <+56>:    mov     x29, sp
+       0x0000aaaaaabd412c <+60>:    adrp    x1, 0xaaaaaac20000
+       0x0000aaaaaabd4130 <+64>:    adrp    x0, 0xaaaaaac20000
+       0x0000aaaaaabd4134 <+68>:    add     x3, x3, #0x290
+       0x0000aaaaaabd4138 <+72>:    add     x1, x1, #0xc00
+       0x0000aaaaaabd413c <+76>:    add     x0, x0, #0xd40
+       0x0000aaaaaabd4140 <+80>:    mov     w2, #0x19b    // #411
+       0x0000aaaaaabd4144 <+84>:    bl      0xaaaaaaaff190 <__assert_fail@plt>
+
+    412     in ./util/qemu-thread-posix.c
+       0x0000aaaaaabd40f8 <+8>:     ldr     w1, [x0]
+
+    413     in ./util/qemu-thread-posix.c
+       0x0000aaaaaabd40fc <+12>:    dmb     ishld
+
+    414     in ./util/qemu-thread-posix.c
+       0x0000aaaaaabd4100 <+16>:    cbz     w1, 0xaaaaaabd4108 <qemu_event_reset+24>
+       0x0000aaaaaabd4104 <+20>:    ret
+       0x0000aaaaaabd4108 <+24>:    ldaxr   w1, [x0]
+       0x0000aaaaaabd410c <+28>:    orr     w1, w1, #0x1
+    => 0x0000aaaaaabd4110 <+32>:    stlxr   w2, w1, [x0]
+       0x0000aaaaaabd4114 <+36>:    cbnz    w2, 0xaaaaaabd4108 <qemu_event_reset+24>
+       0x0000aaaaaabd4118 <+40>:    ret
+
+And I'm currently inside the STLXR and LDAXR logic. To make sure my program counter is advancing, I added a breakpoint at 0x0000aaaaaabd4108, so CBNZ instruction would branch indefinitely into LDXAR instruction again, until the
+LDAXR<->STLXR logic is satisfied (inside qemu_event_wait()).
+
+(gdb) break *(0x0000aaaaaabd4108)
+Breakpoint 2 at 0xaaaaaabd4108: file ./util/qemu-thread-posix.c, line 414.
+
+which is basically this:
+
+    if (value == EV_SET) {                        EV_SET == 0
+        atomic_or(&ev->value, EV_FREE);           EV_FREE = 1
+    }
+    
+and we can see that this logic being called one time after another:
+
+(gdb) c
+Thread 2 "qemu-img" hit Breakpoint 3, 0x0000aaaaaabd4108 in qemu_event_reset (
+    ev=ev@entry=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:414
+
+(gdb) c
+Thread 2 "qemu-img" hit Breakpoint 3, 0x0000aaaaaabd4108 in qemu_event_reset (
+    ev=ev@entry=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:414
+    
+(gdb) c
+Thread 2 "qemu-img" hit Breakpoint 3, 0x0000aaaaaabd4108 in qemu_event_reset (
+    ev=ev@entry=0xaaaaaac87ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:414
+
+EVEN when rcu_call_ready_event->value is already EV_SET (0):
+
+(gdb) print rcu_call_ready_event
+$11 = {value = 0, initialized = true}
+
+(gdb) info break
+Num     Type           Disp Enb Address            What
+1       hw watchpoint  keep y                      rcu_call_ready_event
+3       breakpoint     keep n   0x0000aaaaaabd4108 qemu-thread-posix.c:414
+        breakpoint already hit 23 times
+4       breakpoint     keep y   0x0000aaaaaabd4148 qemu-thread-posix.c:424
+
+IF I enable only rcu_call_ready_event HW watchpoint, nothing is triggered.
+
+(gdb) watch *(rcu_call_ready_event->value)
+Hardware watchpoint 6: *(rcu_call_ready_event->value)
+
+not if I set it directly to QemuEvent->value...
+
+    assert(ev->initialized);
+    value = atomic_read(&ev->value);
+    smp_mb_acquire();
+    if (value == EV_SET) {
+        atomic_or(&ev->value, EV_FREE);
+    }
+
+meaning that "value" and "ev->value" might have a diff value... is that so ?
+
+(gdb) print value
+$14 = <optimized out>
+
+can't say.. checking registers AND stack:
+
+       0x0000aaaaaabd4100 <+16>:    cbz     w1, 0xaaaaaabd4108 <qemu_event_reset+24>
+       0x0000aaaaaabd4104 <+20>:    ret
+       0x0000aaaaaabd4108 <+24>:    ldaxr   w1, [x0]
+       0x0000aaaaaabd410c <+28>:    orr     w1, w1, #0x1
+    => 0x0000aaaaaabd4110 <+32>:    stlxr   w2, w1, [x0]
+       0x0000aaaaaabd4114 <+36>:    cbnz    w2, 0xaaaaaabd4108 
+       
+
+x0             0xaaaaaac87ce8      187649986428136
+x1             0x1                 1
+x2             0x1                 1
+x3             0x0                 0
+x4             0xffffbec61e98      281473882398360
+x5             0xffffbec61c90      281473882397840
+x6             0xffffbec61c90      281473882397840
+x7             0x1                 1
+x8             0x65                101
+x9             0x0                 0
+x10            0x0                 0
+x11            0x0                 0
+x12            0xffffbec61d90      281473882398096
+x13            0x0                 0
+x14            0x0                 0
+x15            0x2                 2
+x16            0xffffbf67ccf0      281473892994288
+x17            0xffffbf274938      281473888766264
+x18            0x23f               575
+x19            0x0                 0
+x20            0xaaaaaac87ce8      187649986428136
+x21            0x0                 0
+x22            0xfffffffff5bf      281474976708031
+x23            0xaaaaaac87ce0      187649986428128
+x24            0xaaaaaac29000      187649986039808
+x25            0xfffffffff658      281474976708184
+x26            0x1000              4096
+x27            0xffffbf28c000      281473888862208
+x28            0xffffbec61d90      281473882398096
+x29            0xffffbec61420      281473882395680
+x30            0xaaaaaabedff8      187649985798136
+sp             0xffffbec61420      0xffffbec61420
+pc             0xaaaaaabd4110      0xaaaaaabd4110 <qemu_event_reset+32>
+cpsr           0x0                 [ EL=0 ]
+fpsr           0x0                 0
+fpcr           0x0                 0
+
+AND the ORR instruction is ALWAYS being executed against 0x1 (not 0x0, which is what I just changed by changing .value):
+
+(gdb) print value
+$14 = <optimized out>
+
+       0x0000aaaaaabd410c <+28>:    orr     w1, w1, #0x1
+       
+#0x1 is being used instead of contents of "value" local variable (volatile).
+
+I'll recompile QEMU flagging all those local "unsigned value" variables as being volatile and check if optimization changes. Or even try to disable optimizations.
+
+
+QEMU BUG: #1
+
+Alright, one of the issues is (according to comment #14):
+
+"""
+Meaning that code is waiting for a futex inside kernel.
+
+(gdb) print rcu_call_ready_event
+$4 = {value = 4294967295, initialized = true}
+
+The QemuEvent "rcu_call_ready_event->value" is set to INT_MAX and I don't know why yet.
+
+rcu_call_ready_event->value is only touched by:
+
+qemu_event_init() -> bool init ? EV_SET : EV_FREE
+qemu_event_reset() -> atomic_or(&ev->value, EV_FREE)
+qemu_event_set() -> atomic_xchg(&ev->value, EV_SET)
+qemu_event_wait() -> atomic_cmpxchg(&ev->value, EV_FREE, EV_BUSY)'
+"""
+
+Now I know why rcu_call_ready_event->value is set to INT_MAX. That is because in the following declaration:
+
+struct QemuEvent {
+#ifndef __linux__
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+#endif
+    unsigned value;
+    bool initialized;
+};
+
+#define EV_SET         0
+#define EV_FREE        1
+#define EV_BUSY       -1
+
+"value" is declared as unsigned, but EV_BUSY sets it to -1, and, according to the Two's Complement Operation (https://en.wikipedia.org/wiki/Two%27s_complement), it will be INT_MAX (4294967295).
+
+So this is the "first bug" found AND it is definitely funny that this hasn't been seen in other architectures at all... I can reproduce it at will. 
+
+With that said, it seems that there is still another issue causing (less frequently): 
+
+(gdb) thread 2
+[Switching to thread 2 (Thread 0xffffbec5ad90 (LWP 17459))]
+#0  syscall () at ../sysdeps/unix/sysv/linux/aarch64/syscall.S:38
+38      ../sysdeps/unix/sysv/linux/aarch64/syscall.S: No such file or directory.
+(gdb) bt
+#0  syscall () at ../sysdeps/unix/sysv/linux/aarch64/syscall.S:38
+#1  0x0000aaaaaabd41cc in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at ./util/qemu-thread-posix.c:438
+#2  qemu_event_wait (ev=ev@entry=0xaaaaaac86ce8 <rcu_call_ready_event>) at ./util/qemu-thread-posix.c:442
+#3  0x0000aaaaaabed05c in call_rcu_thread (opaque=opaque@entry=0x0) at ./util/rcu.c:261
+#4  0x0000aaaaaabd34c8 in qemu_thread_start (args=<optimized out>) at ./util/qemu-thread-posix.c:498
+#5  0x0000ffffbf25c880 in start_thread (arg=0xfffffffff5bf) at pthread_create.c:486
+#6  0x0000ffffbf1b6b9c in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Thread 2 to be stuck at "futex()" kernel syscall (like the FUTEX_WAKE never happened and/or wasn't atomic for this arch/binary). Need to investigate this also.
+
+Paolo,
+
+While debugging hungs in ARM64 while doing a simple:
+
+qemu-img convert -f qcow2 -O qcow2 file.qcow2 output.qcow2
+
+I might have found 2 issues which I'd like you to review, if possible.
+
+ISSUE #1
+========
+
+I've caught the following stack trace after an HUNG in qemu-img convert:
+
+(gdb) bt
+#0 syscall ()
+#1 0x0000aaaaaabd41cc in qemu_futex_wait
+#2 qemu_event_wait (ev=ev@entry=0xaaaaaac86ce8 <rcu_call_ready_event>)
+#3 0x0000aaaaaabed05c in call_rcu_thread
+#4 0x0000aaaaaabd34c8 in qemu_thread_start
+#5 0x0000ffffbf25c880 in start_thread
+#6 0x0000ffffbf1b6b9c in thread_start ()
+
+(gdb) print rcu_call_ready_event
+$4 = {value = 4294967295, initialized = true}
+
+value INT_MAX (4294967295) seems WRONG for qemu_futex_wait():
+
+- EV_BUSY, being -1, and passed as an argument qemu_futex_wait(void *,
+unsigned), is a two's complement, making argument into a INT_MAX when
+that's not what is expected (unless I missed something).
+
+*** If that is the case, unsure if you, Paolo, prefer declaring
+*(QemuEvent)->value as an integer or changing EV_BUSY to "2" would okay
+here ***
+
+BUG: description:
+https://bugs.launchpad.net/qemu/+bug/1805256/comments/15
+
+========
+ISSUE #2
+========
+
+I found this when debugging lockups while in futex() in a specific ARM64
+server - https://bugs.launchpad.net/qemu/+bug/1805256 - which I'm still
+investigating.
+
+After fixing the issue above, I'm still getting stuck into:
+
+qemu_event_wait() -> qemu_futex_wait()
+
+***
+As if qemu_event_set() has ran before qemu_futex_wait() ever started running
+***
+
+The Other threads are waiting for poll() on a PIPE coming from this
+stuck thread (thread #1), and in sigwait():
+
+(gdb) thread 1
+...
+(gdb) bt
+#0  0x0000ffffbf1ad81c in __GI_ppoll
+#1  0x0000aaaaaabcf73c in ppoll
+#2  qemu_poll_ns
+#3  0x0000aaaaaabd0764 in os_host_main_loop_wait
+#4  main_loop_wait
+...
+
+(gdb) thread 2
+...
+(gdb) bt
+#0 syscall ()
+#1 0x0000aaaaaabd41cc in qemu_futex_wait
+#2 qemu_event_wait (ev=ev@entry=0xaaaaaac86ce8 <rcu_call_ready_event>)
+#3 0x0000aaaaaabed05c in call_rcu_thread
+#4 0x0000aaaaaabd34c8 in qemu_thread_start
+#5 0x0000ffffbf25c880 in start_thread
+#6 0x0000ffffbf1b6b9c in thread_start ()
+
+(gdb) thread 3
+...
+(gdb) bt
+#0  0x0000ffffbf11aa20 in __GI___sigtimedwait
+#1  0x0000ffffbf2671b4 in __sigwait
+#2  0x0000aaaaaabd1ddc in sigwait_compat
+#3  0x0000aaaaaabd34c8 in qemu_thread_start
+#4  0x0000ffffbf25c880 in start_thread
+#5  0x0000ffffbf1b6b9c in thread_start
+
+QUESTION:
+
+- Should qemu_event_set() check return code from
+qemu_futex_wake()->qemu_futex()->syscall() in order to know if ANY
+waiter was ever woken up ? Maybe even loop until at least 1 is awaken ?
+
+Tks in advance,
+
+Rafael D. Tinoco
+
+
+In comment #14, please disregard the second half of the issue, related to:
+
+       0x0000aaaaaabd4100 <+16>: cbz w1, 0xaaaaaabd4108 <qemu_event_reset+24>
+       0x0000aaaaaabd4104 <+20>: ret
+       0x0000aaaaaabd4108 <+24>: ldaxr w1, [x0]
+       0x0000aaaaaabd410c <+28>: orr w1, w1, #0x1
+    => 0x0000aaaaaabd4110 <+32>: stlxr w2, w1, [x0]
+       0x0000aaaaaabd4114 <+36>: cbnz w2, 0xaaaaaabd4108
+
+Duh! This is just a regular load/xor/store logic for atomic_or() inside qemu_event_reset().
+
+Quick update...
+
+> value INT_MAX (4294967295) seems WRONG for qemu_futex_wait():
+> 
+> - EV_BUSY, being -1, and passed as an argument qemu_futex_wait(void *,
+> unsigned), is a two's complement, making argument into a INT_MAX when
+> that's not what is expected (unless I missed something).
+> 
+> *** If that is the case, unsure if you, Paolo, prefer declaring
+> *(QemuEvent)->value as an integer or changing EV_BUSY to "2" would okay
+> here ***
+> 
+> BUG: description:
+> https://bugs.launchpad.net/qemu/+bug/1805256/comments/15
+
+I realized this might be intentional, but, still, I tried:
+
+    https://pastebin.ubuntu.com/p/6rkkY6fJdm/
+
+looking for anything that could have misbehaved in arm64 (specially
+concerned on casting and type conversions between the functions).
+
+> QUESTION:
+> 
+> - Should qemu_event_set() check return code from
+> qemu_futex_wake()->qemu_futex()->syscall() in order to know if ANY
+> waiter was ever woken up ? Maybe even loop until at least 1 is awaken ?
+
+And I also tried:
+
+-    qemu_futex(f, FUTEX_WAKE, n, NULL, NULL, 0);
++    while(qemu_futex(pval, FUTEX_WAKE, val, NULL, NULL, 0) == 0)
++        continue;
+
+and it made little difference (took way more time for me to reproduce
+the issue though):
+
+"""
+(gdb) run
+Starting program: /usr/bin/qemu-img convert -f qcow2 -O qcow2
+./disk01.ext4.qcow2 ./output.qcow2
+
+[New Thread 0xffffbec5ad90 (LWP 72839)]
+[New Thread 0xffffbe459d90 (LWP 72840)]
+[New Thread 0xffffbdb57d90 (LWP 72841)]
+[New Thread 0xffffacac9d90 (LWP 72859)]
+[New Thread 0xffffa7ffed90 (LWP 72860)]
+[New Thread 0xffffa77fdd90 (LWP 72861)]
+[New Thread 0xffffa6ffcd90 (LWP 72862)]
+[New Thread 0xffffa67fbd90 (LWP 72863)]
+[New Thread 0xffffa5ffad90 (LWP 72864)]
+
+[Thread 0xffffa5ffad90 (LWP 72864) exited]
+[Thread 0xffffa6ffcd90 (LWP 72862) exited]
+[Thread 0xffffa77fdd90 (LWP 72861) exited]
+[Thread 0xffffbdb57d90 (LWP 72841) exited]
+[Thread 0xffffa67fbd90 (LWP 72863) exited]
+[Thread 0xffffacac9d90 (LWP 72859) exited]
+[Thread 0xffffa7ffed90 (LWP 72860) exited]
+
+<HUNG w/ 3 threads in the stack trace showed before>
+"""
+
+All the tasks left are blocked in a system call, so no task left to call
+qemu_futex_wake() to unblock thread #2 (in futex()), which would unblock
+thread #1 (doing poll() in a pipe with thread #2).
+
+Those 7 threads exit before disk conversion is complete (sometimes in
+the beginning, sometimes at the end).
+
+I'll try to check why those tasks exited.
+
+Any thoughts ?
+
+Tks
+
+
+> Zhengui's theory that notify_me doesn't work properly on ARM is more
+> promising, but he couldn't provide a clear explanation of why he thought
+> notify_me is involved.  In particular, I would have expected notify_me to
+> be wrong if the qemu_poll_ns call came from aio_ctx_dispatch, for example:
+> 
+> 
+>     glib_pollfds_fill
+>       g_main_context_prepare
+>         aio_ctx_prepare
+>           atomic_or(&ctx->notify_me, 1)
+>     qemu_poll_ns
+>     glib_pollfds_poll
+>       g_main_context_check
+>         aio_ctx_check
+>           atomic_and(&ctx->notify_me, ~1)
+>       g_main_context_dispatch
+>         aio_ctx_dispatch
+>           /* do something for event */
+>             qemu_poll_ns 
+> 
+
+Paolo,
+
+I tried confining execution in a single NUMA domain (cpu & mem) and
+still faced the issue, then, I added a mutex "ctx->notify_me_lcktest"
+into context to protect "ctx->notify_me", like showed bellow, and it
+seems to have either fixed or mitigated it.
+
+I was able to cause the hung once every 3 or 4 runs. I have already ran
+qemu-img convert more than 30 times now and couldn't reproduce it again.
+
+Next step is to play with the barriers and check why existing ones
+aren't enough for ordering access to ctx->notify_me ... or should I
+try/do something else in your opinion ?
+
+This arch/machine (Huawei D06):
+
+$ lscpu
+Architecture:        aarch64
+Byte Order:          Little Endian
+CPU(s):              96
+On-line CPU(s) list: 0-95
+Thread(s) per core:  1
+Core(s) per socket:  48
+Socket(s):           2
+NUMA node(s):        4
+Vendor ID:           0x48
+Model:               0
+Stepping:            0x0
+CPU max MHz:         2000.0000
+CPU min MHz:         200.0000
+BogoMIPS:            200.00
+L1d cache:           64K
+L1i cache:           64K
+L2 cache:            512K
+L3 cache:            32768K
+NUMA node0 CPU(s):   0-23
+NUMA node1 CPU(s):   24-47
+NUMA node2 CPU(s):   48-71
+NUMA node3 CPU(s):   72-95
+Flags:               fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics
+cpuid asimdrdm dcpop
+
+----
+
+diff --git a/include/block/aio.h b/include/block/aio.h
+index 0ca25dfec6..0724086d91 100644
+--- a/include/block/aio.h
++++ b/include/block/aio.h
+@@ -84,6 +84,7 @@ struct AioContext {
+      * dispatch phase, hence a simple counter is enough for them.
+      */
+     uint32_t notify_me;
++    QemuMutex notify_me_lcktest;
+
+     /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+      * and to ensure that no callbacks are removed while we're walking and
+diff --git a/util/aio-posix.c b/util/aio-posix.c
+index 51c41ed3c9..031d6e2997 100644
+--- a/util/aio-posix.c
++++ b/util/aio-posix.c
+@@ -529,7 +529,9 @@ static bool run_poll_handlers(AioContext *ctx,
+int64_t max_ns, int64_t *timeout)
+     bool progress;
+     int64_t start_time, elapsed_time;
+
++    qemu_mutex_lock(&ctx->notify_me_lcktest);
+     assert(ctx->notify_me);
++    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+     assert(qemu_lockcnt_count(&ctx->list_lock) > 0);
+
+     trace_run_poll_handlers_begin(ctx, max_ns, *timeout);
+@@ -601,8 +603,10 @@ bool aio_poll(AioContext *ctx, bool blocking)
+      * so disable the optimization now.
+      */
+     if (blocking) {
++        qemu_mutex_lock(&ctx->notify_me_lcktest);
+         assert(in_aio_context_home_thread(ctx));
+         atomic_add(&ctx->notify_me, 2);
++        qemu_mutex_unlock(&ctx->notify_me_lcktest);
+     }
+
+     qemu_lockcnt_inc(&ctx->list_lock);
+@@ -647,8 +651,10 @@ bool aio_poll(AioContext *ctx, bool blocking)
+     }
+
+     if (blocking) {
++        qemu_mutex_lock(&ctx->notify_me_lcktest);
+         atomic_sub(&ctx->notify_me, 2);
+         aio_notify_accept(ctx);
++        qemu_mutex_unlock(&ctx->notify_me_lcktest);
+     }
+
+     /* Adjust polling time */
+diff --git a/util/async.c b/util/async.c
+index c10642a385..140e1e86f5 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -221,7 +221,9 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
+ {
+     AioContext *ctx = (AioContext *) source;
+
++    qemu_mutex_lock(&ctx->notify_me_lcktest);
+     atomic_or(&ctx->notify_me, 1);
++    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+
+     /* We assume there is no timeout already supplied */
+     *timeout = qemu_timeout_ns_to_ms(aio_compute_timeout(ctx));
+@@ -239,8 +241,10 @@ aio_ctx_check(GSource *source)
+     AioContext *ctx = (AioContext *) source;
+     QEMUBH *bh;
+
++    qemu_mutex_lock(&ctx->notify_me_lcktest);
+     atomic_and(&ctx->notify_me, ~1);
+     aio_notify_accept(ctx);
++    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+
+     for (bh = ctx->first_bh; bh; bh = bh->next) {
+         if (bh->scheduled) {
+@@ -346,11 +350,13 @@ void aio_notify(AioContext *ctx)
+     /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+      * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+      */
+-    smp_mb();
++    //smp_mb();
++    qemu_mutex_lock(&ctx->notify_me_lcktest);
+     if (ctx->notify_me) {
+         event_notifier_set(&ctx->notifier);
+         atomic_mb_set(&ctx->notified, true);
+     }
++    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+ }
+
+ void aio_notify_accept(AioContext *ctx)
+@@ -424,6 +430,8 @@ AioContext *aio_context_new(Error **errp)
+     ctx->co_schedule_bh = aio_bh_new(ctx, co_schedule_bh_cb, ctx);
+     QSLIST_INIT(&ctx->scheduled_coroutines);
+
++    qemu_rec_mutex_init(&ctx->notify_me_lcktest);
++
+     aio_set_event_notifier(ctx, &ctx->notifier,
+                            false,
+                            (EventNotifierHandler *)
+
+
+On Wed, Sep 11, 2019 at 04:09:25PM -0300, Rafael David Tinoco wrote:
+> > Zhengui's theory that notify_me doesn't work properly on ARM is more
+> > promising, but he couldn't provide a clear explanation of why he thought
+> > notify_me is involved.  In particular, I would have expected notify_me to
+> > be wrong if the qemu_poll_ns call came from aio_ctx_dispatch, for example:
+> > 
+> > 
+> >     glib_pollfds_fill
+> >       g_main_context_prepare
+> >         aio_ctx_prepare
+> >           atomic_or(&ctx->notify_me, 1)
+> >     qemu_poll_ns
+> >     glib_pollfds_poll
+> >       g_main_context_check
+> >         aio_ctx_check
+> >           atomic_and(&ctx->notify_me, ~1)
+> >       g_main_context_dispatch
+> >         aio_ctx_dispatch
+> >           /* do something for event */
+> >             qemu_poll_ns 
+> > 
+> 
+> Paolo,
+> 
+> I tried confining execution in a single NUMA domain (cpu & mem) and
+> still faced the issue, then, I added a mutex "ctx->notify_me_lcktest"
+> into context to protect "ctx->notify_me", like showed bellow, and it
+> seems to have either fixed or mitigated it.
+> 
+> I was able to cause the hung once every 3 or 4 runs. I have already ran
+> qemu-img convert more than 30 times now and couldn't reproduce it again.
+> 
+> Next step is to play with the barriers and check why existing ones
+> aren't enough for ordering access to ctx->notify_me ... or should I
+> try/do something else in your opinion ?
+> 
+> This arch/machine (Huawei D06):
+> 
+> $ lscpu
+> Architecture:        aarch64
+> Byte Order:          Little Endian
+> CPU(s):              96
+> On-line CPU(s) list: 0-95
+> Thread(s) per core:  1
+> Core(s) per socket:  48
+> Socket(s):           2
+> NUMA node(s):        4
+> Vendor ID:           0x48
+> Model:               0
+> Stepping:            0x0
+> CPU max MHz:         2000.0000
+> CPU min MHz:         200.0000
+> BogoMIPS:            200.00
+> L1d cache:           64K
+> L1i cache:           64K
+> L2 cache:            512K
+> L3 cache:            32768K
+> NUMA node0 CPU(s):   0-23
+> NUMA node1 CPU(s):   24-47
+> NUMA node2 CPU(s):   48-71
+> NUMA node3 CPU(s):   72-95
+> Flags:               fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics
+> cpuid asimdrdm dcpop
+
+Note that I'm also seeing this on a ThunderX2 (same calltrace):
+
+$ lscpu
+Architecture:        aarch64
+Byte Order:          Little Endian
+CPU(s):              224
+On-line CPU(s) list: 0-223
+Thread(s) per core:  4
+Core(s) per socket:  28
+Socket(s):           2
+NUMA node(s):        2
+Vendor ID:           Cavium
+Model:               1
+Model name:          ThunderX2 99xx
+Stepping:            0x1
+BogoMIPS:            400.00
+L1d cache:           32K
+L1i cache:           32K
+L2 cache:            256K
+L3 cache:            32768K
+NUMA node0 CPU(s):   0-111
+NUMA node1 CPU(s):   112-223
+Flags:               fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics cpuid asimdrdm
+
+  -dann
+
+> ----
+> 
+> diff --git a/include/block/aio.h b/include/block/aio.h
+> index 0ca25dfec6..0724086d91 100644
+> --- a/include/block/aio.h
+> +++ b/include/block/aio.h
+> @@ -84,6 +84,7 @@ struct AioContext {
+>       * dispatch phase, hence a simple counter is enough for them.
+>       */
+>      uint32_t notify_me;
+> +    QemuMutex notify_me_lcktest;
+> 
+>      /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+>       * and to ensure that no callbacks are removed while we're walking and
+> diff --git a/util/aio-posix.c b/util/aio-posix.c
+> index 51c41ed3c9..031d6e2997 100644
+> --- a/util/aio-posix.c
+> +++ b/util/aio-posix.c
+> @@ -529,7 +529,9 @@ static bool run_poll_handlers(AioContext *ctx,
+> int64_t max_ns, int64_t *timeout)
+>      bool progress;
+>      int64_t start_time, elapsed_time;
+> 
+> +    qemu_mutex_lock(&ctx->notify_me_lcktest);
+>      assert(ctx->notify_me);
+> +    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+>      assert(qemu_lockcnt_count(&ctx->list_lock) > 0);
+> 
+>      trace_run_poll_handlers_begin(ctx, max_ns, *timeout);
+> @@ -601,8 +603,10 @@ bool aio_poll(AioContext *ctx, bool blocking)
+>       * so disable the optimization now.
+>       */
+>      if (blocking) {
+> +        qemu_mutex_lock(&ctx->notify_me_lcktest);
+>          assert(in_aio_context_home_thread(ctx));
+>          atomic_add(&ctx->notify_me, 2);
+> +        qemu_mutex_unlock(&ctx->notify_me_lcktest);
+>      }
+> 
+>      qemu_lockcnt_inc(&ctx->list_lock);
+> @@ -647,8 +651,10 @@ bool aio_poll(AioContext *ctx, bool blocking)
+>      }
+> 
+>      if (blocking) {
+> +        qemu_mutex_lock(&ctx->notify_me_lcktest);
+>          atomic_sub(&ctx->notify_me, 2);
+>          aio_notify_accept(ctx);
+> +        qemu_mutex_unlock(&ctx->notify_me_lcktest);
+>      }
+> 
+>      /* Adjust polling time */
+> diff --git a/util/async.c b/util/async.c
+> index c10642a385..140e1e86f5 100644
+> --- a/util/async.c
+> +++ b/util/async.c
+> @@ -221,7 +221,9 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
+>  {
+>      AioContext *ctx = (AioContext *) source;
+> 
+> +    qemu_mutex_lock(&ctx->notify_me_lcktest);
+>      atomic_or(&ctx->notify_me, 1);
+> +    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+> 
+>      /* We assume there is no timeout already supplied */
+>      *timeout = qemu_timeout_ns_to_ms(aio_compute_timeout(ctx));
+> @@ -239,8 +241,10 @@ aio_ctx_check(GSource *source)
+>      AioContext *ctx = (AioContext *) source;
+>      QEMUBH *bh;
+> 
+> +    qemu_mutex_lock(&ctx->notify_me_lcktest);
+>      atomic_and(&ctx->notify_me, ~1);
+>      aio_notify_accept(ctx);
+> +    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+> 
+>      for (bh = ctx->first_bh; bh; bh = bh->next) {
+>          if (bh->scheduled) {
+> @@ -346,11 +350,13 @@ void aio_notify(AioContext *ctx)
+>      /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+>       * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+>       */
+> -    smp_mb();
+> +    //smp_mb();
+> +    qemu_mutex_lock(&ctx->notify_me_lcktest);
+>      if (ctx->notify_me) {
+>          event_notifier_set(&ctx->notifier);
+>          atomic_mb_set(&ctx->notified, true);
+>      }
+> +    qemu_mutex_unlock(&ctx->notify_me_lcktest);
+>  }
+> 
+>  void aio_notify_accept(AioContext *ctx)
+> @@ -424,6 +430,8 @@ AioContext *aio_context_new(Error **errp)
+>      ctx->co_schedule_bh = aio_bh_new(ctx, co_schedule_bh_cb, ctx);
+>      QSLIST_INIT(&ctx->scheduled_coroutines);
+> 
+> +    qemu_rec_mutex_init(&ctx->notify_me_lcktest);
+> +
+>      aio_set_event_notifier(ctx, &ctx->notifier,
+>                             false,
+>                             (EventNotifierHandler *)
+> 
+
+
+I've looked into this on ThunderX2. The arm64 code generated for the
+atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+memory barriers. It is just plain ldaxr/stlxr.
+
+From my understanding this is not sufficient for SMP sync.
+
+If I read this comment correct:
+
+    void aio_notify(AioContext *ctx)
+    {
+        /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+         * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+         */
+        smp_mb();
+        if (ctx->notify_me) {
+
+it points out that the smp_mb() should be paired. But as
+I said the used atomics don't generate any barriers at all.
+
+I've tried to verify me theory with this patch and didn't run into the
+issue for ~500 iterations (usually I would trigger the issue ~20 iterations).
+
+--Jan
+
+diff --git a/util/aio-posix.c b/util/aio-posix.c
+index d8f0cb4af8dd..d07dcd4e9993 100644
+--- a/util/aio-posix.c
++++ b/util/aio-posix.c
+@@ -591,6 +591,7 @@ bool aio_poll(AioContext *ctx, bool blocking)
+      */
+     if (blocking) {
+         atomic_add(&ctx->notify_me, 2);
++        smp_mb();
+     }
+ 
+     qemu_lockcnt_inc(&ctx->list_lock);
+@@ -632,6 +633,7 @@ bool aio_poll(AioContext *ctx, bool blocking)
+ 
+     if (blocking) {
+         atomic_sub(&ctx->notify_me, 2);
++        smp_mb();
+     }
+ 
+     /* Adjust polling time */
+diff --git a/util/async.c b/util/async.c
+index 4dd9d95a9e73..92ac209c4615 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -222,6 +222,7 @@ aio_ctx_prepare(GSource *source, gint    *timeout)
+     AioContext *ctx = (AioContext *) source;
+ 
+     atomic_or(&ctx->notify_me, 1);
++    smp_mb();
+ 
+     /* We assume there is no timeout already supplied */
+     *timeout = qemu_timeout_ns_to_ms(aio_compute_timeout(ctx));
+@@ -240,6 +241,7 @@ aio_ctx_check(GSource *source)
+     QEMUBH *bh;
+ 
+     atomic_and(&ctx->notify_me, ~1);
++    smp_mb();
+     aio_notify_accept(ctx);
+ 
+     for (bh = ctx->first_bh; bh; bh = bh->next) {
+
+
+Debug files for aio-posix generated on 18.04 on ThunderX2.
+
+Compiler:
+gcc version 7.4.0 (Ubuntu/Linaro 7.4.0-1ubuntu1~18.04.1)
+
+Distro:
+Ubuntu 18.04.3 LTS
+
+On Wed, Oct 02, 2019 at 11:45:19AM +0200, Paolo Bonzini wrote:
+> On 02/10/19 11:23, Jan Glauber wrote:
+> > I've tried to verify me theory with this patch and didn't run into the
+> > issue for ~500 iterations (usually I would trigger the issue ~20 iterations).
+> 
+> Awesome!  That would be a compiler bug though, as atomic_add and atomic_sub
+> are defined as sequentially consistent:
+> 
+> #define atomic_add(ptr, n) ((void) __atomic_fetch_add(ptr, n, __ATOMIC_SEQ_CST))
+> #define atomic_sub(ptr, n) ((void) __atomic_fetch_sub(ptr, n, __ATOMIC_SEQ_CST))
+
+Compiler bug sounds kind of unlikely...
+
+> What compiler are you using and what distro?  Can you compile util/aio-posix.c
+> with "-fdump-rtl-all -fdump-tree-all", zip the boatload of debugging files and
+> send them my way?
+
+This is on Ubuntu 18.04.3,
+gcc version 7.4.0 (Ubuntu/Linaro 7.4.0-1ubuntu1~18.04.1)
+
+I've uploaded the debug files to:
+https://bugs.launchpad.net/qemu/+bug/1805256/+attachment/5293619/+files/aio-posix.tar.xz
+
+Thanks,
+Jan
+
+> Thanks,
+> 
+> Paolo
+
+
+Documenting this here as bug# was dropped from the mail thread:
+
+On 02/10/19 13:05, Jan Glauber wrote:
+> The arm64 code generated for the
+> atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+> memory barriers. It is just plain ldaxr/stlxr.
+>
+> From my understanding this is not sufficient for SMP sync.
+>
+>>> If I read this comment correct:
+>>>
+>>>     void aio_notify(AioContext *ctx)
+>>>     {
+>>>         /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+>>>          * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+>>>          */
+>>>         smp_mb();
+>>>         if (ctx->notify_me) {
+>>>
+>>> it points out that the smp_mb() should be paired. But as
+>>> I said the used atomics don't generate any barriers at all.
+>>
+>> Awesome!  That would be a compiler bug though, as atomic_add and atomic_sub
+>> are defined as sequentially consistent:
+>>
+>> #define atomic_add(ptr, n) ((void) __atomic_fetch_add(ptr, n, __ATOMIC_SEQ_CST))
+>> #define atomic_sub(ptr, n) ((void) __atomic_fetch_sub(ptr, n, __ATOMIC_SEQ_CST))
+>
+> Compiler bug sounds kind of unlikely...
+Indeed the assembly produced by the compiler matches for example the
+mappings at https://www.cl.cam.ac.uk/~pes20/cpp/cpp0xmappings.html.  A
+small testcase is as follows:
+
+  int ctx_notify_me;
+  int bh_scheduled;
+
+  int x()
+  {
+      int one = 1;
+      int ret;
+      __atomic_store(&bh_scheduled, &one, __ATOMIC_RELEASE);     // x1
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);                   // x2
+      __atomic_load(&ctx_notify_me, &ret, __ATOMIC_RELAXED);     // x3
+      return ret;
+  }
+
+  int y()
+  {
+      int ret;
+      __atomic_fetch_add(&ctx_notify_me, 2, __ATOMIC_SEQ_CST);  // y1
+      __atomic_load(&bh_scheduled, &ret, __ATOMIC_RELAXED);     // y2
+      return ret;
+  }
+
+Here y (which is aio_poll) wants to order the write to ctx->notify_me
+before reads of bh->scheduled.  However, the processor can speculate the
+load of bh->scheduled between the load-acquire and store-release of
+ctx->notify_me.  So you can have something like:
+
+ thread 0 (y)                          thread 1 (x)
+ -----------------------------------   -----------------------------
+ y1: load-acq ctx->notify_me
+ y2: load-rlx bh->scheduled
+                                       x1: store-rel bh->scheduled <-- 1
+                                       x2: memory barrier
+                                       x3: load-rlx ctx->notify_me
+ y1: store-rel ctx->notify_me <-- 2
+
+Being very puzzled, I tried to put this into cppmem:
+
+  int main() {
+    atomic_int ctx_notify_me = 0;
+    atomic_int bh_scheduled = 0;
+    {{{ {
+          bh_scheduled.store(1, mo_release);
+          atomic_thread_fence(mo_seq_cst);
+          // must be zero since the bug report shows no notification
+          ctx_notify_me.load(mo_relaxed).readsvalue(0);
+        }
+    ||| {
+          ctx_notify_me.store(2, mo_seq_cst);
+          r2=bh_scheduled.load(mo_relaxed);
+        }
+    }}};
+    return 0;
+  }
+
+and much to my surprise, the tool said r2 *can* be 0.  Same if I put a
+CAS like
+
+        cas_strong_explicit(ctx_notify_me.readsvalue(0), 0, 2,
+                            mo_seq_cst, mo_seq_cst);
+
+which resembles the code in the test case a bit more.
+
+I then found a discussion about using the C11 memory model in Linux
+(https://gcc.gnu.org/ml/gcc/2014-02/msg00058.html) which contains the
+following statement, which is a bit disheartening even though it is
+about a different test:
+
+   My first gut feeling was that the assertion should never fire, but
+   that was wrong because (as I seem to usually forget) the seq-cst
+   total order is just a constraint but doesn't itself contribute
+   to synchronizes-with -- but this is different for seq-cst fences.
+
+and later in the thread:
+
+   Use of C11 atomics to implement Linux kernel atomic operations
+   requires knowledge of the underlying architecture and the compiler's
+   implementation, as was noted earlier in this thread.
+
+Indeed if I add an atomic_thread_fence I get only one valid execution,
+where r2 must be 1.  This is similar to GCC's bug
+https://gcc.gnu.org/bugzilla/show_bug.cgi?id=65697, and we can fix it in
+QEMU by using __sync_fetch_and_add; in fact cppmem also shows one valid
+execution if the store is replaced with something like GCC's assembly
+for __sync_fetch_and_add (or Linux's assembly for atomic_add_return):
+
+        cas_strong_explicit(ctx_notify_me.readsvalue(0), 0, 2,
+                            mo_release, mo_release);
+        atomic_thread_fence(mo_seq_cst);
+
+So we should:
+
+1) understand why ATOMIC_SEQ_CST is not enough in this case.  QEMU code
+seems to be making the same assumptions as Linux about the memory model,
+and this is wrong because QEMU uses C11 atomics if available.
+Fortunately, this kind of synchronization in QEMU is relatively rare and
+only this particular bit seems affected.  If there is a fix which stays
+within the C11 memory model, and does not pessimize code on x86, we can
+use it[1] and document the pitfall.
+
+2) if there's no way to fix the bug, qemu/atomic.h needs to switch to
+__sync_fetch_and_add and friends.  And again, in this case the
+difference between the C11 and Linux/QEMU memory models must be documented.
+
+Torvald, Will, help me please... :((
+
+Paolo
+
+[1] as would be the case if fetch_add was implemented as
+fetch_add(RELEASE)+thread_fence(SEQ_CST).
+
+
+
+
+
+On Wed, 2019-10-02 at 15:20 +0200, Paolo Bonzini wrote:
+> On 02/10/19 13:05, Jan Glauber wrote:
+>> The arm64 code generated for the
+>> atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+>> memory barriers. It is just plain ldaxr/stlxr.
+>>
+>> From my understanding this is not sufficient for SMP sync.
+>>
+>>>> If I read this comment correct:
+>>>>
+>>>>     void aio_notify(AioContext *ctx)
+>>>>     {
+>>>>         /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+>>>>          * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+>>>>          */
+>>>>         smp_mb();
+>>>>         if (ctx->notify_me) {
+>>>>
+>>>> it points out that the smp_mb() should be paired. But as
+>>>> I said the used atomics don't generate any barriers at all.
+>>>
+>>> Awesome!  That would be a compiler bug though, as atomic_add and atomic_sub
+>>> are defined as sequentially consistent:
+>>>
+>>> #define atomic_add(ptr, n) ((void) __atomic_fetch_add(ptr, n, __ATOMIC_SEQ_CST))
+>>> #define atomic_sub(ptr, n) ((void) __atomic_fetch_sub(ptr, n, __ATOMIC_SEQ_CST))
+>>
+>> Compiler bug sounds kind of unlikely...
+>
+> Indeed the assembly produced by the compiler matches for example the
+> mappings at https://www.cl.cam.ac.uk/~pes20/cpp/cpp0xmappings.html.  A
+> small testcase is as follows:
+>
+>   int ctx_notify_me;
+>   int bh_scheduled;
+>
+>   int x()
+>   {
+>       int one = 1;
+>       int ret;
+>       __atomic_store(&bh_scheduled, &one, __ATOMIC_RELEASE);     // x1
+>       __atomic_thread_fence(__ATOMIC_SEQ_CST);                   // x2
+>       __atomic_load(&ctx_notify_me, &ret, __ATOMIC_RELAXED);     // x3
+>       return ret;
+>   }
+>
+>   int y()
+>   {
+>       int ret;
+>       __atomic_fetch_add(&ctx_notify_me, 2, __ATOMIC_SEQ_CST);  // y1
+>       __atomic_load(&bh_scheduled, &ret, __ATOMIC_RELAXED);     // y2
+>       return ret;
+>   }
+>
+> Here y (which is aio_poll) wants to order the write to ctx->notify_me
+> before reads of bh->scheduled.  However, the processor can speculate the
+> load of bh->scheduled between the load-acquire and store-release of
+> ctx->notify_me.  So you can have something like:
+>
+>  thread 0 (y)                          thread 1 (x)
+>  -----------------------------------   -----------------------------
+>  y1: load-acq ctx->notify_me
+>  y2: load-rlx bh->scheduled
+>                                        x1: store-rel bh->scheduled <-- 1
+>                                        x2: memory barrier
+>                                        x3: load-rlx ctx->notify_me
+>  y1: store-rel ctx->notify_me <-- 2
+>
+> Being very puzzled, I tried to put this into cppmem:
+>
+>   int main() {
+>     atomic_int ctx_notify_me = 0;
+>     atomic_int bh_scheduled = 0;
+>     {{{ {
+>           bh_scheduled.store(1, mo_release);
+>           atomic_thread_fence(mo_seq_cst);
+>           // must be zero since the bug report shows no notification
+>           ctx_notify_me.load(mo_relaxed).readsvalue(0);
+>         }
+>     ||| {
+>           ctx_notify_me.store(2, mo_seq_cst);
+>           r2=bh_scheduled.load(mo_relaxed);
+>         }
+>     }}};
+>     return 0;
+>   }
+>
+> and much to my surprise, the tool said r2 *can* be 0.  Same if I put a
+> CAS like
+>
+>         cas_strong_explicit(ctx_notify_me.readsvalue(0), 0, 2,
+>                             mo_seq_cst, mo_seq_cst);
+>
+> which resembles the code in the test case a bit more.
+
+This example looks like Dekker synchronization (if I get the intent right).
+
+Two possible implementations of this are either (1) with all memory
+accesses having seq-cst MO, or (2) with relaxed-MO accesses and seq-cst
+fences on between the store and load on both ends.  It's possible to mix
+both, but that get's trickier I think.  I'd prefer the one with just
+fences, just because it's easiest, conceptually.
+
+> I then found a discussion about using the C11 memory model in Linux
+> (https://gcc.gnu.org/ml/gcc/2014-02/msg00058.html) which contains the
+> following statement, which is a bit disheartening even though it is
+> about a different test:
+>
+>    My first gut feeling was that the assertion should never fire, but
+>    that was wrong because (as I seem to usually forget) the seq-cst
+>    total order is just a constraint but doesn't itself contribute
+>    to synchronizes-with -- but this is different for seq-cst fences.
+
+It works if you use (1) or (2) consistently.  cppmem and the Batty et al.
+tech report should give you the gory details.
+My comment is just about seq-cst working differently on memory accesses vs.
+fences (in the way it's specified in the memory model).
+
+> and later in the thread:
+>
+>    Use of C11 atomics to implement Linux kernel atomic operations
+>    requires knowledge of the underlying architecture and the compiler's
+>    implementation, as was noted earlier in this thread.
+>
+> Indeed if I add an atomic_thread_fence I get only one valid execution,
+> where r2 must be 1.  This is similar to GCC's bug
+> https://gcc.gnu.org/bugzilla/show_bug.cgi?id=65697, and we can fix it in
+> QEMU by using __sync_fetch_and_add; in fact cppmem also shows one valid
+> execution if the store is replaced with something like GCC's assembly
+> for __sync_fetch_and_add (or Linux's assembly for atomic_add_return):
+>
+>         cas_strong_explicit(ctx_notify_me.readsvalue(0), 0, 2,
+>                             mo_release, mo_release);
+>         atomic_thread_fence(mo_seq_cst);
+>
+> So we should:
+>
+> 1) understand why ATOMIC_SEQ_CST is not enough in this case.  QEMU code
+> seems to be making the same assumptions as Linux about the memory model,
+> and this is wrong because QEMU uses C11 atomics if available.
+> Fortunately, this kind of synchronization in QEMU is relatively rare and
+> only this particular bit seems affected.  If there is a fix which stays
+> within the C11 memory model, and does not pessimize code on x86, we can
+> use it[1] and document the pitfall.
+
+Using the fences between the store/load pairs in Dekker-like
+synchronization should do that, right?  It's also relatively easy to deal
+with.
+
+> 2) if there's no way to fix the bug, qemu/atomic.h needs to switch to
+> __sync_fetch_and_add and friends.  And again, in this case the
+> difference between the C11 and Linux/QEMU memory models must be documented.
+
+I surely not aware of all the constraints here, but I'd be surprised if the
+C11 memory model isn't good enough for portable synchronization code (with
+the exception of the consume MO minefield, perhaps). 
+
+
+
+
+On 02/10/19 16:58, Torvald Riegel wrote:
+> This example looks like Dekker synchronization (if I get the intent right).
+
+It is the same pattern.  However, one of the two synchronized variables
+is a counter rather than just a flag.
+
+> Two possible implementations of this are either (1) with all memory
+> accesses having seq-cst MO, or (2) with relaxed-MO accesses and seq-cst
+> fences on between the store and load on both ends.  It's possible to mix
+> both, but that get's trickier I think.  I'd prefer the one with just
+> fences, just because it's easiest, conceptually.
+
+Got it.
+
+I'd also prefer the one with just fences, because we only really control
+one side of the synchronization primitive (ctx_notify_me in my litmus
+test) and I don't like the idea of forcing seq-cst MO on the other side
+(bh_scheduled).  The performance issue that I mentioned is that x86
+doesn't have relaxed fetch and add, so you'd have a redundant fence like
+this:
+
+	lock	xaddl $2, mem1
+	mfence
+	...
+	movl	mem1, %r8
+
+(Gory QEMU details however allow us to use relaxed load and store here,
+because there's only one writer).
+
+> It works if you use (1) or (2) consistently.  cppmem and the Batty et al.
+> tech report should give you the gory details.
+>
+>> 1) understand why ATOMIC_SEQ_CST is not enough in this case.  QEMU code
+>> seems to be making the same assumptions as Linux about the memory model,
+>> and this is wrong because QEMU uses C11 atomics if available.
+>> Fortunately, this kind of synchronization in QEMU is relatively rare and
+>> only this particular bit seems affected.  If there is a fix which stays
+>> within the C11 memory model, and does not pessimize code on x86, we can
+>> use it[1] and document the pitfall.
+>
+> Using the fences between the store/load pairs in Dekker-like
+> synchronization should do that, right?  It's also relatively easy to deal
+> with.
+>
+>> 2) if there's no way to fix the bug, qemu/atomic.h needs to switch to
+>> __sync_fetch_and_add and friends.  And again, in this case the
+>> difference between the C11 and Linux/QEMU memory models must be documented.
+>
+> I surely not aware of all the constraints here, but I'd be surprised if the
+> C11 memory model isn't good enough for portable synchronization code (with
+> the exception of the consume MO minefield, perhaps). 
+
+This helps a lot already; I'll work on a documentation and code patch.
+Thanks very much.
+
+Paolo
+
+>>   int main() {
+>>     atomic_int ctx_notify_me = 0;
+>>     atomic_int bh_scheduled = 0;
+>>     {{{ {
+>>           bh_scheduled.store(1, mo_release);
+>>           atomic_thread_fence(mo_seq_cst);
+>>           // must be zero since the bug report shows no notification
+>>           ctx_notify_me.load(mo_relaxed).readsvalue(0);
+>>         }
+>>     ||| {
+>>           ctx_notify_me.store(2, mo_seq_cst);
+>>           r2=bh_scheduled.load(mo_relaxed);
+>>         }
+>>     }}};
+>>     return 0;
+>>   }
+
+
+
+
+On Mon, Oct 07, 2019 at 01:06:20PM +0200, Paolo Bonzini wrote:
+> On 02/10/19 11:23, Jan Glauber wrote:
+> > I've looked into this on ThunderX2. The arm64 code generated for the
+> > atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+> > memory barriers. It is just plain ldaxr/stlxr.
+> > 
+> > From my understanding this is not sufficient for SMP sync.
+> > 
+> > If I read this comment correct:
+> > 
+> >     void aio_notify(AioContext *ctx)
+> >     {
+> >         /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> >          * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> >          */
+> >         smp_mb();
+> >         if (ctx->notify_me) {
+> > 
+> > it points out that the smp_mb() should be paired. But as
+> > I said the used atomics don't generate any barriers at all.
+> 
+> Based on the rest of the thread, this patch should also fix the bug:
+> 
+> diff --git a/util/async.c b/util/async.c
+> index 47dcbfa..721ea53 100644
+> --- a/util/async.c
+> +++ b/util/async.c
+> @@ -249,7 +249,7 @@ aio_ctx_check(GSource *source)
+>      aio_notify_accept(ctx);
+>  
+>      for (bh = ctx->first_bh; bh; bh = bh->next) {
+> -        if (bh->scheduled) {
+> +        if (atomic_mb_read(&bh->scheduled)) {
+>              return true;
+>          }
+>      }
+> 
+> 
+> And also the memory barrier in aio_notify can actually be replaced
+> with a SEQ_CST load:
+> 
+> diff --git a/util/async.c b/util/async.c
+> index 47dcbfa..721ea53 100644
+> --- a/util/async.c
+> +++ b/util/async.c
+> @@ -349,11 +349,11 @@ LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+>  
+>  void aio_notify(AioContext *ctx)
+>  {
+> -    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> -     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> +    /* Using atomic_mb_read ensures that e.g. bh->scheduled is written before
+> +     * ctx->notify_me is read.  Pairs with atomic_or in aio_ctx_prepare or
+> +     * atomic_add in aio_poll.
+>       */
+> -    smp_mb();
+> -    if (ctx->notify_me) {
+> +    if (atomic_mb_read(&ctx->notify_me)) {
+>          event_notifier_set(&ctx->notifier);
+>          atomic_mb_set(&ctx->notified, true);
+>      }
+> 
+> 
+> Would you be able to test these (one by one possibly)?
+
+Sure.
+
+> > I've tried to verify me theory with this patch and didn't run into the
+> > issue for ~500 iterations (usually I would trigger the issue ~20 iterations).
+> 
+> Sorry for asking the obvious---500 iterations of what?
+
+The testcase mentioned in the Canonical issue:
+https://bugs.launchpad.net/qemu/+bug/1805256
+
+It's a simple image convert:
+qemu-img convert -f qcow2 -O qcow2 ./disk01.qcow2 ./output.qcow2
+
+Usually it got stuck after 3-20 iterations.
+
+--Jan
+
+
+On Mon, Oct 07, 2019 at 01:06:20PM +0200, Paolo Bonzini wrote:
+> On 02/10/19 11:23, Jan Glauber wrote:
+> > I've looked into this on ThunderX2. The arm64 code generated for the
+> > atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+> > memory barriers. It is just plain ldaxr/stlxr.
+> > 
+> > From my understanding this is not sufficient for SMP sync.
+> > 
+> > If I read this comment correct:
+> > 
+> >     void aio_notify(AioContext *ctx)
+> >     {
+> >         /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> >          * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> >          */
+> >         smp_mb();
+> >         if (ctx->notify_me) {
+> > 
+> > it points out that the smp_mb() should be paired. But as
+> > I said the used atomics don't generate any barriers at all.
+> 
+> Based on the rest of the thread, this patch should also fix the bug:
+> 
+> diff --git a/util/async.c b/util/async.c
+> index 47dcbfa..721ea53 100644
+> --- a/util/async.c
+> +++ b/util/async.c
+> @@ -249,7 +249,7 @@ aio_ctx_check(GSource *source)
+>      aio_notify_accept(ctx);
+>  
+>      for (bh = ctx->first_bh; bh; bh = bh->next) {
+> -        if (bh->scheduled) {
+> +        if (atomic_mb_read(&bh->scheduled)) {
+>              return true;
+>          }
+>      }
+> 
+> 
+> And also the memory barrier in aio_notify can actually be replaced
+> with a SEQ_CST load:
+> 
+> diff --git a/util/async.c b/util/async.c
+> index 47dcbfa..721ea53 100644
+> --- a/util/async.c
+> +++ b/util/async.c
+> @@ -349,11 +349,11 @@ LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+>  
+>  void aio_notify(AioContext *ctx)
+>  {
+> -    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> -     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> +    /* Using atomic_mb_read ensures that e.g. bh->scheduled is written before
+> +     * ctx->notify_me is read.  Pairs with atomic_or in aio_ctx_prepare or
+> +     * atomic_add in aio_poll.
+>       */
+> -    smp_mb();
+> -    if (ctx->notify_me) {
+> +    if (atomic_mb_read(&ctx->notify_me)) {
+>          event_notifier_set(&ctx->notifier);
+>          atomic_mb_set(&ctx->notified, true);
+>      }
+> 
+> 
+> Would you be able to test these (one by one possibly)?
+
+Paolo,
+  I tried them both separately and together on a Hi1620 system, each
+time it hung in the first iteration. Here's a backtrace of a run with
+both patches applied:
+
+(gdb) thread apply all bt
+
+Thread 3 (Thread 0xffff8154b820 (LWP 63900)):
+#0  0x0000ffff8b9402cc in __GI___sigtimedwait (set=<optimized out>, set@entry=0xaaaaf1e08070, 
+    info=info@entry=0xffff8154ad98, timeout=timeout@entry=0x0) at ../sysdeps/unix/sysv/linux/sigtimedwait.c:42
+#1  0x0000ffff8ba77fac in __sigwait (set=set@entry=0xaaaaf1e08070, sig=sig@entry=0xffff8154ae74)
+    at ../sysdeps/unix/sysv/linux/sigwait.c:28
+#2  0x0000aaaab7dc1610 in sigwait_compat (opaque=0xaaaaf1e08070) at util/compatfd.c:35
+#3  0x0000aaaab7dc3e80 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:519
+#4  0x0000ffff8ba6d088 in start_thread (arg=0xffffceefbf4f) at pthread_create.c:463
+#5  0x0000ffff8b9dd4ec in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Thread 2 (Thread 0xffff81d4c820 (LWP 63899)):
+#0  syscall () at ../sysdeps/unix/sysv/linux/aarch64/syscall.S:38
+#1  0x0000aaaab7dc4cd8 in qemu_futex_wait (val=<optimized out>, f=<optimized out>)
+    at /home/ubuntu/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0xaaaab7e48708 <rcu_call_ready_event>) at util/qemu-thread-posix.c:459
+#3  0x0000aaaab7ddf44c in call_rcu_thread (opaque=<optimized out>) at util/rcu.c:260
+#4  0x0000aaaab7dc3e80 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:519
+#5  0x0000ffff8ba6d088 in start_thread (arg=0xffffceefc05f) at pthread_create.c:463
+#6  0x0000ffff8b9dd4ec in thread_start () at ../sysdeps/unix/sysv/linux/aarch64/clone.S:78
+
+Thread 1 (Thread 0xffff81e83010 (LWP 63898)):
+#0  0x0000ffff8b9d4154 in __GI_ppoll (fds=0xaaaaf1e0dbc0, nfds=187650205809964, timeout=<optimized out>, 
+    timeout@entry=0x0, sigmask=0xffffceefbef0) at ../sysdeps/unix/sysv/linux/ppoll.c:39
+#1  0x0000aaaab7dbedb0 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>)
+    at /usr/include/aarch64-linux-gnu/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=timeout@entry=-1) at util/qemu-timer.c:340
+#3  0x0000aaaab7dbfd2c in os_host_main_loop_wait (timeout=-1) at util/main-loop.c:236
+#4  main_loop_wait (nonblocking=<optimized out>) at util/main-loop.c:517
+#5  0x0000aaaab7ce86e8 in convert_do_copy (s=0xffffceefc068) at qemu-img.c:2028
+#6  img_convert (argc=<optimized out>, argv=<optimized out>) at qemu-img.c:2520
+#7  0x0000aaaab7ce1e54 in main (argc=8, argv=<optimized out>) at qemu-img.c:5097
+
+> > I've tried to verify me theory with this patch and didn't run into the
+> > issue for ~500 iterations (usually I would trigger the issue ~20 iterations).
+> 
+> Sorry for asking the obvious---500 iterations of what?
+
+$ for i in $(seq 1 500); do echo "==$i=="; ./qemu/qemu-img convert -p -f qcow2 -O qcow2 bionic-server-cloudimg-arm64.img out.img; done
+==1==
+    (37.19/100%)
+
+  -dann
+
+
+On Mon, Oct 07, 2019 at 04:58:30PM +0200, Paolo Bonzini wrote:
+> On 07/10/19 16:44, dann frazier wrote:
+> > On Mon, Oct 07, 2019 at 01:06:20PM +0200, Paolo Bonzini wrote:
+> >> On 02/10/19 11:23, Jan Glauber wrote:
+> >>> I've looked into this on ThunderX2. The arm64 code generated for the
+> >>> atomic_[add|sub] accesses of ctx->notify_me doesn't contain any
+> >>> memory barriers. It is just plain ldaxr/stlxr.
+> >>>
+> >>> From my understanding this is not sufficient for SMP sync.
+> >>>
+> >>> If I read this comment correct:
+> >>>
+> >>>     void aio_notify(AioContext *ctx)
+> >>>     {
+> >>>         /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> >>>          * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> >>>          */
+> >>>         smp_mb();
+> >>>         if (ctx->notify_me) {
+> >>>
+> >>> it points out that the smp_mb() should be paired. But as
+> >>> I said the used atomics don't generate any barriers at all.
+> >>
+> >> Based on the rest of the thread, this patch should also fix the bug:
+> >>
+> >> diff --git a/util/async.c b/util/async.c
+> >> index 47dcbfa..721ea53 100644
+> >> --- a/util/async.c
+> >> +++ b/util/async.c
+> >> @@ -249,7 +249,7 @@ aio_ctx_check(GSource *source)
+> >>      aio_notify_accept(ctx);
+> >>  
+> >>      for (bh = ctx->first_bh; bh; bh = bh->next) {
+> >> -        if (bh->scheduled) {
+> >> +        if (atomic_mb_read(&bh->scheduled)) {
+> >>              return true;
+> >>          }
+> >>      }
+> >>
+> >>
+> >> And also the memory barrier in aio_notify can actually be replaced
+> >> with a SEQ_CST load:
+> >>
+> >> diff --git a/util/async.c b/util/async.c
+> >> index 47dcbfa..721ea53 100644
+> >> --- a/util/async.c
+> >> +++ b/util/async.c
+> >> @@ -349,11 +349,11 @@ LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+> >>  
+> >>  void aio_notify(AioContext *ctx)
+> >>  {
+> >> -    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+> >> -     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+> >> +    /* Using atomic_mb_read ensures that e.g. bh->scheduled is written before
+> >> +     * ctx->notify_me is read.  Pairs with atomic_or in aio_ctx_prepare or
+> >> +     * atomic_add in aio_poll.
+> >>       */
+> >> -    smp_mb();
+> >> -    if (ctx->notify_me) {
+> >> +    if (atomic_mb_read(&ctx->notify_me)) {
+> >>          event_notifier_set(&ctx->notifier);
+> >>          atomic_mb_set(&ctx->notified, true);
+> >>      }
+> >>
+> >>
+> >> Would you be able to test these (one by one possibly)?
+> > 
+> > Paolo,
+> >   I tried them both separately and together on a Hi1620 system, each
+> > time it hung in the first iteration. Here's a backtrace of a run with
+> > both patches applied:
+> 
+> Ok, not a great start...  I'll find myself an aarch64 machine and look
+> at it more closely.  I'd like the patch to be something we can
+> understand and document, since this is probably the second most-used
+> memory barrier idiom in QEMU.
+> 
+> Paolo
+
+I'm still not sure what the actual issue is here, but could it be some bad
+interaction between the notify_me and the list_lock? The are both 4 byte
+and side-by-side:
+
+address notify_me: 0xaaaadb528aa0  sizeof notify_me: 4
+address list_lock: 0xaaaadb528aa4  sizeof list_lock: 4
+
+AFAICS the generated code looks OK (all load/store exclusive done
+with 32 bit size):
+
+     e6c:       885ffc01        ldaxr   w1, [x0]
+     e70:       11000821        add     w1, w1, #0x2
+     e74:       8802fc01        stlxr   w2, w1, [x0]
+
+...but if I bump notify_me size to uint64_t the issue goes away.
+
+BTW, the image file I convert in the testcase is ~20 GB.
+
+--Jan
+
+diff --git a/include/block/aio.h b/include/block/aio.h
+index a1d6b9e24939..e8a5ea3860bb 100644
+--- a/include/block/aio.h
++++ b/include/block/aio.h
+@@ -83,7 +83,7 @@ struct AioContext {
+      * Instead, the aio_poll calls include both the prepare and the
+      * dispatch phase, hence a simple counter is enough for them.
+      */
+-    uint32_t notify_me;
++    uint64_t notify_me;
+ 
+     /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+      * and to ensure that no callbacks are removed while we're walking and
+
+
+On Wed, Oct 09, 2019 at 11:15:04AM +0200, Paolo Bonzini wrote:
+> On 09/10/19 10:02, Jan Glauber wrote:
+
+> > I'm still not sure what the actual issue is here, but could it be some bad
+> > interaction between the notify_me and the list_lock? The are both 4 byte
+> > and side-by-side:
+> > 
+> > address notify_me: 0xaaaadb528aa0  sizeof notify_me: 4
+> > address list_lock: 0xaaaadb528aa4  sizeof list_lock: 4
+> > 
+> > AFAICS the generated code looks OK (all load/store exclusive done
+> > with 32 bit size):
+> > 
+> >      e6c:       885ffc01        ldaxr   w1, [x0]
+> >      e70:       11000821        add     w1, w1, #0x2
+> >      e74:       8802fc01        stlxr   w2, w1, [x0]
+> > 
+> > ...but if I bump notify_me size to uint64_t the issue goes away.
+> 
+> Ouch. :)  Is this with or without my patch(es)?
+> 
+> Also, what if you just add a dummy uint32_t after notify_me?
+
+With the dummy the testcase also runs fine for 500 iterations.
+
+Dann, can you try if this works on the Hi1620 too?
+
+--Jan
+
+
+On Fri, Oct 11, 2019 at 10:18:18AM +0200, Paolo Bonzini wrote:
+> On 11/10/19 08:05, Jan Glauber wrote:
+> > On Wed, Oct 09, 2019 at 11:15:04AM +0200, Paolo Bonzini wrote:
+> >>> ...but if I bump notify_me size to uint64_t the issue goes away.
+> >>
+> >> Ouch. :)  Is this with or without my patch(es)?
+> 
+> You didn't answer this question.
+
+Oh, sorry... I did but the mail probably didn't make it out.
+I have both of your changes applied (as I think they make sense).
+
+> >> Also, what if you just add a dummy uint32_t after notify_me?
+> > 
+> > With the dummy the testcase also runs fine for 500 iterations.
+> 
+> You might be lucky and causing list_lock to be in another cache line.
+> What if you add __attribute__((aligned(16)) to notify_me (and keep the
+> dummy)?
+
+Good point. I'll try to force both into the same cacheline.
+
+--Jan
+
+> Paolo
+> 
+> > Dann, can you try if this works on the Hi1620 too?
+
+
+On Fri, Oct 11, 2019 at 06:05:25AM +0000, Jan Glauber wrote:
+> On Wed, Oct 09, 2019 at 11:15:04AM +0200, Paolo Bonzini wrote:
+> > On 09/10/19 10:02, Jan Glauber wrote:
+> 
+> > > I'm still not sure what the actual issue is here, but could it be some bad
+> > > interaction between the notify_me and the list_lock? The are both 4 byte
+> > > and side-by-side:
+> > > 
+> > > address notify_me: 0xaaaadb528aa0  sizeof notify_me: 4
+> > > address list_lock: 0xaaaadb528aa4  sizeof list_lock: 4
+> > > 
+> > > AFAICS the generated code looks OK (all load/store exclusive done
+> > > with 32 bit size):
+> > > 
+> > >      e6c:       885ffc01        ldaxr   w1, [x0]
+> > >      e70:       11000821        add     w1, w1, #0x2
+> > >      e74:       8802fc01        stlxr   w2, w1, [x0]
+> > > 
+> > > ...but if I bump notify_me size to uint64_t the issue goes away.
+> > 
+> > Ouch. :)  Is this with or without my patch(es)?
+> > 
+> > Also, what if you just add a dummy uint32_t after notify_me?
+> 
+> With the dummy the testcase also runs fine for 500 iterations.
+> 
+> Dann, can you try if this works on the Hi1620 too?
+
+On Hi1620, it hung on the first iteration. Here's the complete patch
+I'm running with:
+
+diff --git a/include/block/aio.h b/include/block/aio.h
+index 6b0d52f732..e6fd6f1a1a 100644
+--- a/include/block/aio.h
++++ b/include/block/aio.h
+@@ -82,7 +82,7 @@ struct AioContext {
+      * Instead, the aio_poll calls include both the prepare and the
+      * dispatch phase, hence a simple counter is enough for them.
+      */
+-    uint32_t notify_me;
++    uint64_t notify_me;
+ 
+     /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+      * and to ensure that no callbacks are removed while we're walking and
+diff --git a/util/async.c b/util/async.c
+index ca83e32c7f..024c4c567d 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -242,7 +242,7 @@ aio_ctx_check(GSource *source)
+     aio_notify_accept(ctx);
+ 
+     for (bh = ctx->first_bh; bh; bh = bh->next) {
+-        if (bh->scheduled) {
++        if (atomic_mb_read(&bh->scheduled)) {
+             return true;
+         }
+     }
+@@ -342,12 +342,12 @@ LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+ 
+ void aio_notify(AioContext *ctx)
+ {
+-    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+-     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
++    /* Using atomic_mb_read ensures that e.g. bh->scheduled is written before
++     * ctx->notify_me is read.  Pairs with atomic_or in aio_ctx_prepare or
++     * atomic_add in aio_poll.
+      */
+-    smp_mb();
+-    if (ctx->notify_me) {
+-        event_notifier_set(&ctx->notifier);
++    if (atomic_mb_read(&ctx->notify_me)) {
++	event_notifier_set(&ctx->notifier);
+         atomic_mb_set(&ctx->notified, true);
+     }
+ }
+
+
+On Fri, Oct 11, 2019 at 08:30:02AM +0000, Jan Glauber wrote:
+> On Fri, Oct 11, 2019 at 10:18:18AM +0200, Paolo Bonzini wrote:
+> > On 11/10/19 08:05, Jan Glauber wrote:
+> > > On Wed, Oct 09, 2019 at 11:15:04AM +0200, Paolo Bonzini wrote:
+> > >>> ...but if I bump notify_me size to uint64_t the issue goes away.
+> > >>
+> > >> Ouch. :)  Is this with or without my patch(es)?
+> > 
+> > You didn't answer this question.
+> 
+> Oh, sorry... I did but the mail probably didn't make it out.
+> I have both of your changes applied (as I think they make sense).
+> 
+> > >> Also, what if you just add a dummy uint32_t after notify_me?
+> > > 
+> > > With the dummy the testcase also runs fine for 500 iterations.
+> > 
+> > You might be lucky and causing list_lock to be in another cache line.
+> > What if you add __attribute__((aligned(16)) to notify_me (and keep the
+> > dummy)?
+> 
+> Good point. I'll try to force both into the same cacheline.
+
+On the Hi1620, this still hangs in the first iteration:
+
+diff --git a/include/block/aio.h b/include/block/aio.h
+index 6b0d52f732..00e56a5412 100644
+--- a/include/block/aio.h
++++ b/include/block/aio.h
+@@ -82,7 +82,7 @@ struct AioContext {
+      * Instead, the aio_poll calls include both the prepare and the
+      * dispatch phase, hence a simple counter is enough for them.
+      */
+-    uint32_t notify_me;
++    __attribute__((aligned(16))) uint64_t notify_me;
+ 
+     /* A lock to protect between QEMUBH and AioHandler adders and deleter,
+      * and to ensure that no callbacks are removed while we're walking and
+diff --git a/util/async.c b/util/async.c
+index ca83e32c7f..024c4c567d 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -242,7 +242,7 @@ aio_ctx_check(GSource *source)
+     aio_notify_accept(ctx);
+ 
+     for (bh = ctx->first_bh; bh; bh = bh->next) {
+-        if (bh->scheduled) {
++        if (atomic_mb_read(&bh->scheduled)) {
+             return true;
+         }
+     }
+@@ -342,12 +342,12 @@ LinuxAioState *aio_get_linux_aio(AioContext *ctx)
+ 
+ void aio_notify(AioContext *ctx)
+ {
+-    /* Write e.g. bh->scheduled before reading ctx->notify_me.  Pairs
+-     * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
++    /* Using atomic_mb_read ensures that e.g. bh->scheduled is written before
++     * ctx->notify_me is read.  Pairs with atomic_or in aio_ctx_prepare or
++     * atomic_add in aio_poll.
+      */
+-    smp_mb();
+-    if (ctx->notify_me) {
+-        event_notifier_set(&ctx->notifier);
++    if (atomic_mb_read(&ctx->notify_me)) {
++	event_notifier_set(&ctx->notifier);
+         atomic_mb_set(&ctx->notified, true);
+     }
+ }
+
+
+ include/block/aio.h | 3 +++
+ qemu-img.c          | 4 ++++
+ util/async.c        | 5 +----
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/include/block/aio.h b/include/block/aio.h
+index e9bc04c..9153d87 100644
+--- a/include/block/aio.h
++++ b/include/block/aio.h
+@@ -89,6 +89,9 @@ struct AioContext {
+      */
+     uint32_t notify_me;
+ 
++    /* force to notify for qemu-img convert */
++    bool notify_for_convert;
++
+     /* lock to protect between bh's adders and deleter */
+     QemuMutex bh_lock;
+ 
+diff --git a/qemu-img.c b/qemu-img.c
+index 60a2be3..cf037aa 100644
+--- a/qemu-img.c
++++ b/qemu-img.c
+@@ -2411,6 +2411,10 @@ static int img_convert(int argc, char **argv)
+         .wr_in_order        = wr_in_order,
+         .num_coroutines     = num_coroutines,
+     };
++
++    AioContext *ctx = qemu_get_aio_context();
++    ctx->notify_for_convert = 1;
++
+     ret = convert_do_copy(&state);
+ 
+ out:
+diff --git a/util/async.c b/util/async.c
+index 042bf8a..af235fc 100644
+--- a/util/async.c
++++ b/util/async.c
+@@ -336,12 +336,9 @@ void aio_notify(AioContext *ctx)
+      * with atomic_or in aio_ctx_prepare or atomic_add in aio_poll.
+      */
+     smp_mb();
+-    if (ctx->notify_me) {
++    if (ctx->notify_me || ctx->notify_for_convert) {
+         event_notifier_set(&ctx->notifier);
+         atomic_mb_set(&ctx->notified, true);
+-#if defined(__aarch64__)
+-        kill(getpid(), SIGIO);
+-#endif
+     }
+ }
+
+Can you try this aboving patchset to slove it?
+ 
+
+
+I tested the patch in Comment #34, and it was able to pass 500 iterations.
+
+Hello Fred,
+
+Based on Dann's feedback on testing, I'm failing to see where your patch fixes the "root" cause (despite being able to mitigate the issue by changing the aio notification mechanism).
+
+I think the root cause is best described in this 2 emails from the thread:
+
+https://lore.kernel.org/qemu-devel/20191009080220.GA2905@hc/
+
+and
+
+https://<email address hidden>/
+
+So, by adding ctx->notify_for_convert, it is very likely you workarounded the issue by doing what Jan already said: removing both variables (ctx->list_lock and, in old case, ctx->notify_me, in your case, ctx->notify_for_convert) from the same cacheline and making the issue to "disappear" (as we would eventually do in a workaround patch).
+
+What about aarch64 issue with both, ctx->list_lock and ctx->notify_for_convert, being synchronized by qemu used primitives, and being in the same cache line ?
+
+Any "workaround" here would try to dodge the same cacheline situation, but, for upstream, I suppose Paolo wants to have something else regarding aarch64 ATOMIC_SEQ_CST.
+
+like describe in this part of the discussion:
+
+https://<email address hidden>/
+
+Unless I'm missing something, am I ? 
+
+Thank you!
+
+
+
+
+
+I tested the patch in Comment #34, and it was also failed to pass 5 iterations.
+Copyright (C) 2018 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "aarch64-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<http://www.gnu.org/software/gdb/bugs/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word".
+Attaching to process 3987
+[New LWP 3988]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/aarch64-linux-gnu/libthread_db.so.1".
+0x0000ffffbd2b3154 in __GI_ppoll (fds=0xaaaae80ef080, nfds=187650381360708, 
+    timeout=<optimized out>, sigmask=0xffffc31815f0)
+    at ../sysdeps/unix/sysv/linux/ppoll.c:39
+39	../sysdeps/unix/sysv/linux/ppoll.c: No such file or directory.
+(gdb) 
+
+fyi, what I tested in Comment #35 was upstream QEMU (@ aceeaa69d2) with a port of the patch in Comment #34 applied. I've attached that patch here. While it did avoid the issue in my testing, I agree with Rafael's Comment #36 that it does not appear to address the root cause (as I understand it), and is therefore unlikely something we'd ship in Ubuntu.
+
+Could HiSilicon respond to Dann & Rafael's comments #36 and #38?
+Is there an upstream acceptable patch that addresses this issue?
+
+=》Could HiSilicon respond to Dann & Rafael's comments #36 and #38?
+=》Is there an upstream acceptable patch that addresses this issue?
+
+No upstream patchset， I Only provide a private solution and do not know this root cause.
+
+PPA created with temporarily workaround in comment #34.
+
+https://launchpad.net/~ikepanhc/+archive/ubuntu/lp1805256
+
+This PPA can solve temporarily but is not acceptable for offical release.
+
+Take several CPUs offline and re-test. Even only 32 threads left, I still can reproduce this issue easily.
+
+ubuntu@kreiken:~$ lscpu | grep list;for i in `seq 1 10`;do echo ;rm -f out.img;timeout 30 qemu-img convert -f qcow2 -O qcow2 ./bionic-server-cloudimg-arm64.img out.img -p; done
+On-line CPU(s) list:  0-31
+Off-line CPU(s) list: 32-127
+
+    (100.00/100%)
+
+    (43.20/100%)
+    (0.00/100%)
+    (1.00/100%)
+
+
+Hi, Ike. 
+
+I think this tricky bug was fixed by Paolo last month. 
+Please try patch https://git.qemu.org/?p=qemu.git;a=commitdiff;h=5710a3e09f9b85801e5ce70797a4a511e5fc9e2c.
+
+Thanks. I will test it.
+
+The test deb has been pushed to https://launchpad.net/~ikepanhc/+archive/ubuntu/lp1805256
+
+40 run with patch mentioned in #43 and all passed.
+
+Thanks.
+
+
+Hello Ike,
+
+Please, let me know if you want me to go after the needed SRUs for this fix or if you will.
+
+I'll wait for the final feedback from tests with your PPA.
+
+Cheers!
+
+
+fyi, I backported that fix also to focal/groovy and eoan, and with those builds. On my test systems the hang reliable occurs within 20 iterations. After the fix, they have survived > 500 iterations thus far. I'll leave running overnight just to be sure.
+
+Isn't this fixed by commit 5710a3e09f9?
+
+commit 5710a3e09f9b85801e5ce70797a4a511e5fc9e2c
+Author: Paolo Bonzini <email address hidden>
+Date:   Tue Apr 7 10:07:46 2020 -0400
+
+    async: use explicit memory barriers
+    
+    When using C11 atomics, non-seqcst reads and writes do not participate
+    in the total order of seqcst operations.  In util/async.c and util/aio-posix.c,
+    in particular, the pattern that we use
+    
+              write ctx->notify_me                 write bh->scheduled
+              read bh->scheduled                   read ctx->notify_me
+              if !bh->scheduled, sleep             if ctx->notify_me, notify
+    
+    needs to use seqcst operations for both the write and the read.  In
+    general this is something that we do not want, because there can be
+    many sources that are polled in addition to bottom halves.  The
+    alternative is to place a seqcst memory barrier between the write
+    and the read.  This also comes with a disadvantage, in that the
+    memory barrier is implicit on strongly-ordered architectures and
+    it wastes a few dozen clock cycles.
+    
+    Fortunately, ctx->notify_me is never written concurrently by two
+    threads, so we can assert that and relax the writes to ctx->notify_me.
+    The resulting solution works and performs well on both aarch64 and x86.
+    
+    Note that the atomic_set/atomic_read combination is not an atomic
+    read-modify-write, and therefore it is even weaker than C11 ATOMIC_RELAXED;
+    on x86, ATOMIC_RELAXED compiles to a locked operation.
+
+On Wed, May 6, 2020 at 1:20 PM Philippe Mathieu-Daudé
+<email address hidden> wrote:
+>
+> Isn't this fixed by commit 5710a3e09f9?
+
+See comment #43. The discussions hence are about testing/integration
+of that fix.
+
+  -dann
+
+
+FYIO, from now on all the "merge" work will be done in the merge requests being linked to this BUG (at the top). @paelzer will be verifying those.
+
+Tested debs in ppa:rafaeldtinoco/lp1805256 for focal and eoan and 1000 qemu-img convert passed.
+
+Ike's backport in https://launchpad.net/~ikepanhc/+archive/ubuntu/lp1805256 tests well for me on Cavium Sabre. One minor note is that the function in_aio_context_home_thread() is being called in aio-win32.c, but that function didn't exist in 2.11. We probably want to change that to aio_context_in_iothread(). It was renamed in https://git.qemu.org/?p=qemu.git;a=commitdiff;h=d2b63ba8dd20c1091b3f1033e6a95ef95b18149d
+
+FYI: sponsored into groovy
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu8
+
+---------------
+qemu (1:4.2-3ubuntu8) groovy; urgency=medium
+
+  * d/p/ubuntu/lp-1805256*: Fixes for QEMU on aarch64 ARM hosts
+    - async: use explicit memory barriers (LP: #1805256)
+    - aio-wait: delegate polling of main AioContext if BQL not held
+
+ -- Rafael David Tinoco <email address hidden>  Wed, 27 May 2020 21:47:21 +0000
+
+Migrated right now, sponsoring the related SRU portions into B/E/F ... for consideration by the SRU Team.
+
+Hello dann, or anyone else affected,
+
+Accepted qemu into focal-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:4.2-3ubuntu6.2 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-focal to verification-done-focal. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-focal. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+Hello dann, or anyone else affected,
+
+Accepted qemu into eoan-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:4.0+dfsg-0ubuntu9.7 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-eoan to verification-done-eoan. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-eoan. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+Hello dann, or anyone else affected,
+
+Accepted qemu into bionic-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.11+dfsg-1ubuntu7.27 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation on how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, what testing has been performed on the package and change the tag from verification-needed-bionic to verification-done-bionic. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed-bionic. In either case, without details of your testing we will not be able to proceed.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance for helping!
+
+N.B. The updated package will be released to -updates after the bug(s) fixed by this package have been verified and the package has been in -proposed for a minimum of 7 days.
+
+All autopkgtests for the newly accepted qemu (1:4.0+dfsg-0ubuntu9.7) for eoan have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+edk2/0~20190606.20d2e5a1-2ubuntu1.1 (amd64, armhf)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/eoan/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+100 run on bionic/eoan/focal -proposed `qemu-img convert` all successful. No hang occurs. Thanks a lot.
+
+All autopkgtests for the newly accepted qemu (1:4.2-3ubuntu6.2) for focal have finished running.
+The following regressions have been reported in tests triggered by the package:
+
+systemd/245.4-4ubuntu3.1 (arm64)
+
+
+Please visit the excuses page listed below and investigate the failures, proceeding afterwards as per the StableReleaseUpdates policy regarding autopkgtest regressions [1].
+
+https://people.canonical.com/~ubuntu-archive/proposed-migration/focal/update_excuses.html#qemu
+
+[1] https://wiki.ubuntu.com/StableReleaseUpdates#Autopkgtest_Regressions
+
+Thank you!
+
+
+I've looked and retried the tests - all green now.
+Let us give it a few extra days in proposed as planned, but other than that it looks ok to be released.
+
+We had the 14 (instead f 7) days in -proposed for some extended maturing. Nothing came up in regard to this and all validations were good.
+Dropping block-proposed to be released once the SRU Team gets to it.
+
+This bug was fixed in the package qemu - 1:4.2-3ubuntu6.2
+
+---------------
+qemu (1:4.2-3ubuntu6.2) focal; urgency=medium
+
+  * d/p/ubuntu/lp-1805256*: Fixes for QEMU on aarch64 ARM hosts
+    - async: use explicit memory barriers (LP: #1805256)
+    - aio-wait: delegate polling of main AioContext if BQL not held
+
+ -- Rafael David Tinoco <email address hidden>  Wed, 27 May 2020 21:19:20 +0000
+
+The verification of the Stable Release Update for qemu has completed successfully and the package is now being released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 1:4.0+dfsg-0ubuntu9.7
+
+---------------
+qemu (1:4.0+dfsg-0ubuntu9.7) eoan; urgency=medium
+
+  * d/p/ubuntu/lp-1805256*: Fixes for QEMU on aarch64 ARM hosts
+    - async: use explicit memory barriers (LP: #1805256)
+    - aio-wait: delegate polling of main AioContext if BQL not held
+
+ -- Rafael David Tinoco <email address hidden>  Wed, 27 May 2020 20:07:57 +0000
+
+This bug was fixed in the package qemu - 1:2.11+dfsg-1ubuntu7.27
+
+---------------
+qemu (1:2.11+dfsg-1ubuntu7.27) bionic; urgency=medium
+
+  * d/p/ubuntu/lp-1805256*: Fixes for QEMU on aarch64 ARM hosts
+    - aio: rename aio_context_in_iothread() to in_aio_context_home_thread()
+    - aio: Do aio_notify_accept only during blocking aio_poll
+    - aio-posix: Assert that aio_poll() is always called in home thread
+    - async: use explicit memory barriers (LP: #1805256)
+    - aio-wait: delegate polling of main AioContext if BQL not held
+    - aio-posix: Don't count ctx->notifier as progress when polling
+
+ -- Rafael David Tinoco <email address hidden>  Tue, 26 May 2020 17:39:21 +0000
+
+This will re-open again for Bionic due to bug 1885419 forcing a revert of the former backports.
+After a deeper evaluation if the assert is wrong in the backport or just flagging a problem formerly already existing in Bionic this will be re-fixed.
+
+Re-open for bionic due to regression found
+
+Started working on this again...
+
+Worked being done for the Bionic SRU:
+
+BUG: https://bugs.launchpad.net/qemu/+bug/1805256
+(fix for the bionic regression demonstrated at LP: #1885419)
+PPA: https://launchpad.net/~rafaeldtinoco/+archive/ubuntu/lp1805256-bionic
+MERGE: https://tinyurl.com/y8sucs6x
+
+Merge proposal currently going under review, tests and discussions.
+
+I ran the new PPA build (1:2.11+dfsg-1ubuntu7.29~ppa01) on both a ThunderX2 system and a Hi1620 system overnight, and both survived (6574 & 12919 iterations, respectively).
+
+Thanks @dannf! I spoke to Christian and him and I agreed to confine this change into ARM builds only (as SRU for Bionic). Preparing it...
+
+Status from old attempts to solve same nature issues:
+
+----
+
+Older (2018) merge request from @raharper:
+
+https://github.com/koverstreet/bcache-tools/pull/1
+
+addressing the fact that kernel uevents would not always emit 
+CACHED_UUID parameters, making udev to delete (whenever that happens) 
+/dev/bcache/{by-uuid,by-label} symlinks.
+
+This last MR pointed to previous related bugs:
+
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=890446
+https://bugs.launchpad.net/curtin/+bug/1728742
+
+And to an upstream kernel patch:
+
+https://lore.kernel.org/patchwork/patch/921298/
+
+to 
+
+https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1729145
+
+that wasn't accepted upstream.
+
+Even not being accepted upstream, the SRU was attempted:
+
+LP: #1729145
+
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088680.html
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088679.html
+
+Both were NACKED.
+
+Attempted again:
+
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088682.html
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088683.html
+
+NACKED again.
+
+And a v2 was sent:
+
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088751.html
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088750.html
+https://lists.ubuntu.com/archives/kernel-team/2017-December/088749.html
+
+and acked in January 2018 by Coling:
+
+https://lists.ubuntu.com/archives/kernel-team/2018-January/089492.html
+
+but not upstreamed.
+
+BIONIC contains the fix:
+
+commit ed9333e1b583
+Author: Ryan Harper <email address hidden>
+Date:   Mon Dec 11 12:12:01 2017
+
+    UBUNTU: SAUCE: (no-up) bcache: decouple emitting a cached_dev CHANGE uevent
+    
+    BugLink: http://bugs.launchpad.net/bugs/1729145
+    
+    - decouple emitting a cached_dev CHANGE uevent which includes dev.uuid
+      and dev.label from bch_cached_dev_run() which only happens when a
+      bcacheX device is bound to the actual backing block device (bcache0 -> vdb)
+    
+    - update bch_cached_dev_run() to invoke bch_cached_dev_emit_change() as
+      needed; no functional code path changes here
+    
+    - Modify register_bcache to detect a re-registering of a bcache
+      cached_dev, and in that case call bcache_cached_dev_emit_change() to
+    
+    Signed-off-by: Ryan Harper <email address hidden>
+    Signed-off-by: Joseph Salisbury <email address hidden>
+    Acked-by: Colin Ian King <email address hidden>
+    Acked-by: Stefan Bader <email address hidden>
+    Signed-off-by: Khalid Elmously <email address hidden>
+    [ saf: fix incorrect indentation ]
+    Signed-off-by: Seth Forshee <email address hidden>
+
+FOCAL contains the fix:
+
+commit 67553dcd7905
+Author: Ryan Harper <email address hidden>
+Date:   Mon Dec 11 12:12:01 2017
+
+    UBUNTU: SAUCE: (no-up) bcache: decouple emitting a cached_dev CHANGE uevent
+
+GROOVY contains the fix:
+
+commit 67553dcd7905
+Author: Ryan Harper <email address hidden>
+Date:   Mon Dec 11 12:12:01 2017
+
+    UBUNTU: SAUCE: (no-up) bcache: decouple emitting a cached_dev CHANGE uevent
+
+----
+
+So, the kernel patch wasn't accepted, nor bcache-tools patch by 
+@raharper, the bcache-export-cached.
+
+----
+
+New Upstream summary from @raharper:
+
+https://github.com/systemd/systemd/pull/16317#issuecomment-655647313
+
+in the upstream merge request made by @rbalint.
+
+

@@ -1,0 +1,181 @@
+other: 0.120
+PID: 0.091
+vnc: 0.087
+device: 0.083
+semantic: 0.076
+performance: 0.070
+KVM: 0.068
+files: 0.067
+boot: 0.064
+socket: 0.061
+debug: 0.060
+permissions: 0.056
+graphic: 0.053
+network: 0.042
+debug: 0.462
+performance: 0.099
+PID: 0.087
+files: 0.075
+other: 0.064
+socket: 0.039
+device: 0.036
+network: 0.029
+semantic: 0.027
+permissions: 0.023
+boot: 0.020
+graphic: 0.019
+KVM: 0.010
+vnc: 0.009
+
+go build fails under qemu-ppc64le-static (qemu-user)
+
+I am using qemu-user (built static) in a docker container environment.  When running multi-threaded go commands in the container (go build for example) the process may hang, report segfaults or other errors.  I built qemu-ppc64le from the upstream git (master).
+
+I see the problem running on a multi core system with Intel i7 processors.
+# cat /proc/cpuinfo | grep "model name"
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+model name	: Intel(R) Core(TM) i7-2760QM CPU @ 2.40GHz
+
+Steps to reproduce:
+1) Build qemu-ppc64le as static and copy into docker build directory named it qemu-ppc64le-static.
+
+2) Add hello.go to docker build dir.
+
+package main
+import "fmt"
+func main() {
+	fmt.Println("hello world")
+}
+
+3) Create the Dockerfile from below:
+
+FROM ppc64le/golang:1.10.1-alpine3.
+COPY qemu-ppc64le-static /usr/bin/
+COPY hello.go /go
+
+4) Build container
+$ docker build -t qemutest -f Dockerfile ./go 
+
+5) Run test
+$ docker run -it qemutest
+
+/go # /usr/bin/qemu-ppc64le-static --version
+qemu-ppc64le version 2.11.93 (v2.12.0-rc3-dirty)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+
+/go # go version
+go version go1.10.1 linux/ppc64le
+
+/go # go build hello.go
+fatal error: fatal error: stopm holding locksunexpected signal during runtime execution
+
+panic during panic
+[signal SIGSEGV: segmentation violation code=0x1 addr=0x0 pc=0x1003528c]
+
+runtime stack:
+runtime: unexpected return pc for syscall.Syscall6 called from 0xc42007f500
+stack: frame={sp:0xc4203be840, fp:0xc4203be860} stack=[0x4000b7ecf0,0x4000b928f0)
+
+syscall.Syscall6(0x100744e8, 0x3d, 0xc42050c140, 0x20, 0x18, 0x10422b80, 0xc4203be968[signal , 0x10012d88SIGSEGV: segmentation violation, 0xc420594000 code=, 0x00x1 addr=0x0 pc=0x1003528c)
+]
+
+runtime stack:
+	/usr/local/go/src/syscall/asm_linux_ppc64x.s:61runtime.throw(0x10472d19, 0x13)
+ +	/usr/local/go/src/runtime/panic.go:0x6c616 +0x68
+
+
+runtime.stopm()
+	/usr/local/go/src/runtime/proc.go:1939goroutine  +10x158
+ [runtime.exitsyscall0semacquire(0xc42007f500)
+	/usr/local/go/src/runtime/proc.go:3129 +]:
+0x130
+runtime.mcall(0xc42007f500)
+	/usr/local/go/src/runtime/asm_ppc64x.s:183 +0x58sync.runtime_Semacquire
+(0xc4201fab1c)
+	/usr/local/go/src/runtime/sema.go:56 +0x38
+
+----
+Note the results may differ between attempts,  hangs and other faults sometimes happen.
+----
+If I run "go: single threaded I don't see the problem, for example:
+
+/go # GOMAXPROCS=1 go build -p 1 hello.go 
+/go # ./hello
+hello world
+
+I see the same issue with arm64.  I don't think this is a go issue, but don't have a real evidence to prove that.  This problem looks similar to other problem I have seen reported against qemu running multi-threaded applications.
+
+I missed a step for reproduction.  Step 1 should be:
+docker run --rm --privileged multiarch/qemu-user-static:register
+This modprobes binfmt and registers qemu-ppc64le-static as the interpreter for ppc64le executables.
+
+FYI: To workaround this issue you can limit the docker container to a single cpu like this:
+
+docker run --cpuset-cpus 0 -it cross-test3 go build hello.go
+
+This works for docker build as well.
+
+docker build--cpuset-cpus 0 .....
+
+Do you have a simpler repro case (ie one that doesn't require docker) ?
+
+
+I will attempt to find an way to re-create without docker.  The key is we need a way to create a ppc64le (or arm64) fakeroot with go that we can chroot into.  That is easy to do with docker.  BTW: the use case using docker and qemu-user-static is becoming fairly common way to cross build container images.
+
+I care more about the arm64 case, so if you're going to do one then that would be my preference.
+
+
+Using QEMU from tag v2.12.0-rc4 on Ubuntu Xenial ppc64el, it works.
+
+muriloo@jaspion1:~/go-docker$ sudo docker run --rm -it qemutest
+/go # /usr/bin/qemu-ppc64le-static --version
+qemu-ppc64 version 2.11.94 (v2.12.0-rc4-dirty)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+/go # go version
+go version go1.10.1 linux/ppc64le
+/go # go build hello.go
+/go # ./hello
+hello world
+/go #
+
+Here is how I configured QEMU:
+
+muriloo@jaspion1:~/sources/qemu$ ./configure --target-list=ppc64-linux-user --disable-system --disable-tools --static
+
+muriloo@jaspion1:~$ uname -a
+Linux jaspion1 4.4.0-119-generic #143-Ubuntu SMP Mon Apr 2 16:08:02 UTC 2018 ppc64le ppc64le ppc64le GNU/Linux
+
+With QEMU from tag v2.12.0-rc4 on Fedora 27 x86_64, it works too.
+
+muriloo@laptop$ docker run --rm -it qemutest
+/go # qemu-ppc64le-static --version
+qemu-ppc64le version 2.11.94 (v2.12.0-rc4)
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+/go # go version
+go version go1.10.1 linux/ppc64le
+/go # go build hello.go
+/go # ./hello
+hello world
+/go #
+
+muriloo@laptop$ uname -a
+Linux laptop 4.15.17-300.fc27.x86_64 #1 SMP Thu Apr 12 18:19:17 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux
+
+muriloo@laptop$ rpm -q docker
+docker-1.13.1-51.git4032bd5.fc27.x86_64
+
+Thanks for the update,  I will test that version and report back ( it may be a few days)
+
+We recently fixed bug #1696773 which was a cause of various crashes or other problems when trying to run go binaries under linux-user, including "go build hello.go". So I strongly suspect this is a duplicate of that bug. Could you test with the QEMU v4.1.0 rc3 or later, please?
+
+
+Have you ever tried with a newer version of QEMU?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

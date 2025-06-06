@@ -1,0 +1,146 @@
+other: 0.105
+PID: 0.086
+device: 0.083
+KVM: 0.083
+network: 0.082
+performance: 0.081
+vnc: 0.078
+permissions: 0.075
+graphic: 0.074
+semantic: 0.070
+boot: 0.051
+files: 0.045
+debug: 0.044
+socket: 0.044
+socket: 0.183
+debug: 0.176
+network: 0.141
+performance: 0.106
+vnc: 0.097
+files: 0.058
+PID: 0.053
+other: 0.042
+graphic: 0.034
+device: 0.029
+KVM: 0.024
+semantic: 0.020
+boot: 0.020
+permissions: 0.017
+
+Memory leak when using websocket over a low speed network
+
+Description of problem
+-------------------------
+
+When VNC is connected to QEMU via websocket over a low speed network (e.g. 300KB/S Wide Area Network), and there is a lot of frame buffer update, the VNC Client will get stuck, the cursor is almost impossible to move, which may result in accumulation of a large number of data in the QEMU process (memory consumption will keep increasing).
+
+
+Environment
+-------------------------
+All of the following versions have been tested:
+
+QEMU: 2.5.1 / 2.6.0 / 2.8.1.1 / 2.9.0 / 2.10.0
+Host OS: Ubuntu 16.04 Server LTS / CentOS 7 x86_64_1611
+Guest OS: Windows 7 64bit / Ubuntu 16.04 Desktop LTS
+Client OS: Windows 7 64bit / Windows 10 64bit
+Client Browser: IE 11.0.9600 / Chrome 60.0.3112 / Firefox 55.0.2
+VNC Client: TigerVNC Viewer 1.8 / UltraVNC Viewer 1.2.1.5 / TightVNC Viewer 2.8.8 
+VNC Web Client: noVNC 0.5.1 / noVNC 0.61 / noVNC 0.62
+VNC Server: TigerVNC 1.8 / x11vnc 0.9.13 / TightVNC 2.8.8
+VNC Client: TigerVNC Viewer 1.8 / UltraVNC Viewer 1.2.1.5 / TightVNC Viewer 2.8.8
+
+
+Steps to reproduce:
+-------------------------
+100% reproducible.
+
+1. Launch a QEMU instance with websocket option:
+qemu-system-x86_64 -enable-kvm -m 6G ./win_x64.qcow2 -vnc :1,websocket=5701
+
+2. Open VNC Web Client (noVNC/vnc.html) in browser and connect to QEMU VM via websocket
+
+3. Play a video (e.g. Watch YouTube) on VM (To produce a lot of frame buffer update)
+
+4. Limit (e.g. Use NetLimiter) the client inbound bandwidth to 300KB/S (To simulate a low speed WAN)
+
+5. Then client's output gets stuck(less than 1 fps), the cursor is almost impossible to move
+
+6. Observe QEMU process on the host, more and more data are accumulated in the process, the consumption of memory continues to keep increasing
+
+
+Current result:
+-------------------------
+[Top - Initial status]
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND         
+ 2725 root      20   0 7229144 5.910g  23024 S  16.3 18.9   0:12.84 qemu-system-x86_64
+
+[Top - After an hour's playing w/o limit (6-8MB/S)]
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND         
+ 2725 root      20   0 7370284 6.046g  23132 S  28.0 19.3  35:58.15 qemu-system-x86_64
+
+[Top - Limit the bandwidth and continue to playing for another an hour (300KB/S)]
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND         
+ 2725 root      20   0 11.029g 8.853g  23132 S  20.0 28.2  72:14.17 qemu-system-x86_64
+
+Also test several other combinations in the same environment:
+
+1. Client(VNC Viewer) - Server(QEMU)
+2. Client(VNC Viewer) - Server(tigervnc/x11vnc/tightvnc)
+3. Client(noVNC)      - Server(tigervnc/x11vnc/tightvnc)
+
+Likewise, the client's inbound bandwidth is limited to 300KB/S, 
+although a lot of frame are lost, all of they still works (at least the mouse is movable).
+
+It's found that when connect to QEMU via websocket, it never drop any frames.
+QEMU still sends a lot of data to its websocket even when the network is congested, 
+the process is continually consuming more memory, then it gets stack.
+
+
+Expected results:
+-------------------------
+When the network is poor (non-LAN), QEMU would reduce the VNC data send to its websocket correspondingly, and the memory usage remains stable.
+
+Thanks for your report. I've not tried reproducing yet, but from the looking at the code I think I can see why this happens. Code in vnc_update_client discards incoming frame updates from the guest if the output buffer has data pending in it, but it only checks the main VNC server output buffer usage. It fails to check the websockets output buffer usage.
+
+In the modern code this needs fixing in the io/channel-websock.c impl - it is checking the output buffer limit against the wrong buffer - it uses 'rawoutput' instead of 'encoutput', so this fix is easy enough there.
+
+The code is in fact broken all the way back to day1 of the introduction of websockets support though in QEMU 1.2.1 In the historical code it can be fixed by checking ws_output.offset in vnc_update_client as I mentioned previously
+
+We are experiencing the same problem.
+
+At first, we thought the bug is in QEMU's websocket code then we tried using a standalone websocket proxy (websockify). Unfortunately, problems persisted.
+
+We also tried various other VNC servers (with websockify), all of them work fine. It seems that the issue is specific to QEMU.
+
+This has been assigned CVE-2017-15268
+
+http://www.openwall.com/lists/oss-security/2017/10/12/4
+
+commit a7b20a8efa28e5f22c26c06cd06c2f12bc863493
+Author: Daniel P. Berrange <email address hidden>
+Date:   Mon Oct 9 14:43:42 2017 +0100
+
+    io: monitor encoutput buffer size from websocket GSource
+    
+    The websocket GSource is monitoring the size of the rawoutput
+    buffer to determine if the channel can accepts more writes.
+    The rawoutput buffer, however, is merely a temporary staging
+    buffer before data is copied into the encoutput buffer. Thus
+    its size will always be zero when the GSource runs.
+    
+    This flaw causes the encoutput buffer to grow without bound
+    if the other end of the underlying data channel doesn't
+    read data being sent. This can be seen with VNC if a client
+    is on a slow WAN link and the guest OS is sending many screen
+    updates. A malicious VNC client can act like it is on a slow
+    link by playing a video in the guest and then reading data
+    very slowly, causing QEMU host memory to expand arbitrarily.
+    
+    This issue is assigned CVE-2017-15268, publically reported in
+    
+      https://bugs.launchpad.net/qemu/+bug/1718964
+    
+    Reviewed-by: Eric Blake <email address hidden>
+    Signed-off-by: Daniel P. Berrange <email address hidden>
+
+

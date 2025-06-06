@@ -1,0 +1,132 @@
+permissions: 0.105
+device: 0.101
+boot: 0.093
+PID: 0.084
+semantic: 0.084
+other: 0.075
+vnc: 0.075
+files: 0.073
+debug: 0.066
+graphic: 0.059
+performance: 0.054
+KVM: 0.048
+socket: 0.044
+network: 0.039
+debug: 0.808
+semantic: 0.032
+files: 0.023
+device: 0.022
+boot: 0.018
+PID: 0.017
+performance: 0.017
+other: 0.015
+KVM: 0.010
+permissions: 0.009
+graphic: 0.009
+socket: 0.008
+network: 0.007
+vnc: 0.005
+
+dtc crash; pnv_dt_serial cannot find lpc's phandle
+
+pnv_dt_serial has a line which is supposed to set the interrupt-parent of the "isa-serial@i3f8" node to the phandle of "lpc@0". 
+
+To that end, it calls fdt_get_phandle as shown below:
+_FDT((fdt_setprop_cell(fdt, node, "interrupt-parent", fdt_get_phandle(fdt, lpc_off))));
+
+The function fdt_get_phandle fails to find the property "phandle" (or "linux,phandle") for the lpc node. Consequently, pnv_dt_serial sets the interrupt-parent to 0.
+
+
+
+
+
+Now boot the qemu-system-ppc64 powernv machine, and extract the fdt by using the qemu monitor's pmemsave command, taking help of the OPAL firmware's messages to locate the fdt in the physical ram.
+
+qemu-system-ppc64 -m 1g -machine powernv,num-chips=1 \  
+-cpu power9 -smp 2,cores=2,threads=1 -accel tcg,thread=multi \                  
+-kernel ./vmlinux \                                                             
+-append 'disable_radix' \                                                       
+-serial mon:stdio -nographic -nodefaults 
+
+The kernel vmlinux contains nothing but a single instruction which loops infintely, so that we can gather OPAL's messages, especially the one below:
+
+[    0.168845963,5] INIT: Starting kernel at 0x20000000, fdt at 0x304b0b70 14404 bytes
+
+
+
+
+
+Once the fdt is dumped to a file, run the following:
+
+'dtc -O dtb -I dts -o out.dts dtb'
+
+
+After a few warnings, the dtc application crashes because an assertion was fired.
+
+1.dts: Warning (unit_address_vs_reg): /lpcm-opb@6030000000000/lpc@0: node has a unit name, but no reg property
+1.dts: Warning (simple_bus_reg): /lpcm-opb@6030000000000/lpc@0: missing or empty reg/ranges property
+1.dts: Warning (avoid_unnecessary_addr_size): /ibm,opal: unnecessary #address-cells/#size-cells without "ranges" or child "reg" property
+1.dts: Warning (unique_unit_address): /interrupt-controller@0: duplicate unit-address (also used in node /memory@0)
+1.dts: Warning (chosen_node_stdout_path): /chosen:linux,stdout-path: Use 'stdout-path' instead
+dtc: livetree.c:575: get_node_by_phandle: Assertion `generate_fixups' failed.
+Aborted (core dumped)
+
+
+
+The assertion is fired because get_node_by_phandle receives a phandle value of 0, which is unexpected, unless fixups are needed (They are not, when running the dtc command).
+
+
+
+
+Back inside pnv_dt_serial, if the line that sets "interrupt-parent" for the serial device node is commented out, the dtc crash is prevented. Looking at hw/ppc/e500.c, it takes care of allocating necessary phandle values in the nodes, so a similar method can be adopted for powernv.
+
+
+The dtb is attached.
+
+
+
+IIUC there are two bugs here
+
+1) The powernv machine in qemu is attempting to use a phandle for node that doesn't have one.  It will need to assign a phandle to that node and re-use it elsewhere.  This should be pretty straightforward.
+
+2) dtc is crashing with an assertion - that shouldn't happen, even on bad input it should error out rather than crashing.  The problem also occurs with current upstream dtc - I'll try to investigate this.
+
+
+Btw, I'm assuming where you say 'dtc -O dtb -I dts -o out.dts dtb' you actually meant 'dtc -I dtb -O dts -o out.dts dtb'  (i.e. -I and -O swapped around), since you're trying to decompile a blob to source rather than the other way around.
+
+
+> Btw, I'm assuming where you say...
+My bad. Yes, you are correct. The problem is seen when decompiling the blob to source.
+
+
+> 1) The powernv machine in qemu is attempting to use a phandle for node
+> that doesn't have one.
+
+True.
+
+
+> 2) dtc is crashing with an assertion - that shouldn't happen, even on bad
+> input it should error out rather than crashing. The problem also occurs
+> with current upstream dtc - I'll try to investigate this.
+
+The assertion says that "if dtc is trying to get a node by its phandle, and if the input phandle is 0 or -1, then we better be processing plugins, as that is the only mode where we allow such values for a phandle."
+
+
+If one removes the specific assertion which is triggered, the crash is avoided. Then, dtc prints
+this (relevant) message before exiting:
+
+
+"Warning (interrupts_property): /lpcm-opb@6030000000000/lpc@0/isa-serial@i3f8:interrupt-parent: Bad phandle"
+
+
+The message confirms qemu's inability to set the interrupt-parent of isa-serial@i3f8 to the correct, expected value. Depending on the point of view, that warning can be considered as the error that you want dtc to print (although dtc, instead of stopping at this warning, continues ahead instead, and generates a dts with interrupt-parent of that serial device set to 0).
+
+
+When one looks at that generated dts source, two other siblings of isa-serial@i3f8, ipmi-bt@ie4 and mbox@i1000 are found, which have the correct value for their interrupt-parent property. A bit of debugging showed that these two devices are populated by the skiboot firmware (and not by qemu).
+
+This assertion should be fixed by upstream commit 8f695676227 "Avoid assertion in check_interrupts_property()".  That should be included in dtc v1.5.1 which I hope to release soon.
+
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" or "Confirmed" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+

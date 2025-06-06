@@ -1,0 +1,193 @@
+permissions: 0.117
+vnc: 0.101
+PID: 0.096
+performance: 0.085
+semantic: 0.083
+device: 0.077
+other: 0.070
+debug: 0.068
+files: 0.063
+KVM: 0.063
+graphic: 0.057
+boot: 0.054
+socket: 0.034
+network: 0.032
+performance: 0.309
+KVM: 0.214
+debug: 0.122
+device: 0.058
+PID: 0.056
+boot: 0.054
+socket: 0.045
+vnc: 0.034
+semantic: 0.029
+files: 0.026
+other: 0.025
+permissions: 0.014
+network: 0.008
+graphic: 0.005
+
+VIRTIO Sequential Write IOPS limits not working
+
+Root Problem:
+IOPS limit does not work for VIRTIO devices if the disk workload is a sequential write.
+
+To confirm:
+IDE disk devices - the IOPS limit works fine. Disk transfer speed limit works fine.
+VIRTIO disk devices - the IOPS limit works fine for random IO (write/read) and sequential read, but not for sequential write. Disk transfer speed limits work fine.
+
+Tested on Windows 7,10 and 2k12 (Fedora drivers used and here is the twist):
+virtio-win-0.1.96 (stable) or older won't limit write IO if workload is sequential.
+virtio-win-0.1.105 (latest) or newer will limit but I have had two test machines crash when under high workload using IOPS limit.
+
+For Linux:
+The issue is also apparent, tested on Ubuntu 14.04
+
+On the hypervisor (using KVM) machine I have tried with Qemu 2.1.2 (3.16.0-4-amd64 - Debian 8) and Qemu 2.3.0 (3.19.8-1-pve - Proxmox 3.4 and 4) using multiple machines but all are 64bit intel.
+
+Even though the latest VIRTIO guest drivers fix the problem, the guest drivers shouldn't be able to ignore the limits the host puts in place or am I missing something??
+
+On Mon, Aug 10, 2015 at 12:15:25AM -0000, James Watson wrote:
+> IOPS limit does not work for VIRTIO devices if the disk workload is a sequential write.
+> 
+> To confirm:
+> IDE disk devices - the IOPS limit works fine. Disk transfer speed limit works fine.
+> VIRTIO disk devices - the IOPS limit works fine for random IO (write/read) and sequential read, but not for sequential write. Disk transfer speed limits work fine.
+> 
+> Tested on Windows 7,10 and 2k12 (Fedora drivers used and here is the twist):
+> virtio-win-0.1.96 (stable) or older won't limit write IO if workload is sequential.
+> virtio-win-0.1.105 (latest) or newer will limit but I have had two test machines crash when under high workload using IOPS limit.
+> 
+> For Linux:
+> The issue is also apparent, tested on Ubuntu 14.04
+> 
+> On the hypervisor (using KVM) machine I have tried with Qemu 2.1.2
+> (3.16.0-4-amd64 - Debian 8) and Qemu 2.3.0 (3.19.8-1-pve - Proxmox 3.4
+> and 4) using multiple machines but all are 64bit intel.
+> 
+> Even though the latest VIRTIO guest drivers fix the problem, the guest
+> drivers shouldn't be able to ignore the limits the host puts in place or
+> am I missing something??
+
+This is probably due to I/O request merging:
+
+Your benchmark application may generate 32 x 4KB write requests, but
+they are merged by the virtio-blk device into just 1 x 128KB write
+request.
+
+The merging can happen inside the guest, depending on your benchmark
+application and the guest kernel's I/O stack.  It also happens in QEMU's
+virtio-blk emulation.
+
+The most recent versions of QEMU merge both read and write requests.
+Older versions only merged write requests.
+
+It would be more intuitive for request merging to happen after QEMU I/O
+throttling checks.  Currently QEMU's I/O queue plug/unplug isn't
+advanced enough to do the request merging, so it's done earlier in the
+virtio-blk emulation code.
+
+I've CCed Kevin Wolf, Alberto Garcia, and Peter Lieven who may have more
+thoughts on this.
+
+
+
+Am 10.08.2015 um 11:59 schrieb Stefan Hajnoczi <email address hidden>:
+
+> On Mon, Aug 10, 2015 at 12:15:25AM -0000, James Watson wrote:
+>> IOPS limit does not work for VIRTIO devices if the disk workload is a sequential write.
+>> 
+>> To confirm:
+>> IDE disk devices - the IOPS limit works fine. Disk transfer speed limit works fine.
+>> VIRTIO disk devices - the IOPS limit works fine for random IO (write/read) and sequential read, but not for sequential write. Disk transfer speed limits work fine.
+>> 
+>> Tested on Windows 7,10 and 2k12 (Fedora drivers used and here is the twist):
+>> virtio-win-0.1.96 (stable) or older won't limit write IO if workload is sequential.
+>> virtio-win-0.1.105 (latest) or newer will limit but I have had two test machines crash when under high workload using IOPS limit.
+>> 
+>> For Linux:
+>> The issue is also apparent, tested on Ubuntu 14.04
+>> 
+>> On the hypervisor (using KVM) machine I have tried with Qemu 2.1.2
+>> (3.16.0-4-amd64 - Debian 8) and Qemu 2.3.0 (3.19.8-1-pve - Proxmox 3.4
+>> and 4) using multiple machines but all are 64bit intel.
+>> 
+>> Even though the latest VIRTIO guest drivers fix the problem, the guest
+>> drivers shouldn't be able to ignore the limits the host puts in place or
+>> am I missing something??
+> 
+> This is probably due to I/O request merging:
+> 
+> Your benchmark application may generate 32 x 4KB write requests, but
+> they are merged by the virtio-blk device into just 1 x 128KB write
+> request.
+> 
+> The merging can happen inside the guest, depending on your benchmark
+> application and the guest kernel's I/O stack.  It also happens in QEMU's
+> virtio-blk emulation.
+> 
+> The most recent versions of QEMU merge both read and write requests.
+> Older versions only merged write requests.
+> 
+> It would be more intuitive for request merging to happen after QEMU I/O
+> throttling checks.  Currently QEMU's I/O queue plug/unplug isn't
+> advanced enough to do the request merging, so it's done earlier in the
+> virtio-blk emulation code.
+> 
+> I've CCed Kevin Wolf, Alberto Garcia, and Peter Lieven who may have more
+> thoughts on this.
+
+I wouldn't  consider this behavior bad. Instead of virtio-blk merging the request
+the guest could have issued big IOPS right from the beginning. If you are
+concerned that big I/O is harming your storage, you can define a maximum
+iops_size for throttling or limit the maximum bandwidth.
+
+Peter
+
+
+
+
+On Fri 14 Aug 2015 01:34:50 AM CEST, Peter Lieven <email address hidden> wrote:
+
+>>> IOPS limit does not work for VIRTIO devices if the disk workload is
+>>> a sequential write.
+
+>> This is probably due to I/O request merging:
+>> 
+>> Your benchmark application may generate 32 x 4KB write requests, but
+>> they are merged by the virtio-blk device into just 1 x 128KB write
+>> request.
+>> 
+>> The merging can happen inside the guest, depending on your benchmark
+>> application and the guest kernel's I/O stack.  It also happens in
+>> QEMU's virtio-blk emulation.
+>> 
+>> The most recent versions of QEMU merge both read and write requests.
+>> Older versions only merged write requests.
+>> 
+>> It would be more intuitive for request merging to happen after QEMU
+>> I/O throttling checks.  Currently QEMU's I/O queue plug/unplug isn't
+>> advanced enough to do the request merging, so it's done earlier in
+>> the virtio-blk emulation code.
+
+Alternatively we could keep the original number of requests and pass it
+to throttle_account(), but I'm not sure if it's a good idea.
+
+> I wouldn't consider this behavior bad. Instead of virtio-blk merging
+> the request the guest could have issued big IOPS right from the
+> beginning. If you are concerned that big I/O is harming your storage,
+> you can define a maximum iops_size for throttling or limit the maximum
+> bandwidth.
+
+That's right. The way throttling.iops-size works is that I/O requests
+larger than this are accounted as if they were split into smaller
+operations. So, if iops-size is 32KB, a 128KB request will be counted as
+4 for the purpose of limiting the number of IOPS.
+
+Berto
+
+
+Has this issue ever been fixed? If not, is there still interest in fixing it? Or could we close this ticket nowadays?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,338 @@
+PID: 0.111
+device: 0.106
+permissions: 0.094
+debug: 0.091
+semantic: 0.084
+files: 0.081
+other: 0.081
+graphic: 0.058
+socket: 0.056
+boot: 0.055
+performance: 0.050
+network: 0.047
+KVM: 0.045
+vnc: 0.040
+debug: 0.381
+files: 0.140
+semantic: 0.094
+performance: 0.075
+device: 0.066
+boot: 0.048
+other: 0.044
+PID: 0.039
+KVM: 0.027
+vnc: 0.024
+socket: 0.023
+permissions: 0.014
+graphic: 0.013
+network: 0.012
+
+openrisc_sim.c:87:42: error: 'cpu_irqs[0]' may be used uninitialized in this function [-Werror=maybe-uninitialized]
+
+I see the warning since gcc10:
+
+static void openrisc_sim_init(MachineState *machine):
+...
+    qemu_irq *cpu_irqs[2];
+...
+
+
+    serial_mm_init(get_system_memory(), 0x90000000, 0, serial_irq,
+                   115200, serial_hd(0), DEVICE_NATIVE_ENDIAN);
+
+I would initialize cpu_irqs[2] with {}.
+
+Suggested patch:
+
+diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+index 79e7049..724dcd0 100644
+--- a/hw/openrisc/openrisc_sim.c
++++ b/hw/openrisc/openrisc_sim.c
+@@ -129,7 +129,7 @@ static void openrisc_sim_init(MachineState *machine)
+     const char *kernel_filename = machine->kernel_filename;
+     OpenRISCCPU *cpu = NULL;
+     MemoryRegion *ram;
+-    qemu_irq *cpu_irqs[2];
++    qemu_irq *cpu_irqs[2] = {};
+     qemu_irq serial_irq;
+     int n;
+     unsigned int smp_cpus = machine->smp.cpus;
+
+I'm not sure why the compiler thinks it might be uninitialized here -- is it just that it's not aware that smp_cpus can't be zero and so the loop will always initialize cpu_irqs[0] ?
+
+
+Note that our -Wmaybe-uninitialized warnings tends to report false positives. We have a rich meta bug for it:
+https://gcc.gnu.org/bugzilla/show_bug.cgi?id=24639
+
+That's why it can't prove the variable is initialized in all possible execution paths.
+
+Does adding "assert(smp_cpus >= 1 && smp_cpus <= 2);" after the assignment to smp_cpus give the compiler enough information to know there's no use of uninitialized data?
+
+
+Confirming Peter's suggestion does silent the warning.
+
+-- >8 --
+diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+index d08ce61811..02f5259e5e 100644
+--- a/hw/openrisc/openrisc_sim.c
++++ b/hw/openrisc/openrisc_sim.c
+@@ -134,6 +134,7 @@ static void openrisc_sim_init(MachineState *machine)
+     int n;
+     unsigned int smp_cpus = machine->smp.cpus;
+ 
++    assert(smp_cpus >= 1 && smp_cpus <= 2);
+     for (n = 0; n < smp_cpus; n++) {
+         cpu = OPENRISC_CPU(cpu_create(machine->cpu_type));
+         if (cpu == NULL) {
+---
+
+On 5/26/20 8:51 PM, Eric Blake wrote:
+> On my Fedora 32 machine, gcc 10.1.1 at -O2 (the default for a bare
+> './configure') has a false-positive complaint:
+> 
+>   CC      or1k-softmmu/hw/openrisc/openrisc_sim.o
+> /home/eblake/qemu/hw/openrisc/openrisc_sim.c: In function ‘openrisc_sim_init’:
+> /home/eblake/qemu/hw/openrisc/openrisc_sim.c:87:42: error: ‘cpu_irqs[0]’ may be used uninitialized in this function [-Werror=maybe-uninitialized]
+>    87 |         sysbus_connect_irq(s, i, cpu_irqs[i][irq_pin]);
+>       |                                  ~~~~~~~~^~~
+> 
+> Initializing both pointers of cpu_irqs[] to NULL is sufficient to shut
+> up the compiler, even though they are definitely assigned in
+> openrisc_sim_init() prior to the inlined call to
+> openrisc_sim_ompic_init() containing the line in question.
+> 
+> Signed-off-by: Eric Blake <email address hidden>
+> ---
+>  hw/openrisc/openrisc_sim.c | 2 +-
+>  1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+> index d08ce6181199..95011a8015b4 100644
+> --- a/hw/openrisc/openrisc_sim.c
+> +++ b/hw/openrisc/openrisc_sim.c
+> @@ -129,7 +129,7 @@ static void openrisc_sim_init(MachineState *machine)
+>      const char *kernel_filename = machine->kernel_filename;
+>      OpenRISCCPU *cpu = NULL;
+>      MemoryRegion *ram;
+> -    qemu_irq *cpu_irqs[2];
+> +    qemu_irq *cpu_irqs[2] = {};
+
+Ah I now remembered why this warning sound familiar:
+https://bugs.launchpad.net/qemu/+bug/1874073
+
+Peter suggested a different fix, I tested it, and was expecting Martin
+Liska to post an updated patch.
+
+>      qemu_irq serial_irq;
+>      int n;
+>      unsigned int smp_cpus = machine->smp.cpus;
+> 
+
+
+
+Hello. The assert approach is preferred.
+
+When compiling with GCC 10 (Fedora 32) using CFLAGS=-O2 we get:
+
+    CC      or1k-softmmu/hw/openrisc/openrisc_sim.o
+  hw/openrisc/openrisc_sim.c: In function ‘openrisc_sim_init’:
+  hw/openrisc/openrisc_sim.c:87:42: error: ‘cpu_irqs[0]’ may be used uninitialized in this function [-Werror=maybe-uninitialized]
+     87 |         sysbus_connect_irq(s, i, cpu_irqs[i][irq_pin]);
+        |                                  ~~~~~~~~^~~
+
+While humans can tell smp_cpus will always be in the [1, 2] range,
+(openrisc_sim_machine_init sets mc->max_cpus = 2), the compiler
+can't.
+
+Add an assertion to give the compiler a hint there's no use of
+uninitialized data.
+
+Buglink: https://bugs.launchpad.net/qemu/+bug/1874073
+Reported-by: Martin Liška <email address hidden>
+Suggested-by: Peter Maydell <email address hidden>
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+ hw/openrisc/openrisc_sim.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+index d08ce61811..02f5259e5e 100644
+--- a/hw/openrisc/openrisc_sim.c
++++ b/hw/openrisc/openrisc_sim.c
+@@ -134,6 +134,7 @@ static void openrisc_sim_init(MachineState *machine)
+     int n;
+     unsigned int smp_cpus = machine->smp.cpus;
+ 
++    assert(smp_cpus >= 1 && smp_cpus <= 2);
+     for (n = 0; n < smp_cpus; n++) {
+         cpu = OPENRISC_CPU(cpu_create(machine->cpu_type));
+         if (cpu == NULL) {
+-- 
+2.21.3
+
+
+
+On 6/8/20 2:14 AM, Philippe Mathieu-Daudé wrote:
+> When compiling with GCC 10 (Fedora 32) using CFLAGS=-O2 we get:
+
+In the subject: s/silent/silence/
+
+> 
+>      CC      or1k-softmmu/hw/openrisc/openrisc_sim.o
+>    hw/openrisc/openrisc_sim.c: In function ‘openrisc_sim_init’:
+>    hw/openrisc/openrisc_sim.c:87:42: error: ‘cpu_irqs[0]’ may be used uninitialized in this function [-Werror=maybe-uninitialized]
+>       87 |         sysbus_connect_irq(s, i, cpu_irqs[i][irq_pin]);
+>          |                                  ~~~~~~~~^~~
+> 
+> While humans can tell smp_cpus will always be in the [1, 2] range,
+> (openrisc_sim_machine_init sets mc->max_cpus = 2), the compiler
+> can't.
+> 
+> Add an assertion to give the compiler a hint there's no use of
+> uninitialized data.
+> 
+> Buglink: https://bugs.launchpad.net/qemu/+bug/1874073
+> Reported-by: Martin Liška <email address hidden>
+> Suggested-by: Peter Maydell <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+>   hw/openrisc/openrisc_sim.c | 1 +
+>   1 file changed, 1 insertion(+)
+
+Tested-by: Eric Blake <email address hidden>
+
+With the typo fixed,
+Reviewed-by: Eric Blake <email address hidden>
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+When compiling with GCC 10 (Fedora 32) using CFLAGS=-O2 we get:
+
+    CC      or1k-softmmu/hw/openrisc/openrisc_sim.o
+  hw/openrisc/openrisc_sim.c: In function ‘openrisc_sim_init’:
+  hw/openrisc/openrisc_sim.c:87:42: error: ‘cpu_irqs[0]’ may be used uninitialized in this function [-Werror=maybe-uninitialized]
+     87 |         sysbus_connect_irq(s, i, cpu_irqs[i][irq_pin]);
+        |                                  ~~~~~~~~^~~
+
+While humans can tell smp_cpus will always be in the [1, 2] range,
+(openrisc_sim_machine_init sets mc->max_cpus = 2), the compiler
+can't.
+
+Add an assertion to give the compiler a hint there's no use of
+uninitialized data.
+
+Buglink: https://bugs.launchpad.net/qemu/+bug/1874073
+Reported-by: Martin Liška <email address hidden>
+Suggested-by: Peter Maydell <email address hidden>
+Reviewed-by: Thomas Huth <email address hidden>
+Tested-by: Eric Blake <email address hidden>
+Reviewed-by: Eric Blake <email address hidden>
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+v2: Fixed typo in subject (eblake)
+Supersedes: <email address hidden>
+---
+ hw/openrisc/openrisc_sim.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+index d08ce61811..02f5259e5e 100644
+--- a/hw/openrisc/openrisc_sim.c
++++ b/hw/openrisc/openrisc_sim.c
+@@ -134,6 +134,7 @@ static void openrisc_sim_init(MachineState *machine)
+     int n;
+     unsigned int smp_cpus = machine->smp.cpus;
+ 
++    assert(smp_cpus >= 1 && smp_cpus <= 2);
+     for (n = 0; n < smp_cpus; n++) {
+         cpu = OPENRISC_CPU(cpu_create(machine->cpu_type));
+         if (cpu == NULL) {
+-- 
+2.21.3
+
+
+
+Le 08/06/2020 à 18:06, Philippe Mathieu-Daudé a écrit :
+> When compiling with GCC 10 (Fedora 32) using CFLAGS=-O2 we get:
+> 
+>     CC      or1k-softmmu/hw/openrisc/openrisc_sim.o
+>   hw/openrisc/openrisc_sim.c: In function ‘openrisc_sim_init’:
+>   hw/openrisc/openrisc_sim.c:87:42: error: ‘cpu_irqs[0]’ may be used uninitialized in this function [-Werror=maybe-uninitialized]
+>      87 |         sysbus_connect_irq(s, i, cpu_irqs[i][irq_pin]);
+>         |                                  ~~~~~~~~^~~
+> 
+> While humans can tell smp_cpus will always be in the [1, 2] range,
+> (openrisc_sim_machine_init sets mc->max_cpus = 2), the compiler
+> can't.
+> 
+> Add an assertion to give the compiler a hint there's no use of
+> uninitialized data.
+> 
+> Buglink: https://bugs.launchpad.net/qemu/+bug/1874073
+> Reported-by: Martin Liška <email address hidden>
+> Suggested-by: Peter Maydell <email address hidden>
+> Reviewed-by: Thomas Huth <email address hidden>
+> Tested-by: Eric Blake <email address hidden>
+> Reviewed-by: Eric Blake <email address hidden>
+> Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+> ---
+> v2: Fixed typo in subject (eblake)
+> Supersedes: <email address hidden>
+> ---
+>  hw/openrisc/openrisc_sim.c | 1 +
+>  1 file changed, 1 insertion(+)
+> 
+> diff --git a/hw/openrisc/openrisc_sim.c b/hw/openrisc/openrisc_sim.c
+> index d08ce61811..02f5259e5e 100644
+> --- a/hw/openrisc/openrisc_sim.c
+> +++ b/hw/openrisc/openrisc_sim.c
+> @@ -134,6 +134,7 @@ static void openrisc_sim_init(MachineState *machine)
+>      int n;
+>      unsigned int smp_cpus = machine->smp.cpus;
+>  
+> +    assert(smp_cpus >= 1 && smp_cpus <= 2);
+>      for (n = 0; n < smp_cpus; n++) {
+>          cpu = OPENRISC_CPU(cpu_create(machine->cpu_type));
+>          if (cpu == NULL) {
+> 
+
+Applied to my trivial-patches branch.
+
+Thanks,
+Laurent
+
+
+
+On 6/9/20 3:42 PM, Stafford Horne wrote:
+
+>>> While humans can tell smp_cpus will always be in the [1, 2] range,
+>>> (openrisc_sim_machine_init sets mc->max_cpus = 2), the compiler
+>>> can't.
+>>>
+>>> Add an assertion to give the compiler a hint there's no use of
+>>> uninitialized data.
+>>>
+
+> Acked-by: Stafford Horne <email address hidden>
+> 
+> I see there are now two patches for this, I kind of like this assert fix.
+> 
+> Shall I queue it for OpenRISC pulling?  Or can someone else pick this up?
+
+Looks like Laurent already volunteered to queue it through the trivial 
+patches tree.
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+Merged in commit 1db889c71f37d5bad411b2ef83a69739d9d598f9.
+

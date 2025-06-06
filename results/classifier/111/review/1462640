@@ -1,0 +1,172 @@
+other: 0.155
+PID: 0.108
+performance: 0.076
+permissions: 0.075
+debug: 0.073
+device: 0.071
+files: 0.068
+vnc: 0.060
+KVM: 0.059
+semantic: 0.058
+graphic: 0.054
+boot: 0.053
+socket: 0.047
+network: 0.043
+debug: 0.839
+files: 0.027
+other: 0.025
+semantic: 0.019
+performance: 0.018
+PID: 0.018
+network: 0.012
+device: 0.010
+permissions: 0.007
+boot: 0.007
+socket: 0.005
+graphic: 0.005
+vnc: 0.005
+KVM: 0.004
+
+shmat fails on 32-to-64 setup
+
+
+I am trying to run a guest mips32 program (user mode) on a x86_64 host. The program fails on a call to shmat() reproducibly. when digging into this problem, I could make a small guest POC that fails when compiled as i386 (-m32) running on a x86_64 host, but pass when compiled as 64bit. The problem has to do with mmap flags.
+
+From what I can understand, when running 32bits guests programs, qemu reserve the whole guest virtual space with an mmap call. That mmap call specifys MAP:PRIVATE flag. When shmat is called, it tries to make part of that region MAP_SHARED and that fails.
+
+As a possible fix, it looks like it is possible to first unmap the shm region before calling shmat.
+
+steps to reproduce: 
+1 - create a file shm.c with content below
+2 - compile with: gcc -m32 shm.c -o shm32
+3 - run on a x86_64 host: qemu-i386 ./shm32 
+4 - observe shmat fails, by returning ptr -1
+
+5- compile without -m32: : gcc shm.c -o shm64
+6 - observe it pass: qemu-x84_64 ./shm64
+
+
+
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/mman.h>
+#include <stdio.h>
+
+int main()
+{
+    struct shmid_ds shm_desc;
+    int err = 0;
+    int id = shmget(IPC_PRIVATE, 688128, IPC_CREAT|IPC_EXCL|0666);
+    err = shmctl(id, IPC_STAT, &shm_desc);
+    const void *at = 0x7f7df38ea000;
+    void* ptr = shmat(id, at, 0);
+    printf( "got err %d, ptr %p\n", err, ptr );
+}
+
+Which version of QEMU did you use here? Does it still reproduce with the latest version of QEMU?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+I can confirm that this bug still exists in the current qemu master (short commit ID 0050f9978e):
+
+~/qemu$ gcc -m32 shm_bug.c -o shm_bug32
+shm_bug.c: In function ‘main’:
+shm_bug.c:12:24: warning: initialization makes pointer from integer without a cast [-Wint-conversion]
+       const void *at = 0x7f7df38ea000;
+                        ^~~~~~~~~~~~~~
+~/qemu$ i386-linux-user/qemu-i386 ./shm_bug32 
+got err 0, ptr 0xffffffff
+ari@ari-thinkpad:~/qemu$ gcc shm_bug.c -o shm_bug64
+shm_bug.c: In function ‘main’:
+shm_bug.c:12:24: warning: initialization makes pointer from integer without a cast [-Wint-conversion]
+       const void *at = 0x7f7df38ea000;
+                        ^~~~~~~~~~~~~~
+~/qemu$ x86_64-linux-user/qemu-x86_64 ./shm_bug64 
+got err 0, ptr 0x7f7df38ea000
+ari@ari-thinkpad:~/qemu$ 
+
+Additionally, running each executable directly on a 64-bit Ubuntu 18.04 system, we can see that the behavior of the 32-bit binary differs between qemu-i386 and native, while that of the 64-bit binary does not:
+
+~/qemu$ ./shm_bug32 
+got err 0, ptr 0xf38ea000
+~/qemu$ ./shm_bug64
+got err 0, ptr 0x7f7df38ea000
+~/qemu$ 
+
+
+Erm isn't your 64bit pointer being truncated when you build for 32 bit?
+
+Yes, that is correct, but the behavior is still different between "native" execution and execution through qemu-i386. Changing the pointer to be initialized with 0xf38ea000 (essentially truncating it manually) does not change anything:
+
+~/qemu$ gcc -m32 shm_bug.c -o shm_bug32
+shm_bug.c: In function ‘main’:
+shm_bug.c:13:24: warning: initialization makes pointer from integer without a cast [-Wint-conversion]
+       const void *at = 0xf38ea000;
+                        ^~~~~~~~~~
+~/qemu$ ./shm_bug32 
+got err 0, ptr 0xf38ea000
+~/qemu$ i386-linux-user/qemu-i386 ./shm_bug32 
+got err 0, ptr 0xffffffff
+~/qemu$ 
+
+
+Here's the end of strace output for running through qemu-i386:
+
+shmget(IPC_PRIVATE, 688128, IPC_CREAT|IPC_EXCL|0666) = 72810572
+shmctl(72810572, IPC_STAT, {shm_perm={uid=1000, gid=1000, mode=0666, key=0, cuid=1000, cgid=1000}, shm_segsz=688128, shm_cpid=10438, shm_lpid=0, shm_nattch=0, shm_atime=0, shm_dtime=0, shm_ctime=1562340468}) = 0
+shmctl(72810572, IPC_STAT, {shm_perm={uid=1000, gid=1000, mode=0666, key=0, cuid=1000, cgid=1000}, shm_segsz=688128, shm_cpid=10438, shm_lpid=0, shm_nattch=0, shm_atime=0, shm_dtime=0, shm_ctime=1562340468}) = 0
+shmat(72810572, 0x7f27138eb000, 0)      = -1 EINVAL (Invalid argument)
+fstat(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(136, 12), ...}) = 0
+mmap(0x7f271f46d000, 1048576, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = 0x7f271f46d000
+write(1, "got err 0, ptr 0xffffffff\n", 26got err 0, ptr 0xffffffff
+) = 26
+exit_group(0)                           = ?
++++ exited with 0 +++
+~/qemu$ 
+
+
+For comparison, the strace output when running natively:
+
+shmget(IPC_PRIVATE, 688128, IPC_CREAT|IPC_EXCL|0666) = 72843341
+shmctl(72843341, IPC_64|IPC_STAT, {shm_perm={uid=1000, gid=1000, mode=0666, key=0, cuid=1000, cgid=1000}, shm_segsz=688128, shm_cpid=10883, shm_lpid=0, shm_nattch=0, shm_atime=0, shm_dtime=0, shm_ctime=1562340846}) = 0
+shmat(72843341, 0xf38ea000, 0)          = 0xf38ea000
+fstat64(1, {st_mode=S_IFCHR|0620, st_rdev=makedev(136, 12), ...}) = 0
+brk(NULL)                               = 0x58069000
+brk(0x5808a000)                         = 0x5808a000
+brk(0x5808b000)                         = 0x5808b000
+write(1, "got err 0, ptr 0xf38ea000\n", 26got err 0, ptr 0xf38ea000
+) = 26
+exit_group(0)                           = ?
++++ exited with 0 +++
+~/qemu$
+
+I think analysis in comment #1 is correct: If I use "shmat(id, at, SHM_REMAP)" it works.
+
+
+Mapping an arbitrary address in the memory takes the risk to have this address already in use by the loader or a library.
+Where does this address come from?
+Why the qemu-mips program doesn't call shmat() with NULL?
+
+It's no less reasonable than doing an mmap() with a fixed address -- if the application knows what it's doing then it's fine. It's just that it bumps into our internal implementation details of (a) doing an mmap to reserve the full 32-bit space we want to allow the guest to do and (b) just passing guest mappings through to the kernel rather than tracking ourselves what memory the guest has allocated (which would allow us to implement the SHM_REMAP vs no-remap ourselves, modulo race conditions between threads).
+
+(b) also prevents us from implementing the memory-related rlimits correctly, incidentally.
+
+
+Right. I'd also like to point out that I carried out some additional experiments using variations of the program in the issue description, with bizarre results, mips64. I changed the value of the pointer to 0x7f7df38c0000 to increase the alignment a bit and then did the following experiments:
+1) shmat(id, 0x7f7df38c0000, 0) fails, returning 0xffffffffffffffff, errno == 22 (EINVAL)
+2) shmat(id, 0x7f7df38c0000, SHM_REMAP) fails, returning 0xffffffffffffffff, errno == 22 (EINVAL)
+3) shmat(id, 0x7f7df38c0000, SHM_RND) succeeds. Additionally, the return value is exactly the pointer value passed to the host shmat(), that is, 0x7f7df38c0000.
+
+The following thing bothers me:
+With flags set to 0, the address 0x7f7df38c0000 is rejected. This could have been an alignment problem, but the call actually succeeds when the flags are set to SHM_RND (to align the returned address properly), with the pointer value remaining the same.
+
+This looks bizarre to me, no matter the way you look at it.
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/115
+
+

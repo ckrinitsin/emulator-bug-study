@@ -1,0 +1,125 @@
+other: 0.126
+semantic: 0.125
+device: 0.112
+boot: 0.110
+PID: 0.092
+vnc: 0.091
+performance: 0.071
+debug: 0.048
+KVM: 0.046
+permissions: 0.041
+files: 0.039
+network: 0.035
+socket: 0.033
+graphic: 0.030
+debug: 0.247
+device: 0.157
+other: 0.111
+PID: 0.085
+boot: 0.064
+files: 0.058
+semantic: 0.051
+performance: 0.047
+socket: 0.039
+vnc: 0.034
+permissions: 0.033
+graphic: 0.031
+network: 0.029
+KVM: 0.016
+
+VDI block driver bugs
+
+Chunqiang Tang reports the following issues with the VDI block driver, these are present in QEMU 0.14:
+
+"Bug 1. The most serious bug is caused by race condition in updating a new 
+bmap entry in memory and on disk. Considering the following operation 
+sequence. 
+  O1: VM issues a write to sector X
+  O2: VDI allocates a new bmap entry and updates in-memory s->bmap
+  O3: VDI writes data to disk
+  O4: The disk I/O for writing sector X fails
+  O5: VDI reports error to VM and returns.
+
+Note that the bmap entry is updated in memory, but not persisted on disk. 
+Now consider another write that immediately follows:
+  P1: VM issues a write to sector X+1, which locates in the same block as 
+the previously used sector X.
+  P2: s->bmap already has one entry for the block, and hence VDI writes 
+data directly without persisting the new s->bmap entry on disk.
+  P3: The write disk I/O succeeds
+  P4: VDI report success to VM, but the bitmap entry is still not 
+persisted on disk.
+
+Now suppose the VM powers off gracefully (i.e., the QEMU process quits) 
+and reboots. The second write to sector X+1, which is reported as finished 
+successfully, is simply lost, because the corresponding in-memory s->bmap 
+entry is never persisted on disk. This is exactly what FVD's testing tool 
+discovers. After the block device is closed and then re-opened, disk 
+content verification fails.
+
+This is just one example of the problem. Race condition plus host crash 
+also causes problems. Consider another example below.
+  Q1: VM issues a write to sector X
+  Q2: VDI allocates a new bmap entry and updates in-memory s->bmap
+  Q3: VDI writes sector X to disk and waits for the callback
+  Q4: VM issues a write to another sector X+1, which is in the same block 
+as sector X.
+  Q5: VDI sees the bitmap entry in s->bmap is already allocated, and 
+writes sector X+1 to disk.
+  Q6: Write to sector X+1 finishes, and VDI's callback is invoked.
+  Q7: VDI acknowledges to the VM the completion of writing sector X+1
+  Q8: After observing the completion of writing sector X+1, VM issues a 
+flush to ensure that sector X+1 is persisted on disk.
+  Q9: VDI finishes the flush and acknowledge the completion of the 
+operation.
+  Q10: ... (some other arbitrary operations, but the disk I/O for writing 
+sector X is still not finished....)
+  Q11: The host crashes
+
+Now the new bitmap entry is not persisted on disk, while both writing to 
+sector X+1 and the flush has been acknowledged as finished. Sector X+1 is 
+lost, which is a corruption. This problem exists even if it uses O_DSYNC. 
+The root cause of the problem is that, if a request updates in-memory 
+s->bmap, another request that sees this update assumes that the update is 
+already persisted on disk, which is not.
+
+Bug 2: Similar to the bugs the FVD testing tool found for QCOW2, there are 
+several cases of the code below on failure handling path without setting 
+error return code, which mistakenly reports failure as success. This 
+mistake is caught by FVD when doing image content validation.
+       if (acb->hd_aiocb == NULL) {
+           /* missing     ret = -EIO; */
+            goto done; 
+        } 
+
+Bug 3: Similar to the bugs the FVD testing tool found for QCOW2, 
+vdi_aio_cancel does not perform a complete clean up and there are several 
+related bugs. First, memory buffer is not freed, acb->orig_buf and 
+acb->block_buffer. Second, acb->bh is not cancelled. Third, 
+vdi_aio_setup() does not initialize acb->bh to NULL so that when a request 
+acb is cancelled and then later reused for another request, its acb->bh != 
+NULL and the new request fails in  vdi_schedule_bh(). This is caught by 
+FVD's testing tool, when it observes that no I/O failure is injected but 
+VDI reports a failed I/O request, which indicates a bug in the driver."
+
+http://permalink.gmane.org/gmane.comp.emulators.qemu/94340
+
+Is this still an issue with the latest version of QEMU, or could we close this bug nowadays?
+
+On Fri, May 19, 2017 at 8:36 PM, Thomas Huth <email address hidden> wrote:
+> Is this still an issue with the latest version of QEMU, or could we
+> close this bug nowadays?
+
+A quick check of block/vdi.c shows that error handling is still
+lacking.  Updates to in-memory data structures are not reverted if the
+write to disk fails.
+
+Let's leave this in case someone is interested in fixing the bugs
+sometime.  VDI is not used heavily and typically in read-only mode so
+these bugs are not urgent.
+
+
+Hi Stefan (Weil) - this bug is now assigned to you since more than 10 years ... do you still plan to tackle it at some point in time? If not, I'd suggest to unassign it. Also, it's been four years again since the last comment ... should we maybe close this as "Wont Fix" ?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

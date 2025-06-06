@@ -1,0 +1,170 @@
+permissions: 0.109
+semantic: 0.096
+other: 0.091
+network: 0.087
+device: 0.080
+graphic: 0.074
+PID: 0.072
+boot: 0.072
+socket: 0.069
+performance: 0.059
+debug: 0.056
+files: 0.050
+vnc: 0.047
+KVM: 0.038
+debug: 0.242
+files: 0.167
+performance: 0.094
+semantic: 0.087
+other: 0.080
+PID: 0.063
+device: 0.050
+boot: 0.050
+socket: 0.035
+network: 0.035
+graphic: 0.027
+permissions: 0.024
+vnc: 0.024
+KVM: 0.023
+
+readdir() returns NULL (errno=EOVERFLOW) for 32-bit user-static qemu on 64-bit host
+
+This can be simply reproduced by compiling and running the attached C code (readdir-bug.c) under 32-bit user-static qemu, such as qemu-arm-static:
+
+# Setup docker for user-static binfmt
+docker run --rm --privileged multiarch/qemu-user-static:register --reset
+# Compile the code and run (readdir for / is fine, so create a new directory /test).
+docker run -v /path/to/qemu-arm-static:/usr/bin/qemu-arm-static -v /path/to/readdir-bug.c:/tmp/readdir-bug.c -it --rm arm32v7/ubuntu:18.10 bash -c '{ apt update && apt install -y gcc; } >&/dev/null && mkdir -p /test && cd /test && gcc /tmp/readdir-bug.c && ./a.out'
+dir=0xff5b4150
+readdir(dir)=(nil)
+errno=75: Value too large for defined data type
+
+Do remember to replace the /path/to/qemu-arm-static and /path/to/readdir-bug.c to the actual paths of the files.
+
+The root cause is in glibc: https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/getdents.c;h=6d09a5be7057e2792be9150d3a2c7b293cf6fc34;hb=a5275ba5378c9256d18e582572b4315e8edfcbfb#l87
+
+By C standard, the return type of readdir() is DIR*, in which the inode number and offset are 32-bit integers, therefore, glibc calls getdents64() and check if the inode number and offset fits the 32-bit range, and reports EOVERFLOW if not.
+
+The problem here is for 32-bit user-static qemu running on 64-bit host, getdents64 simply passing through the inode number and offset from underlying getdents64 syscall (from 64-bit kernel), which is very likely to not fit into 32-bit range. On real hardware, the 32-bit kernel creates 32-bit inode numbers, therefore works properly.
+
+The glibc code makes sense to do the check to be conformant with C standard, therefore ideally it should be a fix on qemu side. I admit this is difficult because qemu has to maintain a mapping between underlying 64-bit inode numbers and 32-bit inode numbers, which would severely hurt the performance. I don't expect this could be fix anytime soon (or even there would be a fix), but it would be worthwhile to surface this issue.
+
+
+
+More notes: this bug hits glibc-2.28 and later. It works on glibc-2.27. Therefore to reproduce it it needs ubuntu 18.10 or later. Seems like it works for 18.04.
+
+This bug affects all Java programs that (implicitly) uses File.list() or File.listFiles(). Also it makes dash not expanding wildcard /some/directory/* . However, bash works because it uses glob() instead of readdir().
+
+
+The bug also affects shared-mime-info. update-mime-database uses readdir and ends up generating an empty database without reporting any errors, causing pixbuf and anything else that relies on the mime database not to work properly.
+
+Same things happens with update-ca-certificates. It calls c_rehash through openssl, which ends up doing nothing. As a result, curl with https and probably anything else that uses SSL fails to work.
+
+This probably makes the issue fairly critical for tools that create 32bit environments through qemu-debootstrap or build packages in said environment.
+
+I was also hit by this on Gentoo with a 64bit host running 32bit static chroot (arm).  If it matters at all, I saw it after upgrading the 32bit arm chroot to glibc-2.28, while the host was still on 2.27.
+
+Downgrading again hides the issue.  Upgrading the host to glibc 2.28, but keeping the chroot at 2.27 seems to not hit it either.
+
+https://lkml.org/lkml/2018/12/27/155
+
+After studying linux-user/syscall.c a bit, would it be possible to work around this issue by doing something like the following:
+
+Add a new #define EMULATE_GETDENTS64_WITH_GETDENTS, and enable this iff we have getdents, and the target is 32, while the host is 64 bits.   Something similar, but complementary is done with EMULATE_GETDENTS_WITH_GETDENTS64.
+
+In that case, when userspace calls getdents64, we implement a "conversion" (similar to getdents #if logic), which calls the host's getdents and converts the data structures back to their 64-bit variants before handing back to user-space.
+
+I'm likely over-simplifying a problem that I don't fully understand, but would happily work on a patch if someone higher up the food chain could fill in the gaps.
+
+Unfortunately there is no kernel API which we can use on the host to say "give me inodes and offsets which will fit into a 32 bit field". The 'getdents' syscall uses the "unsigned long" type for the d_ino and d_off fields, so on a 64-bit host these will be the same size as the ino64_t and off64_t used by 'getdents64', and you will still have the "trying to fit a quart into a pint pot" problem.
+
+The only way to fix this is to fix the host kernel to provide the API QEMU needs for this (see discussion in the kernel thread linked to in comment #5).
+
+
+Is there a workaround for this? I tried:
+
+- Building on an XFS partition.
+- Building from ubuntu:16.04 so the host has glib <2.27.
+
+It looks like the only way is to have the chroot with glib <2.27, and in alpine images glib is at minimum 2.56.
+
+If the bug is fixed in glib maybe I can install glib from master? I'm trying to build multi-arch docker images and this bug is what prevents me from providing arm/v7 images for the raspberry pi.
+
+Sorry, meant `< 2.28` above.
+
+There has been some motion on this by Aladjev Andrew.  I will butcher the explanation of his approach if I try, but it is described in the following bugs.  I have no idea of the schedule, or even possibility of adoption; it seems to still be in proof-of-concept phase.
+
+GLIBC bug (see last several posts)
+https://sourceware.org/bugzilla/show_bug.cgi?id=23960
+
+Kernel bugzilla (last two posts)
+https://bugzilla.kernel.org/show_bug.cgi?id=205957
+
+Ah, great thanks. It looks like there are patches that fix qemu, although the setup looks a bit complex. I'll report if I get something going.
+
+This problem affected my virtual environment which I used (via qemu-static) to build my project for RaspberryPI platform. After I upgraded my virtual Raspbian to buster release `readdir` stopped working (as described in this thread) due to mapping of 64 inode numbers to qemu 32bit ARM land. I needed this builder working and I found a workaround in some obscure (2nd page of google result) blog.
+
+Before the work around my virtual Raspbian was just a directory on one of my ext4 partitions. To fix the issue I created image file with dd, formatted with mkfs.ext4 it with `dir_index` option disabled and moved my virual Raspbian onto that newly created filesystem. This fixed the issue for me and my builder started again.
+
+I am posting it here so `dir_index` trick can be easier to found for others in this situation.
+
+
+Thanks Marcin. I tested your solution but by me it still gets stuck at the same point. Here's what I did:
+
+$ tune2fs -O ^dir_index /dev/sda1
+$ tune2fs -l /dev/sda1
+tune2fs 1.44.2 (14-May-2018)
+Filesystem volume name:   <none>
+Last mounted on:          /
+Filesystem UUID:          c8fee0cb-a610-4fa5-aab8-c5c765678133
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
+Filesystem flags:         signed_directory_hash 
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+(snip)
+
+But then my build still get stuck on:
+
+clock_gettime(CLOCK_REALTIME, {tv_sec=1580996038, tv_nsec=781126598}) = 0
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 144
+tgkill(29974, 29977, SIGRT_2)           = -1 EAGAIN (Resource temporarily unavailable)
+clock_gettime(CLOCK_REALTIME, {tv_sec=1580996038, tv_nsec=781461434}) = 0
+getdents64(5, /* 0 entries */, 2048)    = 0
+lseek(5, 0, SEEK_SET)                   = 0
+getdents64(5, /* 5 entries */, 2048)    = 144
+tgkill(29974, 29977, SIGRT_2)           = -1 EAGAIN (Resource temporarily unavailable
+
+
+
+I seem to have found another workaround. Knowing now what causes this my guess was: If I make the qemu-arm-static on the host a 32 bit binary and get "multilib" running to make my 64 bit Linux installation run this, then in theory this incompatibility should not happen. If it would, then 32 bit x86 applications whould run into the same problem.
+
+And at least according to my tries, I did so far, this seems to be the case. I was able to reproduce this with svn (no checkout possible from 32 bit armv7h). If the qemu-arm-static binary is a 32 bit x86 application, then SVN checkouts work well now.
+
+So until there is a better solution it seems to be a good idea to make the emulation layer run through multilib for 32 bit target architectures, so the host kernel can switch to its 32 bit backwards compatibility mode.
+
+Yes, using a 32-bit host QEMU process will also work. You might run into a few guest programs that don't work with that -- a 64-bit QEMU process allows us to give the guest the full address space it might need, while a 32-bit QEMU process means that QEMU itself must share with the guest, so if the guest uses a lot of virtual memory or is picky about where it maps things then it might fail to mmap() things where it wants them. But it's probably overall the least-bad workaround at the current time.
+
+
+After reading through the discussion on the mailing list, as it's all about ext4, I got curious...
+I'm testing with qemu-user-static and regulary build arm images in a tmpfs. This show similar behaviour and readdir() fails. However, running in the same root copied onto a btrfs, it seems fine.
+Maybe this is an even less bad workaround for some folks?
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+This is still a bug, and still blocked on the kernel providing APIs to QEMU to request 32-bit directory entries. Linus Walleij proposed a kernel patch to add a suitable fcntl flag but as far as I'm aware it didn't get in so far:
+ https://<email address hidden>/
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/263
+
+

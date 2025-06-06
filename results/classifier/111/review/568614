@@ -1,0 +1,116 @@
+other: 0.110
+semantic: 0.110
+KVM: 0.088
+permissions: 0.082
+device: 0.081
+PID: 0.076
+socket: 0.075
+vnc: 0.065
+performance: 0.061
+files: 0.058
+debug: 0.056
+network: 0.052
+graphic: 0.049
+boot: 0.037
+debug: 0.212
+other: 0.108
+files: 0.101
+PID: 0.094
+semantic: 0.087
+network: 0.071
+device: 0.060
+graphic: 0.047
+boot: 0.046
+vnc: 0.044
+performance: 0.041
+socket: 0.039
+permissions: 0.028
+KVM: 0.022
+
+x86_64 host curses interface: spacing/garbling
+
+Environment:
+Arch Linux x86_64, kernel 2.6.33, qemu 0.12.3
+
+Steps to reproduce:
+1. Have a host system running 64-bit Linux.
+2. Start a qemu VM with the -curses flag.
+
+Expected results:
+Text displayed looks as it would on a real text-mode display, and VM is therefore usable.
+
+Actual results:
+Text displayed contains an extra space between characters, causing text to flow off the right and bottom sides of the screen. This makes the curses interface unintelligible.
+
+The attached patch fixes this problem on 0.12.3 on my installation without changing behavior on a 32-bit machine.  I don't know enough of the semantics of console_ch_t to know if this is the "correct" fix or if there should be, say, an extra cast somewhere instead.
+
+
+
+Just compiled qemu from git to check for bug, and it is still present.
+
+This patch should address the problem.  I've submitted it to qemu-devel.
+
+Perhaps you have found an endianness bug as well, but my issue is with word size (my host is a 64-bit Intel).  I manually applied the patch to a 0.12.3 build, and I am still seeing the problem with the curses console.
+
+It seems that the console_ch_t type is used in a number of different contexts.  The console.c and console.h files use console_ch_t fairly uniformly.  However, the `screen' array in curses.c is cast to both uint8_t* and chtype* (unsigned int* according to my curses library) and passed as console_ch_t* (unsigned long*) to vga_hw_text_update.  That's three different bit-sizes on my machine... is it possible that the problem lies here?
+
+Hi Devin,
+
+Can you test if this bug still exists with 0.14 (or better still, a git build)?
+
+Brad
+
+
+I just compiled from git and the problem persists.
+
+I will reiterate that the issue appears to be with the word size of the types used, not with endianness; see comment 4.  I have not dug any further into the QEMU code to see if I find a more "correct-looking" solution than the quick patch I have attached to this bug.
+
+any news on that bug?
+
+If I remember correctly, the type is unsigned long because it needs to match "chtype" as declared in curses.h.  On some implementations of curses it may be declared differently, we really should use the "chtype" type directly but console.h is also used when the use of curses was disabled in qemu config.
+
+I'm pretty sure the curses support has been tested on machines of both endianness at one point, but mostly with ncurses only.
+
+I just checked out the ncurses source - it looks like the type of "chtype" actually depends on how ncurses is configured at build time:
+
+curses.h.in:
+#if @cf_cv_enable_lp64@ && defined(_LP64)
+typedef unsigned chtype;
+typedef unsigned mmask_t;
+#else
+typedef unsigned @cf_cv_typeof_chtype@ chtype;
+typedef unsigned @cf_cv_typeof_mmask_t@ mmask_t;
+#endif
+
+So even if Qemu targets only ncurses, we can't assume that chtype is anything in particular.
+
+In light of that, I guess this bug boils down to "let's use chtype directly," which (naively) seems like it could be #ifdef'd pretty easily.
+
+This is probably the source of the problem.  As you say it'd be best to use chtype directly if it can be done cleanly, unfortunately it looks like it'll add a curses specific snippet in console.h, but so be it.  The only other option is to add a conversion step in curses.c and give up zero-copy passing screen data to curses, which I'd like to avoid.
+
+How about using CONFIG_CURSES?  If we --enable-curses, then we know we have curses.h and chtype.  If we --disable-curses, then we don't care.
+
+Patch attached.  It's a no-op if curses is disabled, and it fixes the issue on my machine with curses enabled.  I had to undef the color constants from curses.h so we didn't conflict with enum color_names in console.c.
+
+for which version is the last patch?
+also 12.3?
+
+Pretty sure it was the latest Arch package: 0.14.1.  Did you have trouble applying it?
+
+I can run back and make a patch against git if you can't use this.
+
+no I don't believe it was your fault
+I couldn't get the code compile even without your patch...
+
+man this sucks... i had hoped it would be upstream with 0.15 but I might have to try to compile it by myself again
+
+thanks ;)
+
+Alright, I've sent a patch to qemu-devel.  Let's see what happens now...
+
+ahhhh it worked, just tried it with latest stable 0.15 git !!! finally you are my hero! =)
+
+Fix had been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=df00bed0fa30a6f5712
+... so closing this bug ticket now.
+

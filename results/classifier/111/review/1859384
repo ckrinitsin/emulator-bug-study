@@ -1,0 +1,359 @@
+other: 0.109
+files: 0.104
+semantic: 0.091
+device: 0.091
+permissions: 0.087
+PID: 0.085
+debug: 0.083
+vnc: 0.082
+boot: 0.073
+graphic: 0.057
+performance: 0.050
+socket: 0.035
+KVM: 0.032
+network: 0.020
+debug: 0.503
+PID: 0.100
+semantic: 0.072
+device: 0.068
+files: 0.059
+performance: 0.052
+other: 0.045
+socket: 0.022
+network: 0.018
+graphic: 0.015
+permissions: 0.014
+boot: 0.012
+vnc: 0.011
+KVM: 0.008
+
+arm gic: gic_acknowledge_irq doesn't clear line level for other cores for 1-n level-sensitive interrupts and gic_clear_pending uses GIC_DIST_TEST_MODEL (even on v2 where it always read 0 - "N-N")
+
+For a 1-N interrupt (any SPI on the GICv2), as mandated by the TRM, only one CPU can acknowledge the IRQ until it becomes inactive.
+
+The TRM also mandates that SGIs and PPIs follow the N-N model and that SPIs follow the 1-N model.
+
+However this is not currently the case with QEMU. I have locally (no minimal test case) seen e.g. uart interrupts being acknowledged twice before having been deactivated (expected: irqId on one CPU and 1023 on the other instead).
+
+I have narrowed the issue down to the following:
+
+1) arm_gic_common_reset resets all irq_state[id] fields to 0. This means all IRQ will use the N-N model, and if s->revision != REV_11MPCORE, then there's no way to set any interrupt to 1-N.
+
+**If fixed locally** with a hackjob, I still have the following trace:
+
+pl011_irq_state 534130.800 pid=2424 level=0x1
+gic_set_irq 2.900 pid=2424 irq=0x21 level=0x1 cpumask=0xff target=0xff
+gic_update_set_irq 3.300 pid=2424 cpu=0x0 name=irq level=0x1
+gic_update_set_irq 4.200 pid=2424 cpu=0x1 name=irq level=0x1
+gic_acknowledge_irq 539.400 pid=2424 s=cpu cpu=0x1 irq=0x21
+gic_update_set_irq 269.800 pid=2424 cpu=0x0 name=irq level=0x1
+gic_cpu_read 4.100 pid=2424 s=cpu cpu=0x1 addr=0xc val=0x21
+gic_acknowledge_irq 15.600 pid=2424 s=cpu cpu=0x0 irq=0x21
+gic_cpu_read 265.000 pid=2424 s=cpu cpu=0x0 addr=0xc val=0x21
+pl011_write 1594.700 pid=2424 addr=0x44 value=0x50
+pl011_irq_state 2.000 pid=2424 level=0x0
+gic_set_irq 1.300 pid=2424 irq=0x21 level=0x0 cpumask=0xff target=0xff
+pl011_write 30.700 pid=2424 addr=0x38 value=0x0
+pl011_irq_state 1.200 pid=2424 level=0x0
+gic_cpu_write 110.600 pid=2424 s=cpu cpu=0x0 addr=0x10 val=0x21
+gic_cpu_write 193.400 pid=2424 s=cpu cpu=0x0 addr=0x1000 val=0x21
+pl011_irq_state 1169.500 pid=2424 level=0x0
+
+This is because:
+
+2) gic_acknowledge_irq calls gic_clear_pending which uses GIC_DIST_CLEAR_PENDING but this usually has no effect on level-sensitive interrupts.
+
+With this often being a no-op (ie. assuming ispendr was not written to), any 1-n level-sensitive interrupt is still improperly pending on all the other cores.
+
+(Also, I don't really know how the qemu thread model works, there might be race conditions in the acknowledgment logic if gic_acknowledge_irq is called by multiple threads, too.)
+
+
+Alex Longwall <email address hidden> writes:
+
+> Public bug reported:
+>
+> For a 1-N interrupt (any SPI on the GICv2), as mandated by the TRM, only
+> one CPU can acknowledge the IRQ until it becomes inactive.
+>
+> The TRM also mandates that SGIs and PPIs follow the N-N model and that
+> SPIs follow the 1-N model.
+>
+> However this is not currently the case with QEMU. I have locally (no
+> minimal test case) seen e.g. uart interrupts being acknowledged twice
+> before having been deactivated (expected: irqId on one CPU and 1023 on
+> the other instead).
+
+You might find there is enough in kvm-unit-tests GIC tests already to
+build a test case for what you are seeing.
+
+>
+> I have narrowed the issue down to the following:
+>
+> 1) arm_gic_common_reset resets all irq_state[id] fields to 0. This means
+> all IRQ will use the N-N model, and if s->revision != REV_11MPCORE, then
+> there's no way to set any interrupt to 1-N.
+>
+> If ""fixed"" locally with a hackjob, I still have the following trace:
+>
+> pl011_irq_state 534130.800 pid=2424 level=0x1
+> gic_set_irq 2.900 pid=2424 irq=0x21 level=0x1 cpumask=0xff target=0xff
+> gic_update_set_irq 3.300 pid=2424 cpu=0x0 name=irq level=0x1
+> gic_update_set_irq 4.200 pid=2424 cpu=0x1 name=irq level=0x1
+> gic_acknowledge_irq 539.400 pid=2424 s=cpu cpu=0x1 irq=0x21
+> gic_update_set_irq 269.800 pid=2424 cpu=0x0 name=irq level=0x1
+> gic_cpu_read 4.100 pid=2424 s=cpu cpu=0x1 addr=0xc val=0x21
+> gic_acknowledge_irq 15.600 pid=2424 s=cpu cpu=0x0 irq=0x21
+> gic_cpu_read 265.000 pid=2424 s=cpu cpu=0x0 addr=0xc val=0x21
+> pl011_write 1594.700 pid=2424 addr=0x44 value=0x50
+> pl011_irq_state 2.000 pid=2424 level=0x0
+> gic_set_irq 1.300 pid=2424 irq=0x21 level=0x0 cpumask=0xff target=0xff
+> pl011_write 30.700 pid=2424 addr=0x38 value=0x0
+> pl011_irq_state 1.200 pid=2424 level=0x0
+> gic_cpu_write 110.600 pid=2424 s=cpu cpu=0x0 addr=0x10 val=0x21
+> gic_cpu_write 193.400 pid=2424 s=cpu cpu=0x0 addr=0x1000 val=0x21
+> pl011_irq_state 1169.500 pid=2424 level=0x0
+>
+> This is because:
+>
+> 2) gic_acknowledge_irq calls gic_clear_pending which uses
+> GIC_DIST_CLEAR_PENDING but this usually has no effect on level-sensitive
+> interrupts.
+>
+> With this often being a no-op (ie. assuming ispendr was not written to),
+> any 1-n level-sensitive interrupt is still improperly pending on all the
+> other cores.
+>
+> (Also, I don't really know how the qemu thread model works, there might
+> be race conditions in the acknowledgment logic if gic_acknowledge_irq is
+> called by multiple threads, too.)
+
+All updates to the GIC internals should be protected by the BQL which
+applies to all mmio emulated devices.
+
+>
+> Option used:
+> -nographic -machine virt,virtualization=on,accel=tcg,gic-version=2 -cpu cortex-a57 -smp 4 -m 1024
+> -kernel whatever.elf -d unimp,guest_errors -semihosting-config enable,target=native
+> -chardev stdio,id=uart -serial chardev:uart -monitor none
+> -trace gic_update_set_irq -trace gic_acknowledge_irq -trace pl011_irq_state -trace pl011_write -trace gic_cpu_read -trace gic_cpu_write
+> -trace gic_set_irq
+>
+> Commit used: dc65a5bdc9fa543690a775b50d4ffbeb22c56d6d "Merge remote-
+> tracking branch 'remotes/dgibson/tags/ppc-for-5.0-20200108' into
+> staging"
+>
+> ** Affects: qemu
+>      Importance: Undecided
+>          Status: New
+>
+>
+> ** Tags: arm gic
+>
+> ** Description changed:
+>
+>   For a 1-N interrupt (any SPI on the GICv2), as mandated by the TRM, only
+>   one CPU can acknowledge the IRQ until it becomes inactive.
+>   
+>   The TRM also mandates that SGIs and PPIs follow the N-N model and that
+>   SPIs follow the 1-N model.
+>   
+>   However this is not currently the case with QEMU. I have locally (no
+>   minimal test case) seen e.g. uart interrupts being acknowledged twice
+>   before having been deactivated (expected: irqId on one CPU and 1023 on
+>   the other instead).
+>   
+>   I have narrowed the issue down to the following:
+>   
+>   1) arm_gic_common_reset resets all irq_state[id] fields to 0. This means
+>   all IRQ will use the N-N model, and if s->revision != REV_11MPCORE, then
+>   there's no way to set any interrupt to 1-N.
+>   
+>   **If fixed locally** with a hackjob, I still have the following trace:
+>   
+>   pl011_irq_state 534130.800 pid=2424 level=0x1
+>   gic_set_irq 2.900 pid=2424 irq=0x21 level=0x1 cpumask=0xff target=0xff
+>   gic_update_set_irq 3.300 pid=2424 cpu=0x0 name=irq level=0x1
+>   gic_update_set_irq 4.200 pid=2424 cpu=0x1 name=irq level=0x1
+>   gic_acknowledge_irq 539.400 pid=2424 s=cpu cpu=0x1 irq=0x21
+>   gic_update_set_irq 269.800 pid=2424 cpu=0x0 name=irq level=0x1
+>   gic_cpu_read 4.100 pid=2424 s=cpu cpu=0x1 addr=0xc val=0x21
+>   gic_acknowledge_irq 15.600 pid=2424 s=cpu cpu=0x0 irq=0x21
+>   gic_cpu_read 265.000 pid=2424 s=cpu cpu=0x0 addr=0xc val=0x21
+>   pl011_write 1594.700 pid=2424 addr=0x44 value=0x50
+>   pl011_irq_state 2.000 pid=2424 level=0x0
+>   gic_set_irq 1.300 pid=2424 irq=0x21 level=0x0 cpumask=0xff target=0xff
+>   pl011_write 30.700 pid=2424 addr=0x38 value=0x0
+>   pl011_irq_state 1.200 pid=2424 level=0x0
+>   gic_cpu_write 110.600 pid=2424 s=cpu cpu=0x0 addr=0x10 val=0x21
+>   gic_cpu_write 193.400 pid=2424 s=cpu cpu=0x0 addr=0x1000 val=0x21
+>   pl011_irq_state 1169.500 pid=2424 level=0x0
+>   
+>   This is because:
+>   
+>   2) gic_acknowledge_irq calls gic_clear_pending which uses
+>   GIC_DIST_CLEAR_PENDING but this usually has no effect on level-sensitive
+>   interrupts.
+>   
+>   With this often being a no-op (ie. assuming ispendr was not written to),
+>   any 1-n level-sensitive interrupt is still improperly pending on all the
+>   other cores.
+>   
+>   (Also, I don't really know how the qemu thread model works, there might
+>   be race conditions in the acknowledgment logic if gic_acknowledge_irq is
+>   called by multiple threads, too.)
+> + 
+> + Option used:
+> + -nographic -machine virt,virtualization=on,accel=tcg,gic-version=2 -cpu cortex-a57 -smp 4 -m 1024
+> + -kernel whatever.elf -d unimp,guest_errors -semihosting-config enable,target=native
+> + -chardev stdio,id=uart -serial chardev:uart -monitor none
+> + -trace gic_update_set_irq -trace gic_acknowledge_irq -trace pl011_irq_state -trace pl011_write -trace gic_cpu_read -trace gic_cpu_write
+> + -trace gic_set_irq
+> + 
+> + Commit used: dc65a5bdc9fa543690a775b50d4ffbeb22c56d6d "Merge remote-
+> + tracking branch 'remotes/dgibson/tags/ppc-for-5.0-20200108' into
+> + staging"
+>
+> ** Description changed:
+>
+>   For a 1-N interrupt (any SPI on the GICv2), as mandated by the TRM, only
+>   one CPU can acknowledge the IRQ until it becomes inactive.
+>   
+>   The TRM also mandates that SGIs and PPIs follow the N-N model and that
+>   SPIs follow the 1-N model.
+>   
+>   However this is not currently the case with QEMU. I have locally (no
+>   minimal test case) seen e.g. uart interrupts being acknowledged twice
+>   before having been deactivated (expected: irqId on one CPU and 1023 on
+>   the other instead).
+>   
+>   I have narrowed the issue down to the following:
+>   
+>   1) arm_gic_common_reset resets all irq_state[id] fields to 0. This means
+>   all IRQ will use the N-N model, and if s->revision != REV_11MPCORE, then
+>   there's no way to set any interrupt to 1-N.
+>   
+> - **If fixed locally** with a hackjob, I still have the following trace:
+> + If ""fixed"" locally with a hackjob, I still have the following trace:
+>   
+>   pl011_irq_state 534130.800 pid=2424 level=0x1
+>   gic_set_irq 2.900 pid=2424 irq=0x21 level=0x1 cpumask=0xff target=0xff
+>   gic_update_set_irq 3.300 pid=2424 cpu=0x0 name=irq level=0x1
+>   gic_update_set_irq 4.200 pid=2424 cpu=0x1 name=irq level=0x1
+>   gic_acknowledge_irq 539.400 pid=2424 s=cpu cpu=0x1 irq=0x21
+>   gic_update_set_irq 269.800 pid=2424 cpu=0x0 name=irq level=0x1
+>   gic_cpu_read 4.100 pid=2424 s=cpu cpu=0x1 addr=0xc val=0x21
+>   gic_acknowledge_irq 15.600 pid=2424 s=cpu cpu=0x0 irq=0x21
+>   gic_cpu_read 265.000 pid=2424 s=cpu cpu=0x0 addr=0xc val=0x21
+>   pl011_write 1594.700 pid=2424 addr=0x44 value=0x50
+>   pl011_irq_state 2.000 pid=2424 level=0x0
+>   gic_set_irq 1.300 pid=2424 irq=0x21 level=0x0 cpumask=0xff target=0xff
+>   pl011_write 30.700 pid=2424 addr=0x38 value=0x0
+>   pl011_irq_state 1.200 pid=2424 level=0x0
+>   gic_cpu_write 110.600 pid=2424 s=cpu cpu=0x0 addr=0x10 val=0x21
+>   gic_cpu_write 193.400 pid=2424 s=cpu cpu=0x0 addr=0x1000 val=0x21
+>   pl011_irq_state 1169.500 pid=2424 level=0x0
+>   
+>   This is because:
+>   
+>   2) gic_acknowledge_irq calls gic_clear_pending which uses
+>   GIC_DIST_CLEAR_PENDING but this usually has no effect on level-sensitive
+>   interrupts.
+>   
+>   With this often being a no-op (ie. assuming ispendr was not written to),
+>   any 1-n level-sensitive interrupt is still improperly pending on all the
+>   other cores.
+>   
+>   (Also, I don't really know how the qemu thread model works, there might
+>   be race conditions in the acknowledgment logic if gic_acknowledge_irq is
+>   called by multiple threads, too.)
+>   
+>   Option used:
+>   -nographic -machine virt,virtualization=on,accel=tcg,gic-version=2 -cpu cortex-a57 -smp 4 -m 1024
+>   -kernel whatever.elf -d unimp,guest_errors -semihosting-config enable,target=native
+>   -chardev stdio,id=uart -serial chardev:uart -monitor none
+>   -trace gic_update_set_irq -trace gic_acknowledge_irq -trace pl011_irq_state -trace pl011_write -trace gic_cpu_read -trace gic_cpu_write
+>   -trace gic_set_irq
+>   
+>   Commit used: dc65a5bdc9fa543690a775b50d4ffbeb22c56d6d "Merge remote-
+>   tracking branch 'remotes/dgibson/tags/ppc-for-5.0-20200108' into
+>   staging"
+
+
+-- 
+Alex Bennée
+
+
+It would probably help if you were a bit more specific about describing the expected versus actual behaviour you see. I think here that we're talking about the GICD_ICFGR registers and more specifically the bits [2F] that may indicate N-N vs 1-N model.
+
+The GIC architecture specification says that these GICD_IFCGR bits are only relevant for "some early GIC implementations", which for QEMU means "only for the 11MPcore pre-GICv1 GIC". Our GICv2 implementation follows the architecture in having these bits be RAZ/WI (and we implement the behaviour of the 1-N-for-SPI vs N-N-for-SGI in code rather than by testing the 'model' flag, I think).
+
+For part (2), I think you're saying that we're missing the bit of functionality that in the arch spec section 3.2.3 is described as "when the GIC recognises an interrupt acknowledge from one of the target processors it clears the pending state on all the other targeted processors" ? Interestingly, this isn't documented in the section 3.2.4 set of conditions where the pending state is removed...
+
+
+
+> You might find there is enough in kvm-unit-tests GIC tests already to
+build a test case for what you are seeing.
+
+Right, I will do so as soon as possible.
+
+For bug 1) however, a simpler test can be made
+_start:
+    // x0=gicd
+    mov     x0, #0x08000000
+    // Read icfgr[for irqid=32...]
+    ldr     w1, [x0, #(0xc00+32/4)]
+    // Try to write to icfgr
+    mov     w1, #3
+    str     w1, [x0, #(0xc00+32/4)]
+    // Read back
+    ldr     w1, [x0, #(0xc00+32/4)]
+    b .
+
+Running this code through the gdbstub, we can see that the model bits ((2*id+0) mod 16) in icfgr are always 0, no matter what.
+
+However, even for the GICv2, GIC_DIST_TEST_MODEL is being used in qemu source code, meaning all interrupts, including SPIs, are wrongly treated as N-N.
+
+The initialization function of the GIC should (at least for GICv2 devices) initialize these bits as 1 for all SPIs; this is currently not the case.
+
+Oops, yes, missed that use of GIC_DIST_TEST_MODEL because it was in the header file...
+
+
+> about describing the expected versus actual behaviour you see.
+
+Expected behavior:
+
+* core 0 (or 1) reads irqId (irqId becomes active/active-pending)
+* core 1 (or resp. 0) reads 1023
+* core 0 handles and deactivates the interrupt
+
+What I am getting instead:
+
+* core 0 reads irqId
+* core 1 also reads irqId
+* core 0 handles the interrupt, later deactivates it
+* core 1 attempts to handle the interrupt
+
+In arm-gic.c, reads of GICC_IAR call gic_acknowledge_irq. gic_acknowledge_irq, in turn, calls gic_clear_pending (in gic_internal.h) which eventually evaluates GIC_DIST_TEST_MODEL, line 266
+
+For 2): since I've never written to ispendr, the level interrupt is still considered as pending on the other core because GIC_DIST_TEST_LEVEL(...) evaluates to true.
+
+I believe ack should clear the level on other cores for 1-n interrupts
+
+> For part (2), I think you're saying that we're missing the bit of functionality that in the arch spec ...
+
+I do, apologies if what I wrote was confusing.
+
+"Implications of the 1-N model" provides clearer wording about that functionality
+
+Err, I meant 3.2 subitem 5 "Note" "In a multiprocessor implementation, the GIC handles(...)" too, sorry
+
+Please find attached a test case reproducing this issue. (this is a variant of https://github.com/rhdrjones/kvm-unit-tests/blob/master/arm/pl031.c but for multiple CPUs)
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/268
+
+

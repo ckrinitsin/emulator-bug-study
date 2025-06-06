@@ -1,0 +1,186 @@
+other: 0.100
+semantic: 0.092
+performance: 0.087
+device: 0.082
+PID: 0.075
+debug: 0.074
+permissions: 0.072
+files: 0.069
+network: 0.067
+KVM: 0.064
+vnc: 0.060
+socket: 0.056
+graphic: 0.055
+boot: 0.046
+debug: 0.590
+KVM: 0.171
+performance: 0.103
+files: 0.033
+PID: 0.023
+semantic: 0.015
+other: 0.014
+socket: 0.012
+network: 0.009
+device: 0.009
+graphic: 0.007
+boot: 0.006
+vnc: 0.005
+permissions: 0.004
+
+Unstable Win10 guest with qemu 3.1 + huge pages + hv_stimer
+
+Host:
+Gentoo linux x86_64, kernel 4.20.1
+Qemu 3.1.0 
+CPU: Intel i7 6850K
+Chipset: X99
+
+Guest:
+Windows 10 Pro 64bit (1809)
+Machine type: pc-q35_3.1
+Hyper-V enlightenments: hv_stimer,hv_reenlightenment,hv_frequencies,hv_vapic,hv_reset,hv_synic,hv_runtime,hv_vpindex,hv_time,hv_relaxed,hv_spinlocks=0x1fff
+Memory: 16GB backed by 2MB huge pages
+
+Issue:
+Once guest is started, log gets flooded with:
+
+qemu-system-x86_64: vhost_region_add_section: Overlapping but not coherent sections at 103000
+
+or 
+
+qemu-system-x86_64: vhost_region_add_section:Section rounded to 0 prior to previous 1f000
+
+(line endings change)
+
+and as time goes guest loses network access (virtio-net-pci) and general performance diminishes to extent of freezing applications.
+
+Observations:
+1) problem disappears when hv_stimer is removed
+2) problem disappears when memory backing with huge pages is disabled
+3) problem disappears when machine type is downgraded to pc-q35_3.0
+
+Refresh: still happening with Qemu 4.0 and Kernel 5.2.
+
+One additional observation:
+4) problem disappears when vhost is disabled.
+
+Still broken with Qemu 4.1rc2 /w Kernel 5.2. 
+
+This is a huge problem, as it breaks performance, either in networking (you can't use the virtio net which is the only 100G adapter afaik), or you have to disable huge pages, which is a blow to any large vm host, or it breaks stimer, which increases cpu usage, generally breaking virtualization. 
+
+Thank you! 
+
+Other users are having similar issues:
+https://github.com/virtio-win/kvm-guest-drivers-windows/issues/402
+https://www.reddit.com/r/VFIO/comments/cc2473/virtio_network_drivers_failing_on_win10_guest/etk6f6i/
+
+
+What can be done to increase the visibility of this? It's quite annoying to deal with. 
+
+CC's in Vitaly; he knows a bunch about the Hyperv hv_ and windows stuff.
+It feels weird that something timer related should change something hugepage related.
+
+Zilvinas/Damir: Can you paste in the qemu commandline you're using please.
+
+Another observation:
+Adding CPU flag x-hv-synic-kvm-only also fixes the issue, because it switches only synic to Qemu 3.0 behavior, leaving other features of > Qemu 3.0 available.
+
+This observation can be related to this commit: https://github.com/qemu/qemu/commit/9b4cf107b09d18ac30f46fd1c4de8585ccba030c
+
+I will post full qemu command line later.
+
+x-hv-synic-kvm-only does two things:
+1) Disables in-QEMU synic and this should be unrelated to the issue as it is unrelated to stimers.
+
+2) Doesn't clear guest pages (HV_X64_MSR_SIEFP/HV_X64_MSR_SIMP). This can actually be related to huge pages if the cleanup is causing huge page split. Synic pages are 4k. I still fail to see how this is vhost related.
+
+I'll try to take a look.
+
+No, I think it's the other way around: clearing guest pages is unrelated. It is easy to check with the following kernel patch:
+
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index fff790a3f4ee..73c574f930e3 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -776,7 +776,7 @@ int kvm_hv_activate_synic(struct kvm_vcpu *vcpu, bool dont_zero_synic_pages)
+         */
+        kvm_vcpu_deactivate_apicv(vcpu);
+        synic->active = true;
+-       synic->dont_zero_synic_pages = dont_zero_synic_pages;
++       synic->dont_zero_synic_pages = false;
+        return 0;
+ }
+
+my expectation is that the issue will remain.
+
+Now what *can* be causing it: when in-QEMU synic is initialized it creates two memory subregions: for Event page and for Message page (HV_X64_MSR_SIEFP/HV_X64_MSR_SIMP MSRs). These regions are always 4k in size and they can me anywhere in guest's memory, not necessarily 2M aligned.
+
+Now, (if I understood correctly) in vhost code, vhost_region_add_section() is trying to align to qemu_ram_pagesize() and this may intersect with synic regions.  
+
+We need to summon someone who understands memory_region_* magic in QEMU and vhost in particular.
+
+
+As asked by dgilbert-h, I am attaching my qemu command line. It is ripped from libvirt log.
+
+Also attaching my libvirt log with a few errors at the end of the log. 
+
+Thank you for looking into this! 
+
+
+
+Hi, 
+
+This seems to have died out. How do we proceed to get this looked into by the correct people? 
+
+Thanks,
+Damir
+
+Can you try the pair of patches I've just posted:
+    vhost: Don't pass ram device sections
+    hyperv/synic: Allocate as ram_device
+
+and let me know if it helps please.
+
+I have applied these patches on qemu 4.2 and it seems they do fix the problem: no more  vhost_region_add_section in the log, and I haven't observed network or general performance loss in the span of one hour.
+
+Also affects me when running Qemu 4.0.0 with -machine pc-q35-3.1. I get this on the command line:
+
+"qemu-system-x86_64: vhost_region_add_section: Overlapping but not coherent sections at 11a000".
+
+h/w: AMD Ryzen 3900X, Gigabyte Aorus Pro X570 (latest BIOS), kernel 5.3.0.
+
+With -machine q35 (i.e. pc-q35-4.0) the machine crashes when soundhw is specified. Here the quick and dirty command line:
+
+qemu-system-x86_64 \
+  -enable-kvm \
+  -runas user \
+  -serial none \
+  -parallel none \
+  -nodefaults \
+  -name $vmname,process=$vmname \
+  -machine pc-q35-3.1,accel=kvm,mem-merge=off,vmport=off \
+-cpu host,kvm=off,+topoext,hv_vendor_id=1234567890ab,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff,hv_crash,hv_reset,hv_vpindex,hv_runtime,hv_synic,hv_stimer \
+  -smp 24,sockets=1,cores=12,threads=2 \
+    -global ICH9-LPC.disable_s3=1 \
+    -global ICH9-LPC.disable_s4=1 \
+  -m 48G \
+-mem-path /dev/hugepages \
+-mem-prealloc \
+  -rtc base=localtime,clock=host,driftfix=slew  \
+-soundhw hda \
+-audiodev pa,id=pa1,server=/run/user/1000/pulse/native \
+  -vga none \
+  -nographic \
+-usb \
+-device usb-host,vendorid=0x046d,productid=0xc52b \
+-device ioh3420,id=root_port1,chassis=1,bus=pcie.0,addr=03.0 \
+-device vfio-pci,host=0b:00.0,id=hostdev1,bus=root_port1,addr=0x00,multifunction=on \
+-device vfio-pci,host=0b:00.1,id=hostdev2,bus=root_port1,addr=0x00.1 \
+  -drive if=pflash,format=raw,readonly,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=/tmp/my_vars.fd \
+...
+
+I have been using this patch https://patchwork.kernel.org/patch/11346881/ on qemu 4.2 as a fix since January without any ill effects. It is already included into qemu 5.0 rc0 and rc1, so it seems qemu 5.0 will be free from this bug.
+
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=76525114736e8f669766
+

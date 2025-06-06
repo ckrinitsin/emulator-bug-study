@@ -1,0 +1,77 @@
+other: 0.103
+permissions: 0.100
+semantic: 0.089
+graphic: 0.086
+device: 0.086
+boot: 0.079
+debug: 0.076
+PID: 0.068
+performance: 0.067
+socket: 0.059
+vnc: 0.058
+files: 0.058
+KVM: 0.038
+network: 0.033
+debug: 0.307
+files: 0.105
+PID: 0.075
+device: 0.073
+performance: 0.069
+other: 0.069
+boot: 0.061
+semantic: 0.050
+socket: 0.045
+permissions: 0.041
+graphic: 0.033
+network: 0.033
+vnc: 0.027
+KVM: 0.012
+
+Race condition when rebooting with the TCG backend
+
+Reporting this as present in QEMU 3.1.0, although I don't see any commit in current git master (a6ae23831b05a11880b40f7d58e332c45a6b04f7) that would suggest this issue is fixed.
+
+    $ uname -a
+    Linux boole 4.19.0-4-686-pae #1 SMP Debian 4.19.28-2 (2019-03-15) i686 GNU/Linux
+    $ qemu -version
+    QEMU emulator version 3.1.0 (Debian 1:3.1+dfsg-7)
+    Copyright (c) 2003-2018 Fabrice Bellard and the QEMU Project developers
+
+Here's an excerpt from the code which handles reboot requests in SeaBIOS 1.12, located in src/fw/shadow.c:
+
+    // Request a QEMU system reset.  Do the reset in this function as
+    // the BIOS code was overwritten above and not all BIOS
+    // functionality may be available.
+
+    // Attempt PCI style reset
+    outb(0x02, PORT_PCI_REBOOT);
+    outb(0x06, PORT_PCI_REBOOT);
+
+    // Next try triple faulting the CPU to force a reset
+    asm volatile("int3");
+
+This compiles to the following:
+
+    (qemu) x/10i 0xf1993
+    0x000f1993:  b0 02                    movb     $2, %al
+    0x000f1995:  ee                       outb     %al, %dx
+    0x000f1996:  b0 06                    movb     $6, %al
+    0x000f1998:  ee                       outb     %al, %dx
+    0x000f1999:  cc                       int3     
+    0x000f199a:  80 3d 0d 53 0f 00 08     cmpb     $8, 0xf530d
+    0x000f19a1:  75 52                    jne      0xf19f5
+    0x000f19a3:  a1 10 53 0f 00           movl     0xf5310, %eax
+    0x000f19a8:  8b 15 14 53 0f 00        movl     0xf5314, %edx
+    0x000f19ae:  89 c3                    movl     %eax, %ebx
+
+Now, with the TCG backend, upon reaching the second outb instruction, the thread executing JIT-ed opcodes invokes qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET). This signals another thread to reset the guest CPU registers to their initial state. However, the execution thread is *not* stopped, which means it will keep executing already-translated instructions in the TCG buffer. In particular, the bootstrap value of the EIP register will be overwritten. On my machine, this usually results in the guest CPU finding itself in real mode, CS base 0xffff0000, EIP 0x0000199e, which in real mode disassembles to this:
+
+    (qemu) xp/1i 0xf199e
+    0x000f199e:  0f 00 08                 strw     0(%bx, %si)
+
+This instruction triggers a #UD exception, and given that SeaBIOS handles #UD by immediately returning, it manifests as the guest locking up with 100% CPU usage every other reboot.
+
+Never mind, 0ec7e6779fc830e5b4e6a448d75317fafcf69477 fixed this.
+
+This can be closed.
+

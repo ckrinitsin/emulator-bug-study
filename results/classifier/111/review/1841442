@@ -1,0 +1,168 @@
+other: 0.116
+permissions: 0.094
+PID: 0.091
+performance: 0.078
+device: 0.075
+semantic: 0.074
+files: 0.068
+debug: 0.065
+network: 0.063
+KVM: 0.060
+socket: 0.058
+graphic: 0.056
+vnc: 0.054
+boot: 0.048
+files: 0.193
+performance: 0.160
+debug: 0.134
+semantic: 0.110
+PID: 0.092
+other: 0.070
+device: 0.055
+vnc: 0.037
+boot: 0.035
+socket: 0.024
+permissions: 0.024
+graphic: 0.023
+network: 0.021
+KVM: 0.021
+
+floating point emulation can fail to set FE_INEXACT
+
+Floating point emulation can fail to set FE_INEXACT in some circumstances. This shows up quite often in glibc's "math" tests.  A similar test is attached.
+
+On ppc64le native:
+--
+$ gcc nextafter.c -o nextafter -lm
+$ ./nextafter $(./nextafter)
+0x0000000000000001 0.000000
+0x0
+
+0xa000000
+FE_INEXACT FE_UNDERFLOW
+0x0000000000000000 0.000000
+--
+
+On x86_64:
+--
+$ gcc nextafter.c -o nextafter -lm
+$ ./nextafter $(./nextafter)
+0x0000000000000001 0.000000
+0x0
+
+0x30
+FE_INEXACT FE_UNDERFLOW 
+0x0000000000000000 0.000000
+--
+
+Using qemu-system-ppc64
+--
+$ ./nextafter $(./nextafter)
+0x0000000000000001 0.000000
+0x0
+
+0x8000000
+FE_UNDERFLOW 
+0x0000000000000000 0.000000
+--
+
+Using qemu-x86_64:
+--
+$ ./nextafter $(./nextafter)
+0x0000000000000001 0.000000
+0x0
+
+0x0
+
+0x0000000000000000 0.000000
+--
+
+QEMU versions vary, but not too much, and are pretty close to git HEAD:
+- 586f3dced9 (HEAD -> master, origin/master, origin/HEAD) Merge remote-tracking branch 'remotes/cohuck/tags/s390x-20190822' into staging
+- 864ab31 Update version for v4.1.0-rc4 release
+
+Since the issue happens nearly identically on different targets, I suspect the issue lies somewhere in fpu/softfloat.c.
+
+
+
+Well, maybe yes and maybe no.  What you've done is choose two targets
+whose floating point emulation have not been well maintained.
+
+If I try this same test on aarch64, it passes:
+
+$ ~/a.out 0x0000000000000001
+0x0000000000000001 0.000000
+0x0
+
+0x18
+FE_INEXACT FE_UNDERFLOW 
+0x0000000000000000 0.000000
+
+$ ./aarch64-linux-user/qemu-aarch64 ~/a.out 0x0000000000000001
+0x0000000000000001 0.000000
+0x0
+
+0x18
+FE_INEXACT FE_UNDERFLOW 
+0x0000000000000000 0.000000
+
+
+Interesting. Did you run qemu-aarch64 on aarch64? If so, it may have been using "hardfloat".  I ran "qemu-system-ppc64" on x86_64 and "qemu-x86_64" on ppc64le to ensure I was using "softfloat".
+
+
+Richard Henderson <email address hidden> writes:
+
+> Well, maybe yes and maybe no.  What you've done is choose two targets
+> whose floating point emulation have not been well maintained.
+
+So this is a failure on the x86_64 and ppc64 frontends to correctly set
+the softfloat modes when their appropriate registers are set?
+
+>
+> If I try this same test on aarch64, it passes:
+>
+> $ ~/a.out 0x0000000000000001
+> 0x0000000000000001 0.000000
+> 0x0
+>
+> 0x18
+> FE_INEXACT FE_UNDERFLOW
+> 0x0000000000000000 0.000000
+>
+> $ ./aarch64-linux-user/qemu-aarch64 ~/a.out 0x0000000000000001
+> 0x0000000000000001 0.000000
+> 0x0
+>
+> 0x18
+> FE_INEXACT FE_UNDERFLOW
+> 0x0000000000000000 0.000000
+
+
+--
+Alex Bennée
+
+
+> Interesting. Did you run qemu-aarch64 on aarch64? If so, it may have been
+> using "hardfloat". I ran "qemu-system-ppc64" on x86_64 and "qemu-x86_64"
+> on ppc64le to ensure I was using "softfloat".
+
+That's not how that works.  Indeed, the point of the hardfloat path is to
+accelerate fpu emulation for a non-native guest.
+
+That said, qemu-system-ppc64 will *never* use hardfloat, because ppc always
+need the current and correct result of inexact for emulation of the FI bit,
+which requires that we use the softfloat path.
+
+Also, use of the hardfloat path requires normal inputs.  For this test case
+we're passing the minimum denormal input: 0x0000_0000_0000_0001.  So we will
+always use the softfloat path for this.
+
+
+Patch for ppc:
+https://lists.gnu.org/archive/html/qemu-devel/2019-08/msg05532.html
+
+Fixing x86_64 is significantly harder, as support for fp exceptions
+is completely lacking in the code currently.
+
+Fixed by 16ce2fffa660 ("target/ppc: Fix do_float_check_status vs inexact")
+

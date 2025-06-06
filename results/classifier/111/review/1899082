@@ -1,0 +1,164 @@
+other: 0.097
+PID: 0.093
+permissions: 0.080
+boot: 0.079
+semantic: 0.079
+debug: 0.078
+device: 0.077
+performance: 0.072
+graphic: 0.070
+KVM: 0.067
+socket: 0.061
+vnc: 0.058
+files: 0.050
+network: 0.037
+debug: 0.570
+files: 0.100
+PID: 0.090
+performance: 0.078
+boot: 0.042
+other: 0.028
+KVM: 0.026
+device: 0.017
+semantic: 0.014
+network: 0.010
+graphic: 0.007
+socket: 0.007
+permissions: 0.005
+vnc: 0.004
+
+ReplayKernel.test_x86_64_pc fails intermittently
+
+Even though this acceptance test is already skipped on GitLab CI, the intermittent failures can be seen on other environments too.
+
+The record phase works fine, but during the replay phase fail to finish booting the kernel (until the expected place):
+
+16:34:47 DEBUG| [    0.034498] Last level dTLB entries: 4KB 0, 2MB 0, 4MB 0, 1GB 0
+16:34:47 DEBUG| [    0.034790] Spectre V2 : Spectre mitigation: LFENCE not serializing, switching to generic retpoline
+16:34:47 DEBUG| [    0.035093] Spectre V2 : Mitigation: Full generic retpoline
+16:34:47 DEBUG| [    0.035347] Spectre V2 : Spectre v2 / SpectreRSB mitigation: Filling RSB on context switch
+16:34:47 DEBUG| [    0.035667]
+16:36:02 ERROR| 
+16:36:02 ERROR| Reproduced traceback from: /home/cleber/src/avocado/avocado/avocado/core/test.py:767
+16:36:02 ERROR| Traceback (most recent call last):
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/replay_kernel.py", line 92, in test_x86_64_pc
+16:36:02 ERROR|     self.run_rr(kernel_path, kernel_command_line, console_pattern, shift=5)
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/replay_kernel.py", line 73, in run_rr
+16:36:02 ERROR|     False, shift, args, replay_path)
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/replay_kernel.py", line 55, in run_vm
+16:36:02 ERROR|     self.wait_for_console_pattern(console_pattern, vm)
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/boot_linux_console.py", line 53, in wait_for_console_pattern
+16:36:02 ERROR|     vm=vm)
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/avocado_qemu/__init__.py", line 130, in wait_for_console_pattern
+16:36:02 ERROR|     _console_interaction(test, success_message, failure_message, None, vm=vm)
+16:36:02 ERROR|   File "/var/lib/users/cleber/build/qemu/tests/acceptance/avocado_qemu/__init__.py", line 82, in _console_interaction
+16:36:02 ERROR|     msg = console.readline().strip()
+16:36:02 ERROR|   File "/usr/lib64/python3.7/socket.py", line 575, in readinto
+16:36:02 ERROR|     def readinto(self, b):
+16:36:02 ERROR|   File "/home/cleber/src/avocado/avocado/avocado/plugins/runner.py", line 77, in sigterm_handler
+16:36:02 ERROR|     raise RuntimeError("Test interrupted by SIGTERM")
+16:36:02 ERROR| RuntimeError: Test interrupted by SIGTERM
+16:36:02 ERROR| 
+
+On my workstation, I can replicate the failure roughly once every 50 runs.
+
+I'm actually able to increase the reproducibility to ~ 90% when running 8 of those tests simultaneously (on an 8 core system).
+
+I can 100% reproduce it with the following command line:
+taskset 1 tests/venv/bin/avocado --show=app,console,replay run -t arch:x86_64 ../tests/acceptance/replay_kernel.py
+
+But I can't reproduce it outside the avocado toolchain, by running qemu directly.
+
+I traced this bug to hw/char/serial.c/serial_ioport_read
+
+Bug disappears when I add qemu_log("serial_ioport_read %x %x\n", (int)addr, ret); into the end of this function.
+
+I suppose that there is avocado (or socket) io synchronization problem, because running the same test without avocado works normally.
+
+I could reproduce this without Avocado:
+
+--
+#!/bin/bash
+
+SOCKET="/tmp/qemu.sock"
+VMLINUZ_PATH="/tmp/vmlinuz"
+REPLAY_FILE="/tmp/replay.bin"
+
+function run_and_wait() {
+        /usr/bin/qemu-system-x86_64 -display none \
+                                    -vga none  \
+                                    -machine pc \
+                                    -chardev socket,id=console,path=${SOCKET},server=on,wait=off \
+                                    -serial chardev:console \
+                                    -icount shift=5,rr=$1,rrfile=${REPLAY_FILE} \
+                                    -kernel ${VMLINUZ_PATH} \
+                                    -append "printk.time=1 panic=-1 console=ttyS0" -net none -no-reboot &
+        # Wait a little for the socket creation
+        sleep 1
+        socat - UNIX-CONNECT:${SOCKET}
+        echo $?
+}
+
+
+run_and_wait "record"
+echo "Was this (record) finished?"
+
+run_and_wait "replay"
+echo "Was this (replay) finished?"
+--
+
+The second echo is never displayed and my console stops here:
+
+---
+[    0.036667] Speculative Store Bypass: Vulnerable
+[    0.256061] random: fast init done
+[    0.308652] Freeing SMP alternatives memory: 36K
+---
+
+I was able to run the reproducer from Beraldo Leal, and achieved the same results.
+
+Additionally, I got the following output from QEMU:
+
+   qemu-system-x86_64: Missing character write event in the replay log
+
+Which seems to come from replay/replay-char.c:158.
+
+I then tested the record and replay separately, and found that, while the above message is given and QEMU exits at the replay phase, the amount of CPUs given to the *record* stage actually make the difference.  When the recording is done with a single CPU, the replay log seems to be written with the "missing character write event".
+
+Beraldo, thanks for the script.
+However, I can't reproduce the bug using it. I've got the newest QEMU from the repository, and it never hangs in this scenario.
+
+But there are some problems in other runs with more complex tasks.
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

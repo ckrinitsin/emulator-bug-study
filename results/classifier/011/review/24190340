@@ -1,0 +1,2080 @@
+other: 0.094
+debug: 0.090
+permissions: 0.086
+device: 0.082
+KVM: 0.077
+vnc: 0.076
+semantic: 0.074
+boot: 0.074
+files: 0.070
+PID: 0.067
+performance: 0.058
+socket: 0.054
+network: 0.053
+graphic: 0.045
+debug: 0.462
+KVM: 0.211
+PID: 0.058
+performance: 0.052
+socket: 0.052
+other: 0.028
+device: 0.025
+network: 0.024
+files: 0.022
+semantic: 0.019
+vnc: 0.018
+graphic: 0.011
+permissions: 0.010
+boot: 0.009
+
+[BUG, RFC] Block graph deadlock on job-dismiss
+
+Hi all,
+
+There's a bug in block layer which leads to block graph deadlock.
+Notably, it takes place when blockdev IO is processed within a separate
+iothread.
+
+This was initially caught by our tests, and I was able to reduce it to a
+relatively simple reproducer.  Such deadlocks are probably supposed to
+be covered in iotests/graph-changes-while-io, but this deadlock isn't.
+
+Basically what the reproducer does is launches QEMU with a drive having
+'iothread' option set, creates a chain of 2 snapshots, launches
+block-commit job for a snapshot and then dismisses the job, starting
+from the lower snapshot.  If the guest is issuing IO at the same time,
+there's a race in acquiring block graph lock and a potential deadlock.
+
+Here's how it can be reproduced:
+
+1. Run QEMU:
+>
+SRCDIR=/path/to/srcdir
+>
+>
+>
+>
+>
+$SRCDIR/build/qemu-system-x86_64 -enable-kvm \
+>
+>
+-machine q35 -cpu Nehalem \
+>
+>
+-name guest=alma8-vm,debug-threads=on \
+>
+>
+-m 2g -smp 2 \
+>
+>
+-nographic -nodefaults \
+>
+>
+-qmp unix:/var/run/alma8-qmp.sock,server=on,wait=off \
+>
+>
+-serial unix:/var/run/alma8-serial.sock,server=on,wait=off \
+>
+>
+-object iothread,id=iothread0 \
+>
+>
+-blockdev
+>
+node-name=disk,driver=qcow2,file.driver=file,file.filename=/path/to/img/alma8.qcow2
+>
+\
+>
+-device virtio-blk-pci,drive=disk,iothread=iothread0
+2. Launch IO (random reads) from within the guest:
+>
+nc -U /var/run/alma8-serial.sock
+>
+...
+>
+[root@alma8-vm ~]# fio --name=randread --ioengine=libaio --direct=1 --bs=4k
+>
+--size=1G --numjobs=1 --time_based=1 --runtime=300 --group_reporting
+>
+--rw=randread --iodepth=1 --filename=/testfile
+3. Run snapshots creation & removal of lower snapshot operation in a
+loop (script attached):
+>
+while /bin/true ; do ./remove_lower_snap.sh ; done
+And then it occasionally hangs.
+
+Note: I've tried bisecting this, and looks like deadlock occurs starting
+from the following commit:
+
+(BAD)  5bdbaebcce virtio: Re-enable notifications after drain
+(GOOD) c42c3833e0 virtio-scsi: Attach event vq notifier with no_poll
+
+On the latest v10.0.0 it does hang as well.
+
+
+Here's backtrace of the main thread:
+
+>
+#0  0x00007fc547d427ce in __ppoll (fds=0x557eb79657b0, nfds=1,
+>
+timeout=<optimized out>, sigmask=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:43
+>
+#1  0x0000557eb47d955c in qemu_poll_ns (fds=0x557eb79657b0, nfds=1,
+>
+timeout=-1) at ../util/qemu-timer.c:329
+>
+#2  0x0000557eb47b2204 in fdmon_poll_wait (ctx=0x557eb76c5f20,
+>
+ready_list=0x7ffd94b4edd8, timeout=-1) at ../util/fdmon-poll.c:79
+>
+#3  0x0000557eb47b1c45 in aio_poll (ctx=0x557eb76c5f20, blocking=true) at
+>
+../util/aio-posix.c:730
+>
+#4  0x0000557eb4621edd in bdrv_do_drained_begin (bs=0x557eb795e950,
+>
+parent=0x0, poll=true) at ../block/io.c:378
+>
+#5  0x0000557eb4621f7b in bdrv_drained_begin (bs=0x557eb795e950) at
+>
+../block/io.c:391
+>
+#6  0x0000557eb45ec125 in bdrv_change_aio_context (bs=0x557eb795e950,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7682
+>
+#7  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7964250,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7608
+>
+#8  0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7668
+>
+#9  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7e59110,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7608
+>
+#10 0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb7e51960,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7668
+>
+#11 0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb814ed80,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7608
+>
+#12 0x0000557eb45ee8e4 in child_job_change_aio_ctx (c=0x557eb7c9d3f0,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../blockjob.c:157
+>
+#13 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb7c9d3f0,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7592
+>
+#14 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb7d74310,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7661
+>
+#15 0x0000557eb45dcd7e in bdrv_child_cb_change_aio_ctx
+>
+(child=0x557eb8565af0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 =
+>
+{...}, tran=0x557eb7a87160, errp=0x0) at ../block.c:1234
+>
+#16 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb8565af0,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7592
+>
+#17 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+errp=0x0)
+>
+at ../block.c:7661
+>
+#18 0x0000557eb45ec1f3 in bdrv_try_change_aio_context (bs=0x557eb79575e0,
+>
+ctx=0x557eb76c5f20, ignore_child=0x0, errp=0x0) at ../block.c:7715
+>
+#19 0x0000557eb45e1b15 in bdrv_root_unref_child (child=0x557eb7966f30) at
+>
+../block.c:3317
+>
+#20 0x0000557eb45eeaa8 in block_job_remove_all_bdrv (job=0x557eb7952800) at
+>
+../blockjob.c:209
+>
+#21 0x0000557eb45ee641 in block_job_free (job=0x557eb7952800) at
+>
+../blockjob.c:82
+>
+#22 0x0000557eb45f17af in job_unref_locked (job=0x557eb7952800) at
+>
+../job.c:474
+>
+#23 0x0000557eb45f257d in job_do_dismiss_locked (job=0x557eb7952800) at
+>
+../job.c:771
+>
+#24 0x0000557eb45f25fe in job_dismiss_locked (jobptr=0x7ffd94b4f400,
+>
+errp=0x7ffd94b4f488) at ../job.c:783
+>
+--Type <RET> for more, q to quit, c to continue without paging--
+>
+#25 0x0000557eb45d8e84 in qmp_job_dismiss (id=0x557eb7aa42b0 "commit-snap1",
+>
+errp=0x7ffd94b4f488) at ../job-qmp.c:138
+>
+#26 0x0000557eb472f6a3 in qmp_marshal_job_dismiss (args=0x7fc52c00a3b0,
+>
+ret=0x7fc53c880da8, errp=0x7fc53c880da0) at qapi/qapi-commands-job.c:221
+>
+#27 0x0000557eb47a35f3 in do_qmp_dispatch_bh (opaque=0x7fc53c880e40) at
+>
+../qapi/qmp-dispatch.c:128
+>
+#28 0x0000557eb47d1cd2 in aio_bh_call (bh=0x557eb79568f0) at
+>
+../util/async.c:172
+>
+#29 0x0000557eb47d1df5 in aio_bh_poll (ctx=0x557eb76c0200) at
+>
+../util/async.c:219
+>
+#30 0x0000557eb47b12f3 in aio_dispatch (ctx=0x557eb76c0200) at
+>
+../util/aio-posix.c:436
+>
+#31 0x0000557eb47d2266 in aio_ctx_dispatch (source=0x557eb76c0200,
+>
+callback=0x0, user_data=0x0) at ../util/async.c:361
+>
+#32 0x00007fc549232f4f in g_main_dispatch (context=0x557eb76c6430) at
+>
+../glib/gmain.c:3364
+>
+#33 g_main_context_dispatch (context=0x557eb76c6430) at ../glib/gmain.c:4079
+>
+#34 0x0000557eb47d3ab1 in glib_pollfds_poll () at ../util/main-loop.c:287
+>
+#35 0x0000557eb47d3b38 in os_host_main_loop_wait (timeout=0) at
+>
+../util/main-loop.c:310
+>
+#36 0x0000557eb47d3c58 in main_loop_wait (nonblocking=0) at
+>
+../util/main-loop.c:589
+>
+#37 0x0000557eb4218b01 in qemu_main_loop () at ../system/runstate.c:835
+>
+#38 0x0000557eb46df166 in qemu_default_main (opaque=0x0) at
+>
+../system/main.c:50
+>
+#39 0x0000557eb46df215 in main (argc=24, argv=0x7ffd94b4f8d8) at
+>
+../system/main.c:80
+And here's coroutine trying to acquire read lock:
+
+>
+(gdb) qemu coroutine reader_queue->entries.sqh_first
+>
+#0  0x0000557eb47d7068 in qemu_coroutine_switch (from_=0x557eb7aa48b0,
+>
+to_=0x7fc537fff508, action=COROUTINE_YIELD) at
+>
+../util/coroutine-ucontext.c:321
+>
+#1  0x0000557eb47d4d4a in qemu_coroutine_yield () at
+>
+../util/qemu-coroutine.c:339
+>
+#2  0x0000557eb47d56c8 in qemu_co_queue_wait_impl (queue=0x557eb59954c0
+>
+<reader_queue>, lock=0x7fc53c57de50, flags=0) at
+>
+../util/qemu-coroutine-lock.c:60
+>
+#3  0x0000557eb461fea7 in bdrv_graph_co_rdlock () at ../block/graph-lock.c:231
+>
+#4  0x0000557eb460c81a in graph_lockable_auto_lock (x=0x7fc53c57dee3) at
+>
+/home/root/src/qemu/master/include/block/graph-lock.h:213
+>
+#5  0x0000557eb460fa41 in blk_co_do_preadv_part
+>
+(blk=0x557eb84c0810, offset=6890553344, bytes=4096, qiov=0x7fc530006988,
+>
+qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/block-backend.c:1339
+>
+#6  0x0000557eb46104d7 in blk_aio_read_entry (opaque=0x7fc530003240) at
+>
+../block/block-backend.c:1619
+>
+#7  0x0000557eb47d6c40 in coroutine_trampoline (i0=-1213577040, i1=21886) at
+>
+../util/coroutine-ucontext.c:175
+>
+#8  0x00007fc547c2a360 in __start_context () at
+>
+../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+>
+#9  0x00007ffd94b4ea40 in  ()
+>
+#10 0x0000000000000000 in  ()
+So it looks like main thread is processing job-dismiss request and is
+holding write lock taken in block_job_remove_all_bdrv() (frame #20
+above).  At the same time iothread spawns a coroutine which performs IO
+request.  Before the coroutine is spawned, blk_aio_prwv() increases
+'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+trying to acquire the read lock.  But main thread isn't releasing the
+lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+Here's the deadlock.
+
+Any comments and suggestions on the subject are welcomed.  Thanks!
+
+Andrey
+remove_lower_snap.sh
+Description:
+application/shellscript
+
+On 4/24/25 8:32 PM, Andrey Drobyshev wrote:
+>
+Hi all,
+>
+>
+There's a bug in block layer which leads to block graph deadlock.
+>
+Notably, it takes place when blockdev IO is processed within a separate
+>
+iothread.
+>
+>
+This was initially caught by our tests, and I was able to reduce it to a
+>
+relatively simple reproducer.  Such deadlocks are probably supposed to
+>
+be covered in iotests/graph-changes-while-io, but this deadlock isn't.
+>
+>
+Basically what the reproducer does is launches QEMU with a drive having
+>
+'iothread' option set, creates a chain of 2 snapshots, launches
+>
+block-commit job for a snapshot and then dismisses the job, starting
+>
+from the lower snapshot.  If the guest is issuing IO at the same time,
+>
+there's a race in acquiring block graph lock and a potential deadlock.
+>
+>
+Here's how it can be reproduced:
+>
+>
+[...]
+>
+I took a closer look at iotests/graph-changes-while-io, and have managed
+to reproduce the same deadlock in a much simpler setup, without a guest.
+
+1. Run QSD:> ./build/storage-daemon/qemu-storage-daemon --object
+iothread,id=iothread0 \
+>
+--blockdev null-co,node-name=node0,read-zeroes=true \
+>
+>
+--nbd-server addr.type=unix,addr.path=/var/run/qsd_nbd.sock \
+>
+>
+--export
+>
+nbd,id=exp0,node-name=node0,iothread=iothread0,fixed-iothread=true,writable=true
+>
+\
+>
+--chardev
+>
+socket,id=qmp-sock,path=/var/run/qsd_qmp.sock,server=on,wait=off \
+>
+--monitor chardev=qmp-sock
+2. Launch IO:
+>
+qemu-img bench -f raw -c 2000000
+>
+'nbd+unix:///node0?socket=/var/run/qsd_nbd.sock'
+3. Add 2 snapshots and remove lower one (script attached):> while
+/bin/true ; do ./rls_qsd.sh ; done
+
+And then it hangs.
+
+I'll also send a patch with corresponding test case added directly to
+iotests.
+
+This reproduce seems to be hanging starting from Fiona's commit
+67446e605dc ("blockjob: drop AioContext lock before calling
+bdrv_graph_wrlock()").  AioContext locks were dropped entirely later on
+in Stefan's commit b49f4755c7 ("block: remove AioContext locking"), but
+the problem remains.
+
+Andrey
+rls_qsd.sh
+Description:
+application/shellscript
+
+From: Andrey Drobyshev <andrey.drobyshev@virtuozzo.com>
+
+This case is catching potential deadlock which takes place when job-dismiss
+is issued when I/O requests are processed in a separate iothread.
+
+See
+https://mail.gnu.org/archive/html/qemu-devel/2025-04/msg04421.html
+Signed-off-by: Andrey Drobyshev <andrey.drobyshev@virtuozzo.com>
+---
+ .../qemu-iotests/tests/graph-changes-while-io | 101 ++++++++++++++++--
+ .../tests/graph-changes-while-io.out          |   4 +-
+ 2 files changed, 96 insertions(+), 9 deletions(-)
+
+diff --git a/tests/qemu-iotests/tests/graph-changes-while-io 
+b/tests/qemu-iotests/tests/graph-changes-while-io
+index 194fda500e..e30f823da4 100755
+--- a/tests/qemu-iotests/tests/graph-changes-while-io
++++ b/tests/qemu-iotests/tests/graph-changes-while-io
+@@ -27,6 +27,8 @@ from iotests import imgfmt, qemu_img, qemu_img_create, 
+qemu_io, \
+ 
+ 
+ top = os.path.join(iotests.test_dir, 'top.img')
++snap1 = os.path.join(iotests.test_dir, 'snap1.img')
++snap2 = os.path.join(iotests.test_dir, 'snap2.img')
+ nbd_sock = os.path.join(iotests.sock_dir, 'nbd.sock')
+ 
+ 
+@@ -58,6 +60,15 @@ class TestGraphChangesWhileIO(QMPTestCase):
+     def tearDown(self) -> None:
+         self.qsd.stop()
+ 
++    def _wait_for_blockjob(self, status) -> None:
++        done = False
++        while not done:
++            for event in self.qsd.get_qmp().get_events(wait=10.0):
++                if event['event'] != 'JOB_STATUS_CHANGE':
++                    continue
++                if event['data']['status'] == status:
++                    done = True
++
+     def test_blockdev_add_while_io(self) -> None:
+         # Run qemu-img bench in the background
+         bench_thr = Thread(target=do_qemu_img_bench)
+@@ -116,13 +127,89 @@ class TestGraphChangesWhileIO(QMPTestCase):
+                 'device': 'job0',
+             })
+ 
+-            cancelled = False
+-            while not cancelled:
+-                for event in self.qsd.get_qmp().get_events(wait=10.0):
+-                    if event['event'] != 'JOB_STATUS_CHANGE':
+-                        continue
+-                    if event['data']['status'] == 'null':
+-                        cancelled = True
++            self._wait_for_blockjob('null')
++
++        bench_thr.join()
++
++    def test_remove_lower_snapshot_while_io(self) -> None:
++        # Run qemu-img bench in the background
++        bench_thr = Thread(target=do_qemu_img_bench, args=(100000, ))
++        bench_thr.start()
++
++        # While I/O is performed on 'node0' node, consequently add 2 snapshots
++        # on top of it, then remove (commit) them starting from lower one.
++        while bench_thr.is_alive():
++            # Recreate snapshot images on every iteration
++            qemu_img_create('-f', imgfmt, snap1, '1G')
++            qemu_img_create('-f', imgfmt, snap2, '1G')
++
++            self.qsd.cmd('blockdev-add', {
++                'driver': imgfmt,
++                'node-name': 'snap1',
++                'file': {
++                    'driver': 'file',
++                    'filename': snap1
++                }
++            })
++
++            self.qsd.cmd('blockdev-snapshot', {
++                'node': 'node0',
++                'overlay': 'snap1',
++            })
++
++            self.qsd.cmd('blockdev-add', {
++                'driver': imgfmt,
++                'node-name': 'snap2',
++                'file': {
++                    'driver': 'file',
++                    'filename': snap2
++                }
++            })
++
++            self.qsd.cmd('blockdev-snapshot', {
++                'node': 'snap1',
++                'overlay': 'snap2',
++            })
++
++            self.qsd.cmd('block-commit', {
++                'job-id': 'commit-snap1',
++                'device': 'snap2',
++                'top-node': 'snap1',
++                'base-node': 'node0',
++                'auto-finalize': True,
++                'auto-dismiss': False,
++            })
++
++            self._wait_for_blockjob('concluded')
++            self.qsd.cmd('job-dismiss', {
++                'id': 'commit-snap1',
++            })
++
++            self.qsd.cmd('block-commit', {
++                'job-id': 'commit-snap2',
++                'device': 'snap2',
++                'top-node': 'snap2',
++                'base-node': 'node0',
++                'auto-finalize': True,
++                'auto-dismiss': False,
++            })
++
++            self._wait_for_blockjob('ready')
++            self.qsd.cmd('job-complete', {
++                'id': 'commit-snap2',
++            })
++
++            self._wait_for_blockjob('concluded')
++            self.qsd.cmd('job-dismiss', {
++                'id': 'commit-snap2',
++            })
++
++            self.qsd.cmd('blockdev-del', {
++                'node-name': 'snap1'
++            })
++            self.qsd.cmd('blockdev-del', {
++                'node-name': 'snap2'
++            })
+ 
+         bench_thr.join()
+ 
+diff --git a/tests/qemu-iotests/tests/graph-changes-while-io.out 
+b/tests/qemu-iotests/tests/graph-changes-while-io.out
+index fbc63e62f8..8d7e996700 100644
+--- a/tests/qemu-iotests/tests/graph-changes-while-io.out
++++ b/tests/qemu-iotests/tests/graph-changes-while-io.out
+@@ -1,5 +1,5 @@
+-..
++...
+ ----------------------------------------------------------------------
+-Ran 2 tests
++Ran 3 tests
+ 
+ OK
+-- 
+2.43.5
+
+Am 24.04.25 um 19:32 schrieb Andrey Drobyshev:
+>
+So it looks like main thread is processing job-dismiss request and is
+>
+holding write lock taken in block_job_remove_all_bdrv() (frame #20
+>
+above).  At the same time iothread spawns a coroutine which performs IO
+>
+request.  Before the coroutine is spawned, blk_aio_prwv() increases
+>
+'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+>
+trying to acquire the read lock.  But main thread isn't releasing the
+>
+lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+>
+Here's the deadlock.
+And for the IO test you provided, it's client->nb_requests that behaves
+similarly to blk->in_flight here.
+
+The issue also reproduces easily when issuing the following QMP command
+in a loop while doing IO on a device:
+
+>
+void qmp_block_locked_drain(const char *node_name, Error **errp)
+>
+{
+>
+BlockDriverState *bs;
+>
+>
+bs = bdrv_find_node(node_name);
+>
+if (!bs) {
+>
+error_setg(errp, "node not found");
+>
+return;
+>
+}
+>
+>
+bdrv_graph_wrlock();
+>
+bdrv_drained_begin(bs);
+>
+bdrv_drained_end(bs);
+>
+bdrv_graph_wrunlock();
+>
+}
+It seems like either it would be necessary to require:
+1. not draining inside an exclusively locked section
+or
+2. making sure that variables used by drained_poll routines are only set
+while holding the reader lock
+?
+
+Those seem to require rather involved changes, so a third option might
+be to make draining inside an exclusively locked section possible, by
+embedding such locked sections in a drained section:
+
+>
+diff --git a/blockjob.c b/blockjob.c
+>
+index 32007f31a9..9b2f3b3ea9 100644
+>
+--- a/blockjob.c
+>
++++ b/blockjob.c
+>
+@@ -198,6 +198,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+* one to make sure that such a concurrent access does not attempt
+>
+* to process an already freed BdrvChild.
+>
+*/
+>
++    bdrv_drain_all_begin();
+>
+bdrv_graph_wrlock();
+>
+while (job->nodes) {
+>
+GSList *l = job->nodes;
+>
+@@ -211,6 +212,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+g_slist_free_1(l);
+>
+}
+>
+bdrv_graph_wrunlock();
+>
++    bdrv_drain_all_end();
+>
+}
+>
+>
+bool block_job_has_bdrv(BlockJob *job, BlockDriverState *bs)
+This seems to fix the issue at hand. I can send a patch if this is
+considered an acceptable approach.
+
+Best Regards,
+Fiona
+
+On 4/30/25 11:47 AM, Fiona Ebner wrote:
+>
+Am 24.04.25 um 19:32 schrieb Andrey Drobyshev:
+>
+> So it looks like main thread is processing job-dismiss request and is
+>
+> holding write lock taken in block_job_remove_all_bdrv() (frame #20
+>
+> above).  At the same time iothread spawns a coroutine which performs IO
+>
+> request.  Before the coroutine is spawned, blk_aio_prwv() increases
+>
+> 'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+>
+> trying to acquire the read lock.  But main thread isn't releasing the
+>
+> lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+>
+> Here's the deadlock.
+>
+>
+And for the IO test you provided, it's client->nb_requests that behaves
+>
+similarly to blk->in_flight here.
+>
+>
+The issue also reproduces easily when issuing the following QMP command
+>
+in a loop while doing IO on a device:
+>
+>
+> void qmp_block_locked_drain(const char *node_name, Error **errp)
+>
+> {
+>
+>     BlockDriverState *bs;
+>
+>
+>
+>     bs = bdrv_find_node(node_name);
+>
+>     if (!bs) {
+>
+>         error_setg(errp, "node not found");
+>
+>         return;
+>
+>     }
+>
+>
+>
+>     bdrv_graph_wrlock();
+>
+>     bdrv_drained_begin(bs);
+>
+>     bdrv_drained_end(bs);
+>
+>     bdrv_graph_wrunlock();
+>
+> }
+>
+>
+It seems like either it would be necessary to require:
+>
+1. not draining inside an exclusively locked section
+>
+or
+>
+2. making sure that variables used by drained_poll routines are only set
+>
+while holding the reader lock
+>
+?
+>
+>
+Those seem to require rather involved changes, so a third option might
+>
+be to make draining inside an exclusively locked section possible, by
+>
+embedding such locked sections in a drained section:
+>
+>
+> diff --git a/blockjob.c b/blockjob.c
+>
+> index 32007f31a9..9b2f3b3ea9 100644
+>
+> --- a/blockjob.c
+>
+> +++ b/blockjob.c
+>
+> @@ -198,6 +198,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+>       * one to make sure that such a concurrent access does not attempt
+>
+>       * to process an already freed BdrvChild.
+>
+>       */
+>
+> +    bdrv_drain_all_begin();
+>
+>      bdrv_graph_wrlock();
+>
+>      while (job->nodes) {
+>
+>          GSList *l = job->nodes;
+>
+> @@ -211,6 +212,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+>          g_slist_free_1(l);
+>
+>      }
+>
+>      bdrv_graph_wrunlock();
+>
+> +    bdrv_drain_all_end();
+>
+>  }
+>
+>
+>
+>  bool block_job_has_bdrv(BlockJob *job, BlockDriverState *bs)
+>
+>
+This seems to fix the issue at hand. I can send a patch if this is
+>
+considered an acceptable approach.
+>
+>
+Best Regards,
+>
+Fiona
+>
+Hello Fiona,
+
+Thanks for looking into it.  I've tried your 3rd option above and can
+confirm it does fix the deadlock, at least I can't reproduce it.  Other
+iotests also don't seem to be breaking.  So I personally am fine with
+that patch.  Would be nice to hear a word from the maintainers though on
+whether there're any caveats with such approach.
+
+Andrey
+
+On Wed, Apr 30, 2025 at 10:11â¯AM Andrey Drobyshev
+<andrey.drobyshev@virtuozzo.com> wrote:
+>
+>
+On 4/30/25 11:47 AM, Fiona Ebner wrote:
+>
+> Am 24.04.25 um 19:32 schrieb Andrey Drobyshev:
+>
+>> So it looks like main thread is processing job-dismiss request and is
+>
+>> holding write lock taken in block_job_remove_all_bdrv() (frame #20
+>
+>> above).  At the same time iothread spawns a coroutine which performs IO
+>
+>> request.  Before the coroutine is spawned, blk_aio_prwv() increases
+>
+>> 'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+>
+>> trying to acquire the read lock.  But main thread isn't releasing the
+>
+>> lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+>
+>> Here's the deadlock.
+>
+>
+>
+> And for the IO test you provided, it's client->nb_requests that behaves
+>
+> similarly to blk->in_flight here.
+>
+>
+>
+> The issue also reproduces easily when issuing the following QMP command
+>
+> in a loop while doing IO on a device:
+>
+>
+>
+>> void qmp_block_locked_drain(const char *node_name, Error **errp)
+>
+>> {
+>
+>>     BlockDriverState *bs;
+>
+>>
+>
+>>     bs = bdrv_find_node(node_name);
+>
+>>     if (!bs) {
+>
+>>         error_setg(errp, "node not found");
+>
+>>         return;
+>
+>>     }
+>
+>>
+>
+>>     bdrv_graph_wrlock();
+>
+>>     bdrv_drained_begin(bs);
+>
+>>     bdrv_drained_end(bs);
+>
+>>     bdrv_graph_wrunlock();
+>
+>> }
+>
+>
+>
+> It seems like either it would be necessary to require:
+>
+> 1. not draining inside an exclusively locked section
+>
+> or
+>
+> 2. making sure that variables used by drained_poll routines are only set
+>
+> while holding the reader lock
+>
+> ?
+>
+>
+>
+> Those seem to require rather involved changes, so a third option might
+>
+> be to make draining inside an exclusively locked section possible, by
+>
+> embedding such locked sections in a drained section:
+>
+>
+>
+>> diff --git a/blockjob.c b/blockjob.c
+>
+>> index 32007f31a9..9b2f3b3ea9 100644
+>
+>> --- a/blockjob.c
+>
+>> +++ b/blockjob.c
+>
+>> @@ -198,6 +198,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+>>       * one to make sure that such a concurrent access does not attempt
+>
+>>       * to process an already freed BdrvChild.
+>
+>>       */
+>
+>> +    bdrv_drain_all_begin();
+>
+>>      bdrv_graph_wrlock();
+>
+>>      while (job->nodes) {
+>
+>>          GSList *l = job->nodes;
+>
+>> @@ -211,6 +212,7 @@ void block_job_remove_all_bdrv(BlockJob *job)
+>
+>>          g_slist_free_1(l);
+>
+>>      }
+>
+>>      bdrv_graph_wrunlock();
+>
+>> +    bdrv_drain_all_end();
+>
+>>  }
+>
+>>
+>
+>>  bool block_job_has_bdrv(BlockJob *job, BlockDriverState *bs)
+>
+>
+>
+> This seems to fix the issue at hand. I can send a patch if this is
+>
+> considered an acceptable approach.
+Kevin is aware of this thread but it's a public holiday tomorrow so it
+may be a little longer.
+
+Stefan
+
+Am 24.04.2025 um 19:32 hat Andrey Drobyshev geschrieben:
+>
+Hi all,
+>
+>
+There's a bug in block layer which leads to block graph deadlock.
+>
+Notably, it takes place when blockdev IO is processed within a separate
+>
+iothread.
+>
+>
+This was initially caught by our tests, and I was able to reduce it to a
+>
+relatively simple reproducer.  Such deadlocks are probably supposed to
+>
+be covered in iotests/graph-changes-while-io, but this deadlock isn't.
+>
+>
+Basically what the reproducer does is launches QEMU with a drive having
+>
+'iothread' option set, creates a chain of 2 snapshots, launches
+>
+block-commit job for a snapshot and then dismisses the job, starting
+>
+from the lower snapshot.  If the guest is issuing IO at the same time,
+>
+there's a race in acquiring block graph lock and a potential deadlock.
+>
+>
+Here's how it can be reproduced:
+>
+>
+1. Run QEMU:
+>
+> SRCDIR=/path/to/srcdir
+>
+>
+>
+>
+>
+>
+>
+>
+>
+> $SRCDIR/build/qemu-system-x86_64 -enable-kvm \
+>
+>
+>
+>   -machine q35 -cpu Nehalem \
+>
+>
+>
+>   -name guest=alma8-vm,debug-threads=on \
+>
+>
+>
+>   -m 2g -smp 2 \
+>
+>
+>
+>   -nographic -nodefaults \
+>
+>
+>
+>   -qmp unix:/var/run/alma8-qmp.sock,server=on,wait=off \
+>
+>
+>
+>   -serial unix:/var/run/alma8-serial.sock,server=on,wait=off \
+>
+>
+>
+>   -object iothread,id=iothread0 \
+>
+>
+>
+>   -blockdev
+>
+> node-name=disk,driver=qcow2,file.driver=file,file.filename=/path/to/img/alma8.qcow2
+>
+>  \
+>
+>   -device virtio-blk-pci,drive=disk,iothread=iothread0
+>
+>
+2. Launch IO (random reads) from within the guest:
+>
+> nc -U /var/run/alma8-serial.sock
+>
+> ...
+>
+> [root@alma8-vm ~]# fio --name=randread --ioengine=libaio --direct=1 --bs=4k
+>
+> --size=1G --numjobs=1 --time_based=1 --runtime=300 --group_reporting
+>
+> --rw=randread --iodepth=1 --filename=/testfile
+>
+>
+3. Run snapshots creation & removal of lower snapshot operation in a
+>
+loop (script attached):
+>
+> while /bin/true ; do ./remove_lower_snap.sh ; done
+>
+>
+And then it occasionally hangs.
+>
+>
+Note: I've tried bisecting this, and looks like deadlock occurs starting
+>
+from the following commit:
+>
+>
+(BAD)  5bdbaebcce virtio: Re-enable notifications after drain
+>
+(GOOD) c42c3833e0 virtio-scsi: Attach event vq notifier with no_poll
+>
+>
+On the latest v10.0.0 it does hang as well.
+>
+>
+>
+Here's backtrace of the main thread:
+>
+>
+> #0  0x00007fc547d427ce in __ppoll (fds=0x557eb79657b0, nfds=1,
+>
+> timeout=<optimized out>, sigmask=0x0) at
+>
+> ../sysdeps/unix/sysv/linux/ppoll.c:43
+>
+> #1  0x0000557eb47d955c in qemu_poll_ns (fds=0x557eb79657b0, nfds=1,
+>
+> timeout=-1) at ../util/qemu-timer.c:329
+>
+> #2  0x0000557eb47b2204 in fdmon_poll_wait (ctx=0x557eb76c5f20,
+>
+> ready_list=0x7ffd94b4edd8, timeout=-1) at ../util/fdmon-poll.c:79
+>
+> #3  0x0000557eb47b1c45 in aio_poll (ctx=0x557eb76c5f20, blocking=true) at
+>
+> ../util/aio-posix.c:730
+>
+> #4  0x0000557eb4621edd in bdrv_do_drained_begin (bs=0x557eb795e950,
+>
+> parent=0x0, poll=true) at ../block/io.c:378
+>
+> #5  0x0000557eb4621f7b in bdrv_drained_begin (bs=0x557eb795e950) at
+>
+> ../block/io.c:391
+>
+> #6  0x0000557eb45ec125 in bdrv_change_aio_context (bs=0x557eb795e950,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7682
+>
+> #7  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7964250,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7608
+>
+> #8  0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7668
+>
+> #9  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7e59110,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7608
+>
+> #10 0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb7e51960,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7668
+>
+> #11 0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb814ed80,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7608
+>
+> #12 0x0000557eb45ee8e4 in child_job_change_aio_ctx (c=0x557eb7c9d3f0,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../blockjob.c:157
+>
+> #13 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb7c9d3f0,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7592
+>
+> #14 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb7d74310,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7661
+>
+> #15 0x0000557eb45dcd7e in bdrv_child_cb_change_aio_ctx
+>
+>     (child=0x557eb8565af0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 =
+>
+> {...}, tran=0x557eb7a87160, errp=0x0) at ../block.c:1234
+>
+> #16 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb8565af0,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7592
+>
+> #17 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+> ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160,
+>
+> errp=0x0)
+>
+>     at ../block.c:7661
+>
+> #18 0x0000557eb45ec1f3 in bdrv_try_change_aio_context (bs=0x557eb79575e0,
+>
+> ctx=0x557eb76c5f20, ignore_child=0x0, errp=0x0) at ../block.c:7715
+>
+> #19 0x0000557eb45e1b15 in bdrv_root_unref_child (child=0x557eb7966f30) at
+>
+> ../block.c:3317
+>
+> #20 0x0000557eb45eeaa8 in block_job_remove_all_bdrv (job=0x557eb7952800) at
+>
+> ../blockjob.c:209
+>
+> #21 0x0000557eb45ee641 in block_job_free (job=0x557eb7952800) at
+>
+> ../blockjob.c:82
+>
+> #22 0x0000557eb45f17af in job_unref_locked (job=0x557eb7952800) at
+>
+> ../job.c:474
+>
+> #23 0x0000557eb45f257d in job_do_dismiss_locked (job=0x557eb7952800) at
+>
+> ../job.c:771
+>
+> #24 0x0000557eb45f25fe in job_dismiss_locked (jobptr=0x7ffd94b4f400,
+>
+> errp=0x7ffd94b4f488) at ../job.c:783
+>
+> --Type <RET> for more, q to quit, c to continue without paging--
+>
+> #25 0x0000557eb45d8e84 in qmp_job_dismiss (id=0x557eb7aa42b0
+>
+> "commit-snap1", errp=0x7ffd94b4f488) at ../job-qmp.c:138
+>
+> #26 0x0000557eb472f6a3 in qmp_marshal_job_dismiss (args=0x7fc52c00a3b0,
+>
+> ret=0x7fc53c880da8, errp=0x7fc53c880da0) at qapi/qapi-commands-job.c:221
+>
+> #27 0x0000557eb47a35f3 in do_qmp_dispatch_bh (opaque=0x7fc53c880e40) at
+>
+> ../qapi/qmp-dispatch.c:128
+>
+> #28 0x0000557eb47d1cd2 in aio_bh_call (bh=0x557eb79568f0) at
+>
+> ../util/async.c:172
+>
+> #29 0x0000557eb47d1df5 in aio_bh_poll (ctx=0x557eb76c0200) at
+>
+> ../util/async.c:219
+>
+> #30 0x0000557eb47b12f3 in aio_dispatch (ctx=0x557eb76c0200) at
+>
+> ../util/aio-posix.c:436
+>
+> #31 0x0000557eb47d2266 in aio_ctx_dispatch (source=0x557eb76c0200,
+>
+> callback=0x0, user_data=0x0) at ../util/async.c:361
+>
+> #32 0x00007fc549232f4f in g_main_dispatch (context=0x557eb76c6430) at
+>
+> ../glib/gmain.c:3364
+>
+> #33 g_main_context_dispatch (context=0x557eb76c6430) at ../glib/gmain.c:4079
+>
+> #34 0x0000557eb47d3ab1 in glib_pollfds_poll () at ../util/main-loop.c:287
+>
+> #35 0x0000557eb47d3b38 in os_host_main_loop_wait (timeout=0) at
+>
+> ../util/main-loop.c:310
+>
+> #36 0x0000557eb47d3c58 in main_loop_wait (nonblocking=0) at
+>
+> ../util/main-loop.c:589
+>
+> #37 0x0000557eb4218b01 in qemu_main_loop () at ../system/runstate.c:835
+>
+> #38 0x0000557eb46df166 in qemu_default_main (opaque=0x0) at
+>
+> ../system/main.c:50
+>
+> #39 0x0000557eb46df215 in main (argc=24, argv=0x7ffd94b4f8d8) at
+>
+> ../system/main.c:80
+>
+>
+>
+And here's coroutine trying to acquire read lock:
+>
+>
+> (gdb) qemu coroutine reader_queue->entries.sqh_first
+>
+> #0  0x0000557eb47d7068 in qemu_coroutine_switch (from_=0x557eb7aa48b0,
+>
+> to_=0x7fc537fff508, action=COROUTINE_YIELD) at
+>
+> ../util/coroutine-ucontext.c:321
+>
+> #1  0x0000557eb47d4d4a in qemu_coroutine_yield () at
+>
+> ../util/qemu-coroutine.c:339
+>
+> #2  0x0000557eb47d56c8 in qemu_co_queue_wait_impl (queue=0x557eb59954c0
+>
+> <reader_queue>, lock=0x7fc53c57de50, flags=0) at
+>
+> ../util/qemu-coroutine-lock.c:60
+>
+> #3  0x0000557eb461fea7 in bdrv_graph_co_rdlock () at
+>
+> ../block/graph-lock.c:231
+>
+> #4  0x0000557eb460c81a in graph_lockable_auto_lock (x=0x7fc53c57dee3) at
+>
+> /home/root/src/qemu/master/include/block/graph-lock.h:213
+>
+> #5  0x0000557eb460fa41 in blk_co_do_preadv_part
+>
+>     (blk=0x557eb84c0810, offset=6890553344, bytes=4096,
+>
+> qiov=0x7fc530006988, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at
+>
+> ../block/block-backend.c:1339
+>
+> #6  0x0000557eb46104d7 in blk_aio_read_entry (opaque=0x7fc530003240) at
+>
+> ../block/block-backend.c:1619
+>
+> #7  0x0000557eb47d6c40 in coroutine_trampoline (i0=-1213577040, i1=21886)
+>
+> at ../util/coroutine-ucontext.c:175
+>
+> #8  0x00007fc547c2a360 in __start_context () at
+>
+> ../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+>
+> #9  0x00007ffd94b4ea40 in  ()
+>
+> #10 0x0000000000000000 in  ()
+>
+>
+>
+So it looks like main thread is processing job-dismiss request and is
+>
+holding write lock taken in block_job_remove_all_bdrv() (frame #20
+>
+above).  At the same time iothread spawns a coroutine which performs IO
+>
+request.  Before the coroutine is spawned, blk_aio_prwv() increases
+>
+'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+>
+trying to acquire the read lock.  But main thread isn't releasing the
+>
+lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+>
+Here's the deadlock.
+>
+>
+Any comments and suggestions on the subject are welcomed.  Thanks!
+I think this is what the blk_wait_while_drained() call was supposed to
+address in blk_co_do_preadv_part(). However, with the use of multiple
+I/O threads, this is racy.
+
+Do you think that in your case we hit the small race window between the
+checks in blk_wait_while_drained() and GRAPH_RDLOCK_GUARD()? Or is there
+another reason why blk_wait_while_drained() didn't do its job?
+
+Kevin
+
+On 5/2/25 19:34, Kevin Wolf wrote:
+Am 24.04.2025 um 19:32 hat Andrey Drobyshev geschrieben:
+Hi all,
+
+There's a bug in block layer which leads to block graph deadlock.
+Notably, it takes place when blockdev IO is processed within a separate
+iothread.
+
+This was initially caught by our tests, and I was able to reduce it to a
+relatively simple reproducer.  Such deadlocks are probably supposed to
+be covered in iotests/graph-changes-while-io, but this deadlock isn't.
+
+Basically what the reproducer does is launches QEMU with a drive having
+'iothread' option set, creates a chain of 2 snapshots, launches
+block-commit job for a snapshot and then dismisses the job, starting
+from the lower snapshot.  If the guest is issuing IO at the same time,
+there's a race in acquiring block graph lock and a potential deadlock.
+
+Here's how it can be reproduced:
+
+1. Run QEMU:
+SRCDIR=/path/to/srcdir
+$SRCDIR/build/qemu-system-x86_64 -enable-kvm \
+-machine q35 -cpu Nehalem \
+   -name guest=alma8-vm,debug-threads=on \
+   -m 2g -smp 2 \
+   -nographic -nodefaults \
+   -qmp unix:/var/run/alma8-qmp.sock,server=on,wait=off \
+   -serial unix:/var/run/alma8-serial.sock,server=on,wait=off \
+   -object iothread,id=iothread0 \
+   -blockdev 
+node-name=disk,driver=qcow2,file.driver=file,file.filename=/path/to/img/alma8.qcow2
+ \
+   -device virtio-blk-pci,drive=disk,iothread=iothread0
+2. Launch IO (random reads) from within the guest:
+nc -U /var/run/alma8-serial.sock
+...
+[root@alma8-vm ~]# fio --name=randread --ioengine=libaio --direct=1 --bs=4k 
+--size=1G --numjobs=1 --time_based=1 --runtime=300 --group_reporting 
+--rw=randread --iodepth=1 --filename=/testfile
+3. Run snapshots creation & removal of lower snapshot operation in a
+loop (script attached):
+while /bin/true ; do ./remove_lower_snap.sh ; done
+And then it occasionally hangs.
+
+Note: I've tried bisecting this, and looks like deadlock occurs starting
+from the following commit:
+
+(BAD)  5bdbaebcce virtio: Re-enable notifications after drain
+(GOOD) c42c3833e0 virtio-scsi: Attach event vq notifier with no_poll
+
+On the latest v10.0.0 it does hang as well.
+
+
+Here's backtrace of the main thread:
+#0  0x00007fc547d427ce in __ppoll (fds=0x557eb79657b0, nfds=1, timeout=<optimized 
+out>, sigmask=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:43
+#1  0x0000557eb47d955c in qemu_poll_ns (fds=0x557eb79657b0, nfds=1, timeout=-1) 
+at ../util/qemu-timer.c:329
+#2  0x0000557eb47b2204 in fdmon_poll_wait (ctx=0x557eb76c5f20, 
+ready_list=0x7ffd94b4edd8, timeout=-1) at ../util/fdmon-poll.c:79
+#3  0x0000557eb47b1c45 in aio_poll (ctx=0x557eb76c5f20, blocking=true) at 
+../util/aio-posix.c:730
+#4  0x0000557eb4621edd in bdrv_do_drained_begin (bs=0x557eb795e950, parent=0x0, 
+poll=true) at ../block/io.c:378
+#5  0x0000557eb4621f7b in bdrv_drained_begin (bs=0x557eb795e950) at 
+../block/io.c:391
+#6  0x0000557eb45ec125 in bdrv_change_aio_context (bs=0x557eb795e950, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7682
+#7  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7964250, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7608
+#8  0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb79575e0, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7668
+#9  0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb7e59110, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7608
+#10 0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb7e51960, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7668
+#11 0x0000557eb45ebf2b in bdrv_child_change_aio_context (c=0x557eb814ed80, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7608
+#12 0x0000557eb45ee8e4 in child_job_change_aio_ctx (c=0x557eb7c9d3f0, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../blockjob.c:157
+#13 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb7c9d3f0, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7592
+#14 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb7d74310, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7661
+#15 0x0000557eb45dcd7e in bdrv_child_cb_change_aio_ctx
+     (child=0x557eb8565af0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, 
+tran=0x557eb7a87160, errp=0x0) at ../block.c:1234
+#16 0x0000557eb45ebe2d in bdrv_parent_change_aio_context (c=0x557eb8565af0, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7592
+#17 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb79575e0, 
+ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...}, tran=0x557eb7a87160, 
+errp=0x0)
+     at ../block.c:7661
+#18 0x0000557eb45ec1f3 in bdrv_try_change_aio_context (bs=0x557eb79575e0, 
+ctx=0x557eb76c5f20, ignore_child=0x0, errp=0x0) at ../block.c:7715
+#19 0x0000557eb45e1b15 in bdrv_root_unref_child (child=0x557eb7966f30) at 
+../block.c:3317
+#20 0x0000557eb45eeaa8 in block_job_remove_all_bdrv (job=0x557eb7952800) at 
+../blockjob.c:209
+#21 0x0000557eb45ee641 in block_job_free (job=0x557eb7952800) at 
+../blockjob.c:82
+#22 0x0000557eb45f17af in job_unref_locked (job=0x557eb7952800) at ../job.c:474
+#23 0x0000557eb45f257d in job_do_dismiss_locked (job=0x557eb7952800) at 
+../job.c:771
+#24 0x0000557eb45f25fe in job_dismiss_locked (jobptr=0x7ffd94b4f400, 
+errp=0x7ffd94b4f488) at ../job.c:783
+--Type <RET> for more, q to quit, c to continue without paging--
+#25 0x0000557eb45d8e84 in qmp_job_dismiss (id=0x557eb7aa42b0 "commit-snap1", 
+errp=0x7ffd94b4f488) at ../job-qmp.c:138
+#26 0x0000557eb472f6a3 in qmp_marshal_job_dismiss (args=0x7fc52c00a3b0, 
+ret=0x7fc53c880da8, errp=0x7fc53c880da0) at qapi/qapi-commands-job.c:221
+#27 0x0000557eb47a35f3 in do_qmp_dispatch_bh (opaque=0x7fc53c880e40) at 
+../qapi/qmp-dispatch.c:128
+#28 0x0000557eb47d1cd2 in aio_bh_call (bh=0x557eb79568f0) at ../util/async.c:172
+#29 0x0000557eb47d1df5 in aio_bh_poll (ctx=0x557eb76c0200) at 
+../util/async.c:219
+#30 0x0000557eb47b12f3 in aio_dispatch (ctx=0x557eb76c0200) at 
+../util/aio-posix.c:436
+#31 0x0000557eb47d2266 in aio_ctx_dispatch (source=0x557eb76c0200, 
+callback=0x0, user_data=0x0) at ../util/async.c:361
+#32 0x00007fc549232f4f in g_main_dispatch (context=0x557eb76c6430) at 
+../glib/gmain.c:3364
+#33 g_main_context_dispatch (context=0x557eb76c6430) at ../glib/gmain.c:4079
+#34 0x0000557eb47d3ab1 in glib_pollfds_poll () at ../util/main-loop.c:287
+#35 0x0000557eb47d3b38 in os_host_main_loop_wait (timeout=0) at 
+../util/main-loop.c:310
+#36 0x0000557eb47d3c58 in main_loop_wait (nonblocking=0) at 
+../util/main-loop.c:589
+#37 0x0000557eb4218b01 in qemu_main_loop () at ../system/runstate.c:835
+#38 0x0000557eb46df166 in qemu_default_main (opaque=0x0) at ../system/main.c:50
+#39 0x0000557eb46df215 in main (argc=24, argv=0x7ffd94b4f8d8) at 
+../system/main.c:80
+And here's coroutine trying to acquire read lock:
+(gdb) qemu coroutine reader_queue->entries.sqh_first
+#0  0x0000557eb47d7068 in qemu_coroutine_switch (from_=0x557eb7aa48b0, 
+to_=0x7fc537fff508, action=COROUTINE_YIELD) at ../util/coroutine-ucontext.c:321
+#1  0x0000557eb47d4d4a in qemu_coroutine_yield () at 
+../util/qemu-coroutine.c:339
+#2  0x0000557eb47d56c8 in qemu_co_queue_wait_impl (queue=0x557eb59954c0 
+<reader_queue>, lock=0x7fc53c57de50, flags=0) at 
+../util/qemu-coroutine-lock.c:60
+#3  0x0000557eb461fea7 in bdrv_graph_co_rdlock () at ../block/graph-lock.c:231
+#4  0x0000557eb460c81a in graph_lockable_auto_lock (x=0x7fc53c57dee3) at 
+/home/root/src/qemu/master/include/block/graph-lock.h:213
+#5  0x0000557eb460fa41 in blk_co_do_preadv_part
+     (blk=0x557eb84c0810, offset=6890553344, bytes=4096, qiov=0x7fc530006988, 
+qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at ../block/block-backend.c:1339
+#6  0x0000557eb46104d7 in blk_aio_read_entry (opaque=0x7fc530003240) at 
+../block/block-backend.c:1619
+#7  0x0000557eb47d6c40 in coroutine_trampoline (i0=-1213577040, i1=21886) at 
+../util/coroutine-ucontext.c:175
+#8  0x00007fc547c2a360 in __start_context () at 
+../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+#9  0x00007ffd94b4ea40 in  ()
+#10 0x0000000000000000 in  ()
+So it looks like main thread is processing job-dismiss request and is
+holding write lock taken in block_job_remove_all_bdrv() (frame #20
+above).  At the same time iothread spawns a coroutine which performs IO
+request.  Before the coroutine is spawned, blk_aio_prwv() increases
+'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+trying to acquire the read lock.  But main thread isn't releasing the
+lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+Here's the deadlock.
+
+Any comments and suggestions on the subject are welcomed.  Thanks!
+I think this is what the blk_wait_while_drained() call was supposed to
+address in blk_co_do_preadv_part(). However, with the use of multiple
+I/O threads, this is racy.
+
+Do you think that in your case we hit the small race window between the
+checks in blk_wait_while_drained() and GRAPH_RDLOCK_GUARD()? Or is there
+another reason why blk_wait_while_drained() didn't do its job?
+
+Kevin
+At my opinion there is very big race window. Main thread has
+eaten graph write lock. After that another coroutine is stalled
+within GRAPH_RDLOCK_GUARD() as there is no drain at the moment and only
+after that main thread has started drain. That is why Fiona's idea is
+looking working. Though this would mean that normally we should always
+do that at the moment when we acquire write lock. May be even inside
+this function. Den
+
+Am 02.05.2025 um 19:52 hat Denis V. Lunev geschrieben:
+>
+On 5/2/25 19:34, Kevin Wolf wrote:
+>
+> Am 24.04.2025 um 19:32 hat Andrey Drobyshev geschrieben:
+>
+> > Hi all,
+>
+> >
+>
+> > There's a bug in block layer which leads to block graph deadlock.
+>
+> > Notably, it takes place when blockdev IO is processed within a separate
+>
+> > iothread.
+>
+> >
+>
+> > This was initially caught by our tests, and I was able to reduce it to a
+>
+> > relatively simple reproducer.  Such deadlocks are probably supposed to
+>
+> > be covered in iotests/graph-changes-while-io, but this deadlock isn't.
+>
+> >
+>
+> > Basically what the reproducer does is launches QEMU with a drive having
+>
+> > 'iothread' option set, creates a chain of 2 snapshots, launches
+>
+> > block-commit job for a snapshot and then dismisses the job, starting
+>
+> > from the lower snapshot.  If the guest is issuing IO at the same time,
+>
+> > there's a race in acquiring block graph lock and a potential deadlock.
+>
+> >
+>
+> > Here's how it can be reproduced:
+>
+> >
+>
+> > 1. Run QEMU:
+>
+> > > SRCDIR=/path/to/srcdir
+>
+> > > $SRCDIR/build/qemu-system-x86_64 -enable-kvm \
+>
+> > >    -machine q35 -cpu Nehalem \
+>
+> > >    -name guest=alma8-vm,debug-threads=on \
+>
+> > >    -m 2g -smp 2 \
+>
+> > >    -nographic -nodefaults \
+>
+> > >    -qmp unix:/var/run/alma8-qmp.sock,server=on,wait=off \
+>
+> > >    -serial unix:/var/run/alma8-serial.sock,server=on,wait=off \
+>
+> > >    -object iothread,id=iothread0 \
+>
+> > >    -blockdev
+>
+> > > node-name=disk,driver=qcow2,file.driver=file,file.filename=/path/to/img/alma8.qcow2
+>
+> > >  \
+>
+> > >    -device virtio-blk-pci,drive=disk,iothread=iothread0
+>
+> > 2. Launch IO (random reads) from within the guest:
+>
+> > > nc -U /var/run/alma8-serial.sock
+>
+> > > ...
+>
+> > > [root@alma8-vm ~]# fio --name=randread --ioengine=libaio --direct=1
+>
+> > > --bs=4k --size=1G --numjobs=1 --time_based=1 --runtime=300
+>
+> > > --group_reporting --rw=randread --iodepth=1 --filename=/testfile
+>
+> > 3. Run snapshots creation & removal of lower snapshot operation in a
+>
+> > loop (script attached):
+>
+> > > while /bin/true ; do ./remove_lower_snap.sh ; done
+>
+> > And then it occasionally hangs.
+>
+> >
+>
+> > Note: I've tried bisecting this, and looks like deadlock occurs starting
+>
+> > from the following commit:
+>
+> >
+>
+> > (BAD)  5bdbaebcce virtio: Re-enable notifications after drain
+>
+> > (GOOD) c42c3833e0 virtio-scsi: Attach event vq notifier with no_poll
+>
+> >
+>
+> > On the latest v10.0.0 it does hang as well.
+>
+> >
+>
+> >
+>
+> > Here's backtrace of the main thread:
+>
+> >
+>
+> > > #0  0x00007fc547d427ce in __ppoll (fds=0x557eb79657b0, nfds=1,
+>
+> > > timeout=<optimized out>, sigmask=0x0) at
+>
+> > > ../sysdeps/unix/sysv/linux/ppoll.c:43
+>
+> > > #1  0x0000557eb47d955c in qemu_poll_ns (fds=0x557eb79657b0, nfds=1,
+>
+> > > timeout=-1) at ../util/qemu-timer.c:329
+>
+> > > #2  0x0000557eb47b2204 in fdmon_poll_wait (ctx=0x557eb76c5f20,
+>
+> > > ready_list=0x7ffd94b4edd8, timeout=-1) at ../util/fdmon-poll.c:79
+>
+> > > #3  0x0000557eb47b1c45 in aio_poll (ctx=0x557eb76c5f20, blocking=true)
+>
+> > > at ../util/aio-posix.c:730
+>
+> > > #4  0x0000557eb4621edd in bdrv_do_drained_begin (bs=0x557eb795e950,
+>
+> > > parent=0x0, poll=true) at ../block/io.c:378
+>
+> > > #5  0x0000557eb4621f7b in bdrv_drained_begin (bs=0x557eb795e950) at
+>
+> > > ../block/io.c:391
+>
+> > > #6  0x0000557eb45ec125 in bdrv_change_aio_context (bs=0x557eb795e950,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7682
+>
+> > > #7  0x0000557eb45ebf2b in bdrv_child_change_aio_context
+>
+> > > (c=0x557eb7964250, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7608
+>
+> > > #8  0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7668
+>
+> > > #9  0x0000557eb45ebf2b in bdrv_child_change_aio_context
+>
+> > > (c=0x557eb7e59110, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7608
+>
+> > > #10 0x0000557eb45ec0c4 in bdrv_change_aio_context (bs=0x557eb7e51960,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7668
+>
+> > > #11 0x0000557eb45ebf2b in bdrv_child_change_aio_context
+>
+> > > (c=0x557eb814ed80, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7608
+>
+> > > #12 0x0000557eb45ee8e4 in child_job_change_aio_ctx (c=0x557eb7c9d3f0,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../blockjob.c:157
+>
+> > > #13 0x0000557eb45ebe2d in bdrv_parent_change_aio_context
+>
+> > > (c=0x557eb7c9d3f0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7592
+>
+> > > #14 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb7d74310,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7661
+>
+> > > #15 0x0000557eb45dcd7e in bdrv_child_cb_change_aio_ctx
+>
+> > >      (child=0x557eb8565af0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60
+>
+> > > = {...}, tran=0x557eb7a87160, errp=0x0) at ../block.c:1234
+>
+> > > #16 0x0000557eb45ebe2d in bdrv_parent_change_aio_context
+>
+> > > (c=0x557eb8565af0, ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7592
+>
+> > > #17 0x0000557eb45ec06b in bdrv_change_aio_context (bs=0x557eb79575e0,
+>
+> > > ctx=0x557eb76c5f20, visited=0x557eb7e06b60 = {...},
+>
+> > > tran=0x557eb7a87160, errp=0x0)
+>
+> > >      at ../block.c:7661
+>
+> > > #18 0x0000557eb45ec1f3 in bdrv_try_change_aio_context
+>
+> > > (bs=0x557eb79575e0, ctx=0x557eb76c5f20, ignore_child=0x0, errp=0x0) at
+>
+> > > ../block.c:7715
+>
+> > > #19 0x0000557eb45e1b15 in bdrv_root_unref_child (child=0x557eb7966f30)
+>
+> > > at ../block.c:3317
+>
+> > > #20 0x0000557eb45eeaa8 in block_job_remove_all_bdrv
+>
+> > > (job=0x557eb7952800) at ../blockjob.c:209
+>
+> > > #21 0x0000557eb45ee641 in block_job_free (job=0x557eb7952800) at
+>
+> > > ../blockjob.c:82
+>
+> > > #22 0x0000557eb45f17af in job_unref_locked (job=0x557eb7952800) at
+>
+> > > ../job.c:474
+>
+> > > #23 0x0000557eb45f257d in job_do_dismiss_locked (job=0x557eb7952800) at
+>
+> > > ../job.c:771
+>
+> > > #24 0x0000557eb45f25fe in job_dismiss_locked (jobptr=0x7ffd94b4f400,
+>
+> > > errp=0x7ffd94b4f488) at ../job.c:783
+>
+> > > --Type <RET> for more, q to quit, c to continue without paging--
+>
+> > > #25 0x0000557eb45d8e84 in qmp_job_dismiss (id=0x557eb7aa42b0
+>
+> > > "commit-snap1", errp=0x7ffd94b4f488) at ../job-qmp.c:138
+>
+> > > #26 0x0000557eb472f6a3 in qmp_marshal_job_dismiss (args=0x7fc52c00a3b0,
+>
+> > > ret=0x7fc53c880da8, errp=0x7fc53c880da0) at qapi/qapi-commands-job.c:221
+>
+> > > #27 0x0000557eb47a35f3 in do_qmp_dispatch_bh (opaque=0x7fc53c880e40) at
+>
+> > > ../qapi/qmp-dispatch.c:128
+>
+> > > #28 0x0000557eb47d1cd2 in aio_bh_call (bh=0x557eb79568f0) at
+>
+> > > ../util/async.c:172
+>
+> > > #29 0x0000557eb47d1df5 in aio_bh_poll (ctx=0x557eb76c0200) at
+>
+> > > ../util/async.c:219
+>
+> > > #30 0x0000557eb47b12f3 in aio_dispatch (ctx=0x557eb76c0200) at
+>
+> > > ../util/aio-posix.c:436
+>
+> > > #31 0x0000557eb47d2266 in aio_ctx_dispatch (source=0x557eb76c0200,
+>
+> > > callback=0x0, user_data=0x0) at ../util/async.c:361
+>
+> > > #32 0x00007fc549232f4f in g_main_dispatch (context=0x557eb76c6430) at
+>
+> > > ../glib/gmain.c:3364
+>
+> > > #33 g_main_context_dispatch (context=0x557eb76c6430) at
+>
+> > > ../glib/gmain.c:4079
+>
+> > > #34 0x0000557eb47d3ab1 in glib_pollfds_poll () at
+>
+> > > ../util/main-loop.c:287
+>
+> > > #35 0x0000557eb47d3b38 in os_host_main_loop_wait (timeout=0) at
+>
+> > > ../util/main-loop.c:310
+>
+> > > #36 0x0000557eb47d3c58 in main_loop_wait (nonblocking=0) at
+>
+> > > ../util/main-loop.c:589
+>
+> > > #37 0x0000557eb4218b01 in qemu_main_loop () at ../system/runstate.c:835
+>
+> > > #38 0x0000557eb46df166 in qemu_default_main (opaque=0x0) at
+>
+> > > ../system/main.c:50
+>
+> > > #39 0x0000557eb46df215 in main (argc=24, argv=0x7ffd94b4f8d8) at
+>
+> > > ../system/main.c:80
+>
+> >
+>
+> > And here's coroutine trying to acquire read lock:
+>
+> >
+>
+> > > (gdb) qemu coroutine reader_queue->entries.sqh_first
+>
+> > > #0  0x0000557eb47d7068 in qemu_coroutine_switch (from_=0x557eb7aa48b0,
+>
+> > > to_=0x7fc537fff508, action=COROUTINE_YIELD) at
+>
+> > > ../util/coroutine-ucontext.c:321
+>
+> > > #1  0x0000557eb47d4d4a in qemu_coroutine_yield () at
+>
+> > > ../util/qemu-coroutine.c:339
+>
+> > > #2  0x0000557eb47d56c8 in qemu_co_queue_wait_impl (queue=0x557eb59954c0
+>
+> > > <reader_queue>, lock=0x7fc53c57de50, flags=0) at
+>
+> > > ../util/qemu-coroutine-lock.c:60
+>
+> > > #3  0x0000557eb461fea7 in bdrv_graph_co_rdlock () at
+>
+> > > ../block/graph-lock.c:231
+>
+> > > #4  0x0000557eb460c81a in graph_lockable_auto_lock (x=0x7fc53c57dee3)
+>
+> > > at /home/root/src/qemu/master/include/block/graph-lock.h:213
+>
+> > > #5  0x0000557eb460fa41 in blk_co_do_preadv_part
+>
+> > >      (blk=0x557eb84c0810, offset=6890553344, bytes=4096,
+>
+> > > qiov=0x7fc530006988, qiov_offset=0, flags=BDRV_REQ_REGISTERED_BUF) at
+>
+> > > ../block/block-backend.c:1339
+>
+> > > #6  0x0000557eb46104d7 in blk_aio_read_entry (opaque=0x7fc530003240) at
+>
+> > > ../block/block-backend.c:1619
+>
+> > > #7  0x0000557eb47d6c40 in coroutine_trampoline (i0=-1213577040,
+>
+> > > i1=21886) at ../util/coroutine-ucontext.c:175
+>
+> > > #8  0x00007fc547c2a360 in __start_context () at
+>
+> > > ../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+>
+> > > #9  0x00007ffd94b4ea40 in  ()
+>
+> > > #10 0x0000000000000000 in  ()
+>
+> >
+>
+> > So it looks like main thread is processing job-dismiss request and is
+>
+> > holding write lock taken in block_job_remove_all_bdrv() (frame #20
+>
+> > above).  At the same time iothread spawns a coroutine which performs IO
+>
+> > request.  Before the coroutine is spawned, blk_aio_prwv() increases
+>
+> > 'in_flight' counter for Blk.  Then blk_co_do_preadv_part() (frame #5) is
+>
+> > trying to acquire the read lock.  But main thread isn't releasing the
+>
+> > lock as blk_root_drained_poll() returns true since blk->in_flight > 0.
+>
+> > Here's the deadlock.
+>
+> >
+>
+> > Any comments and suggestions on the subject are welcomed.  Thanks!
+>
+> I think this is what the blk_wait_while_drained() call was supposed to
+>
+> address in blk_co_do_preadv_part(). However, with the use of multiple
+>
+> I/O threads, this is racy.
+>
+>
+>
+> Do you think that in your case we hit the small race window between the
+>
+> checks in blk_wait_while_drained() and GRAPH_RDLOCK_GUARD()? Or is there
+>
+> another reason why blk_wait_while_drained() didn't do its job?
+>
+>
+>
+At my opinion there is very big race window. Main thread has
+>
+eaten graph write lock. After that another coroutine is stalled
+>
+within GRAPH_RDLOCK_GUARD() as there is no drain at the moment and only
+>
+after that main thread has started drain.
+You're right, I confused taking the write lock with draining there.
+
+>
+That is why Fiona's idea is looking working. Though this would mean
+>
+that normally we should always do that at the moment when we acquire
+>
+write lock. May be even inside this function.
+I actually see now that not all of my graph locking patches were merged.
+At least I did have the thought that bdrv_drained_begin() must be marked
+GRAPH_UNLOCKED because it polls. That means that calling it from inside
+bdrv_try_change_aio_context() is actually forbidden (and that's the part
+I didn't see back then because it doesn't have TSA annotations).
+
+If you refactor the code to move the drain out to before the lock is
+taken, I think you end up with Fiona's patch, except you'll remove the
+forbidden inner drain and add more annotations for some functions and
+clarify the rules around them. I don't know, but I wouldn't be surprised
+if along the process we find other bugs, too.
+
+So Fiona's drain looks right to me, but we should probably approach it
+more systematically.
+
+Kevin
+

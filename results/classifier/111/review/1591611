@@ -1,0 +1,124 @@
+semantic: 0.102
+other: 0.099
+permissions: 0.088
+graphic: 0.088
+device: 0.079
+PID: 0.072
+vnc: 0.069
+debug: 0.065
+performance: 0.065
+files: 0.059
+socket: 0.059
+network: 0.054
+boot: 0.053
+KVM: 0.050
+debug: 0.226
+files: 0.214
+PID: 0.110
+other: 0.099
+semantic: 0.088
+device: 0.046
+performance: 0.042
+graphic: 0.038
+network: 0.028
+boot: 0.024
+KVM: 0.024
+socket: 0.022
+vnc: 0.021
+permissions: 0.019
+
+chroot using qemu-x86_64-static fails on ppc64el
+
+When attempting to use qemu-x86_64-static from qemu 2.5.0 on a ppc64el host to chroot into an amd64 environment, all commands fail with an assertion error.  /usr/bin/qemu-x86_64-static from the host was copied into the chroot /usr/bin, and the host has multiformat support in the kernel.
+
+Sample output illustrating the problem, as well as bash builtins working:
+
+# chroot /virtualbox/scratchdisks_local_001/amd64_chroot qemu-x86_64-static /bin/bash
+# ls
+bash: ../sysdeps/nptl/fork.c:136: __libc_fork: Assertion `({ __typeof (self->tid) __value; if (sizeof (__value) == 1) asm volatile ("movb %%fs:%P2,%b0" : "=q" (__value) : "0" (0), "i" (__builtin_offsetof (struct pthread, tid))); else if (sizeof (__value) == 4) asm volatile ("movl %%fs:%P1,%0" : "=r" (__value) : "i" (__builtin_offsetof (struct pthread, tid))); else { if (sizeof (__value) != 8) abort (); asm volatile ("movq %%fs:%P1,%q0" : "=r" (__value) : "i" (__builtin_offsetof (struct pthread, tid))); } __value; }) != ppid' failed.
+setup_frame: not implemented
+setup_frame: not implemented
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault
+setup_frame: not implemented
+setup_frame: not implemented
+# echo TEST
+TEST
+# cat test
+bash: ../sysdeps/nptl/fork.c:136: __libc_fork: Assertion `({ __typeof (self->tid) __value; if (sizeof (__value) == 1) asm volatile ("movb %%fs:%P2,%b0" : "=q" (__value) : "0" (0), "i" (__builtin_offsetof (struct pthread, tid))); else if (sizeof (__value) == 4) asm volatile ("movl %%fs:%P1,%0" : "=r" (__value) : "i" (__builtin_offsetof (struct pthread, tid))); else { if (sizeof (__value) != 8) abort (); asm volatile ("movq %%fs:%P1,%q0" : "=r" (__value) : "i" (__builtin_offsetof (struct pthread, tid))); } __value; }) != ppid' failed.
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault
+
+It is currently unknown if other host architectures (e.g. aarch64) are also affected.
+
+We don't have an implementation of the target-specific signal handling code for the x86-64 guest. Anything that cares about signals therefore won't work with this target.
+
+In general the x86-64 guest support for linux-user isn't very good; ARM or AArch64 guest should behave rather better.
+
+
+Are there any plans to implement these signal handlers?
+
+I don't know of any plans to do so. They would not be difficult to implement (500 lines of code or so at most I guess), but on the other hand they've been unimplemented for some years. They fall into the category of "nobody who wants them has cared enough to write the code yet", I'm afraid.
+
+
+Can you point me to the correct location in the codebase / any available resources on these handlers?  I might be able to tackle this at a later date, but am not currently familiar with qemu's codebase.
+
+linux-user/signal.c has a collection of functions for creating a signal frame on the stack before taking a signal, and then reading the data out of it on return from a signal. The four entry points from the rest of QEMU are setup_frame(), setup_rt_frame(), do_sigreturn() and do_rt_sigreturn(). We have implementations for a lot of target architectures, but for TARGET_I386 we only have the case of TARGET_ABI_BITS==32 (ie i386), not the x86-64 case.
+
+What these functions have to do is architecture dependent and generally not documented -- you'll need to look in the corresponding Linux kernel source code to identify the structures and data layouts.
+
+
+By the way there is probably a bug in what we're doing with fork/clone that's causing the initial assertion, as well as the missing signal handling problem.
+
+
+Yes, I saw that -- implementing the signal handlers fixed the hang and a few other problems, but the assertion and subsequent SIGABORT/SIGSEGV are still present.  Currently attempting to track down the fork() issues.
+
+If you've got working code for the signal handlers you can submit those as patches now if you like. (http://wiki.qemu.org/Contribute/SubmitAPatch has info on the formatting hoops.) We have a feature freeze for QEMU 2.7 coming up on the 28th June, so before then would be ideal.
+
+Judging by the assertion, something is going wrong with libc's attempt to set the child tidptr via the ctid argument to clone and the CLONE_CHILD_SETTID flag.
+
+
+OK, the fundamental problem is that do_fork() uses put_user_u32() on child_tidptr, but child_tidptr appears to be a host pointer.  Treating it as a host pointer (direct assignment) allows fork to proceed, but this seems a bit odd to say the least.
+
+Still investigating.
+
+On closer inspection maybe it's not that odd...the parent and child tid pointers are in abi, not target, space.  I'm going to assume direct assignment is correct (using __put_user()) and proceed from there.
+
+No, put_user_u32() is correct and __put_user() would be wrong. child_tidptr is a value passed directly from the guest in a register, so it is a guest pointer, not a host pointer.
+
+
+qemu can locate the guest page with that address but it has a flags field of all zero (no access, invalid).  Any ideas?
+
+So after some further debugging effort it turns out while the page allocator is unaware of the mapping (looks like the x86_64 NPTL implementation never maps the thread ID memory?), g2h() does work on the address, and in this case they map to the same value.  I'll probably submit a patch using g2h in case anyone else might have a better idea on how to handle this.
+
+Finally figured it out!
+
+It's the page size.  qemu user mode does NOT support a host page that is greater than 4k on x86/x86_64 systems, despite some claims to the contrary on older documentation pages.
+
+I'll be updating the patch to print a clear warning on failure instead of allowing corrupt data and the resultant cryptic target messages.
+
+Patch series sent to mailing list here:
+http://lists.nongnu.org/archive/html/qemu-devel/2016-06/msg05334.html
+
+In particular, this patch handles the original signal handler problem:
+http://lists.nongnu.org/archive/html/qemu-devel/2016-06/msg05335.html
+
+I tried QEMU with these patches [qemu-x86_64 version 2.6.94 (v2.7.0-rc4-dirty)] but found the same errors as before:
+
+bash: ../sysdeps/nptl/fork.c:136: __libc_fork: Assertion `THREAD_GETMEM (self, tid) != ppid' failed.
+setup_frame: not implemented
+setup_frame: not implemented
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+setup_frame: not implemented
+bash: ../sysdeps/nptl/fork.c:136: __libc_fork: Assertion `THREAD_GETMEM (self, tid) != ppid' failed.
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+
+So does this patch set form a complete solution or if some more fixes expected?
+
+Thanks,
+Atul.
+
+This bug has been moved to "Fix committed" before v2.9.0 has been release ... so could we move this to "Fix released" now? Or is there still something left to do here?
+
+Nope, looks good here.  As a note to other commenters, this won't work unless you are using a kernel compiled with the 4k page size -- default for PPC64 is 64k.
+

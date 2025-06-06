@@ -1,0 +1,199 @@
+other: 0.147
+semantic: 0.109
+debug: 0.103
+PID: 0.081
+device: 0.080
+vnc: 0.073
+performance: 0.072
+graphic: 0.065
+boot: 0.055
+socket: 0.052
+permissions: 0.049
+KVM: 0.040
+files: 0.038
+network: 0.037
+debug: 0.303
+files: 0.122
+semantic: 0.095
+other: 0.094
+PID: 0.090
+device: 0.061
+network: 0.041
+performance: 0.036
+permissions: 0.032
+boot: 0.029
+KVM: 0.027
+socket: 0.025
+vnc: 0.024
+graphic: 0.021
+
+aarch64-linux-user master: inconsistent pwrite behaviour
+
+Hello,
+
+I am running aarch64-linux-user from master, commit 20d6c7312f1b812bb9c750f4087f69ac8485cc90
+
+And I've found the following inconsistent emulation of pwrite() call when buf==NULL and len=0.
+Minimal reproducible sample is the following:
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
+
+/*
+ System                  | Result
+-------------------------+----------------
+ Native x86_64 4.12.14   | pwrite ret = 0
+ Native aarch64 4.4.159  | pwrite ret = 0
+ qemu-aarch64 at x86_64  | pwrite ret = -1
+   ( 20d6c7312f1b8 )     |
+*/
+
+int main(int argc, char** argv) {
+	int fd = open("test.dat", O_CREAT | O_RDWR, 0644);
+	if (fd < 0) {
+		perror("open");
+		return 1;
+	}
+
+	int ret = fallocate(fd, 0, 0, 1000);
+	if (ret < 0) {
+		perror("fallocate");
+		return 1;
+	}
+
+	ssize_t ret_pwrite = pwrite(fd, NULL, 0, 0);
+	printf("pwrite ret = %ld\n", ret_pwrite);
+
+	close(fd);
+
+	return 0;
+}
+
+
+
+
+
+This seems related to commit 58cfa6c2e6eb51b23cc98f8, where this was fixed for the write() syscall. In that commit message the author writes "Q. Do pread64/pwrite64 need to be changed similarly? A. Experiment suggests not: both linux and linux-user yield -1 for NULL 0-length reads/writes." That doesn't match your results, though, and looking at the source both write and pwrite syscalls go through the vfs_write() function, so their behaviour for a NULL/0 buffer should be identical.
+
+
+strace from an aarch64 machine:
+pwrite64(3, NULL, 0, 0)                 = 0
+
+strace from QEMU:
+32029 pwrite64(3,0,0,0,4797560,0) = -1 errno=14 (Bad address)
+
+
+Do you know how to fix it?
+
+It should be a patch pretty similar to commit 58cfa6c2e6eb51b23cc98f8, but in the pwrite64 codepath. Slightly complicated by needing to deal with the offset possibly being in two input arguments, but basically the same thing.
+
+
+It would be great if you could fix it.
+
+Also, there are probably should exist POSIX conformance test suites around the world. As far as I understand, this particular issue could be found by running such a test under qemu-linux-user. I mean what if there are other similar issues?
+
+We run the Linux Test Project LTP test suite. However I think it may not cover this corner case. (It's also possible I missed it last time I went through our failure results -- it's a lot of analysis effort to disentangle "QEMU bug" from "QEMU missing feature that's impracticably hard to implement" from "test case bug", and sometimes tests roll up multiple tests into a single test binary that include things from several of those cases, which means that it's harder to notice when something that should have passed did not.)
+
+
+I've also check qemu-arm with the same test code. Surprisingly, I see correct result:
+
+pwrite ret = 0
+
+
+Proposed patch at https://patchwork.ozlabs.org/patch/1022092/
+
+NB: my guess is that your pwrite on 32-bit arm test is behaving like that because it isn't going via the pwrite64 syscall, or possibly because glibc there is dealing with the NULL special case early. Use QEMU's -strace argument (or strace on real h/w) to see what libc is actually turning that pwrite() function call into at the syscall level.
+
+
+Commit now in QEMU master as 2bd3f8998e1e7dcd9afc29fab25. This will be in the next release: QEMU 4.0.
+
+
+Thank you!
+
+пт, 18 янв. 2019 г. в 19:36, Peter Maydell <email address hidden>:
+>
+> Commit now in QEMU master as 2bd3f8998e1e7dcd9afc29fab25. This will be
+> in the next release: QEMU 4.0.
+>
+>
+> ** Changed in: qemu
+>        Status: In Progress => Fix Committed
+>
+> --
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1810433
+>
+> Title:
+>   aarch64-linux-user master: inconsistent pwrite behaviour
+>
+> Status in QEMU:
+>   Fix Committed
+>
+> Bug description:
+>   Hello,
+>
+>   I am running aarch64-linux-user from master, commit
+>   20d6c7312f1b812bb9c750f4087f69ac8485cc90
+>
+>   And I've found the following inconsistent emulation of pwrite() call when buf==NULL and len=0.
+>   Minimal reproducible sample is the following:
+>
+>   #define _GNU_SOURCE
+>   #include <stdlib.h>
+>   #include <stdio.h>
+>   #include <unistd.h>
+>   #include <sys/types.h>
+>   #include <sys/stat.h>
+>   #include <fcntl.h>
+>   #include <string.h>
+>
+>   /*
+>    System                  | Result
+>   -------------------------+----------------
+>    Native x86_64 4.12.14   | pwrite ret = 0
+>    Native aarch64 4.4.159  | pwrite ret = 0
+>    qemu-aarch64 at x86_64  | pwrite ret = -1
+>      ( 20d6c7312f1b8 )     |
+>   */
+>
+>   int main(int argc, char** argv) {
+>    int fd = open("test.dat", O_CREAT | O_RDWR, 0644);
+>    if (fd < 0) {
+>     perror("open");
+>     return 1;
+>    }
+>
+>    int ret = fallocate(fd, 0, 0, 1000);
+>    if (ret < 0) {
+>     perror("fallocate");
+>     return 1;
+>    }
+>
+>    ssize_t ret_pwrite = pwrite(fd, NULL, 0, 0);
+>    printf("pwrite ret = %ld\n", ret_pwrite);
+>
+>    close(fd);
+>
+>    return 0;
+>   }
+>
+>
+>   Please note, that the same binary executable prints different output at native aarch64 platform and under aarch64-linux-user
+>
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1810433/+subscriptions
+
+
+
+-- 
+With best regards,
+Matwey V. Kornilov
+
+

@@ -1,0 +1,67 @@
+device: 0.121
+permissions: 0.115
+semantic: 0.105
+other: 0.095
+graphic: 0.085
+PID: 0.070
+files: 0.067
+debug: 0.063
+socket: 0.057
+network: 0.055
+performance: 0.052
+KVM: 0.044
+vnc: 0.041
+boot: 0.030
+debug: 0.356
+KVM: 0.127
+socket: 0.092
+PID: 0.066
+other: 0.057
+boot: 0.049
+device: 0.048
+performance: 0.041
+files: 0.040
+vnc: 0.038
+semantic: 0.032
+network: 0.022
+permissions: 0.017
+graphic: 0.015
+
+VFIO device gets DMA failures when virtio-balloon leak from highmem to lowmem
+
+Is there any known conflict between VFIO passthrough device and virtio-balloon?
+
+The VM has:
+1. 4GB system memory
+2. one VFIO passthrough device which supports high address memory DMA and uses GFP_HIGHUSER pages.
+3. Memory balloon device with 4GB target.
+
+When setting the memory balloon target to 1GB and 4GB in loop during runtime (I used the command "virsh qemu-monitor-command debian --hmp --cmd balloon 1024"), the VFIO device DMA randomly gets failure.
+
+More clues:
+1. configure 2GB system memory (no highmem) VM, no issue with similar operations
+2. setting the memory balloon to higher like 8GB, no issue with similar operations
+
+I'm also trying to narrow down this issue. It's appreciated for that you guys may share some thoughts.
+
+Ballooning is currently incompatible with device assignment.  When the balloon is inflated (memory removed from the VM), the pages are zapped from the process without actually removing them from the vfio DMA mapping.  The pages are still pinned from the previous mapping, making the balloon inflation ineffective (pages are not available for re-use).  When the balloon is deflated, new (different) pages are faulted in for the previously zapped pages, but these are again not DMA mapped for the IOMMU, so now the physical memory backing a given address in the VM are different for processor and assigned device access and DMA will fail.  In order to support this, QEMU would need to do more than simply zap pages from the process address space, they'd need to be unmapped from the IOMMU, but we can only do that using the original mapping size.  Effectively, memory hotplug is a better solution when device assignment is involved.
+
+Hi Alex, Thanks for your confirming. change the status to invalid.
+
+I think we can raise this issue to libvirt. When using virsh or virt-manager, the memory balloon is still enabled by default even if there's a device assignment. 
+
+Alex, I see this issue is closed but I have a question, do you know if the problem only comes the balloon is resized to return memory to the host. I ask because we have a situation where we will start a VM with balloon enabled, and later it maybe possible a devices is assigned via hot-plug. So I would like to avoid this issue by doing the following:
+
+if a vfio devices is assigned;
+   resize the balloon size the the maximal guest memory
+end 
+
+Then because we know we added a vfio devices never resize the balloon to return memory again.
+
+More information about what we want to do: https://github.com/kata-containers/runtime/pull/793
+
+Regards,
+Carlos
+
+There are two scenarios here, if we have a regular, directly assigned physical device (including VFs), vfio's page pinning will populate the full memory footprint of the guest regardless of the balloon.  The balloon is effectively fully deflated, but the balloon driver in the guest hasn't released the pages back for guest kernel use.  In that case marking the balloon as deflated at least allows those pages to be used since they're allocated.  However, if the assigned device is an mdev device, then the pages might only be pinned on usage, depending on the vendor driver, and pages acquired by the guest balloon driver are unlikely to be used by the in-guest driver for the device.  It's always possible that the mdev vendor driver could pin them anyway, but there is a chance that those pages are actually still freed to the host until that point.  Latest QEMU will of course enable the  balloon inhibitor for either case so further balloon inflation will no longer zap pages.
+

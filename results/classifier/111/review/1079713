@@ -1,0 +1,304 @@
+files: 0.080
+other: 0.079
+debug: 0.075
+network: 0.075
+device: 0.074
+PID: 0.073
+graphic: 0.072
+boot: 0.072
+permissions: 0.070
+performance: 0.069
+semantic: 0.068
+KVM: 0.065
+socket: 0.063
+vnc: 0.063
+KVM: 0.714
+network: 0.153
+debug: 0.035
+device: 0.022
+other: 0.014
+boot: 0.012
+files: 0.012
+socket: 0.010
+PID: 0.008
+semantic: 0.006
+performance: 0.005
+permissions: 0.003
+graphic: 0.003
+vnc: 0.002
+
+failed to set sndbuf on VMs network interface
+
+I am trying to set "sndbuf" for a VMs network device to "0".
+I inserted to my XML file:
+      <tune>
+        <sndbuf>0</sndbuf>
+      </tune>
+The XML file validates, but I am not able to start the virtual machine.
+
+# virsh edit vm3
+<domain type='kvm'>
+  <name>vm3</name>
+  <uuid><HIDDEN></uuid>
+  <memory unit='KiB'>524288</memory>
+  <currentMemory unit='KiB'>524288</currentMemory>
+  <vcpu placement='static'>1</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-1.2'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='<HIDDEN>'/>
+      <target dev='vda' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </disk>
+    <controller type='usb' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+    </controller>
+    <interface type='bridge'>
+      <mac address='<HIDDEN>'/>
+      <source bridge='br2'/>
+      <model type='virtio'/>
+      <tune>
+        <sndbuf>0</sndbuf>
+      </tune>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <input type='mouse' bus='ps2'/>
+    <graphics type='vnc' port='-1' autoport='yes'/>
+    <sound model='ich6'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <video>
+      <model type='cirrus' vram='9216' heads='1'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+</domain>
+
+Domain vm3 XML configuration edited.
+
+# LANG=en_US.utf-8 virsh start vm3
+error: Failed to start domain vm3
+error: internal error Process exited while reading console log output: char device redirected to /dev/pts/4
+
+
+
+
+
+Thanks for reporting this bug.  This is a reqression in qemu-kvm since precise.  In precise, the following works fine (meaning, kvm starts up - no idea if it does what it should):
+
+kvm -vnc :1 -cdrom raring-mini-amd64.iso -hda raring.img -net nic,model=virtio -net tap,script=no,downscript=no,ifname=tap0,sndbuf=0
+
+In raring (and presumably quantal) it gives a segfault
+
+Latest upstream qemu.git still reproduces this, so marking it as affecting QEMU.
+
+On Mon, Nov 26, 2012 at 1:43 PM, Andreas Färber <email address hidden> wrote:
+> Am 26.11.2012 13:10, schrieb Stefan Hajnoczi:
+>> visit_type_size() requires either visitor->type_size() or
+>> visitor_uint64() to be implemented, otherwise a NULL function pointer is
+>> invoked.
+>>
+>> It is possible to trigger this crash as follows:
+>>
+>>   $ qemu-system-x86_64 -netdev tap,sndbuf=0,id=netdev0 \
+>>                        -device virtio-blk-pci,netdev=netdev0
+>>
+>> The 'sndbuf' option has type "size".
+>>
+>> Signed-off-by: Stefan Hajnoczi <email address hidden>
+>> ---
+>> This patch ensures that -netdev tap,sndbuf=X works in QEMU 1.3.
+>
+> Reviewed-by: Andreas Färber <email address hidden>
+>
+> Did you check whether any other types were unhandled?
+
+The visitors do not handle all types.  Only the opts visitor and now
+the dealloc visitor handle ->type_size().
+
+This will not cause a problem yet because only the netdev options
+include fields with the 'size' type.  That code path is now covered.
+
+In the longer term we should clean up the int, number, uint64, size
+type proliferation and handle them consistently.
+
+> Should a comment be added somewhere along the lines of "If you add a
+> hook here you also need to implement one there" to avoid such
+> inconsistency for the future?
+
+There is no single point like register_visitor() where we could check
+that callbacks are set up.  That would have been a nice way to prevent
+incomplete visitors.
+
+The issue is that qapi/qapi-visit-core.h says type_uint64 and
+type_size may be NULL, but it documents that visit_type_size() falls
+back to type_uint64() if type_size() is NULL.  The case we hit was
+that type_uint64() is also NULL.  Should it fall back to type_int()
+(int64_t)?
+
+Stefan
+
+
+On Mon, Nov 26, 2012 at 02:22:58PM +0100, Stefan Hajnoczi wrote:
+> On Mon, Nov 26, 2012 at 1:43 PM, Andreas Färber <email address hidden> wrote:
+> > Am 26.11.2012 13:10, schrieb Stefan Hajnoczi:
+> >> visit_type_size() requires either visitor->type_size() or
+> >> visitor_uint64() to be implemented, otherwise a NULL function pointer is
+> >> invoked.
+> >>
+> >> It is possible to trigger this crash as follows:
+> >>
+> >>   $ qemu-system-x86_64 -netdev tap,sndbuf=0,id=netdev0 \
+> >>                        -device virtio-blk-pci,netdev=netdev0
+> >>
+> >> The 'sndbuf' option has type "size".
+> >>
+> >> Signed-off-by: Stefan Hajnoczi <email address hidden>
+> >> ---
+> >> This patch ensures that -netdev tap,sndbuf=X works in QEMU 1.3.
+> >
+> > Reviewed-by: Andreas Färber <email address hidden>
+> >
+> > Did you check whether any other types were unhandled?
+> 
+> The visitors do not handle all types.  Only the opts visitor and now
+> the dealloc visitor handle ->type_size().
+> 
+> This will not cause a problem yet because only the netdev options
+> include fields with the 'size' type.  That code path is now covered.
+> 
+> In the longer term we should clean up the int, number, uint64, size
+> type proliferation and handle them consistently.
+
+Dealloc visitor is somewhat of a special case, as it only cares about
+the underlying C type and not about the visitor-specific representation.
+In the case of generated types like these, it only needs to match the
+type that QAPI generates (uint64_t in the case of type_size).
+
+For input/output visitors, new types should either have a compatible
+fallback, or abort if there's no compatible fallback and we attempt to
+use a visitor that doesn't support the type. AFAIK we don't have one
+that falls into the latter category atm (there is one in the QIDL series
+for native C arrays, which has no generic fallback and will abort in
+cases where we use a visitor that doesn't implement that type
+explicitly).
+
+Dealloc shouldn't use compatibility fallbacks though, which is probably
+something we need to clean up. It should have explicit implementations
+for all types we introduce, and those implementations should match the
+type use for QAPI-generated types.
+
+> 
+> > Should a comment be added somewhere along the lines of "If you add a
+> > hook here you also need to implement one there" to avoid such
+> > inconsistency for the future?
+> 
+> There is no single point like register_visitor() where we could check
+> that callbacks are set up.  That would have been a nice way to prevent
+> incomplete visitors.
+> 
+> The issue is that qapi/qapi-visit-core.h says type_uint64 and
+> type_size may be NULL, but it documents that visit_type_size() falls
+> back to type_uint64() if type_size() is NULL.  The case we hit was
+> that type_uint64() is also NULL.  Should it fall back to type_int()
+> (int64_t)?
+
+I hit this issue implementing a test case for QIDL that introduces
+the usage of type_size() for QmpOutputVisitor. The problem is that it
+references ->type_uint64() directly instead of using visit_type_uint64()
+which has the fallback handling (->type_int()) for visitors that don't
+have a specific implementation for type_uint64.
+
+I have a patch in the QIDL series that does this, and this would also fix the
+issue you're hitting with the dealloc visitor, but as noted above I
+think relying on fallbacks for the dealloc visitor is the wrong
+approach, so I think we should treat these as 2 seperate issues and take
+your patch for 1.3. The error case I hit isn't reachable in 1.3 atm so I
+think that should be sufficient for now.
+
+> 
+> Stefan
+> 
+
+
+On Mon, Nov 26, 2012 at 01:10:12PM +0100, Stefan Hajnoczi wrote:
+> visit_type_size() requires either visitor->type_size() or
+> visitor_uint64() to be implemented, otherwise a NULL function pointer is
+> invoked.
+> 
+> It is possible to trigger this crash as follows:
+> 
+>   $ qemu-system-x86_64 -netdev tap,sndbuf=0,id=netdev0 \
+>                        -device virtio-blk-pci,netdev=netdev0
+> 
+> The 'sndbuf' option has type "size".
+> 
+> Signed-off-by: Stefan Hajnoczi <email address hidden>
+
+Reviewed-by: Michael Roth <email address hidden>
+
+> ---
+> This patch ensures that -netdev tap,sndbuf=X works in QEMU 1.3.
+> 
+>  qapi/qapi-dealloc-visitor.c | 6 ++++++
+>  1 file changed, 6 insertions(+)
+> 
+> diff --git a/qapi/qapi-dealloc-visitor.c b/qapi/qapi-dealloc-visitor.c
+> index a154523..a07b171 100644
+> --- a/qapi/qapi-dealloc-visitor.c
+> +++ b/qapi/qapi-dealloc-visitor.c
+> @@ -132,6 +132,11 @@ static void qapi_dealloc_type_number(Visitor *v, double *obj, const char *name,
+>  {
+>  }
+> 
+> +static void qapi_dealloc_type_size(Visitor *v, size_t *obj, const char *name,
+> +                                   Error **errp)
+> +{
+> +}
+> +
+>  static void qapi_dealloc_type_enum(Visitor *v, int *obj, const char *strings[],
+>                                     const char *kind, const char *name,
+>                                     Error **errp)
+> @@ -164,6 +169,7 @@ QapiDeallocVisitor *qapi_dealloc_visitor_new(void)
+>      v->visitor.type_bool = qapi_dealloc_type_bool;
+>      v->visitor.type_str = qapi_dealloc_type_str;
+>      v->visitor.type_number = qapi_dealloc_type_number;
+> +    v->visitor.type_size = qapi_dealloc_type_size;
+> 
+>      QTAILQ_INIT(&v->stack);
+> 
+> -- 
+> 1.8.0
+> 
+> 
+
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+[Expired for qemu-kvm (Ubuntu) because there has been no activity for 60 days.]
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

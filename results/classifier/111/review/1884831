@@ -1,0 +1,210 @@
+other: 0.108
+PID: 0.095
+device: 0.094
+semantic: 0.087
+debug: 0.082
+graphic: 0.072
+vnc: 0.071
+permissions: 0.070
+KVM: 0.065
+performance: 0.062
+network: 0.058
+socket: 0.051
+boot: 0.045
+files: 0.040
+debug: 0.185
+files: 0.110
+device: 0.109
+PID: 0.096
+other: 0.075
+boot: 0.067
+socket: 0.065
+network: 0.063
+vnc: 0.059
+performance: 0.047
+semantic: 0.044
+KVM: 0.039
+permissions: 0.023
+graphic: 0.019
+
+qemu-nbd fails to discard bigger chunks
+
+This report is moved from systemd to here:
+https://github.com/systemd/systemd/issues/16242
+
+A qemu-nbd device reports that it can discard a lot of bytes:
+
+cat /sys/block/nbd0/queue/discard_max_bytes
+2199023255040
+
+And indeed, discard works with small images:
+
+$ qemu-img create -f qcow2 /tmp/image.img 2M
+$ sudo qemu-nbd --connect=/dev/nbd0 /tmp/image.img
+$ sudo blkdiscard /dev/nbd0
+
+but not for bigger ones (still smaller than discard_max_bytes):
+
+$ qemu-img create -f qcow2 /tmp/image.img 5G
+$ sudo qemu-nbd --connect=/dev/nbd0 /tmp/image.img
+$ sudo blkdiscard /dev/nbd0
+
+On 6/23/20 3:19 PM, TobiasHunger wrote:
+> Public bug reported:
+> 
+> This report is moved from systemd to here:
+> https://github.com/systemd/systemd/issues/16242
+> 
+> A qemu-nbd device reports that it can discard a lot of bytes:
+> 
+> cat /sys/block/nbd0/queue/discard_max_bytes
+> 2199023255040
+
+That smells fishy.  It is 0xffffffff * 512.  But in reality, the NBD 
+protocol is (currently) capped at 32 bits, so it cannot handle any 
+request 4G or larger.
+
+It is not qemu-nbd that populates 
+/sys/block/nbd0/queue/discard_max_bytes, but the kernel.  Are you sure 
+this is not a bug in the kernel's nbd.ko module, where it may be the 
+case that it is reporting -1 as a 32-bit value which then gets 
+mistakenly turned into a faulty advertisement?  Can you tweak your 
+software to behave as if /dev/nbd0 had a discard_max_bytes of 0xfffff000 
+instead?
+
+In fact, to prove the bug is in the kernel's nbd.ko and not in qemu-nbd, 
+I created an NBD server using nbdkit:
+
+# modprobe nbd
+# nbdkit memory 5G
+# nbd-client -b 512 localhost /dev/nbd0
+# cat /sys/block/nbd0/queue/discard_max_bytes
+2199023255040
+
+Same answer, different nbd server.  So it's not qemu's fault.
+
+> 
+> And indeed, discard works with small images:
+> 
+> $ qemu-img create -f qcow2 /tmp/image.img 2M
+> $ sudo qemu-nbd --connect=/dev/nbd0 /tmp/image.img
+> $ sudo blkdiscard /dev/nbd0
+> 
+> but not for bigger ones (still smaller than discard_max_bytes):
+> 
+> $ qemu-img create -f qcow2 /tmp/image.img 5G
+> $ sudo qemu-nbd --connect=/dev/nbd0 /tmp/image.img
+> $ sudo blkdiscard /dev/nbd0
+> 
+> ** Affects: qemu
+>       Importance: Undecided
+>           Status: New
+> 
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+Hmm, carrying on further, with the nbd-client connection, I'm seeing that the kernel DID break things into two separate BLKDISCARD calls, as seen from the nbdkit side of things:
+
+# from the blkdiscard strace:
+ioctl(3, BLKGETSIZE64, [5368709120])    = 0
+ioctl(3, BLKSSZGET, [512])              = 0
+ioctl(3, BLKDISCARD, [0, 5368709120])   = 0
+# from the nbdkit debug log:
+nbdkit: memory.0: debug: memory: trim count=4294966784 offset=0 fua=0
+nbdkit: memory.3: debug: memory: trim count=1073742336 offset=4294966784 fua=0
+
+I'm now comparing the set of ioctl calls made by nbd-client vs. qemu-nbd to see what might explain the difference for why it worked with nbd-client when the two different servers connect to the kernel nbd.ko module.  In the meantime, since nbd-client worked but qemu-nbd did not, it does look like this may be qemu's problem after all.
+
+
+Let's get nbd.ko out of the picture.  The problem can be reproduced in user space (here, where I built qemu-nbd to log trace messages to stderr):
+
+$ truncate --size=3G file
+$ qemu-nbd -f raw file --trace=nbd_\*
+$ nbdsh -u nbd://localhost:10810 -c 'h.trim(3*1024*1024*1024,0)'
+Traceback (most recent call last):
+  File "/usr/lib64/python3.8/runpy.py", line 194, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib64/python3.8/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/usr/lib64/python3.8/site-packages/nbd.py", line 1762, in <module>
+    nbdsh.shell()
+  File "/usr/lib64/python3.8/site-packages/nbdsh.py", line 100, in shell
+    exec (c, d, d)
+  File "<string>", line 1, in <module>
+  File "/usr/lib64/python3.8/site-packages/nbd.py", line 1098, in trim
+    return libnbdmod.trim (self._o, count, offset, flags)
+nbd.Error: nbd_trim: trim: command failed: Input/output error (EIO)
+
+and looking at the trace output from qemu-nbd, I see:
+493771@1592948038.044141:nbd_negotiate_success Negotiation succeeded
+493771@1592948038.044167:nbd_trip Reading request
+493771@1592948038.044262:nbd_receive_request Got request: { magic = 0x25609513, .flags = 0x0, .type = 0x4, from = 0, len = 3221225472 }
+493771@1592948038.044272:nbd_co_receive_request_decode_type Decoding type: handle = 1, type = 4 (trim)
+493771@1592948038.044291:nbd_co_send_structured_error Send structured error reply: handle = 1, error = 5 (EIO), msg = 'discard failed'
+
+so this is definitely a case of qemu as NBD server NOT honoring requests between 2G and 4G.  I'll have a patch posted soon.
+
+
+
+
+On 6/23/20 4:35 PM, Eric Blake wrote:
+> Let's get nbd.ko out of the picture.  The problem can be reproduced in
+> user space (here, where I built qemu-nbd to log trace messages to
+> stderr):
+> 
+> $ truncate --size=3G file
+> $ qemu-nbd -f raw file --trace=nbd_\*
+> $ nbdsh -u nbd://localhost:10810 -c 'h.trim(3*1024*1024*1024,0)'
+
+> nbd.Error: nbd_trim: trim: command failed: Input/output error (EIO)
+> 
+
+> 
+> so this is definitely a case of qemu as NBD server NOT honoring requests
+> between 2G and 4G.  I'll have a patch posted soon.
+
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg06592.html
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting older bugs to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" within the next 60 days (otherwise it will get
+closed as "Expired"). We will then eventually migrate the ticket auto-
+matically to the new system (but you won't be the reporter of the bug
+in the new system and thus won't get notified on changes anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+Commit 890cbccb0 included in upstream release 5.1.0.
+

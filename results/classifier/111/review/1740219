@@ -1,0 +1,208 @@
+permissions: 0.177
+semantic: 0.096
+device: 0.082
+PID: 0.078
+debug: 0.073
+performance: 0.072
+other: 0.070
+files: 0.062
+network: 0.060
+graphic: 0.050
+socket: 0.048
+vnc: 0.048
+boot: 0.047
+KVM: 0.038
+performance: 0.682
+debug: 0.070
+boot: 0.050
+PID: 0.042
+files: 0.035
+other: 0.025
+device: 0.025
+semantic: 0.018
+socket: 0.011
+vnc: 0.011
+network: 0.010
+graphic: 0.009
+permissions: 0.007
+KVM: 0.004
+
+static linux-user ARM emulation has several-second startup time
+
+static linux-user emulation has several-second startup time
+
+My problem: I'm a Parabola packager, and I'm updating our
+qemu-user-static package from 2.8 to 2.11.  With my new
+statically-linked 2.11, running `qemu-arm /my/arm-chroot/bin/true`
+went from taking 0.006s to 3s!  This does not happen with the normal
+dynamically linked 2.11, or the old static 2.8.
+
+What happens is it gets stuck in
+`linux-user/elfload.c:init_guest_space()`.  What `init_guest_space`
+does is map 2 parts of the address space: `[base, base+guest_size]`
+and `[base+0xffff0000, base+0xffff0000+page_size]`; where it must find
+an acceptable `base`.  Its strategy is to `mmap(NULL, guest_size,
+...)` decide where the first range is, and then check if that
++0xffff0000 is also available.  If it isn't, then it starts trying
+`mmap(base, ...)` for the entire address space from low-address to
+high-address.
+
+"Normally," it finds an accaptable `base` within the first 2 tries.
+With a static 2.11, it's taking thousands of tries.
+
+----
+
+Now, from my understanding, there are 2 factors working together to
+cause that in static 2.11 but not the other builds:
+
+ - 2.11 increased the default `guest_size` from 0xf7000000 to 0xffff0000
+ - PIE (and thus ASLR) is disabled for static builds
+
+For some reason that I don't understand, with the smaller
+`guest_size` the initial `mmap(NULL, guest_size, ...)` usually
+returns an acceptable address range; but larger `guest_size` makes it
+consistently return a block of memory that butts right up against
+another already mapped chunk of memory.  This isn't just true on the
+older builds, it's true with the 2.11 builds if I use the `-R` flag to
+shrink the `guest_size` back down to 0xf7000000.  That is with
+linux-hardened 4.13.13 on x86-64.
+
+So then, it it falls back to crawling the entire address space; so it
+tries base=0x00001000.  With ASLR, that probably succeeds.  But with
+ASLR being disabled on static builds, the text segment is at
+0x60000000; which is does not leave room for the needed
+0xffff1000-size block before it.  So then it tries base=0x00002000.
+And so on, more than 6000 times until it finally gets to and passes
+the text segment; calling mmap more than 12000 times.
+
+----
+
+I'm not sure what the fix is.  Perhaps try to mmap a continuous chunk
+of size 0xffff1000, then munmap it and then mmap the 2 chunks that we
+actually need.  The disadvantage to that is that it does not support
+the sparse address space that the current algorithm supports for
+`guest_size < 0xffff0000`.  If `guest_size < 0xffff0000` *and* the big
+mmap fails, then it could fall back to a sparse search; though I'm not
+sure the current algorithm is a good choice for it, as we see in this
+bug.  Perhaps it should inspect /proc/self/maps to try to find a
+suitable range before ever calling mmap?
+
+Actually, it seems that the `[base+0xffff0000, base+0xffff0000+page_size]` segment is only mapped on 32-bit ARM.  So this is 32-bit ARM-specific.
+
+To have a link to it from here, on the 28th I submitted a patchset to fix this: https://lists.nongnu.org/archive/html/qemu-devel/2017-12/msg05237.html
+
+From Alistair Buxton (a-j-buxton) on bug 1756807:
+I just tested the patch from https://bugs.launchpad.net/qemu/+bug/1740219 and it fixes the problem for me. Specifically I only tried the final patch of the series.
+
+I duped the bugs onto this one since it is older and has a suggested patch on the ML.
+
+Added an qemu(Ubuntu) task to further track this, keeping it incomplete there until this is resolved upstream.
+
+Everything except for the final patch (which has the actual fix) is now applied on the master branch.
+
+This is now fixed on master, as of 3be2e41b3323169852dca11ffe6ff772c33e5aaa.
+
+The sha above is the merge, thanks Luke.
+
+The actual change by you is
+commit 2a53535af471f4bee9d6cb5b363746b8d5ed21dd
+Author: Luke Shumaker <email address hidden>
+Date:   Thu Dec 28 13:08:13 2017 -0500
+
+    linux-user: init_guest_space: Try to make ARM space+commpage continuous
+
+I'll be away a week but then look at taking this fix in.
+
+@Luke - to check in advance, are there depending changes post 2.11.1 that are needed for this that you know of?
+
+I don't believe so.  The patchset applies cleanly on 2.11.0, and fixes the issue there.
+
+Oh, but it's worth noting that patch 1/10 had a mistake in it, which was corrected when applied as 8756e1361d177e91dc6d88f37749b809fd2407fb.
+
+Back again,
+my question was more about if we are able to JUST take 2a53535af471f4bee9d6cb5b363746b8d5ed21dd without the rest.
+
+We are already in Feature Freeze for Ubuntu 18.04, so we can either
+
+a) wait for the next release and pick it up in full by the new qemu version (well we will do that anyway)
+
+b) identify a fix only (not all the cleanup and reworks) patch that will be good for the 2.11.1 in Bionic
+
+Especially being "just slow" but not broken makes it harder to consider the closer we get to release (I hate that as well being a performance engineer, but minimizing regressions is a target as well :-) ).
+Essentially to some extend being in feature freeze is as if we are under [1] already.
+
+So will 2a53535af471f4bee9d6cb5b363746b8d5ed21dd alone be good in your opinion?
+Or will it need more and if so what would be the minimal set of your changes.
+
+
+[1]: https://wiki.ubuntu.com/StableReleaseUpdates
+
+Yes, I believe that 2a53535af471f4bee9d6cb5b363746b8d5ed21dd alone is good.
+
+Considering 2.12-rcX a release set the upstream status to that
+
+We don't generally mark bugs 'fix released' until the final (non-rc) release is made.
+
+
+I wasn't sure if you'd usually take the interim step to "Fix Committed", thanks Peter.
+
+For Ubuntu: PPA: https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/3225
+
+Regression test against ppa looked good tonight.
+
+There are new changes which I need to add for two more bugs.
+But testing from the ppa is ok right now already.
+
+@Luke: Please test against this PPA, as I want to ensure it is working for your case before pushing to Bionic.
+
+I'm not on a Debian/Ubuntu-ish system, but extracting
+
+    qemu-user-static_2.11+dfsg-1ubuntu6~ppa3_amd64.deb : data.tar.xz : usr/bin/qemu-arm-static
+
+and testing with that binary:
+
+    $ time usr/bin/qemu-arm-static /var/lib/archbuild/dbscripts@armv7h/luke/usr/bin/ldconfig --help
+    Usage: ldconfig [OPTION...]
+  ...
+    <https://github.com/archlinuxarm/PKGBUILDs/issues>.
+
+    real	0m0.068s
+    user	0m0.067s
+    sys	0m0.000s
+
+That is: LGTM.
+
+Thanks Luke.
+I tried the same from the deb of libc for arm in bionic.
+
+Down from
+real    0m2.031s
+to
+real    0m0.002s
+
+So confirmed as well.
+
+This bug was fixed in the package qemu - 1:2.11+dfsg-1ubuntu6
+
+---------------
+qemu (1:2.11+dfsg-1ubuntu6) bionic; urgency=medium
+
+  * Remove LP: 1752026 changes to d/p/ubuntu/define-ubuntu-machine-types.patch.
+    The Kernel fixes are preferred and already committed to the kernel.
+    Therefore remove the default disabling of the HTM feature (LP: #1761175)
+  * d/p/ubuntu/lp1739665-SSE-AVX-AVX512-cpu-features.patch: Enable new
+    SSE/AVX/AVX512 cpu features (LP: #1739665)
+  * d/p/ubuntu/lp1740219-continuous-space-commpage.patch: make Arm
+    space+commpage continuous which avoids long startup times on
+    qemu-user-static (LP: #1740219)
+  * d/p/ubuntu/lp-1761372-*: provide pseries-bionic-2.11-sxxm type as
+    convenience with all meltdown/spectre workarounds enabled by default.
+    This is not the default type following upstream and x86 on that.
+    (LP: #1761372).
+  * d/p/ubuntu/lp-1704312-1-* provide means to manually handle filesystem-dax
+    with pmem by backporting align and unarmed options (LP: #1704312).
+  * d/p/ubuntu/lp-1762315-slirp-Add-domainname.patch: slirp: Add domainname
+    option to slirp's DHCP server (LP: #1762315)
+
+ -- Christian Ehrhardt <email address hidden>  Wed, 04 Apr 2018 15:16:07 +0200
+

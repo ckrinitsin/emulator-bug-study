@@ -1,0 +1,920 @@
+permissions: 0.085
+other: 0.083
+device: 0.081
+debug: 0.075
+semantic: 0.073
+PID: 0.072
+vnc: 0.072
+performance: 0.072
+socket: 0.072
+files: 0.071
+network: 0.064
+KVM: 0.064
+boot: 0.062
+graphic: 0.053
+files: 0.236
+debug: 0.195
+other: 0.099
+semantic: 0.090
+PID: 0.074
+performance: 0.058
+boot: 0.043
+device: 0.042
+network: 0.040
+graphic: 0.034
+permissions: 0.026
+vnc: 0.025
+socket: 0.025
+KVM: 0.013
+
+ARM semihosting HEAPINFO results wrote to wrong address
+
+This affects latest development branch of QEMU.
+
+According to the ARM spec of the HEAPINFO semihosting call:
+
+https://developer.arm.com/documentation/100863/0300/Semihosting-operations/SYS-HEAPINFO--0x16-?lang=en
+
+> the PARAMETER REGISTER contains the address of a pointer to a four-field data block.
+
+However, QEMU treated the PARAMETER REGISTER as pointing to a four-field data block directly.
+
+Here is a simple program that can demonstrate this problem: https://github.com/iNvEr7/qemu-learn/tree/newlib-bug/semihosting-newlib
+
+This code links with newlib with semihosting mode, which will call the HEAPINFO SVC during crt0 routine. When running in QEMU (make run), it may crash the program either because of invalid write or memory curruption, depending on the compiled program structure.
+
+Also refer to my discussion with newlib folks: https://sourceware.org/pipermail/newlib/2021/018260.html
+
+Broken in commit 3c37cfe0b1e8a49, I think.
+
+
+I'm not sure this every worked properly and it's certainly not
+exercised by check-tcg or Peter's semihosting tests. Hoist it into
+it's own helper function and attempt to validate the results in the
+linux-user semihosting test at the least.
+
+Bug: https://bugs.launchpad.net/bugs/1915925
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ tests/tcg/arm/semicall.h      |   1 +
+ semihosting/arm-compat-semi.c | 129 +++++++++++++++++++---------------
+ tests/tcg/arm/semihosting.c   |  34 ++++++++-
+ 3 files changed, 107 insertions(+), 57 deletions(-)
+
+diff --git a/tests/tcg/arm/semicall.h b/tests/tcg/arm/semicall.h
+index d4f6818192..676a542be5 100644
+--- a/tests/tcg/arm/semicall.h
++++ b/tests/tcg/arm/semicall.h
+@@ -9,6 +9,7 @@
+ 
+ #define SYS_WRITE0      0x04
+ #define SYS_READC       0x07
++#define SYS_HEAPINFO    0x16
+ #define SYS_REPORTEXC   0x18
+ 
+ uintptr_t __semi_call(uintptr_t type, uintptr_t arg0)
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 94950b6c56..a8fdbceb5f 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -822,6 +822,78 @@ static const GuestFDFunctions guestfd_fns[] = {
+     put_user_utl(val, args + (n) * sizeof(target_ulong))
+ #endif
+ 
++/*
++ * SYS_HEAPINFO is a little weird: "On entry, the PARAMETER REGISTER
++ * contains the address of a pointer to a four-field data block" which
++ * we then fill in. The PARAMETER REGISTER is unchanged.
++ */
++
++struct HeapInfo {
++    target_ulong heap_base;
++    target_ulong heap_limit;
++    target_ulong stack_base;
++    target_ulong stack_limit;
++};
++
++static bool do_heapinfo(CPUState *cs, target_long arg0)
++{
++    target_ulong limit;
++    struct HeapInfo info = {};
++#ifdef CONFIG_USER_ONLY
++    TaskState *ts = cs->opaque;
++#else
++    target_ulong rambase = common_semi_rambase(cs);
++#endif
++
++#ifdef CONFIG_USER_ONLY
++    /*
++     * Some C libraries assume the heap immediately follows .bss, so
++     * allocate it using sbrk.
++     */
++    if (!ts->heap_limit) {
++        abi_ulong ret;
++
++        ts->heap_base = do_brk(0);
++        limit = ts->heap_base + COMMON_SEMI_HEAP_SIZE;
++        /* Try a big heap, and reduce the size if that fails.  */
++        for (;;) {
++            ret = do_brk(limit);
++            if (ret >= limit) {
++                break;
++            }
++            limit = (ts->heap_base >> 1) + (limit >> 1);
++        }
++        ts->heap_limit = limit;
++    }
++
++    info.heap_base = ts->heap_base;
++    info.heap_limit = ts->heap_limit;
++    info.stack_base = ts->stack_base;
++    info.stack_limit = 0; /* Stack limit.  */
++
++    if (copy_to_user(arg0, &info, sizeof(info))) {
++        errno = EFAULT;
++        return  set_swi_errno(cs, -1);
++    }
++#else
++    limit = current_machine->ram_size;
++    /* TODO: Make this use the limit of the loaded application.  */
++    info.heap_base = rambase + limit / 2;
++    info.heap_limit = rambase + limit;
++    info.stack_base = rambase + limit; /* Stack base */
++    info.stack_limit = rambase; /* Stack limit.  */
++
++    if (cpu_memory_rw_debug(cs, arg0, &info, sizeof(info), true)) {
++        errno = EFAULT;
++        return  set_swi_errno(cs, -1);
++    }
++
++#endif
++
++    return 0;
++}
++
++
+ /*
+  * Do a semihosting call.
+  *
+@@ -1184,63 +1256,8 @@ target_ulong do_common_semihosting(CPUState *cs)
+         }
+     case TARGET_SYS_HEAPINFO:
+         {
+-            target_ulong retvals[4];
+-            target_ulong limit;
+-            int i;
+-#ifdef CONFIG_USER_ONLY
+-            TaskState *ts = cs->opaque;
+-#else
+-            target_ulong rambase = common_semi_rambase(cs);
+-#endif
+-
+             GET_ARG(0);
+-
+-#ifdef CONFIG_USER_ONLY
+-            /*
+-             * Some C libraries assume the heap immediately follows .bss, so
+-             * allocate it using sbrk.
+-             */
+-            if (!ts->heap_limit) {
+-                abi_ulong ret;
+-
+-                ts->heap_base = do_brk(0);
+-                limit = ts->heap_base + COMMON_SEMI_HEAP_SIZE;
+-                /* Try a big heap, and reduce the size if that fails.  */
+-                for (;;) {
+-                    ret = do_brk(limit);
+-                    if (ret >= limit) {
+-                        break;
+-                    }
+-                    limit = (ts->heap_base >> 1) + (limit >> 1);
+-                }
+-                ts->heap_limit = limit;
+-            }
+-
+-            retvals[0] = ts->heap_base;
+-            retvals[1] = ts->heap_limit;
+-            retvals[2] = ts->stack_base;
+-            retvals[3] = 0; /* Stack limit.  */
+-#else
+-            limit = current_machine->ram_size;
+-            /* TODO: Make this use the limit of the loaded application.  */
+-            retvals[0] = rambase + limit / 2;
+-            retvals[1] = rambase + limit;
+-            retvals[2] = rambase + limit; /* Stack base */
+-            retvals[3] = rambase; /* Stack limit.  */
+-#endif
+-
+-            for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+-                bool fail;
+-
+-                fail = SET_ARG(i, retvals[i]);
+-
+-                if (fail) {
+-                    /* Couldn't write back to argument block */
+-                    errno = EFAULT;
+-                    return set_swi_errno(cs, -1);
+-                }
+-            }
+-            return 0;
++            return do_heapinfo(cs, arg0);
+         }
+     case TARGET_SYS_EXIT:
+     case TARGET_SYS_EXIT_EXTENDED:
+diff --git a/tests/tcg/arm/semihosting.c b/tests/tcg/arm/semihosting.c
+index 33faac9916..fd5780ec3c 100644
+--- a/tests/tcg/arm/semihosting.c
++++ b/tests/tcg/arm/semihosting.c
+@@ -7,7 +7,13 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++#define _GNU_SOURCE  /* asprintf is a GNU extension */
++
+ #include <stdint.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
+ #include "semicall.h"
+ 
+ int main(int argc, char *argv[argc])
+@@ -18,8 +24,34 @@ int main(int argc, char *argv[argc])
+     uintptr_t exit_block[2] = {0x20026, 0};
+     uintptr_t exit_code = (uintptr_t) &exit_block;
+ #endif
++    struct {
++        void *heap_base;
++        void *heap_limit;
++        void *stack_base;
++        void *stack_limit;
++    } info;
++    void *ptr_to_info = (void *) &info;
++    char *heap_info, *stack_info;
++    void *brk = sbrk(0);
++
++    __semi_call(SYS_WRITE0, (uintptr_t) "Hello World\n");
++
++    memset(&info, 0, sizeof(info));
++    __semi_call(SYS_HEAPINFO, (uintptr_t) &ptr_to_info);
++
++    asprintf(&heap_info, "heap: %p -> %p\n", info.heap_base, info.heap_limit);
++    __semi_call(SYS_WRITE0, (uintptr_t) heap_info);
++    if (info.heap_base != brk) {
++        sprintf(heap_info, "heap mismatch: %p\n", brk);
++        __semi_call(SYS_WRITE0, (uintptr_t) heap_info);
++        return -1;
++    }
++
++    asprintf(&stack_info, "stack: %p -> %p\n", info.stack_base, info.stack_limit);
++    __semi_call(SYS_WRITE0, (uintptr_t) stack_info);
++    free(heap_info);
++    free(stack_info);
+ 
+-    __semi_call(SYS_WRITE0, (uintptr_t) "Hello World");
+     __semi_call(SYS_REPORTEXC, exit_code);
+     /* if we get here we failed */
+     return -1;
+-- 
+2.20.1
+
+
+
+On Fri, 5 Mar 2021 at 13:54, Alex Bennée <email address hidden> wrote:
+>
+> I'm not sure this every worked properly and it's certainly not
+> exercised by check-tcg or Peter's semihosting tests. Hoist it into
+> it's own helper function and attempt to validate the results in the
+> linux-user semihosting test at the least.
+>
+> Bug: https://bugs.launchpad.net/bugs/1915925
+> Cc: Bug 1915925 <email address hidden>
+> Cc: Keith Packard <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+>  tests/tcg/arm/semicall.h      |   1 +
+>  semihosting/arm-compat-semi.c | 129 +++++++++++++++++++---------------
+>  tests/tcg/arm/semihosting.c   |  34 ++++++++-
+>  3 files changed, 107 insertions(+), 57 deletions(-)
+> +#else
+> +    limit = current_machine->ram_size;
+> +    /* TODO: Make this use the limit of the loaded application.  */
+> +    info.heap_base = rambase + limit / 2;
+> +    info.heap_limit = rambase + limit;
+> +    info.stack_base = rambase + limit; /* Stack base */
+> +    info.stack_limit = rambase; /* Stack limit.  */
+> +
+> +    if (cpu_memory_rw_debug(cs, arg0, &info, sizeof(info), true)) {
+
+Blatting a C struct into guest memory has endianness and padding
+problems. Why not just do things the way the old Arm code did it ?
+
+Also, you don't seem to have the correct "is the CPU in
+32-bit or 64-bit mode" test here: you cannot rely on target_ulong
+being the right size, you must make a runtime check.
+
+I suggested in the other email the way I think we should fix this.
+
+thanks
+-- PMM
+
+
+Alex Bennée <email address hidden> writes:
+
+> I'm not sure this every worked properly and it's certainly not
+> exercised by check-tcg or Peter's semihosting tests. Hoist it into
+> it's own helper function and attempt to validate the results in the
+> linux-user semihosting test at the least.
+
+The patch is mostly code motion, moving the existing heapinfo stuff into
+a separate function. That makes it really hard to see how you've
+changed the values being returned. I'd love to see a two patch series,
+one of which moves the code as-is and a second patch which fixes
+whatever bugs you've found.
+
+-- 
+-keith
+
+
+Peter Maydell <email address hidden> writes:
+
+> Also, you don't seem to have the correct "is the CPU in
+> 32-bit or 64-bit mode" test here: you cannot rely on target_ulong
+> being the right size, you must make a runtime check.
+
+Do you mean whether a dual aarch64/arm core is in arm or aarch64 mode,
+or whether an aarch64 is running a 32-bit ABI?
+
+-- 
+-keith
+
+
+On Fri, 5 Mar 2021 at 20:22, Keith Packard <email address hidden> wrote:
+>
+> Peter Maydell <email address hidden> writes:
+>
+> > Also, you don't seem to have the correct "is the CPU in
+> > 32-bit or 64-bit mode" test here: you cannot rely on target_ulong
+> > being the right size, you must make a runtime check.
+>
+> Do you mean whether a dual aarch64/arm core is in arm or aarch64 mode,
+> or whether an aarch64 is running a 32-bit ABI?
+
+For semihosting for Arm what matters is "what state is the core
+in at the point where it makes the semihosting SVC/HLT/etc insn?".
+
+How does RISCV specify it?
+
+thanks
+-- PMM
+
+
+Peter Maydell <email address hidden> writes:
+
+> For semihosting for Arm what matters is "what state is the core
+> in at the point where it makes the semihosting SVC/HLT/etc insn?".
+
+Ok, that means we *aren't* talking about -mabi=ilp32, which is good --
+in my current picolibc implementation, the semihosting code uses a pure
+64-bit interface for aarch64 targets, even when using ilp32 ABI.
+
+> How does RISCV specify it?
+
+Because the ISA is identical between 64- and 32- bit (and 128-bit)
+execution modes, the only difference between the two is the Machine XLEN
+value which encodes the native base integer ISA width. You switch modes
+by modifying this value.
+
+I don't know of any implementation in hardware or software that supports
+modifying this value. I'm not sure we need to support this in the
+semihosting code for qemu as I'm pretty sure getting qemu to support
+dynamic XLEN values would be a large project (a project which I don't
+personally feel would offer much value).
+
+-- 
+-keith
+
+
+On Fri, 5 Mar 2021 at 23:54, Keith Packard <email address hidden> wrote:
+>
+> Peter Maydell <email address hidden> writes:
+>
+> > For semihosting for Arm what matters is "what state is the core
+> > in at the point where it makes the semihosting SVC/HLT/etc insn?".
+>
+> Ok, that means we *aren't* talking about -mabi=ilp32, which is good --
+> in my current picolibc implementation, the semihosting code uses a pure
+> 64-bit interface for aarch64 targets, even when using ilp32 ABI.
+
+ILP32 for AArch64 is a zombie target -- it is kinda-sorta
+supported in some toolchains but has no support in eg
+the Linux syscall ABI. The semihosting ABI does not implement
+any kind of ILP32 variant -- you can have A32/T32 (AArch32)
+semihosting, where register and field sizes are 32 bit, or
+you can have A64 (AArch64) semihosting, where register and
+field sizes are 64 bit.
+
+> > How does RISCV specify it?
+>
+> Because the ISA is identical between 64- and 32- bit (and 128-bit)
+> execution modes, the only difference between the two is the Machine XLEN
+> value which encodes the native base integer ISA width. You switch modes
+> by modifying this value.
+
+I meant, how does the RISCV semihosting ABI specify what
+the field size is? To answer my own question, I just looked at
+the spec doc and it says "depends on whether the caller is
+32-bit or 64-bit", which implies that we need to look at the
+current state of the CPU in some way.
+
+> I don't know of any implementation in hardware or software that supports
+> modifying this value. I'm not sure we need to support this in the
+> semihosting code for qemu as I'm pretty sure getting qemu to support
+> dynamic XLEN values would be a large project (a project which I don't
+> personally feel would offer much value).
+
+Part of why I asked is that the current RISCV implementation
+is just looking at sizeof(target_ulong); but the qemu-system-riscv64
+executable AIUI now supports emulating both "this is a 64 bit
+guest CPU" and "this is a 32 bit host CPU", and so looking at
+a QEMU-compile-time value like "sizeof(target_ulong)" will
+produce the wrong answer for 32-bit CPUs emulated in
+the qemu-system-riscv64 binary. My guess is maybe
+it should be looking at the result of riscv_cpu_is_32bit() instead.
+
+thanks
+-- PMM
+
+
+Peter Maydell <email address hidden> writes:
+
+> ILP32 for AArch64 is a zombie target -- it is kinda-sorta
+> supported in some toolchains but has no support in eg
+> the Linux syscall ABI. The semihosting ABI does not implement
+> any kind of ILP32 variant -- you can have A32/T32 (AArch32)
+> semihosting, where register and field sizes are 32 bit, or
+> you can have A64 (AArch64) semihosting, where register and
+> field sizes are 64 bit.
+
+Yeah, I did ILP32 support for Picolibc; all of the aarch64 asm support
+needed fixing as ilp32 doesn't specify that register arguments clear the
+top 32 bits. Seems pretty obvious that it's little used.
+
+For semihosting, as the ABI isn't visible to the hardware/emulator, the
+only reasonable answer that I could come up with was to treat ILP32 the
+same as the LP64 and pass 64 bit parameters.
+
+As picolibc is designed for bare-metal environments, it's pretty easy to
+support ilp32 otherwise.
+
+> I meant, how does the RISCV semihosting ABI specify what
+> the field size is? To answer my own question, I just looked at
+> the spec doc and it says "depends on whether the caller is
+> 32-bit or 64-bit", which implies that we need to look at the
+> current state of the CPU in some way.
+
+Yes. As qemu currently fixes that value based on compilation parameters,
+we can use the relevant native types directly and ignore the CPU
+state. Adding dynamic XLEN support to qemu would involve a bunch of work
+as the same code can be run in both 64- and 32- bit modes, so you'd have
+to translate it twice and select which to execute based on the CPU
+state.
+
+> Part of why I asked is that the current RISCV implementation
+> is just looking at sizeof(target_ulong); but the qemu-system-riscv64
+> executable AIUI now supports emulating both "this is a 64 bit
+> guest CPU" and "this is a 32 bit host CPU", and so looking at
+> a QEMU-compile-time value like "sizeof(target_ulong)" will
+> produce the wrong answer for 32-bit CPUs emulated in
+> the qemu-system-riscv64 binary. My guess is maybe
+> it should be looking at the result of riscv_cpu_is_32bit() instead.
+
+Wow. I read through the code and couldn't find anything that looked like
+it supported that, sounds like I must have missed something?
+
+-- 
+-keith
+
+
+On Sat, 6 Mar 2021 at 16:54, Keith Packard <email address hidden> wrote:
+>
+> Peter Maydell <email address hidden> writes:
+> > Part of why I asked is that the current RISCV implementation
+> > is just looking at sizeof(target_ulong); but the qemu-system-riscv64
+> > executable AIUI now supports emulating both "this is a 64 bit
+> > guest CPU" and "this is a 32 bit host CPU", and so looking at
+> > a QEMU-compile-time value like "sizeof(target_ulong)" will
+> > produce the wrong answer for 32-bit CPUs emulated in
+> > the qemu-system-riscv64 binary. My guess is maybe
+> > it should be looking at the result of riscv_cpu_is_32bit() instead.
+>
+> Wow. I read through the code and couldn't find anything that looked like
+> it supported that, sounds like I must have missed something?
+
+I thought Alistair had done that work (which brings riscv into
+line with the other 32/64 bit QEMU targets, which all support
+the 32-bit CPU types in the 64-bit-capable executable). But maybe
+it hasn't landed in master yet?
+
+thanks
+-- PMM
+
+
+Alistair Francis <email address hidden> writes:
+
+> I have started on the effort, but I have not finished yet. Adding
+> riscv_cpu_is_32bit() was the first step there and I have some more
+> patches locally but I don't have anything working yet.
+
+That's awesome. I think waiting until we see what APIs you're developing
+for detecting and operating in 32-bit mode on a 64-bit capable processor
+seems like a good idea for now.
+
+-- 
+-keith
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow the pointer and place the results of SYS_HEAPINFO
+there.
+
+Bug: https://bugs.launchpad.net/bugs/1915925
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ semihosting/arm-compat-semi.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 733eea1e2d..2ac9226d29 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1210,6 +1210,8 @@ target_ulong do_common_semihosting(CPUState *cs)
+             retvals[2] = rambase + limit; /* Stack base */
+             retvals[3] = rambase; /* Stack limit.  */
+ #endif
++            /* The result array is pointed to by arg0 */
++            args = arg0;
+ 
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+-- 
+2.20.1
+
+
+
+On Tue, 9 Mar 2021 at 14:23, Alex Bennée <email address hidden> wrote:
+>
+> As per the spec:
+>
+>   the PARAMETER REGISTER contains the address of a pointer to a
+>   four-field data block.
+>
+> So we need to follow the pointer and place the results of SYS_HEAPINFO
+> there.
+>
+> Bug: https://bugs.launchpad.net/bugs/1915925
+> Cc: Bug 1915925 <email address hidden>
+> Cc: Keith Packard <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+>  semihosting/arm-compat-semi.c | 2 ++
+>  1 file changed, 2 insertions(+)
+>
+> diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+> index 733eea1e2d..2ac9226d29 100644
+> --- a/semihosting/arm-compat-semi.c
+> +++ b/semihosting/arm-compat-semi.c
+> @@ -1210,6 +1210,8 @@ target_ulong do_common_semihosting(CPUState *cs)
+>              retvals[2] = rambase + limit; /* Stack base */
+>              retvals[3] = rambase; /* Stack limit.  */
+>  #endif
+> +            /* The result array is pointed to by arg0 */
+> +            args = arg0;
+>
+>              for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+>                  bool fail;
+> --
+
+No, 'args' is the argument array. That's not the same thing
+as the data block we're writing, and we shouldn't reassign
+that variable here.
+
+What was wrong with the old arm-semi.c code, which just did
+appropriate loads and stores here, and worked fine and was
+not buggy ?
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> On Tue, 9 Mar 2021 at 14:23, Alex Bennée <email address hidden> wrote:
+>>
+>> As per the spec:
+>>
+>>   the PARAMETER REGISTER contains the address of a pointer to a
+>>   four-field data block.
+>>
+>> So we need to follow the pointer and place the results of SYS_HEAPINFO
+>> there.
+>>
+>> Bug: https://bugs.launchpad.net/bugs/1915925
+>> Cc: Bug 1915925 <email address hidden>
+>> Cc: Keith Packard <email address hidden>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> ---
+>>  semihosting/arm-compat-semi.c | 2 ++
+>>  1 file changed, 2 insertions(+)
+>>
+>> diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+>> index 733eea1e2d..2ac9226d29 100644
+>> --- a/semihosting/arm-compat-semi.c
+>> +++ b/semihosting/arm-compat-semi.c
+>> @@ -1210,6 +1210,8 @@ target_ulong do_common_semihosting(CPUState *cs)
+>>              retvals[2] = rambase + limit; /* Stack base */
+>>              retvals[3] = rambase; /* Stack limit.  */
+>>  #endif
+>> +            /* The result array is pointed to by arg0 */
+>> +            args = arg0;
+>>
+>>              for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+>>                  bool fail;
+>> --
+>
+> No, 'args' is the argument array. That's not the same thing
+> as the data block we're writing, and we shouldn't reassign
+> that variable here.
+>
+> What was wrong with the old arm-semi.c code, which just did
+> appropriate loads and stores here, and worked fine and was
+> not buggy ?
+
+I was just trying avoid repeating too much verbiage. But OK I've
+reverted to the original code with the new helper:
+
+            for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                bool fail;
+
+                if (is_64bit_semihosting(env)) {
+                    fail = put_user_u64(retvals[i], arg0 + i * 8);
+                } else {
+                    fail = put_user_u32(retvals[i], arg0 + i * 4);
+                }
+
+                if (fail) {
+                    /* Couldn't write back to argument block */
+                    errno = EFAULT;
+                    return set_swi_errno(cs, -1);
+                }
+            }
+            return 0;
+
+
+>
+> thanks
+> -- PMM
+
+
+-- 
+Alex Bennée
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+
+Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+Bug: https://bugs.launchpad.net/bugs/1915925
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+
+---
+v3
+  - just revert the old behaviour
+---
+ semihosting/arm-compat-semi.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 0f0e129a7c..fe079ca93a 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1214,7 +1214,11 @@ target_ulong do_common_semihosting(CPUState *cs)
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+ 
+-                fail = SET_ARG(i, retvals[i]);
++                if (is_64bit_semihosting(env)) {
++                    fail = put_user_u64(retvals[i], arg0 + i * 8);
++                } else {
++                    fail = put_user_u32(retvals[i], arg0 + i * 4);
++                }
+ 
+                 if (fail) {
+                     /* Couldn't write back to argument block */
+-- 
+2.20.1
+
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+
+Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+Bug: https://bugs.launchpad.net/bugs/1915925
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+
+---
+v3
+  - just revert the old behaviour
+---
+ semihosting/arm-compat-semi.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 0f0e129a7c..fe079ca93a 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1214,7 +1214,11 @@ target_ulong do_common_semihosting(CPUState *cs)
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+ 
+-                fail = SET_ARG(i, retvals[i]);
++                if (is_64bit_semihosting(env)) {
++                    fail = put_user_u64(retvals[i], arg0 + i * 8);
++                } else {
++                    fail = put_user_u32(retvals[i], arg0 + i * 4);
++                }
+ 
+                 if (fail) {
+                     /* Couldn't write back to argument block */
+-- 
+2.20.1
+
+
+
+On Fri, 12 Mar 2021 at 10:29, Alex Bennée <email address hidden> wrote:
+>
+> As per the spec:
+>
+>   the PARAMETER REGISTER contains the address of a pointer to a
+>   four-field data block.
+>
+> So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+>
+> Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+> Bug: https://bugs.launchpad.net/bugs/1915925
+> Cc: Bug 1915925 <email address hidden>
+> Cc: Keith Packard <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+>
+> ---
+> v3
+>   - just revert the old behaviour
+
+Reviewed-by: Peter Maydell <email address hidden>
+
+thanks
+-- PMM
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+
+Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Peter Maydell <email address hidden>
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Bug: https://bugs.launchpad.net/bugs/1915925
+Message-Id: <email address hidden>
+---
+ semihosting/arm-compat-semi.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 0f0e129a7c..fe079ca93a 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1214,7 +1214,11 @@ target_ulong do_common_semihosting(CPUState *cs)
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+ 
+-                fail = SET_ARG(i, retvals[i]);
++                if (is_64bit_semihosting(env)) {
++                    fail = put_user_u64(retvals[i], arg0 + i * 8);
++                } else {
++                    fail = put_user_u32(retvals[i], arg0 + i * 4);
++                }
+ 
+                 if (fail) {
+                     /* Couldn't write back to argument block */
+-- 
+2.20.1
+
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+
+Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Peter Maydell <email address hidden>
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Bug: https://bugs.launchpad.net/bugs/1915925
+Message-Id: <email address hidden>
+Message-Id: <email address hidden>
+---
+ semihosting/arm-compat-semi.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 0f0e129a7c..fe079ca93a 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1214,7 +1214,11 @@ target_ulong do_common_semihosting(CPUState *cs)
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+ 
+-                fail = SET_ARG(i, retvals[i]);
++                if (is_64bit_semihosting(env)) {
++                    fail = put_user_u64(retvals[i], arg0 + i * 8);
++                } else {
++                    fail = put_user_u32(retvals[i], arg0 + i * 4);
++                }
+ 
+                 if (fail) {
+                     /* Couldn't write back to argument block */
+-- 
+2.20.1
+
+
+
+As per the spec:
+
+  the PARAMETER REGISTER contains the address of a pointer to a
+  four-field data block.
+
+So we need to follow arg0 and place the results of SYS_HEAPINFO there.
+
+Fixes: 3c37cfe0b1 ("semihosting: Change internal common-semi interfaces to use CPUState *")
+Signed-off-by: Alex Bennée <email address hidden>
+Reviewed-by: Peter Maydell <email address hidden>
+Cc: Bug 1915925 <email address hidden>
+Cc: Keith Packard <email address hidden>
+Bug: https://bugs.launchpad.net/bugs/1915925
+Message-Id: <email address hidden>
+
+diff --git a/semihosting/arm-compat-semi.c b/semihosting/arm-compat-semi.c
+index 0f0e129a7c..fe079ca93a 100644
+--- a/semihosting/arm-compat-semi.c
++++ b/semihosting/arm-compat-semi.c
+@@ -1214,7 +1214,11 @@ target_ulong do_common_semihosting(CPUState *cs)
+             for (i = 0; i < ARRAY_SIZE(retvals); i++) {
+                 bool fail;
+ 
+-                fail = SET_ARG(i, retvals[i]);
++                if (is_64bit_semihosting(env)) {
++                    fail = put_user_u64(retvals[i], arg0 + i * 8);
++                } else {
++                    fail = put_user_u32(retvals[i], arg0 + i * 4);
++                }
+ 
+                 if (fail) {
+                     /* Couldn't write back to argument block */
+-- 
+2.20.1
+
+
+
+This is now merged and while be available in the 6.0 release.
+

@@ -1,0 +1,712 @@
+other: 0.113
+device: 0.089
+PID: 0.082
+debug: 0.078
+permissions: 0.076
+semantic: 0.074
+performance: 0.073
+network: 0.068
+socket: 0.068
+KVM: 0.066
+vnc: 0.057
+boot: 0.055
+graphic: 0.053
+files: 0.048
+debug: 0.405
+KVM: 0.374
+files: 0.068
+performance: 0.042
+other: 0.027
+PID: 0.022
+semantic: 0.019
+device: 0.012
+socket: 0.008
+graphic: 0.007
+boot: 0.005
+permissions: 0.004
+network: 0.004
+vnc: 0.004
+
+guest migration 100% cpu freeze bug
+
+# Investigate migration cpu hog(100%) bug
+
+I have some issues when migrating from qemu 2.6.2 to qemu 2.11.1.
+The hypervisors are running kernel 4.9.92 on debian stretch with libvirt v4.0.0.
+Linux, libvirt and qemu are all custom compiled.
+
+I migrated around 21.000 vms from qemu 2.6.2 to qemu 2.11.1 and every once in a while a vm is stuck at 100% cpu after the migration from 2.6.2 to 2.11.1. This happend with about 50-60 vms so far.
+
+I attached gdb to a vcpu thread of one stuck vm, and a bt showed the following info:
+#0  0x00007f4f19949dd7 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x0000557c9edede47 in kvm_vcpu_ioctl (cpu=cpu@entry=0x557ca1058840, type=type@entry=0xae80) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x0000557c9ededfb6 in kvm_cpu_exec (cpu=cpu@entry=0x557ca1058840) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x0000557c9edcab44 in qemu_kvm_cpu_thread_fn (arg=0x557ca1058840) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1128
+#4  0x00007f4f19c0f494 in start_thread (arg=0x7f4f053f3700) at pthread_create.c:333
+#5  0x00007f4f19951acf in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+The ioctl call is a ioctl(18, KVM_RUN and it looks like it is looping inside the vm itself.
+
+I saved the state of the VM (with `virsh save`) after I found it was hanging on its vcpu threads. Then I restored this vm on a test environment running the same kernel, QEMU and libvirt version). After the restore the VM still was haning at 100% cpu usage on all the vcpus.
+I tried to use the perf kvm guest option to trace the guest vm with a copy of the kernel, modules and kallsyms files from inside the guest vm and I got the following trace:
+
+$ perf kvm --guest --guestkallsyms=kallsyms --guestmodules=modules record -g -p 14471 -o perf.data
+$ perf kvm --guest --guestkallsyms=kallsyms --guestmodules=modules report -i perf.data --stdio > analyze
+
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 105K of event 'cycles'
+# Event count (approx.): 67588147605
+#
+# Children      Self  Command  Shared Object            Symbol                                      Parent symbol
+# ........  ........  .......  .......................  ..........................................  .............
+#
+    28.79%    28.79%  :16028   [guest.kernel.kallsyms]  [g] fuse_get_root_inode                     [other]
+    23.48%    23.48%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_init          [other]
+     7.32%     7.32%  :16029   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration                 [other]
+     4.82%     4.82%  :16029   [guest.kernel.kallsyms]  [g] posix_cpu_clock_get                     [other]
+     4.20%     4.20%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_timer_expire_entry    [other]
+     3.87%     3.87%  :16029   [guest.kernel.kallsyms]  [g] kvm_init_debugfs                        [other]
+     3.66%     3.66%  :16029   [guest.kernel.kallsyms]  [g] fat_msg                                 [other]
+     3.11%     3.11%  :16029   [guest.kernel.kallsyms]  [g] match_token                             [other]
+     3.07%     3.07%  :16029   [guest.kernel.kallsyms]  [g] load_balance                            [other]
+     1.87%     1.87%  :16029   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot                 [other]
+     1.69%     1.69%  :16031   [guest.kernel.kallsyms]  [g] kvm_init_debugfs                        [other]
+     1.59%     1.59%  :16029   [guest.kernel.kallsyms]  [g] sys_kcmp                                [other]
+     1.19%     1.19%  :16031   [guest.kernel.kallsyms]  [g] save_paranoid                           [other]
+     0.82%     0.82%  :16031   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot                 [other]
+     0.69%     0.69%  :16031   [guest.kernel.kallsyms]  [g] kvm_cpu_notify                          [other]
+     0.54%     0.54%  :16031   [guest.kernel.kallsyms]  [g] rcu_process_callbacks                   [other]
+     0.46%     0.46%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_start         [other]
+     0.43%     0.43%  :16031   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth                    [other]
+     0.42%     0.42%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_expire_entry  [other]
+     0.37%     0.37%  :16029   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range                  [other]
+     0.35%     0.35%  :16031   [guest.kernel.kallsyms]  [g] sys_kcmp                                [other]
+     0.35%     0.35%  :16031   [guest.kernel.kallsyms]  [g] console_unlock                          [other]
+     0.34%     0.34%  :16029   [guest.kernel.kallsyms]  [g] __fat_fs_error                          [other]
+     0.31%     0.31%  :16031   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration                 [other]
+     0.24%     0.24%  :16031   [guest.kernel.kallsyms]  [g] paravirt_write_msr                      [other]
+     0.24%     0.24%  :16029   [guest.kernel.kallsyms]  [g] parse_no_kvmclock                       [other]
+     0.24%     0.24%  :16029   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state              [other]
+     0.21%     0.21%  :16030   [guest.kernel.kallsyms]  [g] ptrace_request                          [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] print_stack_trace                       [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] build_sched_domains                     [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] __synchronize_srcu                      [other]
+     0.17%     0.17%  :16031   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep                        [other]
+     0.16%     0.16%  :16031   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range                  [other]
+     0.16%     0.16%  :16031   [guest.kernel.kallsyms]  [g] irq_node_proc_show                      [other]
+     0.15%     0.15%  :16031   [guest.kernel.kallsyms]  [g] __srcu_read_lock                        [other]
+     0.15%     0.15%  :16031   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart                [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] parse_no_kvmclock                       [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] __irq_domain_add                        [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4                 [other]
+     0.10%     0.10%  :16031   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state              [other]
+     0.09%     0.09%  :16031   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev                   [other]
+     0.09%     0.09%  :16029   [guest.kernel.kallsyms]  [g] __sched_setscheduler                    [other]
+     0.09%     0.09%  :16031   [guest.kernel.kallsyms]  [g] process_srcu                            [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] avc_compute_av                          [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] arch_remove_reservations                [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] __switch_to_xtra                        [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] __create_irqs                           [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit      [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] posix_clock_read                        [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] posix_clock_poll                        [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] native_cpu_up                           [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] do_nmi                                  [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs                 [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] fat_msg                                 [other]
+     0.05%     0.05%  :16031   [guest.kernel.kallsyms]  [g] check_tsc_warp                          [other]
+     0.04%     0.04%  :16031   [guest.kernel.kallsyms]  [g] tick_handle_oneshot_broadcast           [other]
+     0.03%     0.03%  :16031   [guest.kernel.kallsyms]  [g] set_cpu_itimer                          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] arp_ignore                              [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] store_powersave_bias_gov_sys            [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] cleanup_srcu_struct                     [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask                    [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] alarm_timer_nsleep                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] time_cpufreq_notifier                   [other]
+     0.02%     0.02%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_itimer_state          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] tick_check_new_device                   [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] init_timer_key                          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] tick_setup_device                       [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] clockevents_register_device             [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] __srcu_read_unlock                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] init_srcu_struct                        [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show                  [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] rcu_jiffies_till_stall_check            [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run                    [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry     [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] avc_denied.isra.0                       [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] __fat_fs_error                          [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] wakeme_after_rcu                        [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] prof_cpu_mask_proc_write                [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] srcu_barrier                            [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_get_device                         [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] irq_domain_add_simple                   [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] synchronize_srcu_expedited              [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] sysfs_show_current_tick_dev             [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_is_oneshot_available               [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_check_replacement                  [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] clockevents_notify                      [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] show_stack                              [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] debug_kfree                             [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_do_broadcast.constprop.6           [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] sock_rps_save_rxhash.isra.28.part.29    [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] store_ignore_nice_load.isra.3           [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] perf_trace_itimer_expire                [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] hrtick_start                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] parse_probe_arg                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] wakeup_softirqd                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tick_install_replacement                [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] detach_if_pending                       [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] default_affinity_show                   [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tick_do_periodic_broadcast              [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq               [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tasklet_kill                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] update_rq_clock                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tasklet_init                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] arch_local_irq_enable                   [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] irq_affinity_proc_show                  [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] store_sampling_down_factor.isra.4       [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] amd_get_subcaches                       [other]
+
+Also tried a `virsh restore` with the `--bypass-cache` option and ran a perf trace. Noticable is the different trace. See output below:
+
+# perf trace without filesystem cache:
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1M of event 'cycles'
+# Event count (approx.): 798928823821
+#
+# Children      Self  Command  Shared Object            Symbol
+# ........  ........  .......  .......................  ..........................................
+#
+    25.32%    25.32%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_init
+     9.55%     9.55%  :34334   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     5.83%     5.83%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_timer_expire_entry
+     5.60%     5.60%  :34334   [guest.kernel.kallsyms]  [g] posix_cpu_clock_get
+     4.37%     4.37%  :34334   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     4.30%     4.30%  :34334   [guest.kernel.kallsyms]  [g] fat_msg
+     3.63%     3.63%  :34334   [guest.kernel.kallsyms]  [g] match_token
+     3.44%     3.44%  :34334   [guest.kernel.kallsyms]  [g] load_balance
+     3.28%     3.28%  :34333   [guest.kernel.kallsyms]  [g] save_paranoid
+     2.25%     2.25%  :34334   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     2.19%     2.19%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_expire_entry
+     1.89%     1.89%  :34334   [guest.kernel.kallsyms]  [g] sys_kcmp
+     1.73%     1.73%  :34336   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     1.58%     1.58%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_start
+     1.26%     1.26%  :34336   [guest.kernel.kallsyms]  [g] save_paranoid
+     1.09%     1.09%  :34333   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     1.01%     1.01%  :34333   [unknown]                [u] 0x0000000000434c1b
+     0.94%     0.94%  :34336   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth
+     0.88%     0.88%  :34333   [guest.kernel.kallsyms]  [g] avc_denied.isra.0
+     0.87%     0.87%  :34336   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     0.73%     0.73%  :34333   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     0.68%     0.68%  :34336   [guest.kernel.kallsyms]  [g] kvm_cpu_notify
+     0.65%     0.65%  :34336   [guest.kernel.kallsyms]  [g] rcu_process_callbacks
+     0.57%     0.57%  :34333   [guest.kernel.kallsyms]  [g] paravirt_write_msr
+     0.56%     0.56%  :34333   [guest.kernel.kallsyms]  [g] avc_compute_av
+     0.40%     0.40%  :34334   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.39%     0.39%  :34334   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.39%     0.39%  :34335   [guest.kernel.kallsyms]  [g] ptrace_request
+     0.38%     0.38%  :34336   [guest.kernel.kallsyms]  [g] sys_kcmp
+     0.34%     0.34%  :34333   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart
+     0.32%     0.32%  :34336   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     0.31%     0.31%  :34336   [guest.kernel.kallsyms]  [g] console_unlock
+     0.30%     0.30%  :34334   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.29%     0.29%  :34334   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.27%     0.27%  :34333   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     0.27%     0.27%  :34333   [guest.kernel.kallsyms]  [g] check_tsc_warp
+     0.26%     0.26%  :34333   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run
+     0.26%     0.26%  :34336   [guest.kernel.kallsyms]  [g] paravirt_write_msr
+     0.26%     0.26%  :34333   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.25%     0.25%  :34333   [guest.kernel.kallsyms]  [g] sys_kcmp
+     0.22%     0.22%  :34336   [guest.kernel.kallsyms]  [g] build_sched_domains
+     0.22%     0.22%  :34333   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep
+     0.22%     0.22%  :34333   [guest.kernel.kallsyms]  [g] print_stack_trace
+     0.21%     0.21%  :34336   [guest.kernel.kallsyms]  [g] irq_node_proc_show
+     0.19%     0.19%  :34336   [guest.kernel.kallsyms]  [g] print_stack_trace
+     0.19%     0.19%  :34336   [guest.kernel.kallsyms]  [g] __srcu_read_lock
+     0.18%     0.18%  :34336   [guest.kernel.kallsyms]  [g] __synchronize_srcu
+     0.17%     0.17%  :34333   [guest.kernel.kallsyms]  [g] __create_irqs
+     0.17%     0.17%  :34336   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep
+     0.17%     0.17%  :34336   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.15%     0.15%  :34336   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart
+     0.14%     0.14%  :34333   [guest.kernel.kallsyms]  [g] rcu_process_callbacks
+     0.14%     0.14%  :34333   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs
+     0.13%     0.13%  :34336   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.11%     0.11%  :34333   [guest.kernel.kallsyms]  [g] tasklet_init
+     0.11%     0.11%  :34336   [guest.kernel.kallsyms]  [g] process_srcu
+     0.11%     0.11%  :34336   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.11%     0.11%  :34333   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] __switch_to_xtra
+     0.10%     0.10%  :34334   [guest.kernel.kallsyms]  [g] __sched_setscheduler
+     0.10%     0.10%  :34333   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] posix_clock_read
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] posix_clock_poll
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] __irq_domain_add
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] avc_compute_av
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] posix_clock_read
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] __create_irqs
+     0.08%     0.08%  :34336   [guest.kernel.kallsyms]  [g] posix_clock_poll
+     0.08%     0.08%  :34336   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] arch_remove_reservations
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] native_cpu_up
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] native_cpu_up
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] check_tsc_warp
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] do_nmi
+     0.06%     0.06%  :34336   [guest.kernel.kallsyms]  [g] do_nmi
+     0.06%     0.06%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_itimer_state
+     0.05%     0.05%  :34336   [guest.kernel.kallsyms]  [g] fat_msg
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] store_powersave_bias_gov_sys
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] tick_handle_oneshot_broadcast
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] set_cpu_itimer
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] cleanup_srcu_struct
+     0.03%     0.03%  :34336   [guest.kernel.kallsyms]  [g] __srcu_read_unlock
+     0.03%     0.03%  :34336   [guest.kernel.kallsyms]  [g] time_cpufreq_notifier
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] alarm_timer_nsleep
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] fat_msg
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] tick_check_new_device
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] __switch_to_xtra
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] tick_setup_device
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] init_timer_key
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] rcu_jiffies_till_stall_check
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] arp_ignore
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] clockevents_register_device
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] init_srcu_struct
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] irq_node_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_check_replacement
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] avc_denied.isra.0
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_get_device
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] irq_affinity_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] sysfs_show_current_tick_dev
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_is_oneshot_available
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] irq_domain_add_simple
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_do_broadcast.constprop.6
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] sock_rps_save_rxhash.isra.28.part.29
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] prof_cpu_mask_proc_write
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] perf_trace_itimer_expire
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] srcu_barrier
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] store_ignore_nice_load.isra.3
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] wakeme_after_rcu
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] debug_kfree
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] clockevents_notify
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] parse_probe_arg
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] hrtick_start
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] detach_if_pending
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tasklet_init
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] show_stack
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] wakeup_softirqd
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] arch_local_irq_enable
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tasklet_kill
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] default_affinity_show
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] store_sampling_down_factor.isra.4
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] synchronize_srcu_expedited
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] update_rq_clock
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_do_periodic_broadcast
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_install_replacement
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] amd_get_subcaches
+     0.00%     0.00%  :34334   [guest.kernel.kallsyms]  [g] amd_get_subcaches
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_handle_periodic
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] __page_cache_alloc
+
+I am not sure how correct the symbol mapping of perf is, so I don't know if this is usable at all.
+
+I have dumped info registers with the `qemu-monitor-command` command after the  migration problematic VM and this gave the following output:
+
+RAX=0000000000001975 RBX=ffff8802342fc000 RCX=000000000000beac RDX=000000000000beaa
+RSI=000000000000beac RDI=ffff8802342fc000 RBP=ffff880233d3fb18 RSP=ffff880233d3fb18
+R8 =0000000000000286 R9 =ffff8800a71eee40 R10=ffff8800a71eeed4 R11=000000000000000a
+R12=ffff8802342fc000 R13=ffffffff81cdf010 R14=ffff880233d3fb58 R15=ffff88003672b200
+RIP=ffffffff817360b7 RFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 000fffff 00000000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 000fffff 00000000
+FS =0000 0000000000000000 000fffff 00000000
+GS =0000 ffff88023fc00000 000fffff 00000000
+LDT=0000 0000000000000000 000fffff 00000000
+TR =0040 ffff88023fc04440 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88023fc0c000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=0000000000408950 CR3=0000000232098000 CR4=00000670
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001fa0
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=ffffffffff0000ff0000000000000000 XMM01=0000010101000000ffffffffffffffff
+XMM02=00007fe302de17006776615f64616f6c XMM03=00000000000000000000000000000000
+XMM04=00000000000000000000000000000000 XMM05=00000000000000000000000000ff0000
+XMM06=5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b XMM07=20202020202020202020202020202020
+XMM08=00000000000000000000000000000000 XMM09=00000000000000000000000000000000
+XMM10=00000000000000000000000000000000 XMM11=00000000000000000000000000000000
+XMM12=00ff000000ff0000000000000000ff00 XMM13=00000000000000000000000000000000
+XMM14=00000000000000000000000000000000 XMM15=00000000000000000000000000000000
+
+And I looped this for a minute to check were the RIP is changing to:
+136 RIP=0000000000434c1b
+173 RIP=ffffffff8105144a
+  2 RIP=ffffffff810521ff
+  1 RIP=ffffffff81070816
+
+
+I tried to reproduce this with some manual actions prior to migrating between qemu 2.6.2 and 2.11.1 on our testing environment using similar hardware (56 core model name: Intel(R) Xeon(R) Gold 6126 CPU @ 2.60GHz)
+And I was not able to reproduce this, i tried the following:
+- restore without filesystem caches (see new perf traces below)
+- create vm with same kernel as stuck vm
+- restore paused detach net device and virtio block device (detach doesn't work)
+- try to do a lot of network and disk io while migrating
+- ecrypt fs actions during migration
+- migrate 4000 times between 2.6.2 -> 2.11 using loop
+- add extra timer calls inside guest for migrate loop (done using cyclictest)
+- try with guest kernel 3.13.0-145-generic, same kernel vm was running with this issue
+- try host clock/timer calls on 2.11.1 host prior and during migration bound on first cpu core (cyclictest -a 0 -c 1 -d 200 -H -l 1 -t 2)
+
+I asked the vm owner what he is doing on his vm, and he told me that he is using 80% of his mem around 14G of the 16G, the vm is running a tomcat 7 server and a libreoffice deamon the vm has a load of 1.0 and runs Ubuntu 14.04 with kernel 3.13.0-145.
+
+The other vms were running centos 6, centos 7, debian 7, debian 8, ubuntu 13.10, ubuntu 14.04, ubuntu 12.04 the majority of these vms are running linux kernel 3.*.
+
+The thing is I am actually out of ideas for reproducing this, and I am not sure how to pinpoint this issue, I would like some help and possible some extra tips on debugging.
+
+I don't have any suggestions wrt the actual bug cause, but just want to suggest adding the XML config and corresponding CLI args used on both the source and dest hosts (see /var/log/libvirt/qemu/$GUEST.log) to this bug, for one of the VMs that sees the 100% CPU hang.
+
+hangs like this after migration are a pain to debug; especially with that really rare recurrence rate.
+
+The fact the RIP is changing and is moving in and out of the kernel suggests something is happening; so it might be that we've corrupted some memory, or got a device in a mess where the device state is wrong and it's spinning waiting for the device to do something that would normally be very quick.
+Similarly we could have dropped an interrupt across the migration.
+You should probably look at what the other CPUs are doing as well.
+
+You could take the kernel RIP values you see in your last test and see if they match some particular driver; make sure you have *exactly* the same guest kernel version when trying to match the values up.
+
+You could try using the 'crash' program from a memory dump; that might be able to get you a process list and also the dmesg  text; if you're lucky there's a moan at the bottom of dmesg.
+
+You're doing a heck of a lot of migrates; does 2.6.2->2.6.2 and 2.11.1->2.11.1 work fine for you - i.e. is it only the cross version that's broken?
+
+
+
+guest xml definition:
+<domain type='kvm'>
+  <name>vps25</name>
+  <uuid>0cf4666d-6855-b3a8-12da-00002967563f</uuid>
+  <memory unit='KiB'>8388608</memory>
+  <currentMemory unit='KiB'>8388608</currentMemory>
+  <vcpu placement='static'>4</vcpu>
+  <resource>
+    <partition>/machine</partition>
+  </resource>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-2.6'>hvm</type>
+    <boot dev='hd'/>
+    <boot dev='network'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <cpu mode='custom' match='exact' check='partial'>
+    <model fallback='forbid'>Westmere</model>
+  </cpu>
+  <clock offset='utc'>
+    <timer name='hpet' present='yes'/>
+  </clock>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw' cache='none'/>
+      <source file='/mnt/data/vps25/vps25.raw'/>
+      <target dev='hda' bus='virtio'/>
+      <iotune>
+        <read_bytes_sec>734003200</read_bytes_sec>
+        <write_bytes_sec>576716800</write_bytes_sec>
+        <read_iops_sec>3500</read_iops_sec>
+        <write_iops_sec>2500</write_iops_sec>
+      </iotune>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </disk>
+    <interface type='bridge'>
+      <mac address='52:54:00:xx:xx:xx'/>
+      <source bridge='br15'/>
+      <bandwidth>
+        <inbound average='131072'/>
+        <outbound average='131072'/>
+      </bandwidth>
+      <target dev='v1002'/>
+      <model type='virtio'/>
+      <filterref filter='firewall-vps25'/>
+      <link state='up'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+    <input type='mouse' bus='ps2'/>
+    <input type='tablet' bus='usb'/>
+    <graphics type='vnc' port='-1' autoport='yes' listen='0.0.0.0' keymap='en-us' passwd='xxxxxxxxxxx'>
+      <listen type='address' address='0.0.0.0'/>
+    </graphics>
+    <sound model='es1370'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <video>
+      <model type='vga' vram='16384' heads='1' primary='yes'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </memballoon>
+  </devices>
+  <seclabel type='none' model='none'/>
+  <seclabel type='dynamic' model='dac' relabel='yes'/>
+</domain>
+
+$GUEST.log source:
+2018-06-07 11:40:49.315+0000: starting up libvirt version: 4.0.0, qemu version: 2.6.2, hostname: hv4
+LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin QEMU_AUDIO_DRV=none /usr/bin/kvm -name guest=vps25,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-443-vps25/master-key.aes -machine pc-i440fx-2.6,accel=kvm,usb=off,dump-guest-core=off -cpu Westmere -m 8192 -realtime mlock=off -smp 4,sockets=1,cores=4,threads=1 -uuid 0cf4666d-6855-b3a8-12da-00002967563f -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/domain-443-vps25/monitor.sock,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc -no-shutdown -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -drive file=/mnt/data/vps25/vps25.raw,format=raw,if=none,id=drive-virtio-disk0,cache=none,throttling.bps-read=734003200,throttling.bps-write=576716800,throttling.iops-read=3500,throttling.iops-write=2500 -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x5,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 -netdev tap,fd=29,id=hostnet0,vhost=on,vhostfd=31 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=52:54:00:xx:xx:xx,bus=pci.0,addr=0x3,bootindex=2 -device usb-tablet,id=input1,bus=usb.0,port=1 -vnc 0.0.0.0:2,password -device VGA,id=video0,vgamem_mb=16,bus=pci.0,addr=0x2 -device ES1370,id=sound0,bus=pci.0,addr=0x4 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x6 -msg timestamp=on
+2018-06-07 11:42:53.081+0000: initiating migration
+2018-06-07 11:42:58.299+0000: shutting down, reason=migrated
+2018-06-07T11:42:59.084477Z kvm: terminating on signal 15 from pid 2685
+
+$GUEST.log destination:
+2018-06-07 11:42:52.851+0000: starting up libvirt version: 4.0.0, qemu version: 2.11.1 (v2.11.1-dirty), hostname: hv0
+LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin QEMU_AUDIO_DRV=none /usr/bin/kvm -name guest=vps25,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-2760-vps25/master-key.aes -machine pc-i440fx-2.6,accel=kvm,usb=off,dump-guest-core=off -cpu Westmere,vme=on,pclmuldq=on,x2apic=on,hypervisor=on,arat=on -m 8192 -realtime mlock=off -smp 4,sockets=1,cores=4,threads=1 -uuid 0cf4666d-6855-b3a8-12da-00002967563f -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/domain-2760-vps25/monitor.sock,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc -no-shutdown -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -drive file=/mnt/data/vps25/vps25.raw,format=raw,if=none,id=drive-virtio-disk0,cache=none,throttling.bps-read=734003200,throttling.bps-write=576716800,throttling.iops-read=3500,throttling.iops-write=2500 -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x5,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 -netdev tap,fd=25,id=hostnet0,vhost=on,vhostfd=27 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=52:54:00:xx:xx:xx,bus=pci.0,addr=0x3,bootindex=2 -device usb-tablet,id=input1,bus=usb.0,port=1 -vnc 0.0.0.0:3,password -device VGA,id=video0,vgamem_mb=16,bus=pci.0,addr=0x2 -device ES1370,id=sound0,bus=pci.0,addr=0x4 -incoming defer -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x6 -msg timestamp=on
+2018-06-07T11:42:58.257207Z kvm: warning: TSC frequency mismatch between VM (2593906 kHz) and host (2394455 kHz), and TSC scaling unavailable
+2018-06-07T11:42:58.257417Z kvm: warning: TSC frequency mismatch between VM (2593906 kHz) and host (2394455 kHz), and TSC scaling unavailable
+2018-06-07T11:42:58.257532Z kvm: warning: TSC frequency mismatch between VM (2593906 kHz) and host (2394455 kHz), and TSC scaling unavailable
+2018-06-07T11:42:58.257663Z kvm: warning: TSC frequency mismatch between VM (2593906 kHz) and host (2394455 kHz), and TSC scaling unavailable
+
+
+I do like to add that I only saw this when the source we migrate from is running on a relatively new CPU: Intel(R) Xeon(R) Gold 6126 CPU @ 2.60GHz.
+
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 85
+model name      : Intel(R) Xeon(R) Gold 6126 CPU @ 2.60GHz
+stepping        : 4
+microcode       : 0x200002c
+cpu MHz         : 1048.950
+cache size      : 19712 KB
+physical id     : 0
+siblings        : 24
+core id         : 6
+cpu cores       : 12
+apicid          : 12
+initial apicid  : 12
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 22
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc aperfmperf eagerfpu pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch epb invpcid_single retpoline intel_pt kaiser tpr_shadow vnmi flexpriority ept vpid fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm mpx avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local dtherm ida arat pln pts hwp hwp_act_window hwp_epp hwp_pkg_req pku ospke
+bugs            : cpu_meltdown spectre_v1 spectre_v2
+bogomips        : 5200.00
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 46 bits physical, 48 bits virtual
+power management:
+
+I did use this CPU at the source while migrating in loops but was not able to reproduce.
+
+> You're doing a heck of a lot of migrates; does 2.6.2->2.6.2 and 2.11.1->2.11.1 work fine for you - i.e. is it only the cross version that's broken?
+I did not see this issue amongst 2.6.2 -> 2.6.2 migrations, but I do have to add that it wasn't that obvious.
+
+I did not see any of these issues during 2.6.2 -> 2.6.2 migrations and also "not yet" between 2.11.1 -> 2.11.1, I am writing "not yet" as I am not really migrating that much between 2.11.1 at this moment.
+What I can do is migrate VMs around and skip the "Gold 6126" source CPU so we can perhaps rule this out.
+VMs having this issue are not that hard to pinpoint because of the spiking vcpus.
+
+I will try to run crash against a dump of the VMs memory with an exact copy of the running kernel to try and get a state of the running kernel and trying to read dmesg.
+
+> You should probably look at what the other CPUs are doing as well.
+
+I tried this but attaching gdb and running info registers or stepping through does not show me the same RIP values as I see with the `qemu-monitor-command` info registers command.
+Is there another way so I could get the register values of all individual vcpus?
+
+> You could take the kernel RIP values you see in your last test and see if they match some particular driver; make sure you have *exactly* the same guest kernel version when trying to match the values up.
+
+I will get back to you on this.
+
+After doing another 10.000 migrations on pre-Skylake hardware it looks like the "100% freeze bug" is not related to qemu 2.6 => 2.11 migrations, but only to Skylake hardware.
+We only see this bug with migrations to/from the new "Intel(R) Xeon(R) Gold 6126" CPUs.
+
+I stumbled across an article about this new generation of Skylake CPUs today, I'm not sure if that is related. Changes in the PAUSE instruction which can cause weird software behavior when using spinlocks:
+https://aloiskraus.wordpress.com/2018/06/16/why-skylakex-cpus-are-sometimes-50-slower-how-intel-has-broken-existing-code/
+
+
+That 'PAUSE' thing is just a performance issue (in weird cases); so whatever the problem is it's unlikely related to that - there are loads of other changes in Skylake.
+
+So, lets narrow it down - have you seen it in migrations *between* a pair of skylakes, or just when it's migrating too/from something else.
+
+I have seen it with migrations between Skylake servers, but also to and from Skylake to non-Skylake servers.
+
+But you've not seen it in any migration between non-skylake CPUs?
+
+Now that you've figured out it's skylake related, can you more easily repeat it?
+e.g. what happens if you set your own VM up and make it migrate back and forth between two
+hosts constantly; can you get that to fail?
+
+We have done over 30.000 migrations (of different VMs) between non-Skylake CPUs from qemu 2.6 to 2.11 and have never encountered the "100% freeze bug". That's why I'm sure it's related to Skylake (Intel(R) Xeon(R) Gold 6126) CPU.
+
+I'm testing migrations with my own VM between Skylake and non-Skylake servers, but so far I'm not able to reproduce this issue... Only customer VMs experience this issue, it looks completely random...
+
+
+
+ok, it's always a pain when you can't reproduce it on demand, but  it does happen.
+I suggest you start by figuring out which guest OS versions are hitting it; and then just create a couple of VMs with identical configs and set them constantly bouncing between a pair of boxes -  a bit of scripting and you can get yourself a few hundred migrations an hour like that in a test.
+
+As soon as you can nail it on one of your own VMs then you can get a full RAM dump and back trace and registers and see wth is going on.
+
+This looks suspicious:
+ $GUEST.log source:  -cpu Westmere 
+ $GUEST.log destination: -cpu Westmere,vme=on,pclmuldq=on,x2apic=on,hypervisor=on,arat=on
+
+libvirt is supposed to use the same device configuration on the source and destination.  In the best case, the additional options are useless because QEMU already ensures CPUID compatibility.  In the worst case, this will make CPUID change during migration.
+
+It's not a specific guest OS version that suffers from this bug, we already had multiple incidents on Debian 7, Ubuntu 14.04 and CentOS 6. I will try to reproduce it again.
+
+The command line output from the destination host looks different indeed, could it be possible that this is caused by a libvirt bug in combination with the Skylake Gold CPUs? We are running libvirt 4.0.0.
+
+Right; even if you're getting the problem across multiple OS versions, just pick one that fails; the most convenient one to debug/newest.  Hmm are all the ones that are failing old - that's an old Debian, an old Ubuntu and an old CentOS?  Do any more modern guests fail?
+
+If the -cpu is different on source/destination then it could well explain it; it could be a libvirt bug; but the set of command lines you posted near the start of this bug were between different host CPUs; are you still seeing different -cpu options when you migrate between the pair of Skylakes?
+
+
+It seems like all failing VMs are older, running kernel 3.*. I have not seen this with more modern guests, but maybe that's just luck.
+
+A customer with a freezing VM told me he's running tomcat/java applications. I'm going to try and reproduce it with older guest operating systems in combination with tomcat/java just to be sure. Will let you know as soon as I have test results.
+
+I also did migration tests to get more information about the different -cpu options. If I do migrations between qemu 2.6 => 2.6 to Skylake and non-Skylake I am not able to reproduce the extra cpu options after migration. I do get extra cpu options after doing the same migrations between 2.11 => 2.11, also between non-Skylake servers. All tests are done on host servers running Debian 9 with libvirt 4.0.0. It can be that the -cpu options change is unrelated to the freeze issue, as I also see this -cpu change on non-Skylake => non-Skylake migrations.
+
+
+
+
+
+
+
+Note that with the -cpu there are two issues:
+  a) Odd combinations of flags
+  b) The fact the -cpu options are different between source and dest
+
+(b) is what's more likely to be a problem - the source/destination flags really should be the same.
+If they're differnt between source/dest on 2.11<=>2.11 on skylake then we need to fix the difference in flags before debugging further.
+
+Failure on older kernels is not unheard of; I did have a problem recently that only affected rhel5 and older (so it's not this one since you've got a centos 6).
+
+I upgraded libvirt to version 4.4.0 and it looks like this behavior is still there. It still changes the cpu options after migration. What I do notice is that a "virsh dumpxml" shows me the following after starting a new VM:
+
+  <cpu mode='custom' match='exact' check='full'>
+    <model fallback='forbid'>Westmere</model>
+    <topology sockets='1' cores='1' threads='1'/>
+    <feature policy='require' name='vme'/>
+    <feature policy='require' name='pclmuldq'/>
+    <feature policy='require' name='x2apic'/>
+    <feature policy='require' name='hypervisor'/>
+    <feature policy='require' name='arat'/>
+  </cpu>
+
+I get this "virsh dumpxml" results on libvirt 4.0.0 and 4.4.0. I don't see the same output when I do a "virsh edit" before starting the VM:
+
+  <cpu mode='custom' match='exact' check='partial'>
+    <model fallback='allow'>Westmere</model>
+    <topology sockets='1' cores='1' threads='1'/>
+  </cpu>
+
+For some reason libvirt adds those options to the running config while starting a VM, and during a migration it will add the same cpu options to the migrated VM. This explains at least why those options appear in the command line after migration, but why does libvirt adds those options when a VM starts in the first place?
+
+How can I debug this behavior?
+
+As I only see the freezes when Skylake Gold is involved, I started to look at more differences between Skylake and non-Skylake servers. I'll paste the information I found so far below:
+
+Intel(R) Xeon(R) Gold 6126 CPU
+/sys/module/kvm_intel/parameters/enable_shadow_vmcs: Y
+/sys/module/kvm_intel/parameters/eptad: Y
+/sys/module/kvm_intel/parameters/pml: Y
+
+Intel(R) Xeon(R) CPU E5-2660
+/sys/module/kvm_intel/parameters/enable_shadow_vmcs: N
+/sys/module/kvm_intel/parameters/eptad: N
+/sys/module/kvm_intel/parameters/pml: N
+
+Extra CPU flags in "Intel(R) Xeon(R) Gold 6126 CPU" compared to "Intel(R) Xeon(R) CPU E5-2660":
+art sdbg fma movbe f16c rdrand abm 3dnowprefetch epb invpcid_single fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm cqm mpx avx512f avx512dq rdseed adx smap clflushopt clwb intel_pt avx512cd avx512bw avx512vl xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local hwp hwp_act_window hwp_epp hwp_pkg_req pku ospke
+
+
+We finally managed to reproduce this issue in our test environment. 2 out of 3 VMs froze within 12 hours of constant migrations.
+
+All migrations took place between Skylake Gold => non-Skylake Gold and non-Skylake Gold => Skylake Gold. Test environment hypervisors are running Debian 9, Qemu 2.11 and Libvirt 4.0.0.
+
+The test VMs are Debian 8 based with -encrypted filesystems- and a dd loop running to generate io load. VMs without encrypted filesystem do not freeze.
+
+I may have found the issue and if it is the case it should be fixed after applying: http://lists.nongnu.org/archive/html/qemu-devel/2018-04/msg00820.html
+Is there a reason why this patch is not backported to 2.11.2?
+
+The theory is that the VM is not actually "frozen", but catching up in time, as the TSC clock is unstable with Skylake CPUs.
+4 years ago we suffered from a similar bug, fixed by: https://lists.nongnu.org/archive/html/qemu-devel/2014-09/msg01238.html
+
+I did a diff between 2.6 and 2.11, and found this change:
+
+-        uint64_t time_at_migration = kvmclock_current_nsec(s);
+-
+-        s->clock_valid = false;
+ 
+-        /* We can't rely on the migrated clock value, just discard it */
+-        if (time_at_migration) {
+-            s->clock = time_at_migration;
++        /*
++         * If the host where s->clock was read did not support reliable
++         * KVM_GET_CLOCK, read kvmclock value from memory.
++         */
++        if (!s->clock_is_reliable) {
++            uint64_t pvclock_via_mem = kvmclock_current_nsec(s);
++            /* We can't rely on the saved clock value, just discard it */
++            if (pvclock_via_mem) {
++                s->clock = pvclock_via_mem;
++            }
+
+If clock_is_reliable is not set, which it isn't when migrating a VM that was originally started on 2.6, we never set the correct clock.
+This causes exactly the same condition as the "freezes" we had 4 years ago.
+
+I'm not able to reproduce this issue on test VMs, only on customer VMs. Can somebody confirm my theory?
+
+Frank: If you're happy that http://lists.nongnu.org/archive/html/qemu-devel/2018-04/msg00820.html
+then we should close this as 'fix released' since this was commit c2b01cfec1f which went in v2.12.0-rc2; although we could then ask for qemu-stable.
+
+
+Hi David,
+
+I can confirm that the specific patch solves our migration freezes. We have not seen any freezes after applying this patch to 2.11.2.
+
+We can close this issue as 'fix released'.
+
+as per the last two comments, this fix is already in 2.12
+
+https://bugs.launchpad.net/qemu/+bug/1831225
+

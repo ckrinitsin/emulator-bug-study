@@ -1,0 +1,93 @@
+other: 0.104
+device: 0.094
+PID: 0.087
+debug: 0.081
+network: 0.080
+vnc: 0.077
+semantic: 0.070
+permissions: 0.064
+KVM: 0.062
+boot: 0.061
+socket: 0.056
+graphic: 0.055
+performance: 0.055
+files: 0.054
+debug: 0.430
+network: 0.154
+PID: 0.069
+boot: 0.065
+device: 0.044
+KVM: 0.040
+other: 0.040
+files: 0.039
+semantic: 0.027
+socket: 0.024
+performance: 0.021
+vnc: 0.016
+graphic: 0.016
+permissions: 0.016
+
+-netdev user: guestfwd doesn't work
+
+Hello!
+
+QEMU emulator version 2.6.1 (Debian 1:2.6.1+dfsg-0ubuntu4), Copyright (c) 2003-2008 Fabrice Bellard
+
+The IP address 192.168.1.46 is assigned to eth0.
+
+qemu-system-x86_64 \
+    -no-hpet \
+    -nodefconfig \
+    -machine accel=kvm \
+    -cpu host \
+    -smp 2 \
+    -drive if=virtio,file=yakkety-server-cloudimg-amd64.img \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev 'user,id=net0,hostfwd=tcp::2222-:22,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.46 8842' \
+    -m 1024 \
+    -initrd yakkety-server-cloudimg-amd64-initrd-generic \
+    -kernel yakkety-server-cloudimg-amd64-vmlinuz-generic \
+    -append 'root=/dev/vda1 modprobe.blacklist=floppy systemd.log_level=debug systemd.journald.forward_to_console=1'
+
+Without the guestfwd=... part everything works nicely. With it I get the following message.
+
+
+qemu-system-x86_64: -netdev user,id=net0,hostfwd=tcp::2222-:22,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.46 8842: conflicting/invalid host:port in guest forwarding rule 'tcp:1.2.3.4:1234-cmd:nc 192.168.1.46 8842'
+qemu-system-x86_64: -netdev user,id=net0,hostfwd=tcp::2222-:22,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.46 8842: Device 'user' could not be initialized
+
+
+But I just compiled c640f2849ee8775fe1bbd7a2772610aa77816f9f, and I get the same behavior.
+
+pas@strange:~/qemu/x86_64-softmmu$ ./qemu-system-x86_64 -net 'user,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.48 80'
+qemu-system-x86_64: -net user,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.48 80: conflicting/invalid host:port in guest forwarding rule 'tcp:1.2.3.4:1234-cmd:nc 192.168.1.48 80'
+qemu-system-x86_64: -net user,guestfwd=tcp:1.2.3.4:1234-cmd:nc 192.168.1.48 80: Device 'user' could not be initialized
+
+
+After poking a bit around it seems that this check fails in slirp/slirp.c: (around line 1074)
+
+    if ((guest_addr->s_addr & slirp->vnetwork_mask.s_addr) !=
+        slirp->vnetwork_addr.s_addr ||
+        guest_addr->s_addr == slirp->vhost_addr.s_addr ||
+        guest_addr->s_addr == slirp->vnameserver_addr.s_addr) {
+        return -1;
+    }
+
+Because guest_addr, and slirp has equivalent s_addr values.
+
+x86_64-softmmu/qemu-system-x86_64 -net 'user,net=10.0.2.0/24,host=10.0.2.2,guestfwd=tcp:12.0.0.2:80-cmd:echo ok'
+
+guest_addr: 12.0.0.2
+vnetwork_mask: 12.0.0.2
+vhost_addr: 12.0.0.2
+vnameserver_addr: 12.0.0.2
+guest_addr & mask: 12.0.0.2
+
+
+Thanks in advance for looking into this!
+
+Not sure whether this is really a bug or working as intended - but apparently, the server IP address from the guest point of view (before the NAT) has to be in the same subnet as the guest itself. So everything should work fine if you use something like this in your first example:
+
+ -netdev 'user,id=net0,hostfwd=tcp::2222-:22,guestfwd=tcp:10.0.2.200:1234-cmd:nc 192.168.1.46 8842'
+
+(i.e. just replace the 1.2.3.4 with 10.0.2.200)
+

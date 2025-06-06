@@ -1,0 +1,116 @@
+permissions: 0.107
+other: 0.101
+device: 0.098
+PID: 0.089
+graphic: 0.083
+semantic: 0.081
+debug: 0.077
+boot: 0.068
+performance: 0.062
+files: 0.057
+socket: 0.056
+network: 0.048
+KVM: 0.043
+vnc: 0.031
+debug: 0.270
+performance: 0.191
+PID: 0.104
+KVM: 0.071
+files: 0.070
+socket: 0.064
+device: 0.062
+semantic: 0.043
+vnc: 0.034
+boot: 0.031
+other: 0.024
+network: 0.018
+permissions: 0.010
+graphic: 0.009
+
+Qemu-img convert appears to be stuck on aarch64 host with low probability
+
+Hi,  I found a problem that qemu-img convert appears to be stuck on aarch64 host with low probability.
+
+The convert command  line is  "qemu-img convert -f qcow2 -O raw disk.qcow2 disk.raw ".
+
+The bt is below:
+
+Thread 2 (Thread 0x40000b776e50 (LWP 27215)):
+#0  0x000040000a3f2994 in sigtimedwait () from /lib64/libc.so.6
+#1  0x000040000a39c60c in sigwait () from /lib64/libpthread.so.0
+#2  0x0000aaaaaae82610 in sigwait_compat (opaque=0xaaaac5163b00) at util/compatfd.c:37
+#3  0x0000aaaaaae85038 in qemu_thread_start (args=args@entry=0xaaaac5163b90) at util/qemu_thread_posix.c:496
+#4  0x000040000a3918bc in start_thread () from /lib64/libpthread.so.0
+#5  0x000040000a492b2c in thread_start () from /lib64/libc.so.6
+
+Thread 1 (Thread 0x40000b573370 (LWP 27214)):
+#0  0x000040000a489020 in ppoll () from /lib64/libc.so.6
+#1  0x0000aaaaaadaefc0 in ppoll (__ss=0x0, __timeout=0x0, __nfds=<optimized out>, __fds=<optimized out>) at /usr/include/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>) at qemu_timer.c:391
+#3  0x0000aaaaaadae014 in os_host_main_loop_wait (timeout=<optimized out>) at main_loop.c:272
+#4  0x0000aaaaaadae190 in main_loop_wait (nonblocking=<optimized out>) at main_loop.c:534
+#5  0x0000aaaaaad97be0 in convert_do_copy (s=0xffffdc32eb48) at qemu-img.c:1923
+#6  0x0000aaaaaada2d70 in img_convert (argc=<optimized out>, argv=<optimized out>) at qemu-img.c:2414
+#7  0x0000aaaaaad99ac4 in main (argc=7, argv=<optimized out>) at qemu-img.c:5305
+
+
+The problem seems to be very similar to the phenomenon described by this patch (https://resources.ovirt.org/pub/ovirt-4.1/src/qemu-kvm-ev/0025-aio_notify-force-main-loop-wakeup-with-SIGIO-aarch64.patch), 
+
+which force main loop wakeup with SIGIO.  But this patch was reverted by the patch (http://ovirt.repo.nfrance.com/src/qemu-kvm-ev/kvm-Revert-aio_notify-force-main-loop-wakeup-with-SIGIO-.patch).
+
+The problem still seems to exist in aarch64 host. The qemu version I used is 2.8.1. The host version is 4.19.28-1.2.108.aarch64.
+ Do you have any solutions to fix it?  Thanks for your reply !
+
+
+Anyone else has a similar problem?
+
+I  can't reproduce this problem with  qemu.git/matser?  It seems to have been fixed in qemu.git/matser.
+
+But  I haven't found which patch fixed this problem from QEMU version 2.8.1 to  qemu.git/matser. 
+
+Could anybody give me some suggestions? Thanks for your reply.
+
+Hi, unfortunately a lot has changed from 2.8 and it might be hard to identify a single individual fix that may be responsible for this; there are aio_context fixes that go in nearly every version.
+
+It may be quickest (unfortunately) to start git-bisecting the problem to see if you can identify which build alleviates the behavior to see if it isn't something you can backport directly -- but you might find that this particular fix has a lot of requisites and you might find it difficult to backport to 2.8.1.
+
+Best of luck,
+--js
+
+
+
+Marking this bug as fixed according to comment 2.
+
+dann frazier met the same problem as me in (https://bugs.launchpad.net/qemu/+bug/1805256).
+
+He said this bugs still persists w/ latest upstream (@ afccfc0). His reply to me is below:
+
+No, sorry - this bugs still persists w/ latest upstream (@ afccfc0). I found a report of similar symptoms:
+
+  https://patchwork.kernel.org/patch/10047341/
+  https://bugzilla.redhat.com/show_bug.cgi?id=1524770#c13
+
+To be clear, ^ is already fixed upstream, so it is not the *same* issue - but perhaps related.
+
+
+Ok, we can track the bug reported by Dann Frazier in ticket 1805256 instead.
+
+I can reproduce this problem with qemu.git/matser. It still exists in qemu.git/matser. I found that when an IO return in
+worker threads and want to call aio_notify to wake up main_loop, but it found that ctx->notify_me is cleared to 0 by main_loop in aio_ctx_check by calling atomic_and(&ctx->notify_me, ~1) . So worker thread won't write enventfd to notify main_loop. If such a scene happens, the main_loop will hang:
+
+   main loop                                   worker thread1                         worker thread2
+---------------------------------------------------------------------------------------------------------------------        
+     qemu_poll_ns                            aio_worker        
+                                        qemu_bh_schedule(pool->completion_bh)                              
+    glib_pollfds_poll
+    g_main_context_check
+    aio_ctx_check                                                                     aio_worker                                                                                       
+    atomic_and(&ctx->notify_me, ~1)                                                                   
+                                                                               qemu_bh_schedule(pool->completion_bh)
+    /* do something for event */   
+    qemu_poll_ns
+    /* hangs !!!*/  
+
+
+As we known ,ctx->notify_me will be visited by worker thread and main loop. I thank we should add a lock protection for ctx->notify_me to avoid this happend.
+

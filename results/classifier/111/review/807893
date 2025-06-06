@@ -1,0 +1,513 @@
+permissions: 0.098
+PID: 0.091
+semantic: 0.089
+other: 0.086
+debug: 0.083
+device: 0.076
+performance: 0.073
+files: 0.073
+graphic: 0.066
+boot: 0.066
+socket: 0.062
+vnc: 0.053
+network: 0.044
+KVM: 0.039
+debug: 0.306
+PID: 0.194
+permissions: 0.164
+files: 0.061
+other: 0.056
+device: 0.039
+boot: 0.036
+semantic: 0.024
+graphic: 0.023
+network: 0.021
+performance: 0.021
+KVM: 0.020
+socket: 0.018
+vnc: 0.016
+
+qemu privilege escalation
+
+If qemu is started as root, with -runas, the extra groups is not dropped correctly
+
+/proc/`pidof qemu`/status
+..
+Uid:    100     100     100     100
+Gid:    100     100     100     100
+FDSize: 32
+Groups: 0 1 2 3 4 6 10 11 26 27 
+...
+
+The fix is to add initgroups() or setgroups(1, [gid]) where appropriate to os-posix.c.
+
+The extra gid's allow read or write access to other files (such as /dev etc).
+
+Emulating the qemu code:
+
+# python
+...
+>>> import os
+>>> os.setgid(100)
+>>> os.setuid(100)
+>>> os.execve("/bin/sh", [ "/bin/sh" ], os.environ)
+sh-4.1$ xxd /dev/sda | head -n2
+0000000: eb48 9000 0000 0000 0000 0000 0000 0000  .H..............
+0000010: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+sh-4.1$ ls -l /dev/sda
+brw-rw---- 1 root disk 8, 0 Jul  8 11:54 /dev/sda
+sh-4.1$ id
+uid=100(qemu00) gid=100(users) groups=100(users),0(root),1(bin),2(daemon),3(sys),4(adm),6(disk),10(wheel),11(floppy),26(tape),27(video)
+
+Andrew Griffiths reports that -runas does not set supplementary group
+IDs.  This means that gid 0 (root) is not dropped when switching to an
+unprivileged user.
+
+Add an initgroups(3) call to use the -runas user's /etc/groups
+membership to update the supplementary group IDs.
+
+Signed-off-by: Stefan Hajnoczi <email address hidden>
+---
+Note this needs compile testing on various POSIX host platforms.  Tested on
+Linux.  Should work on BSD and Solaris.  initgroups(3) is SVr4/BSD but not in
+POSIX.
+
+ os-posix.c |    6 ++++++
+ 1 files changed, 6 insertions(+), 0 deletions(-)
+
+diff --git a/os-posix.c b/os-posix.c
+index 7dfb278..6f8d488 100644
+--- a/os-posix.c
++++ b/os-posix.c
+@@ -31,6 +31,7 @@
+ /*needed for MAP_POPULATE before including qemu-options.h */
+ #include <sys/mman.h>
+ #include <pwd.h>
++#include <grp.h>
+ #include <libgen.h>
+ 
+ /* Needed early for CONFIG_BSD etc. */
+@@ -199,6 +200,11 @@ static void change_process_uid(void)
+             fprintf(stderr, "Failed to setgid(%d)\n", user_pwd->pw_gid);
+             exit(1);
+         }
++        if (initgroups(user_pwd->pw_name, user_pwd->pw_gid) < 0) {
++            fprintf(stderr, "Failed to initgroups(\"%s\", %d)\n",
++                    user_pwd->pw_name, user_pwd->pw_gid);
++            exit(1);
++        }
+         if (setuid(user_pwd->pw_uid) < 0) {
+             fprintf(stderr, "Failed to setuid(%d)\n", user_pwd->pw_uid);
+             exit(1);
+-- 
+1.7.5.4
+
+
+
+Yep, that fix looks fine. RedHat should have a CVE number for this issue. 
+
+or any other linux vendor that has an interest in qemu :) 
+
+On Sat, Jul 9, 2011 at 10:22 AM, Stefan Hajnoczi
+<email address hidden> wrote:
+> Andrew Griffiths reports that -runas does not set supplementary group
+> IDs.  This means that gid 0 (root) is not dropped when switching to an
+> unprivileged user.
+>
+> Add an initgroups(3) call to use the -runas user's /etc/groups
+> membership to update the supplementary group IDs.
+>
+> Signed-off-by: Stefan Hajnoczi <email address hidden>
+> ---
+> Note this needs compile testing on various POSIX host platforms.  Tested on
+> Linux.  Should work on BSD and Solaris.  initgroups(3) is SVr4/BSD but not in
+> POSIX.
+>
+>  os-posix.c |    6 ++++++
+>  1 files changed, 6 insertions(+), 0 deletions(-)
+
+Are you happy with this patch?  Bumping because security-related.
+
+Regarding portability, Linux, BSD, Solaris, and Mac OS X all provide
+initgroups(3).  I think we're good.
+
+Stefan
+
+
+Requesting CVE.  Tools like libvirt deprivilege themselves before launching qemu as an unprivileged user (no use of -runas), so aren't vulnerable.
+
+This bug is being tracked as CVE-2011-2527
+
+* Stefan Hajnoczi (<email address hidden>) wrote:
+> @@ -199,6 +200,11 @@ static void change_process_uid(void)
+>              fprintf(stderr, "Failed to setgid(%d)\n", user_pwd->pw_gid);
+>              exit(1);
+>          }
+> +        if (initgroups(user_pwd->pw_name, user_pwd->pw_gid) < 0) {
+> +            fprintf(stderr, "Failed to initgroups(\"%s\", %d)\n",
+> +                    user_pwd->pw_name, user_pwd->pw_gid);
+> +            exit(1);
+> +        }
+
+Does initgroups need access to /etc/group?  How does this combine w/
+-chroot?
+
+Added bonus...this will fail when the initial user is not privileged
+_and_ is the same user as -runas user (probably not what a user intended,
+but would've worked before).  Something like:
+
+[doh@laptop qemu]$ qemu -runas doh
+
+
+* Chris Wright (<email address hidden>) wrote:
+> * Stefan Hajnoczi (<email address hidden>) wrote:
+> > @@ -199,6 +200,11 @@ static void change_process_uid(void)
+> >              fprintf(stderr, "Failed to setgid(%d)\n", user_pwd->pw_gid);
+> >              exit(1);
+> >          }
+> > +        if (initgroups(user_pwd->pw_name, user_pwd->pw_gid) < 0) {
+> > +            fprintf(stderr, "Failed to initgroups(\"%s\", %d)\n",
+> > +                    user_pwd->pw_name, user_pwd->pw_gid);
+> > +            exit(1);
+> > +        }
+> 
+> Does initgroups need access to /etc/group?  How does this combine w/
+> -chroot?
+
+Tested this on Linux, and w/out /etc/group it simply fails to add any
+supplementary groups (doesn't fail completely, just fails safely).
+Appears similar from solaris manpages.
+
+Given that...
+
+Acked-by: Chris Wright <email address hidden>
+
+
+Thanks, applied.
+
+On Sat, Jul 9, 2011 at 12:22 PM, Stefan Hajnoczi
+<email address hidden> wrote:
+> Andrew Griffiths reports that -runas does not set supplementary group
+> IDs.  This means that gid 0 (root) is not dropped when switching to an
+> unprivileged user.
+>
+> Add an initgroups(3) call to use the -runas user's /etc/groups
+> membership to update the supplementary group IDs.
+>
+> Signed-off-by: Stefan Hajnoczi <email address hidden>
+> ---
+> Note this needs compile testing on various POSIX host platforms.  Tested on
+> Linux.  Should work on BSD and Solaris.  initgroups(3) is SVr4/BSD but not in
+> POSIX.
+>
+>  os-posix.c |    6 ++++++
+>  1 files changed, 6 insertions(+), 0 deletions(-)
+>
+> diff --git a/os-posix.c b/os-posix.c
+> index 7dfb278..6f8d488 100644
+> --- a/os-posix.c
+> +++ b/os-posix.c
+> @@ -31,6 +31,7 @@
+>  /*needed for MAP_POPULATE before including qemu-options.h */
+>  #include <sys/mman.h>
+>  #include <pwd.h>
+> +#include <grp.h>
+>  #include <libgen.h>
+>
+>  /* Needed early for CONFIG_BSD etc. */
+> @@ -199,6 +200,11 @@ static void change_process_uid(void)
+>             fprintf(stderr, "Failed to setgid(%d)\n", user_pwd->pw_gid);
+>             exit(1);
+>         }
+> +        if (initgroups(user_pwd->pw_name, user_pwd->pw_gid) < 0) {
+> +            fprintf(stderr, "Failed to initgroups(\"%s\", %d)\n",
+> +                    user_pwd->pw_name, user_pwd->pw_gid);
+> +            exit(1);
+> +        }
+>         if (setuid(user_pwd->pw_uid) < 0) {
+>             fprintf(stderr, "Failed to setuid(%d)\n", user_pwd->pw_uid);
+>             exit(1);
+> --
+> 1.7.5.4
+>
+>
+>
+
+
+# ps axwu
+...
+qemu00   29957  0.5  9.8 480568 405228 ?       Sl   Jul12   7:41 /usr/bin/qemu-system-x86_64 -runas ...
+...
+
+# ps axwu -L
+...
+qemu00   29957 29957  0.2    3  9.8 480568 405228 ?       Sl   Jul12   2:49 /usr/bin/qemu-system-x86_64 -runas ...
+root     29957 29959  0.3    3  9.8 480568 405228 ?       Sl   Jul12   4:47 /usr/bin/qemu-system-x86_64 -runas ...
+root     29957 29960  0.0    3  9.8 480568 405228 ?       Sl   Jul12   0:00 /usr/bin/qemu-system-x86_64 -runas ...
+...
+
+
+# cat /proc/29957/task/29959/status 
+Name:   qemu-system-x86
+State:  S (sleeping)
+Tgid:   29957
+Pid:    29959
+PPid:   1
+TracerPid:      0
+Uid:    0       0       0       0
+Gid:    0       0       0       0
+FDSize: 32
+Groups: 999 
+
+...
+
+Threads can have their own uid/gid set.
+
+
+
+Once you have code execution in the process, you can modify the others threads execution (if required) to execute your own code. With full capabilities, it would be trivial to escape from a chroot on a normal Linux kernel (grsecurity with appropriate kernel chroot restrictions enabled would reduce the avenues available for escaping.).
+
+I seem to recall other distro's handle thread privileges differently. 
+
+
+
+correction: s/other distro's/other operating systems/g
+
+
+On Wed, Jul 13, 2011 at 11:12 AM, Andrew Griffiths
+<email address hidden> wrote:
+> Once you have code execution in the process, you can modify the others
+> threads execution (if required) to execute your own code. With full
+> capabilities, it would be trivial to escape from a chroot on a normal
+> Linux kernel (grsecurity with appropriate kernel chroot restrictions
+> enabled would reduce the avenues available for escaping.).
+>
+> I seem to recall other distro's handle thread privileges differently.
+
+Hi Andrew,
+I think what Chris meant is that libvirt does not use -runas at all.
+It drops privileges (including initgroups(3)) itself *before* invoking
+QEMU.  So I think his statement is simply that libvirt (commonly used
+in KVM deployments) is not affected.
+
+Stefan
+
+
+Hello Stefan,
+
+I was explaining the threads / uids per thread issue, in case it wasn't obvious of what the impact was, or how to exploit that issue (in case someone was wondering about that). It was not directed at Chris in any shape or form, nor was it about libvirt.
+
+
+
+
+
+
+On Wed, Jul 13, 2011 at 11:50 AM, Andrew Griffiths
+<email address hidden> wrote:
+> I was explaining the threads / uids per thread issue, in case it wasn't
+> obvious of what the impact was, or how to exploit that issue (in case
+> someone was wondering about that). It was not directed at Chris in any
+> shape or form, nor was it about libvirt.
+
+I see.  Thanks for the clarification.
+
+Stefan
+
+
+Regarding the threads having different privilege level, I have isolated that to being related to my grsecurity configuration (more specifically, chroot_findtask will block it).
+
+While it's still an issue on older glibc where the setuid/setgid code does not enforce it across all threads, it may not be high priority since fixing it would be a lot more effort.
+
+
+On Thu, Jul 14, 2011 at 11:37 AM, Andrew Griffiths
+<email address hidden> wrote:
+> Regarding the threads having different privilege level, I have isolated
+> that to being related to my grsecurity configuration (more specifically,
+> chroot_findtask will block it).
+>
+> While it's still an issue on older glibc where the setuid/setgid code
+> does not enforce it across all threads, it may not be high priority
+> since fixing it would be a lot more effort.
+
+Wow, just learnt something new that glibc does behind our backs :).  I
+see it uses SIGRTMIN+1 to signal threads and get them to do the set*id
+system calls.
+
+I'm glad it does this because although most QEMU threads should be
+started after command-line parsing, I can think of instances where we
+might start a thread before -runas is completed.
+
+Stefan
+
+
+Actually, from a quick google perhaps ensuring all threads run after chroot / dropping privileges might be a good idea.
+
+- http://wiki.freebsd.org/Per-Thread%20Credentials
+- http://www.cocoabuilder.com/archive/cocoa/33107-cthread-fork.html
+
+though it looks like you might need to put in effort into getting per-thread uid's for freebsd/macosx when they make that available, and you're assuming they're running a recent glibc. Depending on complexity, it can't hurt to ensure you're not going to hit into per-thread uid/gid's. I'm of two minds about glibc doing this. This was a particular favourite bug class of mine :)
+
+It seems that there is a linux distro which uses uclibc, which does not emulate the glibc behaviour:
+
+http://dl-4.alpinelinux.org/alpine/v2.2/main/x86/  <-- has qemu packages.
+
+we can use http://paste.pocoo.org/raw/438497/ to emulate qemu's behaviour
+
+# ./test
+[main] my [ug]id is 100/100
+[thread] my [ug]id is 0/0
+
+^-- the qemu thread would be running as root
+
+running the same code under glibc (without grsecurity chroot_findtask), and it will drop privileges as you'd expect on recent glibc. 
+
+
+
+
+On Thu, Jul 14, 2011 at 12:46 PM, Andrew Griffiths
+<email address hidden> wrote:
+> Actually, from a quick google perhaps ensuring all threads run after
+> chroot / dropping privileges might be a good idea.
+>
+> - http://wiki.freebsd.org/Per-Thread%20Credentials
+> - http://www.cocoabuilder.com/archive/cocoa/33107-cthread-fork.html
+>
+> though it looks like you might need to put in effort into getting per-
+> thread uid's for freebsd/macosx when they make that available, and
+> you're assuming they're running a recent glibc. Depending on complexity,
+> it can't hurt to ensure you're not going to hit into per-thread
+> uid/gid's. I'm of two minds about glibc doing this. This was a
+> particular favourite bug class of mine :)
+>
+> It seems that there is a linux distro which uses uclibc, which does not
+> emulate the glibc behaviour:
+>
+> http://dl-4.alpinelinux.org/alpine/v2.2/main/x86/  <-- has qemu
+> packages.
+
+Good point about other OSes and distros.  QEMU does not create any
+threads before -runas processing AFAICT.
+
+It's a nasty problem in general though because shared libraries could...
+
+Stefan
+
+
+It does create threads before chroot/setgid/setuid, see https://bugs.launchpad.net/qemu/+bug/807893/comments/10.
+
+That process was created with following options:
+
+-enable-kvm
+-runas
+-chroot
+-m
+-kernel
+-append
+-drive 
+-net nic,model=virtio, -net tap,ifname=xxx
+-serial none
+-serial unix:.. 
+-serial file: ...
+-monitor unix:...
+-daemonize
+
+
+with some grepping of parent callers, looks like the cpu is probably my issue
+
+static void qemu_kvm_start_vcpu(CPUState *env)
+{
+    env->thread = qemu_mallocz(sizeof(QemuThread));
+    env->halt_cond = qemu_mallocz(sizeof(QemuCond));
+    qemu_cond_init(env->halt_cond);
+    qemu_thread_create(env->thread, qemu_kvm_cpu_thread_fn, env);
+
+    /* init the dynamic translator */
+    cpu_exec_init_all(tb_size * 1024 * 1024);
+
+
+.. etc
+6613 clone(child_stack=0xa75df454, flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, parent_tidptr=0xa75dfbd8, {entry_number:6, base_addr:0xa75dfb70, limit:1048575, seg_32bit:1, contents:0, read_exec_only:0, limit_in_pages:1, seg_not_present:0, useable:1}, child_tidptr=0xa75dfbd8) = 16615
+.. etc
+16615 ioctl(4, KVM_CREATE_VCPU, 0)      = 7
+16615 ioctl(3, KVM_GET_VCPU_MMAP_SIZE, 0) = 12288
+16615 mmap2(NULL, 12288, PROT_READ|PROT_WRITE, MAP_SHARED, 7, 0) = 0xa6ddc000
+16615 ioctl(7, KVM_SET_VAPIC_ADDR, 0xa75de1a4) = 0
+
+later on it does chroot/setgid/setuid
+
+
+On Thu, Jul 14, 2011 at 2:00 PM, Andrew Griffiths
+<email address hidden> wrote:
+> with some grepping of parent callers, looks like the cpu is probably my
+> issue
+
+The -runas processing doesn't happen until os_setup_post() right
+before entering the main loop.  It is too late at that point because
+threads may have been spawned.
+
+My mistake was to think -runas processing happens in os_parse_cmd_args().
+
+Stefan
+
+
+I think I verified this issue on lastest qemu
+
+steps:
+1./configure && make
+2.start  qemu-kvm process with -runas nobody
+./qemu-system-x86_64 -m 2G -smp 4 -cpu qemu64,+x2apic -usbdevice tablet -drive file=/home/win2003-32-new.raw,if=none,id=drive-ide0-0-0,werror=stop,rerror=stop,cache=none,format=raw -device ide-drive,bus=ide.0,unit=0,bootindex=1,drive=drive-ide0-0-0,id=ide0-0-0 -netdev tap,id=hostnet0,script=/etc/qemu-ifup,downscript=no -device rtl8139,netdev=hostnet0,mac=76:0E:40:3F:2F:3F -boot dc -uuid cc5aee77-d631-41d4-92a0-4e59c3b5cb6c -rtc-td-hack -monitor stdio -name win2k3-32-serial -vnc :10 -device virtio-balloon-pci,id=balloon0 -runas nobody
+
+3# cat /proc/25996/status 
+Name:	qemu-system-x86
+State:	R (running)
+Tgid:	25996
+Pid:	25996
+PPid:	28206
+TracerPid:	0
+Uid:	99	99	99	99
+Gid:	99	99	99	99
+Utrace:	0
+FDSize:	256
+Groups:	99 
+
+4# cat /proc/25996/task/25996/status 
+Name:	qemu-system-x86
+State:	R (running)
+Tgid:	25996
+Pid:	25996
+PPid:	28206
+TracerPid:	0
+Uid:	99	99	99	99
+Gid:	99	99	99	99
+Utrace:	0
+FDSize:	256
+Groups:	99 
+
+Based on above ,I think this bug has been fixed ald.
+
+Best Regards,
+Mike
+
+Mike, the issue is solved for Linux hosts with a modern glibc. Andrew
+explained that uclibc or non-Linux hosts may still be affected if they do
+not apply set*id() to all threads in the process.
+
+The safe way to solve this universally is to perform -runas before creating
+threads.
+
+
+Here's some reproduction code you can use to see the difference between glibc and raw system calls:
+
+https://gist.github.com/1084042
+
+If you're wondering about Linux and non-glibc distributions using qemu, Alpine is one particular answer to that question (so the affected Linux distributions is non-zero). 
+
+
+
+
+
+
+According to Stefan, this problem has been fixed by this commit:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=cc4662f9642995c78
+... so let's close this bug ticket now.
+

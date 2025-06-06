@@ -1,0 +1,452 @@
+permissions: 0.100
+debug: 0.093
+performance: 0.087
+device: 0.087
+PID: 0.080
+other: 0.077
+boot: 0.075
+semantic: 0.072
+files: 0.070
+graphic: 0.060
+KVM: 0.056
+network: 0.050
+vnc: 0.050
+socket: 0.044
+performance: 0.413
+KVM: 0.389
+debug: 0.061
+PID: 0.021
+other: 0.019
+network: 0.018
+socket: 0.017
+files: 0.015
+device: 0.011
+semantic: 0.010
+graphic: 0.008
+vnc: 0.007
+boot: 0.006
+permissions: 0.004
+
+guest hangs after live migration due to tsc jump
+
+We have two identical Ubuntu servers running libvirt/kvm/qemu, sharing a Gluster filesystem. Guests can be live migrated between them. However, live migration often leads to the guest being stuck at 100% for a while. In that case, the dmesg output for such a guest will show (once it recovers): Clocksource tsc unstable (delta = 662463064082 ns). In this particular example, a guest was migrated and only after 11 minutes (662 seconds) did it become responsive again.
+
+It seems that newly booted guests doe not suffer from this problem, these can be migrated back and forth at will. After a day or so, the problem becomes apparent. It also seems that migrating from server A to server B causes much more problems than going from B back to A. If necessary, I can do more measurements to qualify these observations.
+
+The VM servers run Ubuntu 13.04 with these packages:
+Kernel: 3.8.0-35-generic x86_64
+Libvirt: 1.0.2
+Qemu: 1.4.0
+Gluster-fs: 3.4.2 (libvirt access the images via the filesystem, not using libgfapi yet as the Ubuntu libvirt is not linked against libgfapi).
+The interconnect between both machines (both for migration and gluster) is 10GbE. 
+Both servers are synced to NTP and well within 1ms form one another.
+
+Guests are either Ubuntu 13.04 or 13.10.
+
+On the guests, the current_clocksource is kvm-clock.
+The XML definition of the guests only contains:  <clock offset='utc'/> 
+
+Now as far as I've read in the documentation of kvm-clock, it specifically supports live migrations, so I'm a bit surprised at these problems. There isn't all that much information to find on these issue, although I have found postings by others that seem to have run into the same issues, but without a solution.
+
+Thanks for reporting this bug.  Unfortunately 13.04 (on your servers) is no longer supported.  Could you test to see if you can reproduce this on 13.10 or 14.04?  If you can, then I'll mark this as also affecting linux (the kernel) and hopefully we can get 'apport-collect 1297218' output from both the host and a guest.
+
+These servers will be upgraded to 14.04LTS once that's released, I'll update the ticket accordingly once we've tested this.
+
+I've set up a test environment using Ubuntu 14.04 LTS on two servers.
+These are running glusterfs as a shared filesystem (3.5.0 from semiosis' PPA), connected through QDR infiniband as a backend.
+
+Live migrating a guest (also running 14.04 LTS) after a few days of uptime still leads to a clock jump:
+[Fri May 16 14:12:37 2014] Clocksource tsc unstable (delta = 85707222 ns)
+
+
+
+I've tried running apport, but it says 'no packages found matching libvirt'
+
+Could you try using libvirt-bin as the package name?  (I thought it
+had to be the other way around, but it's worth a try)
+
+
+apport information
+
+apport information
+
+apport information
+
+I would be curious to hear whether this can also be reproduced with a ceph or an nfs backing store (though i'm not asking you to set that up if noone speaks up to say yes - i'll just have to test it myself)
+
+Has this ever reproduced immediately, or have you just never tried migrating without a few days uptime in the vm beforehand?
+
+Marking high priority (though if it turns out to be only related to a gluster backend, so that using ceph is a workaround, then we should lower it to medium per guidelines)
+
+A few notes after a few weeks of playing with this.
+
+I've not reproduced the failure with migration per se.
+
+However, when I did not add 'aio=native' to the backing store flags (i.e. file=/mnt/disk.img,if=virtio,cache=none,aio=native), after around 2 days qemu would exit saying
+
+ (qemu) qemu: qemu_thread_create: Resource temporarily unavailable
+
+This appears to me to be a bug in the underlying gluster mount.
+
+Until it is verified that this can be reproduced with another shared backing store and is not simply a result of bad behavior of the underlying glusterfs, priority of this bug will be lowered.
+
+I've just done a migration on my test setup, on a guest having 21 days of uptime.
+Result: The guest froze for 53 seconds, then went happily on its way again.
+The 'TSC unstable' message did not show up, but ntp shows that the machine is now 53 seconds behind. The physical hosts have no NTP timing error.
+
+I'm not sure how gluster could cause this post-migration freeze. I'll rebuild the test-setup to run on a different clustered filesystem and will try again.
+
+
+
+So it is behind for exactly as long as it was frozen.
+
+I wonder if you could reproduce this with upstream qemu git HEAD.
+
+But non-gluster reproduction will also be interesting.
+
+
+After some deliberation on what shared storage to use, I decided to take that factor out of the equation alltogether:
+
+server-a# virsh migrate --live --persistent --undefinesource --copy-storage-inc guest qemu+tls://server-b/system
+
+So the storage is now on a non-shared directory and copied across before the VM is migrated.
+
+This works, so I'm going to have it accrue uptime for a week or so again, to see how the clock behaves on migration.
+
+I've repeated the experiment without any shared storage, so that eliminates GlusterFS as a suspect.
+
+server-a# virsh migrate --live --persistent --undefinesource --copy-storage-inc guest qemu+tls://server-b/system
+
+Result: After about a week of uptime, the guest froze solid for 27 seconds after the migration. This is after the migration, because the guest is running on the destination server, using up a full core, and not present on the originating server anymore. CPU usage goes back to normal once the guest becomes responsive again.
+
+Just before the migration, NTP was perfectly locked to well within 100us. Right after the machine become responsive again, this NTP status shows the machine simply lost more than 27 seconds:
+
+root@guest:~# ntpq -p 
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+*cl0     xx.xx.xx.xx       3 u   15   16  377    0.457  27388.3   0.100
+ cl1     xx.xx.xx.xx       3 u   13   16  377    0.429  27388.4   0.178
+
+root@guest:~# uptime
+ 16:03:30 up 8 days, 23:45,  1 user,  load average: 0.02, 0.02, 0.05
+
+During these 27 seconds, it did not respond to any network activity or (virtual) console. There is no mention of clock-jumps or anything else in dmesg this time.
+
+Note that I have now reproduced this on two different pairs of machines: our original KVM cluster, and two compute nodes (different hardware) to test this with a supported Ubuntu release.
+
+
+
+Could you please try to reproduce this using the qemu version at https://launchpad.net/~ubuntu-virt/+archive/virt-daily-upstream ?
+
+I will work on merging the newest debian qemu today, but the virt-daily-upstream ppa has the git upstream HEAD.  It would be good to know whether that fixes this.
+
+In the production setup, we have two KVM servers. According to NTP, their clock corrections are:
+server-a: -147.2 ppm
+server-b: -142.1 ppm
+
+NTP is running on the guest as well, and it's drift-rate matches whichever server the guest is running on, after NTP has had time to adjust.
+
+The length of time that the guest freezes is exactly the time since the last migration, times the NTP rate of the server it is on.
+
+I did two migrations, one at 11h30, and another at 14h10, so 9600 seconds between migrations.
+The freeze after the second migration was 1.369s (as reported by "ntpdate -q server-a", right after the migration).
+This 9600 seconds, times the 142.1 ppm of the server it was on, would predict a freeze of 1.364 s.
+
+I will set up a pair of machines with the qemu PPA later this week.
+
+Using the packages from the virt-daily-upstream PPA, as suggested in #16, seems to resolve the issue: there are no detectable hangs after a live migration, and the clock offset afterwards is only 0.13s, where it used to be 2.3s for the same amount of uptime.
+
+$ dpkg -l \*qemu\* |awk '/^ii/{print $2 "\t"$3}'
+ipxe-qemu	1.0.0+git-20131111.c3d1e78-2ubuntu1
+qemu	2.0~git-20140609.959e41-0ubuntu1
+qemu-keymaps	2.0.0+dfsg-2ubuntu1.1
+qemu-system	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-arm	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-common	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-mips	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-misc	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-ppc	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-sparc	2.0~git-20140609.959e41-0ubuntu1
+qemu-system-x86	2.0~git-20140609.959e41-0ubuntu1
+qemu-user	2.0~git-20140609.959e41-0ubuntu1
+qemu-utils	2.0~git-20140609.959e41-0ubuntu1
+
+
+
+
+
+
+I've installed the latest virt-daily-upstream yesterday, and tried a migration today. Result: guest froze for 3.6 seconds after only 1 day of uptime, exactly the behaviour as seen with the stock Ubuntu-14.04 packages.
+
+So with qemu-git-2.1.0-rc2-git-20140721, the migration problem is back.
+
+This is not completely unexpected, as upstream recently reverted the patches that were supposed to fix this: 
+
+http://lists.gnu.org/archive/html/qemu-devel/2014-05/msg00508.html
+http://lists.gnu.org/archive/html/qemu-devel/2014-07/msg02866.html
+http://lists.gnu.org/archive/html/qemu-devel/2014-07/msg02864.html
+
+
+I've pushed those 3 patches on top of the otherwise identical package in 
+the same ubuntu-virt/virt-daily-upstream ppa.  If you can confirm that they
+again fix it, then we can cherrypick those and ask inform upstream.
+
+
+Serge, Paul
+
+As I can see all the cases in this ticket involves storage blkcopy with --copy-storage-inc. My initial reason for rolling this patchset back was a freeze on p2p migration without this flag being set. Although I am hitting both of the problems, and cumulative after-migration delay hitting me for almost a year, I prefer to live with it instead of observing guest with completely stuck I/O. If possible, please confirm if bug disappears for migration without flag from above in your case.
+
+As another test (still running qemu-git-2.1.0-rc2-git-20140721), I disabled NTP on the two servers (and rebooted them), but left it running on the guest.
+
+When doing the migration, server a (where the guest was running) had an NTP offset of -3.037619 s, and server b was at -3.337718 s. The guest was nicely synchronized before the migration, but afterwards had a clock offset of 0.349590 s, which roughly corresponds to the difference in offsets. The small NTP offset on the guest after the migration implies that it did briefly freeze, but too short to notice. I'll leave it running for longer to be able to confirm this with sufficient accuracy.
+
+Another test with NTP disabled on the servers (but enabled on the guest):
+Still running qemu-git-2.1.0-rc2-git-20140721
+
+server-a:~$ ntpdate -q cl0
+stratum 3, offset -29.405612, delay 0.02597
+
+server-b$ ntpdate -q cl0
+stratum 3, offset -32.990292, delay 0.02597
+
+The guest is running NTP, hosted on server-b for more than 10 days. Its NTP reports:. ntp.drift=-35.387 ppm.
+This matches the offset of server-b (32.99 seconds in 10 days, 19h21) very well: -35.33 ppm.
+
+Doing a live migration of the guest from server-b to server-a:
+Guest does not hang at all (NTP offset after migration: 0.38s).
+
+So if NTP is not running on the hosts, then there are no issues with the guest, it seems.
+
+Andrey,
+
+I don't quite understand (I suspect Paul didn't quite understand) what you wanted tested.  Could you please rephrase, as specifically as possible?  Do you want Paul to verify that the packages with the patchset still work with --copy-storage-inc enabled?
+
+Paul,
+
+do I understand right that:
+
+	1. disabling ksm on the hosts always fixes the pause on migration
+	2. disabling ksm on the host is not needed with the patchset by
+	   Alexander Graf?
+
+
+Andrey: the bug also occurs when not using '--copy-storage-inc'. I originally encountered the bug on a pair of servers that share a glusterfs filesystem. As part of the debugging effort, I took glusterfs out of the equation to show that it is not the cause of the issue. My test envirement is therefore currently setup with --copy-storage-inc, but my production environment uses glusterfs, and has the same issue.
+
+It looks as though the relevant commits were re-committed to upstream git HEAD (9a48bcd1b82494671c111109b0eefdb882581499 and 317b0a6d8ba44e9bf8f9c3dbd776c4536843d82c).  So this may be fixed in vivid, and we might be able to cherrypick the final patches to trusty.
+
+@Paul,
+
+could you confirm whether qemu 1:2.2+dfsg-3exp~ubuntu1 from https://launchpad.net/~ubuntu-virt/+archive/ubuntu/virt-daily-upstream fixes this issue?  If it does then I'll go ahead and backport the patch.
+
+Hi,
+
+I've seen some strange time behavior in some of our VMs usually triggered by live migration. In some VMs we have seen some significant time drift which NTP was not able to correct after doing a live migration. 
+
+I've not been able so far to reproduce the same case, however, I did notice that live migration does introduce some increase in clock jitter values, and I am not sure if that might have anything to do with any significant time drift.
+
+Here is an example of a CentOS 6 guest running under qemu 1.2 before doing a live migration:
+
+[root@centos ~]# ntpq -pcrv
+     remote           refid      st t when poll reach   delay   offset  jitter
+==========================================================================
++helium.constant 18.26.4.105      2 u   65   64  377   60.539   -0.011   0.554
+-209.118.204.201 128.9.176.30     2 u   47   64  377   15.750   -1.835   0.388
+*time3.chpc.utah 198.60.22.240    2 u   46   64  377   30.585    3.934   0.253
++dns2.untangle.c 216.218.254.202  2 u   21   64  377   22.196    2.345   0.740
+associd=0 status=0615 leap_none, sync_ntp, 1 event, clock_sync,
+version="ntpd 4.2.6p5@1.2349-o Sat Dec 20 02:53:39 UTC 2014 (1)",
+processor="x86_64", system="Linux/2.6.32-504.3.3.el6.x86_64", leap=00,
+stratum=3, precision=-21, rootdelay=32.355, rootdisp=53.173,
+refid=155.101.3.115,
+reftime=d86264f3.444c75e7  Thu, Jan 15 2015 16:10:27.266,
+clock=d86265ed.10a34c1c  Thu, Jan 15 2015 16:14:37.064, peer=3418, tc=6,
+mintc=3, offset=0.000, frequency=2.863, sys_jitter=2.024,
+clk_jitter=2.283, clk_wander=0.000
+
+[root@centos ~]# ntpdc -c kerninfo
+pll offset:           0 s
+pll frequency:        2.863 ppm
+maximum error:        0.19838 s
+estimated error:      0.002282 s
+status:               2001  pll nano
+pll time constant:    6
+precision:            1e-09 s
+frequency tolerance:  500 ppm
+
+Immediately after live migration, you can see that there is an increase in jitter values:
+[root@centos ~]# ntpq -pcrv
+     remote           refid      st t when poll reach   delay   offset  jitter
+==========================================================================
+-helium.constant 18.26.4.105      2 u   59   64  377   60.556   -0.916  31.921
++209.118.204.201 128.9.176.30     2 u   38   64  377   15.717   28.879  12.220
++time3.chpc.utah 132.163.4.103    2 u   45   64  353   30.639    3.240  26.975
+*dns2.untangle.c 216.218.254.202  2 u   17   64  377   22.248   33.039  11.791
+associd=0 status=0615 leap_none, sync_ntp, 1 event, clock_sync,
+version="ntpd 4.2.6p5@1.2349-o Sat Dec 20 02:53:39 UTC 2014 (1)",
+processor="x86_64", system="Linux/2.6.32-504.3.3.el6.x86_64", leap=00,
+stratum=3, precision=-21, rootdelay=25.086, rootdisp=83.736,
+refid=74.123.29.4,
+reftime=d8626838.47529689  Thu, Jan 15 2015 16:24:24.278,
+clock=d8626849.4920018a  Thu, Jan 15 2015 16:24:41.285, peer=3419, tc=6,
+mintc=3, offset=24.118, frequency=11.560, sys_jitter=15.145,
+clk_jitter=8.056, clk_wander=2.757
+
+[root@centos ~]# ntpdc -c kerninfo
+pll offset:           0.0211957 s
+pll frequency:        11.560 ppm
+maximum error:        0.112523 s
+estimated error:      0.008055 s
+status:               2001  pll nano
+pll time constant:    6
+precision:            1e-09 s
+frequency tolerance:  500 ppm
+
+
+The increase in the jitter and offset values is well within the 500 ppm frequency tolerance limit, and therefore are easily corrected by subsequent NTP clock sync events, but some live migrations do cause much higher jitter and offset jumps, which can not be corrected by NTP and cause the time to go way off. Any idea why this is the case?
+
+I've tried backporting the patches (9a48bcd1b82494671c111109b0eefdb882581499 and 317b0a6d8ba44e9bf8f9c3dbd776c4536843d82c) on top of upstream qemu 1.2, but it actually caused even higher jitter in the order of 100+ ppm.
+
+Any idea what I might be missing?
+
+The attachment "backport.patch" seems to be a patch.  If it isn't, please remove the "patch" flag from the attachment, remove the "patch" tag, and if you are a member of the ~ubuntu-reviewers, unsubscribe the team.
+
+[This is an automated message performed by a Launchpad user owned by ~brian-murray, for any issues please contact him.]
+
+Hi,
+
+just to be clear, the backport.patch which you uploaded actually increased jitter for you, making the situation worse, right?
+
+
+Hi Serge,
+Yes, that's the case. Let me also make it clear that this is a backport on top of qemu 1.2 stable.
+
+Ping.
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+I believe this should be fixed in 15.04, as the cited patches are present.  Could someone confirm?
+
+I'm sorry, but I'm not clear at this point on the status of this bug.  I never received an answer to comments #32 and comment #35, and don't know what, if anything, to apply in an SRU.
+
+
+Could someone confirm whether this is fixed in 15.04 and/or 15.10?
+
+Thanks for looking into this.  We started experimenting with live migration on 14.04 and stumbled over this bug.   As a workaround we've installed qemu from the Ubuntu Cloud archive (https://wiki.ubuntu.com/ServerTeam/CloudArchive).  I can confirm this bug is fixed in
+
+qemu-kvm:amd64/trusty-updates 1:2.2+dfsg-5expubuntu9.3~cloud0
+
+An SRU for 14.04 would be nice.
+
+Thanks in advance.
+
+
+
+Thanks - marked fixed released for development release.  We can SRU this into trusty if we know exactly which patch actualy fixed it.
+
+But unfortunately we do not know which patch fixed it, making an SRU much more problematic.  Someone who is able to reproduce the bug would need to try to either bisect, or make educated guesses and test patch cherrypicks.
+
+In the absence of any progress on this, and suddenly remembering that I'm occasionally affected by this, I did some digging and found this:
+
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=786789
+
+Looks like those four patches might be the solution?
+
+@Steve,
+
+it seems to me those are the same as the 'backport.patch' from an earlier comment?
+
+@serge,
+
+I'd be happy to test each of the patches, but considering the length of this page I'd like an exact link to a patch and/or patches that need to be tested, and against which version (trusty-security i suppose?).
+
+
+See https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1297218/+attachment/4301780/+files/backport.patch referenced in comment #29 
+
+That patch does not apply cleanly on qemu (2.0.0+dfsg, from trusty). There are changes in "kvmclock_pre_save" and "kvmclock_post_save", there's only "kvmclock_vm_state_change" in 2.0.0.
+
+Peeking at the 4 referenced patches on https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=786789
+the code changes are "about the same", so I'll concatenate those 4 and build that.
+
+Thanks,
+
+I can reasonably assume that this solved my problem. I've live migrated 41 VM's 5 times between 2 hypervisors without the 100% cpu problem appearing. 
+
+My production servers run 2.0.0+dfsg-2ubuntu1.22, and still observe the same problem.
+
+
+Attached is the patch that I created with quilt in debian/patches; This one mirrors the 4 patches that are listed in the debian bugreport[1]. The patch should apply cleanly with qemu 2.0.0+dfsg-2ubuntu1.24 (from trusty-security).
+
+Let's hope others can benefit from an ubuntu update :)
+
+[1] https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=786789
+
+Thank you.  I'm doing a test build in ppa:serge-hallyn/virt, and will run a full regression test from there.  I'll push for SRU if that passes.
+
+Would you mind putting in the bug Description (at top) a concise summary of the test case, for the SRU process?
+
+Conflicting experimental packages in that ppa, trying ubuntu-virt/ppa instead.
+
+We have four identical Ubuntu servers running libvirt/kvm/qemu, with access to CEPH rbd filesystems. Guests can be live migrated between them. However, live migration leads in ~30% of the cases to guests being stuck at 100%. Only a few times we had the patience to wait, and upon logging in our passwords were said to be expired; thus we couldn't log in.
+
+This happened mostly to long running VM's, but not all of them; this makes debugging hard.
+
+These servers run ubuntu 14.04 (trusty):
+ceph:    0.94.7-1trusty
+qemu:    2.0.0+dfsg-2ubuntu1.22
+linux:   3.13.0.88.94
+libvirt: 1.2.2-0ubuntu13.1.16
+
+
+Is this what you request?
+
+No, I'm afraid not.  But if you can test when this package is accepted into trusty-proposed that'll be great.
+
+Hello Paul, or anyone else affected,
+
+Accepted qemu into trusty-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/2.0.0+dfsg-2ubuntu1.25 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Hello Chris,
+
+Steps taken to test the proposed package:
+
+1) enabled trusty-proposed
+2) installed qemu-system-arm qemu-system-common qemu-system-misc qemu-system-x86 qemu-user version 2.0.0+dfsg-2ubuntu1.25
+3) again on a second trusty14.04 server
+4) migrate 41 running VM's (uptimes vary between 1 and 142 days) between 2 upgraded hosts, several times.
+
+Result: I haven't observed any problems after 168 live migrations.
+
+Hypervisor OS: ubuntu 14.04 (trusty):
+ceph: 0.94.7-1trusty
+qemu: 2.0.0+dfsg-2ubuntu1.25
+linux: 3.13.0.92.99
+libvirt: 1.2.2-0ubuntu13.1.17
+
+VMs are a mix of debian-jessie and debian-wheezy.
+
+
+
+
+
+Awesome- thanks for verifying
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 2.0.0+dfsg-2ubuntu1.25
+
+---------------
+qemu (2.0.0+dfsg-2ubuntu1.25) trusty; urgency=medium
+
+  [Kai Storbeck]
+  * backport patch to fix guest hangs after live migration (LP: #1297218)
+
+ -- Serge Hallyn <email address hidden>  Fri, 01 Jul 2016 14:25:20 -0500
+
+If I've got comment 27 right, the issue has also been fixed upstream, so I'm setting the status now to "Fix released". If there's still something left to do here, feel free to change it again.
+

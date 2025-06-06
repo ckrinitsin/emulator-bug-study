@@ -1,0 +1,83 @@
+other: 0.093
+device: 0.084
+KVM: 0.079
+vnc: 0.073
+permissions: 0.073
+PID: 0.070
+debug: 0.070
+socket: 0.069
+files: 0.069
+graphic: 0.069
+semantic: 0.066
+network: 0.065
+boot: 0.065
+performance: 0.056
+debug: 0.697
+PID: 0.080
+files: 0.061
+performance: 0.034
+other: 0.027
+semantic: 0.024
+device: 0.022
+KVM: 0.011
+graphic: 0.009
+permissions: 0.008
+network: 0.007
+socket: 0.007
+boot: 0.007
+vnc: 0.005
+
+Qemu 2.2.0 savevm crash.
+
+qemu 2.1.2 is good.
+
+(gdb) bt
+#0  0x00007ffff4aae445 in raise () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007ffff4ab1bab in abort () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x0000555555997951 in qcow2_cache_find_entry_to_replace (c=0x555556389780) at block/qcow2-cache.c:262
+#3  0x0000555555997a1a in qcow2_cache_do_get (bs=0x5555563836f0, c=0x555556389780, offset=1094713344, table=0x7fffffffc528, 
+    read_from_disk=true) at block/qcow2-cache.c:285
+#4  0x0000555555997c45 in qcow2_cache_get (bs=0x5555563836f0, c=0x555556389780, offset=1094713344, table=0x7fffffffc528)
+    at block/qcow2-cache.c:331
+#5  0x0000555555991ca9 in l2_allocate (bs=0x5555563836f0, l1_index=1, table=0x7fffffffc5a0) at block/qcow2-cluster.c:247
+#6  0x000055555599290c in get_cluster_table (bs=0x5555563836f0, offset=549755813888, new_l2_table=0x7fffffffc610, 
+    new_l2_index=0x7fffffffc62c) at block/qcow2-cluster.c:620
+#7  0x0000555555994213 in discard_single_l2 (bs=0x5555563836f0, offset=549755813888, nb_clusters=156, type=QCOW2_DISCARD_NEVER, 
+    full_discard=false) at block/qcow2-cluster.c:1425
+#8  0x0000555555994491 in qcow2_discard_clusters (bs=0x5555563836f0, offset=549755813888, nb_sectors=638976, type=QCOW2_DISCARD_NEVER, 
+    full_discard=false) at block/qcow2-cluster.c:1516
+#9  0x00005555559965c8 in qcow2_snapshot_create (bs=0x5555563836f0, sn_info=0x7fffffffc830) at block/qcow2-snapshot.c:441
+#10 0x00005555559ad1ad in bdrv_snapshot_create (bs=0x5555563836f0, sn_info=0x7fffffffc830) at block/snapshot.c:167
+#11 0x000055555565e90f in do_savevm (mon=0x555556992d20, qdict=0x5555599d5c00) at /vms/qemu/qemu-2.2.0/savevm.c:1126
+
+(gdb) show args
+Argument list to give program being debugged when it is started is "-name u1404-01 -S -machine pc,accel=kvm,usb=off -m 1024 -smp 2,sockets=2,cores=1,threads=1 -no-user-config -nodefaults -monitor stdio -rtc base=utc -no-shutdown -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x5 -drive file=/vms/images/u1404-01.img,if=none,id=drive-virtio-disk0,format=qcow2,cache=directsync -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0 -drive if=none,id=drive-ide0-1-0,readonly=on,format=raw -device ide-cd,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -device usb-tablet,id=input0 -vnc 0.0.0.0:0 -device cirrus-vga,id=video0,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x6".
+
+Maybe bdrv_snapshot_create() should take s->lock but it's not clear yet what causes all qcow2 cache entries to be referenced.
+
+How do you reproduce this crash?  Please give exact steps including what commands to run inside the guest and what QEMU monitor commands to run.
+
+Is the crash deterministic (does it happen every time or with a random chance)?
+
+The bug can be reproduced every time.
+
+1. I install a Ubuntu 14.04 guest.
+2. The monitor command is  (qemu) snapshot_blkdev_internal drive-virtio-disk0 s1
+3. Or (qemu) savevm s1
+
+I think I get the reason. 
+
+From Qemu 2.2.0, in qcow2_open:  l2_cache_size = MAX(DEFAULT_L2_CACHE_BYTE_SIZE/s->cluster_size, MIN_L2_CACHE_SIZE);
+Here DEFAULT_L2_CACHE_BYTE_SIZE=1M, MIN_L2_CACHE_SIZE=1.
+
+If the cluster_size < 1M, the  l2_cache_size will be greater than 1, it is ok.
+
+If the cluster_size>=1M, the l2_cache_size will be 1. After create snapshot, the first qcow2_co_writev will abort at qcow2_cache_find_entry_to_replace, because no free room in l2_table_cache. If change the MIN_L2_CACHE_SIZE to 16, it is ok.
+
+
+
+
+
+
+Triaging old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
