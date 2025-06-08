@@ -1,0 +1,183 @@
+permissions: 0.937
+TCG: 0.934
+debug: 0.925
+architecture: 0.924
+register: 0.922
+mistranslation: 0.915
+risc-v: 0.914
+x86: 0.909
+semantic: 0.904
+device: 0.904
+kernel virtual machine: 0.901
+performance: 0.898
+assembly: 0.896
+PID: 0.894
+vnc: 0.893
+arm: 0.887
+files: 0.879
+graphic: 0.862
+boot: 0.841
+socket: 0.817
+other: 0.813
+network: 0.758
+
+[BUG] cxl,i386: e820 mappings may not be correct for cxl
+
+Context included below from prior discussion
+    - `cxl create-region` would fail on inability to allocate memory
+    - traced this down to the memory region being marked RESERVED
+    - E820 map marks the CXL fixed memory window as RESERVED
+
+
+Re: x86 errors, I found that region worked with this patch. (I also
+added the SRAT patches the Davidlohr posted, but I do not think they are
+relevant).
+
+I don't think this is correct, and setting this to E820_RAM causes the
+system to fail to boot at all, but with this change `cxl create-region`
+succeeds, which suggests our e820 mappings in the i386 machine are
+incorrect.
+
+Anyone who can help or have an idea as to what e820 should actually be
+doing with this region, or if this is correct and something else is
+failing, please help!
+
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 566accf7e6..a5e688a742 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1077,7 +1077,7 @@ void pc_memory_init(PCMachineState *pcms,
+                 memory_region_init_io(&fw->mr, OBJECT(machine), &cfmws_ops, fw,
+                                       "cxl-fixed-memory-region", fw->size);
+                 memory_region_add_subregion(system_memory, fw->base, &fw->mr);
+-                e820_add_entry(fw->base, fw->size, E820_RESERVED);
++                e820_add_entry(fw->base, fw->size, E820_NVS);
+                 cxl_fmw_base += fw->size;
+                 cxl_resv_end = cxl_fmw_base;
+             }
+
+
+On Mon, Oct 10, 2022 at 05:32:42PM +0100, Jonathan Cameron wrote:
+>
+>
+> > but i'm not sure of what to do with this info.  We have some proof
+>
+> > that real hardware works with this no problem, and the only difference
+>
+> > is that the EFI/bios/firmware is setting the memory regions as `usable`
+>
+> > or `soft reserved`, which would imply the EDK2 is the blocker here
+>
+> > regardless of the OS driver status.
+>
+> >
+>
+> > But I'd seen elsewhere you had gotten some of this working, and I'm
+>
+> > failing to get anything working at the moment.  If you have any input i
+>
+> > would greatly appreciate the help.
+>
+> >
+>
+> > QEMU config:
+>
+> >
+>
+> > /opt/qemu-cxl2/bin/qemu-system-x86_64 \
+>
+> > -drive
+>
+> > file=/var/lib/libvirt/images/cxl.qcow2,format=qcow2,index=0,media=d\
+>
+> > -m 2G,slots=4,maxmem=4G \
+>
+> > -smp 4 \
+>
+> > -machine type=q35,accel=kvm,cxl=on \
+>
+> > -enable-kvm \
+>
+> > -nographic \
+>
+> > -device pxb-cxl,id=cxl.0,bus=pcie.0,bus_nr=52 \
+>
+> > -device cxl-rp,id=rp0,bus=cxl.0,chassis=0,slot=0 \
+>
+> > -object memory-backend-file,id=cxl-mem0,mem-path=/tmp/cxl-mem0,size=256M \
+>
+> > -object memory-backend-file,id=lsa0,mem-path=/tmp/cxl-lsa0,size=256M \
+>
+> > -device cxl-type3,bus=rp0,pmem=true,memdev=cxl-mem0,lsa=lsa0,id=cxl-pmem0
+>
+> > \
+>
+> > -M cxl-fmw.0.targets.0=cxl.0,cxl-fmw.0.size=256M
+>
+> >
+>
+> > I'd seen on the lists that you had seen issues with single-rp setups,
+>
+> > but no combination of configuration I've tried (including all the ones
+>
+> > in the docs and tests) lead to a successful region creation with
+>
+> > `cxl create-region`
+>
+>
+>
+> Hmm. Let me have a play.  I've not run x86 tests for a while so
+>
+> perhaps something is missing there.
+>
+>
+>
+> I'm carrying a patch to override check_last_peer() in
+>
+> cxl_port_setup_targets() as that is wrong for some combinations,
+>
+> but that doesn't look like it's related to what you are seeing.
+>
+>
+I'm not sure if it's relevant, but turned out I'd forgotten I'm carrying 3
+>
+patches that aren't upstream (and one is a horrible hack).
+>
+>
+Hack:
+https://lore.kernel.org/linux-cxl/20220819094655.000005ed@huawei.com/
+>
+Shouldn't affect a simple case like this...
+>
+>
+https://lore.kernel.org/linux-cxl/20220819093133.00006c22@huawei.com/T/#t
+>
+(Dan's version)
+>
+>
+https://lore.kernel.org/linux-cxl/20220815154044.24733-1-Jonathan.Cameron@huawei.com/T/#t
+>
+>
+For writes to work you will currently need two rps (nothing on the second is
+>
+fine)
+>
+as we still haven't resolved if the kernel should support an HDM decoder on
+>
+a host bridge with one port.  I think it should (Spec allows it), others
+>
+unconvinced.
+>
+>
+Note I haven't shifted over to x86 yet so may still be something different
+>
+from
+>
+arm64.
+>
+>
+Jonathan
+>
+>
+

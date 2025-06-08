@@ -1,0 +1,366 @@
+kernel virtual machine: 0.812
+risc-v: 0.809
+mistranslation: 0.800
+other: 0.786
+TCG: 0.785
+x86: 0.779
+vnc: 0.768
+performance: 0.758
+permissions: 0.758
+register: 0.756
+architecture: 0.755
+files: 0.751
+boot: 0.750
+device: 0.748
+assembly: 0.747
+debug: 0.746
+arm: 0.744
+semantic: 0.737
+network: 0.732
+socket: 0.732
+graphic: 0.730
+PID: 0.727
+
+[BUG] accel/tcg: cpu_exec_longjmp_cleanup: assertion failed: (cpu == current_cpu)
+
+It seems there is a bug in SIGALRM handling when 486 system emulates x86_64 
+code.
+
+This code: 
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+
+pthread_t thread1, thread2;
+
+// Signal handler for SIGALRM
+void alarm_handler(int sig) {
+    // Do nothing, just wake up the other thread
+}
+
+// Thread 1 function
+void* thread1_func(void* arg) {
+    // Set up the signal handler for SIGALRM
+    signal(SIGALRM, alarm_handler);
+
+    // Wait for 5 seconds
+    sleep(1);
+
+    // Send SIGALRM signal to thread 2
+    pthread_kill(thread2, SIGALRM);
+
+    return NULL;
+}
+
+// Thread 2 function
+void* thread2_func(void* arg) {
+    // Wait for the SIGALRM signal
+    pause();
+
+    printf("Thread 2 woke up!\n");
+
+    return NULL;
+}
+
+int main() {
+    // Create thread 1
+    if (pthread_create(&thread1, NULL, thread1_func, NULL) != 0) {
+        fprintf(stderr, "Failed to create thread 1\n");
+        return 1;
+    }
+
+    // Create thread 2
+    if (pthread_create(&thread2, NULL, thread2_func, NULL) != 0) {
+        fprintf(stderr, "Failed to create thread 2\n");
+        return 1;
+    }
+
+    // Wait for both threads to finish
+    pthread_join(thread1, NULL);
+    pthread_join(thread2, NULL);
+
+    return 0;
+}
+
+
+Fails with this -strace log (there are also unsupported syscalls 334 and 435, 
+but it seems it doesn't affect the code much):
+
+...
+736 rt_sigaction(SIGALRM,0x000000001123ec20,0x000000001123ecc0) = 0
+736 clock_nanosleep(CLOCK_REALTIME,0,{tv_sec = 1,tv_nsec = 0},{tv_sec = 
+1,tv_nsec = 0})
+736 rt_sigprocmask(SIG_BLOCK,0x00000000109fad20,0x0000000010800b38,8) = 0
+736 Unknown syscall 435
+736 
+clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|
+ ...
+736 rt_sigprocmask(SIG_SETMASK,0x0000000010800b38,NULL,8)
+736 set_robust_list(0x11a419a0,0) = -1 errno=38 (Function not implemented)
+736 rt_sigprocmask(SIG_SETMASK,0x0000000011a41fb0,NULL,8) = 0
+ = 0
+736 pause(0,0,2,277186368,0,295966400)
+736 
+futex(0x000000001123f990,FUTEX_CLOCK_REALTIME|FUTEX_WAIT_BITSET,738,NULL,NULL,0)
+ = 0
+736 rt_sigprocmask(SIG_BLOCK,0x00000000109fad20,0x000000001123ee88,8) = 0
+736 getpid() = 736
+736 tgkill(736,739,SIGALRM) = 0
+ = -1 errno=4 (Interrupted system call)
+--- SIGALRM {si_signo=SIGALRM, si_code=SI_TKILL, si_pid=736, si_uid=0} ---
+0x48874a != 0x3c69e10
+736 rt_sigprocmask(SIG_SETMASK,0x000000001123ee88,NULL,8) = 0
+**
+ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion failed: 
+(cpu == current_cpu)
+Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion 
+failed: (cpu == current_cpu)
+0x48874a != 0x3c69e10
+**
+ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion failed: 
+(cpu == current_cpu)
+Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion 
+failed: (cpu == current_cpu)
+# 
+
+The code fails either with or without -singlestep, the command line:
+
+/usr/bin/qemu-x86_64 -L /opt/x86_64 -strace -singlestep  /opt/x86_64/alarm.bin
+
+Source code of QEMU 8.1.1 was modified with patch "[PATCH] qemu/timer: Don't 
+use RDTSC on i486" [1], 
+with added few ioctls (not relevant) and cpu_exec_longjmp_cleanup() now prints 
+current pointers of 
+cpu and current_cpu (line "0x48874a != 0x3c69e10").
+
+config.log (built as a part of buildroot, basically the minimal possible 
+configuration for running x86_64 on 486):
+
+# Configured with: 
+'/mnt/hd_8tb_p1/p1/home/crossgen/buildroot_486_2/output/build/qemu-8.1.1/configure'
+ '--prefix=/usr' 
+'--cross-prefix=/mnt/hd_8tb_p1/p1/home/crossgen/buildroot_486_2/output/host/bin/i486-buildroot-linux-gnu-'
+ '--audio-drv-list=' 
+'--python=/mnt/hd_8tb_p1/p1/home/crossgen/buildroot_486_2/output/host/bin/python3'
+ 
+'--ninja=/mnt/hd_8tb_p1/p1/home/crossgen/buildroot_486_2/output/host/bin/ninja' 
+'--disable-alsa' '--disable-bpf' '--disable-brlapi' '--disable-bsd-user' 
+'--disable-cap-ng' '--disable-capstone' '--disable-containers' 
+'--disable-coreaudio' '--disable-curl' '--disable-curses' 
+'--disable-dbus-display' '--disable-docs' '--disable-dsound' '--disable-hvf' 
+'--disable-jack' '--disable-libiscsi' '--disable-linux-aio' 
+'--disable-linux-io-uring' '--disable-malloc-trim' '--disable-membarrier' 
+'--disable-mpath' '--disable-netmap' '--disable-opengl' '--disable-oss' 
+'--disable-pa' '--disable-rbd' '--disable-sanitizers' '--disable-selinux' 
+'--disable-sparse' '--disable-strip' '--disable-vde' '--disable-vhost-crypto' 
+'--disable-vhost-user-blk-server' '--disable-virtfs' '--disable-whpx' 
+'--disable-xen' '--disable-attr' '--disable-kvm' '--disable-vhost-net' 
+'--disable-download' '--disable-hexagon-idef-parser' '--disable-system' 
+'--enable-linux-user' '--target-list=x86_64-linux-user' '--disable-vhost-user' 
+'--disable-slirp' '--disable-sdl' '--disable-fdt' '--enable-trace-backends=nop' 
+'--disable-tools' '--disable-guest-agent' '--disable-fuse' 
+'--disable-fuse-lseek' '--disable-seccomp' '--disable-libssh' 
+'--disable-libusb' '--disable-vnc' '--disable-nettle' '--disable-numa' 
+'--disable-pipewire' '--disable-spice' '--disable-usb-redir' 
+'--disable-install-blobs'
+
+Emulation of the same x86_64 code with qemu 6.2.0 installed on another x86_64 
+native machine works fine.
+
+[1]
+https://lists.nongnu.org/archive/html/qemu-devel/2023-11/msg05387.html
+Best regards,
+Petr
+
+On Sat, 25 Nov 2023 at 13:09, Petr Cvek <petrcvekcz@gmail.com> wrote:
+>
+>
+It seems there is a bug in SIGALRM handling when 486 system emulates x86_64
+>
+code.
+486 host is pretty well out of support currently. Can you reproduce
+this on a less ancient host CPU type ?
+
+>
+ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion failed:
+>
+(cpu == current_cpu)
+>
+Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup:
+>
+assertion failed: (cpu == current_cpu)
+>
+0x48874a != 0x3c69e10
+>
+**
+>
+ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion failed:
+>
+(cpu == current_cpu)
+>
+Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup:
+>
+assertion failed: (cpu == current_cpu)
+What compiler version do you build QEMU with? That
+assert is there because we have seen some buggy compilers
+in the past which don't correctly preserve the variable
+value as the setjmp/longjmp spec requires them to.
+
+thanks
+-- PMM
+
+Dne 27. 11. 23 v 10:37 Peter Maydell napsal(a):
+>
+On Sat, 25 Nov 2023 at 13:09, Petr Cvek <petrcvekcz@gmail.com> wrote:
+>
+>
+>
+> It seems there is a bug in SIGALRM handling when 486 system emulates x86_64
+>
+> code.
+>
+>
+486 host is pretty well out of support currently. Can you reproduce
+>
+this on a less ancient host CPU type ?
+>
+It seems it only fails when the code is compiled for i486. QEMU built with the 
+same compiler with -march=i586 and above runs on the same physical hardware 
+without a problem. All -march= variants were executed on ryzen 3600.
+
+>
+> ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion
+>
+> failed: (cpu == current_cpu)
+>
+> Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup:
+>
+> assertion failed: (cpu == current_cpu)
+>
+> 0x48874a != 0x3c69e10
+>
+> **
+>
+> ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion
+>
+> failed: (cpu == current_cpu)
+>
+> Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup:
+>
+> assertion failed: (cpu == current_cpu)
+>
+>
+What compiler version do you build QEMU with? That
+>
+assert is there because we have seen some buggy compilers
+>
+in the past which don't correctly preserve the variable
+>
+value as the setjmp/longjmp spec requires them to.
+>
+i486 and i586+ code variants were compiled with GCC 13.2.0 (more exactly, 
+slackware64 current multilib distribution).
+
+i486 binary which runs on the real 486 is also GCC 13.2.0 and installed as a 
+part of the buildroot crosscompiler (about two week old git snapshot).
+
+>
+thanks
+>
+-- PMM
+best regards,
+Petr
+
+On 11/25/23 07:08, Petr Cvek wrote:
+ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion failed: 
+(cpu == current_cpu)
+Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion 
+failed: (cpu == current_cpu)
+#
+
+The code fails either with or without -singlestep, the command line:
+
+/usr/bin/qemu-x86_64 -L /opt/x86_64 -strace -singlestep  /opt/x86_64/alarm.bin
+
+Source code of QEMU 8.1.1 was modified with patch "[PATCH] qemu/timer: Don't use 
+RDTSC on i486" [1],
+with added few ioctls (not relevant) and cpu_exec_longjmp_cleanup() now prints 
+current pointers of
+cpu and current_cpu (line "0x48874a != 0x3c69e10").
+If you try this again with 8.2-rc2, you should not see an assertion failure.
+You should see instead
+
+QEMU internal SIGILL {code=ILLOPC, addr=0x12345678}
+which I think more accurately summarizes the situation of attempting RDTSC on hardware
+that does not support it.
+r~
+
+Dne 29. 11. 23 v 15:25 Richard Henderson napsal(a):
+>
+On 11/25/23 07:08, Petr Cvek wrote:
+>
+> ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup: assertion
+>
+> failed: (cpu == current_cpu)
+>
+> Bail out! ERROR:../accel/tcg/cpu-exec.c:546:cpu_exec_longjmp_cleanup:
+>
+> assertion failed: (cpu == current_cpu)
+>
+> #
+>
+>
+>
+> The code fails either with or without -singlestep, the command line:
+>
+>
+>
+> /usr/bin/qemu-x86_64 -L /opt/x86_64 -strace -singlestepÂ
+>
+> /opt/x86_64/alarm.bin
+>
+>
+>
+> Source code of QEMU 8.1.1 was modified with patch "[PATCH] qemu/timer: Don't
+>
+> use RDTSC on i486" [1],
+>
+> with added few ioctls (not relevant) and cpu_exec_longjmp_cleanup() now
+>
+> prints current pointers of
+>
+> cpu and current_cpu (line "0x48874a != 0x3c69e10").
+>
+>
+>
+If you try this again with 8.2-rc2, you should not see an assertion failure.
+>
+You should see instead
+>
+>
+QEMU internal SIGILL {code=ILLOPC, addr=0x12345678}
+>
+>
+which I think more accurately summarizes the situation of attempting RDTSC on
+>
+hardware that does not support it.
+>
+>
+Compilation of vanilla qemu v8.2.0-rc2 with -march=i486 by GCC 13.2.0 and 
+running the resulting binary on ryzen still leads to:
+
+**
+ERROR:../accel/tcg/cpu-exec.c:533:cpu_exec_longjmp_cleanup: assertion failed: 
+(cpu == current_cpu)
+Bail out! ERROR:../accel/tcg/cpu-exec.c:533:cpu_exec_longjmp_cleanup: assertion 
+failed: (cpu == current_cpu)
+Aborted
+
+>
+>
+r~
+Petr
+
