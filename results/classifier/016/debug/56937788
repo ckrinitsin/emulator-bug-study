@@ -1,0 +1,371 @@
+debug: 0.971
+virtual: 0.939
+hypervisor: 0.419
+x86: 0.253
+files: 0.082
+PID: 0.062
+operating system: 0.049
+device: 0.048
+i386: 0.031
+TCG: 0.023
+user-level: 0.016
+assembly: 0.015
+kernel: 0.013
+register: 0.011
+peripherals: 0.008
+ppc: 0.007
+arm: 0.006
+VMM: 0.006
+socket: 0.006
+performance: 0.005
+architecture: 0.005
+semantic: 0.004
+boot: 0.003
+network: 0.003
+alpha: 0.003
+KVM: 0.002
+risc-v: 0.001
+graphic: 0.001
+permissions: 0.001
+vnc: 0.001
+mistranslation: 0.000
+
+[Qemu-devel] [Bug] virtio-blk: qemu will crash if hotplug virtio-blk device failed
+
+I found that hotplug virtio-blk device will lead to qemu crash.
+
+Re-production steps:
+
+1.       Run VM named vm001
+
+2.       Create a virtio-blk.xml which contains wrong configurations:
+<disk device="lun" rawio="yes" type="block">
+  <driver cache="none" io="native" name="qemu" type="raw" />
+  <source dev="/dev/mapper/11-dm" />
+  <target bus="virtio" dev="vdx" />
+</disk>
+
+3.       Run command : virsh attach-device vm001 vm001
+
+Libvirt will return err msg:
+
+error: Failed to attach device from blk-scsi.xml
+
+error: internal error: unable to execute QEMU command 'device_add': Please set 
+scsi=off for virtio-blk devices in order to use virtio 1.0
+
+it means hotplug virtio-blk device failed.
+
+4.       Suspend or shutdown VM will leads to qemu crash
+
+
+
+from gdb:
+
+
+(gdb) bt
+#0  object_get_class (address@hidden) at qom/object.c:750
+#1  0x00007f9a72582e01 in virtio_vmstate_change (opaque=0x7f9a73d10960, 
+running=0, state=<optimized out>) at 
+/mnt/sdb/lzc/code/open/qemu/hw/virtio/virtio.c:2203
+#2  0x00007f9a7261ef52 in vm_state_notify (address@hidden, address@hidden) at 
+vl.c:1685
+#3  0x00007f9a7252603a in do_vm_stop (state=RUN_STATE_PAUSED) at 
+/mnt/sdb/lzc/code/open/qemu/cpus.c:941
+#4  vm_stop (address@hidden) at /mnt/sdb/lzc/code/open/qemu/cpus.c:1807
+#5  0x00007f9a7262eb1b in qmp_stop (address@hidden) at qmp.c:102
+#6  0x00007f9a7262c70a in qmp_marshal_stop (args=<optimized out>, 
+ret=<optimized out>, errp=0x7ffe63e255d8) at qmp-marshal.c:5854
+#7  0x00007f9a72897e79 in do_qmp_dispatch (errp=0x7ffe63e255d0, 
+request=0x7f9a76510120, cmds=0x7f9a72ee7980 <qmp_commands>) at 
+qapi/qmp-dispatch.c:104
+#8  qmp_dispatch (cmds=0x7f9a72ee7980 <qmp_commands>, address@hidden) at 
+qapi/qmp-dispatch.c:131
+#9  0x00007f9a725288d5 in handle_qmp_command (parser=<optimized out>, 
+tokens=<optimized out>) at /mnt/sdb/lzc/code/open/qemu/monitor.c:3852
+#10 0x00007f9a7289d514 in json_message_process_token (lexer=0x7f9a73ce4498, 
+input=0x7f9a73cc6880, type=JSON_RCURLY, x=36, y=17) at 
+qobject/json-streamer.c:105
+#11 0x00007f9a728bb69b in json_lexer_feed_char (address@hidden, ch=125 '}', 
+address@hidden) at qobject/json-lexer.c:323
+#12 0x00007f9a728bb75e in json_lexer_feed (lexer=0x7f9a73ce4498, 
+buffer=<optimized out>, size=<optimized out>) at qobject/json-lexer.c:373
+#13 0x00007f9a7289d5d9 in json_message_parser_feed (parser=<optimized out>, 
+buffer=<optimized out>, size=<optimized out>) at qobject/json-streamer.c:124
+#14 0x00007f9a7252722e in monitor_qmp_read (opaque=<optimized out>, 
+buf=<optimized out>, size=<optimized out>) at 
+/mnt/sdb/lzc/code/open/qemu/monitor.c:3894
+#15 0x00007f9a7284ee1b in tcp_chr_read (chan=<optimized out>, cond=<optimized 
+out>, opaque=<optimized out>) at chardev/char-socket.c:441
+#16 0x00007f9a6e03e99a in g_main_context_dispatch () from 
+/usr/lib64/libglib-2.0.so.0
+#17 0x00007f9a728a342c in glib_pollfds_poll () at util/main-loop.c:214
+#18 os_host_main_loop_wait (timeout=<optimized out>) at util/main-loop.c:261
+#19 main_loop_wait (address@hidden) at util/main-loop.c:515
+#20 0x00007f9a724e7547 in main_loop () at vl.c:1999
+#21 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at 
+vl.c:4877
+
+Problem happens in virtio_vmstate_change which is called by vm_state_notify,
+static void virtio_vmstate_change(void *opaque, int running, RunState state)
+{
+    VirtIODevice *vdev = opaque;
+    BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+    bool backend_run = running && (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK);
+    vdev->vm_running = running;
+
+    if (backend_run) {
+        virtio_set_status(vdev, vdev->status);
+    }
+
+    if (k->vmstate_change) {
+        k->vmstate_change(qbus->parent, backend_run);
+    }
+
+    if (!backend_run) {
+        virtio_set_status(vdev, vdev->status);
+    }
+}
+
+Vdev's parent_bus is NULL, so qdev_get_parent_bus(DEVICE(vdev)) will crash.
+virtio_vmstate_change is added to the list vm_change_state_head at 
+virtio_blk_device_realize(virtio_init),
+but after hotplug virtio-blk failed, virtio_vmstate_change will not be removed 
+from vm_change_state_head.
+
+
+I apply a patch as follews:
+
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 5884ce3..ea532dc 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -2491,6 +2491,7 @@ static void virtio_device_realize(DeviceState *dev, Error 
+**errp)
+     virtio_bus_device_plugged(vdev, &err);
+     if (err != NULL) {
+         error_propagate(errp, err);
++        vdc->unrealize(dev, NULL);
+         return;
+     }
+
+On Tue, Oct 31, 2017 at 05:19:08AM +0000, linzhecheng wrote:
+>
+I found that hotplug virtio-blk device will lead to qemu crash.
+The author posted a patch in a separate email thread.  Please see
+"[PATCH] fix: unrealize virtio device if we fail to hotplug it".
+
+>
+Re-production steps:
+>
+>
+1.       Run VM named vm001
+>
+>
+2.       Create a virtio-blk.xml which contains wrong configurations:
+>
+<disk device="lun" rawio="yes" type="block">
+>
+<driver cache="none" io="native" name="qemu" type="raw" />
+>
+<source dev="/dev/mapper/11-dm" />
+>
+<target bus="virtio" dev="vdx" />
+>
+</disk>
+>
+>
+3.       Run command : virsh attach-device vm001 vm001
+>
+>
+Libvirt will return err msg:
+>
+>
+error: Failed to attach device from blk-scsi.xml
+>
+>
+error: internal error: unable to execute QEMU command 'device_add': Please
+>
+set scsi=off for virtio-blk devices in order to use virtio 1.0
+>
+>
+it means hotplug virtio-blk device failed.
+>
+>
+4.       Suspend or shutdown VM will leads to qemu crash
+>
+>
+>
+>
+from gdb:
+>
+>
+>
+(gdb) bt
+>
+#0  object_get_class (address@hidden) at qom/object.c:750
+>
+#1  0x00007f9a72582e01 in virtio_vmstate_change (opaque=0x7f9a73d10960,
+>
+running=0, state=<optimized out>) at
+>
+/mnt/sdb/lzc/code/open/qemu/hw/virtio/virtio.c:2203
+>
+#2  0x00007f9a7261ef52 in vm_state_notify (address@hidden, address@hidden) at
+>
+vl.c:1685
+>
+#3  0x00007f9a7252603a in do_vm_stop (state=RUN_STATE_PAUSED) at
+>
+/mnt/sdb/lzc/code/open/qemu/cpus.c:941
+>
+#4  vm_stop (address@hidden) at /mnt/sdb/lzc/code/open/qemu/cpus.c:1807
+>
+#5  0x00007f9a7262eb1b in qmp_stop (address@hidden) at qmp.c:102
+>
+#6  0x00007f9a7262c70a in qmp_marshal_stop (args=<optimized out>,
+>
+ret=<optimized out>, errp=0x7ffe63e255d8) at qmp-marshal.c:5854
+>
+#7  0x00007f9a72897e79 in do_qmp_dispatch (errp=0x7ffe63e255d0,
+>
+request=0x7f9a76510120, cmds=0x7f9a72ee7980 <qmp_commands>) at
+>
+qapi/qmp-dispatch.c:104
+>
+#8  qmp_dispatch (cmds=0x7f9a72ee7980 <qmp_commands>, address@hidden) at
+>
+qapi/qmp-dispatch.c:131
+>
+#9  0x00007f9a725288d5 in handle_qmp_command (parser=<optimized out>,
+>
+tokens=<optimized out>) at /mnt/sdb/lzc/code/open/qemu/monitor.c:3852
+>
+#10 0x00007f9a7289d514 in json_message_process_token (lexer=0x7f9a73ce4498,
+>
+input=0x7f9a73cc6880, type=JSON_RCURLY, x=36, y=17) at
+>
+qobject/json-streamer.c:105
+>
+#11 0x00007f9a728bb69b in json_lexer_feed_char (address@hidden, ch=125 '}',
+>
+address@hidden) at qobject/json-lexer.c:323
+>
+#12 0x00007f9a728bb75e in json_lexer_feed (lexer=0x7f9a73ce4498,
+>
+buffer=<optimized out>, size=<optimized out>) at qobject/json-lexer.c:373
+>
+#13 0x00007f9a7289d5d9 in json_message_parser_feed (parser=<optimized out>,
+>
+buffer=<optimized out>, size=<optimized out>) at qobject/json-streamer.c:124
+>
+#14 0x00007f9a7252722e in monitor_qmp_read (opaque=<optimized out>,
+>
+buf=<optimized out>, size=<optimized out>) at
+>
+/mnt/sdb/lzc/code/open/qemu/monitor.c:3894
+>
+#15 0x00007f9a7284ee1b in tcp_chr_read (chan=<optimized out>, cond=<optimized
+>
+out>, opaque=<optimized out>) at chardev/char-socket.c:441
+>
+#16 0x00007f9a6e03e99a in g_main_context_dispatch () from
+>
+/usr/lib64/libglib-2.0.so.0
+>
+#17 0x00007f9a728a342c in glib_pollfds_poll () at util/main-loop.c:214
+>
+#18 os_host_main_loop_wait (timeout=<optimized out>) at util/main-loop.c:261
+>
+#19 main_loop_wait (address@hidden) at util/main-loop.c:515
+>
+#20 0x00007f9a724e7547 in main_loop () at vl.c:1999
+>
+#21 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>)
+>
+at vl.c:4877
+>
+>
+Problem happens in virtio_vmstate_change which is called by vm_state_notify,
+>
+static void virtio_vmstate_change(void *opaque, int running, RunState state)
+>
+{
+>
+VirtIODevice *vdev = opaque;
+>
+BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+>
+VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+>
+bool backend_run = running && (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK);
+>
+vdev->vm_running = running;
+>
+>
+if (backend_run) {
+>
+virtio_set_status(vdev, vdev->status);
+>
+}
+>
+>
+if (k->vmstate_change) {
+>
+k->vmstate_change(qbus->parent, backend_run);
+>
+}
+>
+>
+if (!backend_run) {
+>
+virtio_set_status(vdev, vdev->status);
+>
+}
+>
+}
+>
+>
+Vdev's parent_bus is NULL, so qdev_get_parent_bus(DEVICE(vdev)) will crash.
+>
+virtio_vmstate_change is added to the list vm_change_state_head at
+>
+virtio_blk_device_realize(virtio_init),
+>
+but after hotplug virtio-blk failed, virtio_vmstate_change will not be
+>
+removed from vm_change_state_head.
+>
+>
+>
+I apply a patch as follews:
+>
+>
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+>
+index 5884ce3..ea532dc 100644
+>
+--- a/hw/virtio/virtio.c
+>
++++ b/hw/virtio/virtio.c
+>
+@@ -2491,6 +2491,7 @@ static void virtio_device_realize(DeviceState *dev,
+>
+Error **errp)
+>
+virtio_bus_device_plugged(vdev, &err);
+>
+if (err != NULL) {
+>
+error_propagate(errp, err);
+>
++        vdc->unrealize(dev, NULL);
+>
+return;
+>
+}
+signature.asc
+Description:
+PGP signature
+

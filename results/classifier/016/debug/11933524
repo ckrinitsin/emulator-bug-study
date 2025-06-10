@@ -1,0 +1,1152 @@
+i386: 0.998
+x86: 0.946
+debug: 0.943
+kernel: 0.926
+boot: 0.907
+operating system: 0.652
+architecture: 0.061
+device: 0.024
+files: 0.023
+PID: 0.022
+TCG: 0.014
+register: 0.009
+assembly: 0.009
+semantic: 0.005
+hypervisor: 0.005
+virtual: 0.005
+peripherals: 0.003
+KVM: 0.003
+permissions: 0.003
+performance: 0.003
+alpha: 0.002
+risc-v: 0.002
+graphic: 0.001
+VMM: 0.001
+user-level: 0.001
+network: 0.001
+ppc: 0.001
+socket: 0.001
+mistranslation: 0.001
+vnc: 0.000
+arm: 0.000
+
+[BUG] hw/i386/pc.c: CXL Fixed Memory Window should not reserve e820 in bios
+
+Early-boot e820 records will be inserted by the bios/efi/early boot
+software and be reported to the kernel via insert_resource.  Later, when
+CXL drivers iterate through the regions again, they will insert another
+resource and make the RESERVED memory area a child.
+
+This RESERVED memory area causes the memory region to become unusable,
+and as a result attempting to create memory regions with
+
+    `cxl create-region ...`
+
+Will fail due to the RESERVED area intersecting with the CXL window.
+
+
+During boot the following traceback is observed:
+
+0xffffffff81101650 in insert_resource_expand_to_fit ()
+0xffffffff83d964c5 in e820__reserve_resources_late ()
+0xffffffff83e03210 in pcibios_resource_survey ()
+0xffffffff83e04f4a in pcibios_init ()
+
+Which produces a call to reserve the CFMWS area:
+
+(gdb) p *new
+$54 = {start = 0x290000000, end = 0x2cfffffff, name = "Reserved",
+       flags = 0x200, desc = 0x7, parent = 0x0, sibling = 0x0,
+       child = 0x0}
+
+Later the Kernel parses ACPI tables and reserves the exact same area as
+the CXL Fixed Memory Window.  The use of `insert_resource_conflict`
+retains the RESERVED region and makes it a child of the new region.
+
+0xffffffff811016a4 in insert_resource_conflict ()
+                      insert_resource ()
+0xffffffff81a81389 in cxl_parse_cfmws ()
+0xffffffff818c4a81 in call_handler ()
+                      acpi_parse_entries_array ()
+
+(gdb) p/x *new
+$59 = {start = 0x290000000, end = 0x2cfffffff, name = "CXL Window 0",
+       flags = 0x200, desc = 0x0, parent = 0x0, sibling = 0x0,
+       child = 0x0}
+
+This produces the following output in /proc/iomem:
+
+590000000-68fffffff : CXL Window 0
+  590000000-68fffffff : Reserved
+
+This reserved area causes `get_free_mem_region()` to fail due to a check
+against `__region_intersects()`.  Due to this reserved area, the
+intersect check will only ever return REGION_INTERSECTS, which causes
+`cxl create-region` to always fail.
+
+Signed-off-by: Gregory Price <gregory.price@memverge.com>
+---
+ hw/i386/pc.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 566accf7e6..5bf5465a21 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+         hwaddr cxl_size = MiB;
+ 
+         cxl_base = pc_get_cxl_range_start(pcms);
+-        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+         memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+         memory_region_add_subregion(system_memory, cxl_base, mr);
+         cxl_resv_end = cxl_base + cxl_size;
+@@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+                 memory_region_init_io(&fw->mr, OBJECT(machine), &cfmws_ops, fw,
+                                       "cxl-fixed-memory-region", fw->size);
+                 memory_region_add_subregion(system_memory, fw->base, &fw->mr);
+-                e820_add_entry(fw->base, fw->size, E820_RESERVED);
+                 cxl_fmw_base += fw->size;
+                 cxl_resv_end = cxl_fmw_base;
+             }
+-- 
+2.37.3
+
+Early-boot e820 records will be inserted by the bios/efi/early boot
+software and be reported to the kernel via insert_resource.  Later, when
+CXL drivers iterate through the regions again, they will insert another
+resource and make the RESERVED memory area a child.
+
+This RESERVED memory area causes the memory region to become unusable,
+and as a result attempting to create memory regions with
+
+     `cxl create-region ...`
+
+Will fail due to the RESERVED area intersecting with the CXL window.
+
+
+During boot the following traceback is observed:
+
+0xffffffff81101650 in insert_resource_expand_to_fit ()
+0xffffffff83d964c5 in e820__reserve_resources_late ()
+0xffffffff83e03210 in pcibios_resource_survey ()
+0xffffffff83e04f4a in pcibios_init ()
+
+Which produces a call to reserve the CFMWS area:
+
+(gdb) p *new
+$54 = {start = 0x290000000, end = 0x2cfffffff, name = "Reserved",
+        flags = 0x200, desc = 0x7, parent = 0x0, sibling = 0x0,
+        child = 0x0}
+
+Later the Kernel parses ACPI tables and reserves the exact same area as
+the CXL Fixed Memory Window.  The use of `insert_resource_conflict`
+retains the RESERVED region and makes it a child of the new region.
+
+0xffffffff811016a4 in insert_resource_conflict ()
+                       insert_resource ()
+0xffffffff81a81389 in cxl_parse_cfmws ()
+0xffffffff818c4a81 in call_handler ()
+                       acpi_parse_entries_array ()
+
+(gdb) p/x *new
+$59 = {start = 0x290000000, end = 0x2cfffffff, name = "CXL Window 0",
+        flags = 0x200, desc = 0x0, parent = 0x0, sibling = 0x0,
+        child = 0x0}
+
+This produces the following output in /proc/iomem:
+
+590000000-68fffffff : CXL Window 0
+   590000000-68fffffff : Reserved
+
+This reserved area causes `get_free_mem_region()` to fail due to a check
+against `__region_intersects()`.  Due to this reserved area, the
+intersect check will only ever return REGION_INTERSECTS, which causes
+`cxl create-region` to always fail.
+
+Signed-off-by: Gregory Price <gregory.price@memverge.com>
+---
+  hw/i386/pc.c | 2 --
+  1 file changed, 2 deletions(-)
+
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+index 566accf7e6..5bf5465a21 100644
+--- a/hw/i386/pc.c
++++ b/hw/i386/pc.c
+@@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+          hwaddr cxl_size = MiB;
+cxl_base = pc_get_cxl_range_start(pcms);
+-        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+          memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+          memory_region_add_subregion(system_memory, cxl_base, mr);
+          cxl_resv_end = cxl_base + cxl_size;
+@@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+                  memory_region_init_io(&fw->mr, OBJECT(machine), &cfmws_ops, 
+fw,
+                                        "cxl-fixed-memory-region", fw->size);
+                  memory_region_add_subregion(system_memory, fw->base, &fw->mr);
+Or will this be subregion of cxl_base?
+
+Thanks,
+Pankaj
+-                e820_add_entry(fw->base, fw->size, E820_RESERVED);
+                  cxl_fmw_base += fw->size;
+                  cxl_resv_end = cxl_fmw_base;
+              }
+
+>
+> -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+>           memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+>
+>           memory_region_add_subregion(system_memory, cxl_base, mr);
+>
+>           cxl_resv_end = cxl_base + cxl_size;
+>
+> @@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+>                   memory_region_init_io(&fw->mr, OBJECT(machine),
+>
+> &cfmws_ops, fw,
+>
+>                                         "cxl-fixed-memory-region",
+>
+> fw->size);
+>
+>                   memory_region_add_subregion(system_memory, fw->base,
+>
+> &fw->mr);
+>
+>
+Or will this be subregion of cxl_base?
+>
+>
+Thanks,
+>
+Pankaj
+The memory region backing this memory area still has to be initialized
+and added in the QEMU system, but it will now be initialized for use by
+linux after PCI/ACPI setup occurs and the CXL driver discovers it via
+CDAT.
+
+It's also still possible to assign this area a static memory region at
+bool by setting up the SRATs in the ACPI tables, but that patch is not
+upstream yet.
+
+On Tue, Oct 18, 2022 at 5:14 AM Gregory Price <gourry.memverge@gmail.com> wrote:
+>
+>
+Early-boot e820 records will be inserted by the bios/efi/early boot
+>
+software and be reported to the kernel via insert_resource.  Later, when
+>
+CXL drivers iterate through the regions again, they will insert another
+>
+resource and make the RESERVED memory area a child.
+I have already sent a patch
+https://www.mail-archive.com/qemu-devel@nongnu.org/msg882012.html
+.
+When the patch is applied, there would not be any reserved entries
+even with passing E820_RESERVED .
+So this patch needs to be evaluated in the light of the above patch I
+sent. Once you apply my patch, does the issue still exist?
+
+>
+>
+This RESERVED memory area causes the memory region to become unusable,
+>
+and as a result attempting to create memory regions with
+>
+>
+`cxl create-region ...`
+>
+>
+Will fail due to the RESERVED area intersecting with the CXL window.
+>
+>
+>
+During boot the following traceback is observed:
+>
+>
+0xffffffff81101650 in insert_resource_expand_to_fit ()
+>
+0xffffffff83d964c5 in e820__reserve_resources_late ()
+>
+0xffffffff83e03210 in pcibios_resource_survey ()
+>
+0xffffffff83e04f4a in pcibios_init ()
+>
+>
+Which produces a call to reserve the CFMWS area:
+>
+>
+(gdb) p *new
+>
+$54 = {start = 0x290000000, end = 0x2cfffffff, name = "Reserved",
+>
+flags = 0x200, desc = 0x7, parent = 0x0, sibling = 0x0,
+>
+child = 0x0}
+>
+>
+Later the Kernel parses ACPI tables and reserves the exact same area as
+>
+the CXL Fixed Memory Window.  The use of `insert_resource_conflict`
+>
+retains the RESERVED region and makes it a child of the new region.
+>
+>
+0xffffffff811016a4 in insert_resource_conflict ()
+>
+insert_resource ()
+>
+0xffffffff81a81389 in cxl_parse_cfmws ()
+>
+0xffffffff818c4a81 in call_handler ()
+>
+acpi_parse_entries_array ()
+>
+>
+(gdb) p/x *new
+>
+$59 = {start = 0x290000000, end = 0x2cfffffff, name = "CXL Window 0",
+>
+flags = 0x200, desc = 0x0, parent = 0x0, sibling = 0x0,
+>
+child = 0x0}
+>
+>
+This produces the following output in /proc/iomem:
+>
+>
+590000000-68fffffff : CXL Window 0
+>
+590000000-68fffffff : Reserved
+>
+>
+This reserved area causes `get_free_mem_region()` to fail due to a check
+>
+against `__region_intersects()`.  Due to this reserved area, the
+>
+intersect check will only ever return REGION_INTERSECTS, which causes
+>
+`cxl create-region` to always fail.
+>
+>
+Signed-off-by: Gregory Price <gregory.price@memverge.com>
+>
+---
+>
+hw/i386/pc.c | 2 --
+>
+1 file changed, 2 deletions(-)
+>
+>
+diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+index 566accf7e6..5bf5465a21 100644
+>
+--- a/hw/i386/pc.c
+>
++++ b/hw/i386/pc.c
+>
+@@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+hwaddr cxl_size = MiB;
+>
+>
+cxl_base = pc_get_cxl_range_start(pcms);
+>
+-        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+>
+memory_region_add_subregion(system_memory, cxl_base, mr);
+>
+cxl_resv_end = cxl_base + cxl_size;
+>
+@@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+memory_region_init_io(&fw->mr, OBJECT(machine), &cfmws_ops,
+>
+fw,
+>
+"cxl-fixed-memory-region", fw->size);
+>
+memory_region_add_subregion(system_memory, fw->base,
+>
+&fw->mr);
+>
+-                e820_add_entry(fw->base, fw->size, E820_RESERVED);
+>
+cxl_fmw_base += fw->size;
+>
+cxl_resv_end = cxl_fmw_base;
+>
+}
+>
+--
+>
+2.37.3
+>
+
+This patch does not resolve the issue, reserved entries are still created.
+[Â  Â  0.000000] BIOS-e820: [mem 0x0000000280000000-0x00000002800fffff] reserved
+[Â  Â  0.000000] BIOS-e820: [mem 0x0000000290000000-0x000000029fffffff] reserved
+# cat /proc/iomem
+290000000-29fffffff : CXL Window 0
+Â  290000000-29fffffff : Reserved
+# cxl create-region -m -d decoder0.0 -w 1 -g 256 mem0
+cxl region: create_region: region0: set_size failed: Numerical result out of range
+cxl region: cmd_create_region: created 0 regions
+On Tue, Oct 18, 2022 at 2:05 AM Ani Sinha <
+ani@anisinha.ca
+> wrote:
+On Tue, Oct 18, 2022 at 5:14 AM Gregory Price <
+gourry.memverge@gmail.com
+> wrote:
+>
+> Early-boot e820 records will be inserted by the bios/efi/early boot
+> software and be reported to the kernel via insert_resource.Â  Later, when
+> CXL drivers iterate through the regions again, they will insert another
+> resource and make the RESERVED memory area a child.
+I have already sent a patch
+https://www.mail-archive.com/qemu-devel@nongnu.org/msg882012.html
+.
+When the patch is applied, there would not be any reserved entries
+even with passing E820_RESERVED .
+So this patch needs to be evaluated in the light of the above patch I
+sent. Once you apply my patch, does the issue still exist?
+>
+> This RESERVED memory area causes the memory region to become unusable,
+> and as a result attempting to create memory regions with
+>
+>Â  Â  Â `cxl create-region ...`
+>
+> Will fail due to the RESERVED area intersecting with the CXL window.
+>
+>
+> During boot the following traceback is observed:
+>
+> 0xffffffff81101650 in insert_resource_expand_to_fit ()
+> 0xffffffff83d964c5 in e820__reserve_resources_late ()
+> 0xffffffff83e03210 in pcibios_resource_survey ()
+> 0xffffffff83e04f4a in pcibios_init ()
+>
+> Which produces a call to reserve the CFMWS area:
+>
+> (gdb) p *new
+> $54 = {start = 0x290000000, end = 0x2cfffffff, name = "Reserved",
+>Â  Â  Â  Â  flags = 0x200, desc = 0x7, parent = 0x0, sibling = 0x0,
+>Â  Â  Â  Â  child = 0x0}
+>
+> Later the Kernel parses ACPI tables and reserves the exact same area as
+> the CXL Fixed Memory Window.Â  The use of `insert_resource_conflict`
+> retains the RESERVED region and makes it a child of the new region.
+>
+> 0xffffffff811016a4 in insert_resource_conflict ()
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â insert_resource ()
+> 0xffffffff81a81389 in cxl_parse_cfmws ()
+> 0xffffffff818c4a81 in call_handler ()
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â acpi_parse_entries_array ()
+>
+> (gdb) p/x *new
+> $59 = {start = 0x290000000, end = 0x2cfffffff, name = "CXL Window 0",
+>Â  Â  Â  Â  flags = 0x200, desc = 0x0, parent = 0x0, sibling = 0x0,
+>Â  Â  Â  Â  child = 0x0}
+>
+> This produces the following output in /proc/iomem:
+>
+> 590000000-68fffffff : CXL Window 0
+>Â  Â 590000000-68fffffff : Reserved
+>
+> This reserved area causes `get_free_mem_region()` to fail due to a check
+> against `__region_intersects()`.Â  Due to this reserved area, the
+> intersect check will only ever return REGION_INTERSECTS, which causes
+> `cxl create-region` to always fail.
+>
+> Signed-off-by: Gregory Price <
+gregory.price@memverge.com
+>
+> ---
+>Â  hw/i386/pc.c | 2 --
+>Â  1 file changed, 2 deletions(-)
+>
+> diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+> index 566accf7e6..5bf5465a21 100644
+> --- a/hw/i386/pc.c
+> +++ b/hw/i386/pc.c
+> @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>Â  Â  Â  Â  Â  hwaddr cxl_size = MiB;
+>
+>Â  Â  Â  Â  Â  cxl_base = pc_get_cxl_range_start(pcms);
+> -Â  Â  Â  Â  e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>Â  Â  Â  Â  Â  memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+>Â  Â  Â  Â  Â  memory_region_add_subregion(system_memory, cxl_base, mr);
+>Â  Â  Â  Â  Â  cxl_resv_end = cxl_base + cxl_size;
+> @@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  memory_region_init_io(&fw->mr, OBJECT(machine), &cfmws_ops, fw,
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  Â  "cxl-fixed-memory-region", fw->size);
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  memory_region_add_subregion(system_memory, fw->base, &fw->mr);
+> -Â  Â  Â  Â  Â  Â  Â  Â  e820_add_entry(fw->base, fw->size, E820_RESERVED);
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  cxl_fmw_base += fw->size;
+>Â  Â  Â  Â  Â  Â  Â  Â  Â  cxl_resv_end = cxl_fmw_base;
+>Â  Â  Â  Â  Â  Â  Â  }
+> --
+> 2.37.3
+>
+
++Gerd Hoffmann
+
+On Tue, Oct 18, 2022 at 8:16 PM Gregory Price <gourry.memverge@gmail.com> wrote:
+>
+>
+This patch does not resolve the issue, reserved entries are still created.
+>
+>
+[    0.000000] BIOS-e820: [mem 0x0000000280000000-0x00000002800fffff] reserved
+>
+[    0.000000] BIOS-e820: [mem 0x0000000290000000-0x000000029fffffff] reserved
+>
+>
+# cat /proc/iomem
+>
+290000000-29fffffff : CXL Window 0
+>
+290000000-29fffffff : Reserved
+>
+>
+# cxl create-region -m -d decoder0.0 -w 1 -g 256 mem0
+>
+cxl region: create_region: region0: set_size failed: Numerical result out of
+>
+range
+>
+cxl region: cmd_create_region: created 0 regions
+>
+>
+On Tue, Oct 18, 2022 at 2:05 AM Ani Sinha <ani@anisinha.ca> wrote:
+>
+>
+>
+> On Tue, Oct 18, 2022 at 5:14 AM Gregory Price <gourry.memverge@gmail.com>
+>
+> wrote:
+>
+> >
+>
+> > Early-boot e820 records will be inserted by the bios/efi/early boot
+>
+> > software and be reported to the kernel via insert_resource.  Later, when
+>
+> > CXL drivers iterate through the regions again, they will insert another
+>
+> > resource and make the RESERVED memory area a child.
+>
+>
+>
+> I have already sent a patch
+>
+>
+https://www.mail-archive.com/qemu-devel@nongnu.org/msg882012.html
+.
+>
+> When the patch is applied, there would not be any reserved entries
+>
+> even with passing E820_RESERVED .
+>
+> So this patch needs to be evaluated in the light of the above patch I
+>
+> sent. Once you apply my patch, does the issue still exist?
+>
+>
+>
+> >
+>
+> > This RESERVED memory area causes the memory region to become unusable,
+>
+> > and as a result attempting to create memory regions with
+>
+> >
+>
+> >     `cxl create-region ...`
+>
+> >
+>
+> > Will fail due to the RESERVED area intersecting with the CXL window.
+>
+> >
+>
+> >
+>
+> > During boot the following traceback is observed:
+>
+> >
+>
+> > 0xffffffff81101650 in insert_resource_expand_to_fit ()
+>
+> > 0xffffffff83d964c5 in e820__reserve_resources_late ()
+>
+> > 0xffffffff83e03210 in pcibios_resource_survey ()
+>
+> > 0xffffffff83e04f4a in pcibios_init ()
+>
+> >
+>
+> > Which produces a call to reserve the CFMWS area:
+>
+> >
+>
+> > (gdb) p *new
+>
+> > $54 = {start = 0x290000000, end = 0x2cfffffff, name = "Reserved",
+>
+> >        flags = 0x200, desc = 0x7, parent = 0x0, sibling = 0x0,
+>
+> >        child = 0x0}
+>
+> >
+>
+> > Later the Kernel parses ACPI tables and reserves the exact same area as
+>
+> > the CXL Fixed Memory Window.  The use of `insert_resource_conflict`
+>
+> > retains the RESERVED region and makes it a child of the new region.
+>
+> >
+>
+> > 0xffffffff811016a4 in insert_resource_conflict ()
+>
+> >                       insert_resource ()
+>
+> > 0xffffffff81a81389 in cxl_parse_cfmws ()
+>
+> > 0xffffffff818c4a81 in call_handler ()
+>
+> >                       acpi_parse_entries_array ()
+>
+> >
+>
+> > (gdb) p/x *new
+>
+> > $59 = {start = 0x290000000, end = 0x2cfffffff, name = "CXL Window 0",
+>
+> >        flags = 0x200, desc = 0x0, parent = 0x0, sibling = 0x0,
+>
+> >        child = 0x0}
+>
+> >
+>
+> > This produces the following output in /proc/iomem:
+>
+> >
+>
+> > 590000000-68fffffff : CXL Window 0
+>
+> >   590000000-68fffffff : Reserved
+>
+> >
+>
+> > This reserved area causes `get_free_mem_region()` to fail due to a check
+>
+> > against `__region_intersects()`.  Due to this reserved area, the
+>
+> > intersect check will only ever return REGION_INTERSECTS, which causes
+>
+> > `cxl create-region` to always fail.
+>
+> >
+>
+> > Signed-off-by: Gregory Price <gregory.price@memverge.com>
+>
+> > ---
+>
+> >  hw/i386/pc.c | 2 --
+>
+> >  1 file changed, 2 deletions(-)
+>
+> >
+>
+> > diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+> > index 566accf7e6..5bf5465a21 100644
+>
+> > --- a/hw/i386/pc.c
+>
+> > +++ b/hw/i386/pc.c
+>
+> > @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+> >          hwaddr cxl_size = MiB;
+>
+> >
+>
+> >          cxl_base = pc_get_cxl_range_start(pcms);
+>
+> > -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+> >          memory_region_init(mr, OBJECT(machine), "cxl_host_reg", cxl_size);
+>
+> >          memory_region_add_subregion(system_memory, cxl_base, mr);
+>
+> >          cxl_resv_end = cxl_base + cxl_size;
+>
+> > @@ -1077,7 +1076,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+> >                  memory_region_init_io(&fw->mr, OBJECT(machine),
+>
+> > &cfmws_ops, fw,
+>
+> >                                        "cxl-fixed-memory-region",
+>
+> > fw->size);
+>
+> >                  memory_region_add_subregion(system_memory, fw->base,
+>
+> > &fw->mr);
+>
+> > -                e820_add_entry(fw->base, fw->size, E820_RESERVED);
+>
+> >                  cxl_fmw_base += fw->size;
+>
+> >                  cxl_resv_end = cxl_fmw_base;
+>
+> >              }
+>
+> > --
+>
+> > 2.37.3
+>
+> >
+
+>
+>> > diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+>> > index 566accf7e6..5bf5465a21 100644
+>
+>> > --- a/hw/i386/pc.c
+>
+>> > +++ b/hw/i386/pc.c
+>
+>> > @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+>> >          hwaddr cxl_size = MiB;
+>
+>> >
+>
+>> >          cxl_base = pc_get_cxl_range_start(pcms);
+>
+>> > -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+Just dropping it doesn't look like a good plan to me.
+
+You can try set etc/reserved-memory-end fw_cfg file instead.  Firmware
+(both seabios and ovmf) read it and will make sure the 64bit pci mmio
+window is placed above that address, i.e. this effectively reserves
+address space.  Right now used by memory hotplug code, but should work
+for cxl too I think (disclaimer: don't know much about cxl ...).
+
+take care & HTH,
+  Gerd
+
+On Tue, 8 Nov 2022 12:21:11 +0100
+Gerd Hoffmann <kraxel@redhat.com> wrote:
+
+>
+> >> > diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+> >> > index 566accf7e6..5bf5465a21 100644
+>
+> >> > --- a/hw/i386/pc.c
+>
+> >> > +++ b/hw/i386/pc.c
+>
+> >> > @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+> >> >          hwaddr cxl_size = MiB;
+>
+> >> >
+>
+> >> >          cxl_base = pc_get_cxl_range_start(pcms);
+>
+> >> > -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+>
+Just dropping it doesn't look like a good plan to me.
+>
+>
+You can try set etc/reserved-memory-end fw_cfg file instead.  Firmware
+>
+(both seabios and ovmf) read it and will make sure the 64bit pci mmio
+>
+window is placed above that address, i.e. this effectively reserves
+>
+address space.  Right now used by memory hotplug code, but should work
+>
+for cxl too I think (disclaimer: don't know much about cxl ...).
+As far as I know CXL impl. in QEMU isn't using etc/reserved-memory-end
+at all, it' has its own mapping.
+
+Regardless of that, reserved E820 entries look wrong, and looking at
+commit message OS is right to bailout on them (expected according
+to ACPI spec).
+Also spec says 
+
+"
+E820 Assumptions and Limitations
+ [...]
+ The platform boot firmware does not return a range description for the memory 
+mapping of
+ PCI devices, ISA Option ROMs, and ISA Plug and Play cards because the OS has 
+mechanisms
+ available to detect them.
+"
+
+so dropping reserved entries looks reasonable from ACPI spec point of view.
+(disclaimer: don't know much about cxl ... either)
+>
+>
+take care & HTH,
+>
+Gerd
+>
+
+On Fri, Nov 11, 2022 at 11:51:23AM +0100, Igor Mammedov wrote:
+>
+On Tue, 8 Nov 2022 12:21:11 +0100
+>
+Gerd Hoffmann <kraxel@redhat.com> wrote:
+>
+>
+> > >> > diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+> > >> > index 566accf7e6..5bf5465a21 100644
+>
+> > >> > --- a/hw/i386/pc.c
+>
+> > >> > +++ b/hw/i386/pc.c
+>
+> > >> > @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+> > >> >          hwaddr cxl_size = MiB;
+>
+> > >> >
+>
+> > >> >          cxl_base = pc_get_cxl_range_start(pcms);
+>
+> > >> > -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+>
+>
+> Just dropping it doesn't look like a good plan to me.
+>
+>
+>
+> You can try set etc/reserved-memory-end fw_cfg file instead.  Firmware
+>
+> (both seabios and ovmf) read it and will make sure the 64bit pci mmio
+>
+> window is placed above that address, i.e. this effectively reserves
+>
+> address space.  Right now used by memory hotplug code, but should work
+>
+> for cxl too I think (disclaimer: don't know much about cxl ...).
+>
+>
+As far as I know CXL impl. in QEMU isn't using etc/reserved-memory-end
+>
+at all, it' has its own mapping.
+This should be changed.  cxl should make sure the highest address used
+is stored in etc/reserved-memory-end to avoid the firmware mapping pci
+resources there.
+
+>
+so dropping reserved entries looks reasonable from ACPI spec point of view.
+Yep, I don't want dispute that.
+
+I suspect the reason for these entries to exist in the first place is to
+inform the firmware that it should not place stuff there, and if we
+remove that to conform with the spec we need some alternative way for
+that ...
+
+take care,
+  Gerd
+
+On Fri, 11 Nov 2022 12:40:59 +0100
+Gerd Hoffmann <kraxel@redhat.com> wrote:
+
+>
+On Fri, Nov 11, 2022 at 11:51:23AM +0100, Igor Mammedov wrote:
+>
+> On Tue, 8 Nov 2022 12:21:11 +0100
+>
+> Gerd Hoffmann <kraxel@redhat.com> wrote:
+>
+>
+>
+> > > >> > diff --git a/hw/i386/pc.c b/hw/i386/pc.c
+>
+> > > >> > index 566accf7e6..5bf5465a21 100644
+>
+> > > >> > --- a/hw/i386/pc.c
+>
+> > > >> > +++ b/hw/i386/pc.c
+>
+> > > >> > @@ -1061,7 +1061,6 @@ void pc_memory_init(PCMachineState *pcms,
+>
+> > > >> >          hwaddr cxl_size = MiB;
+>
+> > > >> >
+>
+> > > >> >          cxl_base = pc_get_cxl_range_start(pcms);
+>
+> > > >> > -        e820_add_entry(cxl_base, cxl_size, E820_RESERVED);
+>
+> >
+>
+> > Just dropping it doesn't look like a good plan to me.
+>
+> >
+>
+> > You can try set etc/reserved-memory-end fw_cfg file instead.  Firmware
+>
+> > (both seabios and ovmf) read it and will make sure the 64bit pci mmio
+>
+> > window is placed above that address, i.e. this effectively reserves
+>
+> > address space.  Right now used by memory hotplug code, but should work
+>
+> > for cxl too I think (disclaimer: don't know much about cxl ...).
+>
+>
+>
+> As far as I know CXL impl. in QEMU isn't using etc/reserved-memory-end
+>
+> at all, it' has its own mapping.
+>
+>
+This should be changed.  cxl should make sure the highest address used
+>
+is stored in etc/reserved-memory-end to avoid the firmware mapping pci
+>
+resources there.
+if (pcmc->has_reserved_memory && machine->device_memory->base) {            
+ 
+[...]
+                                                             
+        if (pcms->cxl_devices_state.is_enabled) {                               
+ 
+            res_mem_end = cxl_resv_end;
+
+that should be handled by this line
+
+        }                                   
+                                     
+        *val = cpu_to_le64(ROUND_UP(res_mem_end, 1 * GiB));                     
+ 
+        fw_cfg_add_file(fw_cfg, "etc/reserved-memory-end", val, sizeof(*val));  
+ 
+    }  
+
+so SeaBIOS shouldn't intrude into CXL address space
+(I assume EDK2 behave similarly here)
+ 
+>
+> so dropping reserved entries looks reasonable from ACPI spec point of view.
+>
+>
+>
+>
+Yep, I don't want dispute that.
+>
+>
+I suspect the reason for these entries to exist in the first place is to
+>
+inform the firmware that it should not place stuff there, and if we
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+just to educate me, can you point out what SeaBIOS code does with reservations.
+
+>
+remove that to conform with the spec we need some alternative way for
+>
+that ...
+with etc/reserved-memory-end set as above,
+is E820_RESERVED really needed here?
+
+(my understanding was that E820_RESERVED weren't accounted for when
+initializing PCI devices)
+
+>
+>
+take care,
+>
+Gerd
+>
+
+>
+if (pcmc->has_reserved_memory && machine->device_memory->base) {
+>
+>
+[...]
+>
+>
+if (pcms->cxl_devices_state.is_enabled) {
+>
+>
+res_mem_end = cxl_resv_end;
+>
+>
+that should be handled by this line
+>
+>
+}
+>
+>
+*val = cpu_to_le64(ROUND_UP(res_mem_end, 1 * GiB));
+>
+>
+fw_cfg_add_file(fw_cfg, "etc/reserved-memory-end", val,
+>
+sizeof(*val));
+>
+}
+>
+>
+so SeaBIOS shouldn't intrude into CXL address space
+Yes, looks good, so with this in place already everyting should be fine.
+
+>
+(I assume EDK2 behave similarly here)
+Correct, ovmf reads that fw_cfg file too.
+
+>
+> I suspect the reason for these entries to exist in the first place is to
+>
+> inform the firmware that it should not place stuff there, and if we
+>
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>
+just to educate me, can you point out what SeaBIOS code does with
+>
+reservations.
+They are added to the e820 map which gets passed on to the OS.  seabios
+uses (and updateas) the e820 map too, when allocating memory for
+example.  While thinking about it I'm not fully sure it actually looks
+at reservations, maybe it only uses (and updates) ram entries when
+allocating memory.
+
+>
+> remove that to conform with the spec we need some alternative way for
+>
+> that ...
+>
+>
+with etc/reserved-memory-end set as above,
+>
+is E820_RESERVED really needed here?
+No.  Setting etc/reserved-memory-end is enough.
+
+So for the original patch:
+Acked-by: Gerd Hoffmann <kraxel@redhat.com>
+
+take care,
+  Gerd
+
+On Fri, Nov 11, 2022 at 02:36:02PM +0100, Gerd Hoffmann wrote:
+>
+>     if (pcmc->has_reserved_memory && machine->device_memory->base) {
+>
+>
+>
+> [...]
+>
+>
+>
+>         if (pcms->cxl_devices_state.is_enabled) {
+>
+>
+>
+>             res_mem_end = cxl_resv_end;
+>
+>
+>
+> that should be handled by this line
+>
+>
+>
+>         }
+>
+>
+>
+>         *val = cpu_to_le64(ROUND_UP(res_mem_end, 1 * GiB));
+>
+>
+>
+>         fw_cfg_add_file(fw_cfg, "etc/reserved-memory-end", val,
+>
+> sizeof(*val));
+>
+>     }
+>
+>
+>
+> so SeaBIOS shouldn't intrude into CXL address space
+>
+>
+Yes, looks good, so with this in place already everyting should be fine.
+>
+>
+> (I assume EDK2 behave similarly here)
+>
+>
+Correct, ovmf reads that fw_cfg file too.
+>
+>
+> > I suspect the reason for these entries to exist in the first place is to
+>
+> > inform the firmware that it should not place stuff there, and if we
+>
+>        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>
+> just to educate me, can you point out what SeaBIOS code does with
+>
+> reservations.
+>
+>
+They are added to the e820 map which gets passed on to the OS.  seabios
+>
+uses (and updateas) the e820 map too, when allocating memory for
+>
+example.  While thinking about it I'm not fully sure it actually looks
+>
+at reservations, maybe it only uses (and updates) ram entries when
+>
+allocating memory.
+>
+>
+> > remove that to conform with the spec we need some alternative way for
+>
+> > that ...
+>
+>
+>
+> with etc/reserved-memory-end set as above,
+>
+> is E820_RESERVED really needed here?
+>
+>
+No.  Setting etc/reserved-memory-end is enough.
+>
+>
+So for the original patch:
+>
+Acked-by: Gerd Hoffmann <kraxel@redhat.com>
+>
+>
+take care,
+>
+Gerd
+It's upstream already, sorry I can't add your tag.
+
+-- 
+MST
+

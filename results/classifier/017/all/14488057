@@ -1,0 +1,770 @@
+virtual: 0.945
+permissions: 0.940
+architecture: 0.936
+user-level: 0.931
+PID: 0.930
+device: 0.929
+register: 0.927
+debug: 0.925
+operating system: 0.921
+TCG: 0.921
+risc-v: 0.917
+assembly: 0.912
+hypervisor: 0.911
+performance: 0.911
+semantic: 0.905
+arm: 0.900
+boot: 0.892
+x86: 0.889
+graphic: 0.887
+ppc: 0.885
+mistranslation: 0.885
+peripherals: 0.883
+vnc: 0.882
+KVM: 0.880
+VMM: 0.870
+alpha: 0.866
+kernel: 0.849
+network: 0.846
+socket: 0.825
+files: 0.823
+i386: 0.718
+--------------------
+x86: 0.998
+TCG: 0.890
+virtual: 0.788
+operating system: 0.750
+permissions: 0.093
+i386: 0.064
+files: 0.048
+VMM: 0.039
+assembly: 0.034
+debug: 0.029
+hypervisor: 0.028
+PID: 0.016
+mistranslation: 0.013
+kernel: 0.010
+semantic: 0.006
+register: 0.006
+user-level: 0.005
+network: 0.005
+architecture: 0.004
+alpha: 0.004
+device: 0.003
+performance: 0.003
+graphic: 0.002
+boot: 0.002
+risc-v: 0.002
+socket: 0.002
+peripherals: 0.001
+ppc: 0.001
+vnc: 0.001
+KVM: 0.000
+arm: 0.000
+
+[Qemu-devel] [BUG] user-to-root privesc inside VM via bad translation caching
+
+This is an issue in QEMU's system emulation for X86 in TCG mode.
+The issue permits an attacker who can execute code in guest ring 3
+with normal user privileges to inject code into other processes that
+are running in guest ring 3, in particular root-owned processes.
+
+== reproduction steps ==
+
+ - Create an x86-64 VM and install Debian Jessie in it. The following
+   steps should all be executed inside the VM.
+ - Verify that procmail is installed and the correct version:
+       address@hidden:~# apt-cache show procmail | egrep 'Version|SHA'
+       Version: 3.22-24
+       SHA1: 54ed2d51db0e76f027f06068ab5371048c13434c
+       SHA256: 4488cf6975af9134a9b5238d5d70e8be277f70caa45a840dfbefd2dc444bfe7f
+ - Install build-essential and nasm ("apt install build-essential nasm").
+ - Unpack the exploit, compile it and run it:
+       address@hidden:~$ tar xvf procmail_cache_attack.tar
+       procmail_cache_attack/
+       procmail_cache_attack/shellcode.asm
+       procmail_cache_attack/xp.c
+       procmail_cache_attack/compile.sh
+       procmail_cache_attack/attack.c
+       address@hidden:~$ cd procmail_cache_attack
+       address@hidden:~/procmail_cache_attack$ ./compile.sh
+       address@hidden:~/procmail_cache_attack$ ./attack
+       memory mappings set up
+       child is dead, codegen should be complete
+       executing code as root! :)
+       address@hidden:~/procmail_cache_attack# id
+       uid=0(root) gid=0(root) groups=0(root),[...]
+
+Note: While the exploit depends on the precise version of procmail,
+the actual vulnerability is in QEMU, not in procmail. procmail merely
+serves as a seldomly-executed setuid root binary into which code can
+be injected.
+
+
+== detailed issue description ==
+QEMU caches translated basic blocks. To look up a translated basic
+block, the function tb_find() is used, which uses tb_htable_lookup()
+in its slowpath, which in turn compares translated basic blocks
+(TranslationBlock) to the lookup information (struct tb_desc) using
+tb_cmp().
+
+tb_cmp() attempts to ensure (among other things) that both the virtual
+start address of the basic block and the physical addresses that the
+basic block covers match. When checking the physical addresses, it
+assumes that a basic block can span at most two pages.
+
+gen_intermediate_code() attempts to enforce this by stopping the
+translation of a basic block if nearly one page of instructions has
+been translated already:
+
+    /* if too long translation, stop generation too */
+    if (tcg_op_buf_full() ||
+        (pc_ptr - pc_start) >= (TARGET_PAGE_SIZE - 32) ||
+        num_insns >= max_insns) {
+        gen_jmp_im(pc_ptr - dc->cs_base);
+        gen_eob(dc);
+        break;
+    }
+
+However, while real X86 processors have a maximum instruction length
+of 15 bytes, QEMU's instruction decoder for X86 does not place any
+limit on the instruction length or the number of instruction prefixes.
+Therefore, it is possible to create an arbitrarily long instruction
+by e.g. prepending an arbitrary number of LOCK prefixes to a normal
+instruction. This permits creating a basic block that spans three
+pages by simply appending an approximately page-sized instruction to
+the end of a normal basic block that starts close to the end of a
+page.
+
+Such an overlong basic block causes the basic block caching to fail as
+follows: If code is generated and cached for a basic block that spans
+the physical pages (A,E,B), this basic block will be returned by
+lookups in a process in which the physical pages (A,B,C) are mapped
+in the same virtual address range (assuming that all other lookup
+parameters match).
+
+This behavior can be abused by an attacker e.g. as follows: If a
+non-relocatable world-readable setuid executable legitimately contains
+the pages (A,B,C), an attacker can map (A,E,B) into his own process,
+at the normal load address of A, where E is an attacker-controlled
+page. If a legitimate basic block spans the pages A and B, an attacker
+can write arbitrary non-branch instructions at the start of E, then
+append an overlong instruction
+that ends behind the start of C, yielding a modified basic block that
+spans all three pages. If the attacker then executes the modified
+basic block in his process, the modified basic block is cached.
+Next, the attacker can execute the setuid binary, which will reuse the
+cached modified basic block, executing attacker-controlled
+instructions in the context of the privileged process.
+
+I am sending this to qemu-devel because a QEMU security contact
+told me that QEMU does not consider privilege escalation inside a
+TCG VM to be a security concern.
+procmail_cache_attack.tar
+Description:
+Unix tar archive
+
+On 20 March 2017 at 14:36, Jann Horn <address@hidden> wrote:
+>
+This is an issue in QEMU's system emulation for X86 in TCG mode.
+>
+The issue permits an attacker who can execute code in guest ring 3
+>
+with normal user privileges to inject code into other processes that
+>
+are running in guest ring 3, in particular root-owned processes.
+>
+I am sending this to qemu-devel because a QEMU security contact
+>
+told me that QEMU does not consider privilege escalation inside a
+>
+TCG VM to be a security concern.
+Correct; it's just a bug. Don't trust TCG QEMU as a security boundary.
+
+We should really fix the crossing-a-page-boundary code for x86.
+I believe we do get it correct for ARM Thumb instructions.
+
+thanks
+-- PMM
+
+On Mon, Mar 20, 2017 at 10:46 AM, Peter Maydell wrote:
+>
+On 20 March 2017 at 14:36, Jann Horn <address@hidden> wrote:
+>
+> This is an issue in QEMU's system emulation for X86 in TCG mode.
+>
+> The issue permits an attacker who can execute code in guest ring 3
+>
+> with normal user privileges to inject code into other processes that
+>
+> are running in guest ring 3, in particular root-owned processes.
+>
+>
+> I am sending this to qemu-devel because a QEMU security contact
+>
+> told me that QEMU does not consider privilege escalation inside a
+>
+> TCG VM to be a security concern.
+>
+>
+Correct; it's just a bug. Don't trust TCG QEMU as a security boundary.
+>
+>
+We should really fix the crossing-a-page-boundary code for x86.
+>
+I believe we do get it correct for ARM Thumb instructions.
+How about doing the instruction size check as follows?
+
+diff --git a/target/i386/translate.c b/target/i386/translate.c
+index 72c1b03a2a..94cf3da719 100644
+--- a/target/i386/translate.c
++++ b/target/i386/translate.c
+@@ -8235,6 +8235,10 @@ static target_ulong disas_insn(CPUX86State
+*env, DisasContext *s,
+     default:
+         goto unknown_op;
+     }
++    if (s->pc - pc_start > 15) {
++        s->pc = pc_start;
++        goto illegal_op;
++    }
+     return s->pc;
+  illegal_op:
+     gen_illegal_opcode(s);
+
+Thanks,
+--
+Pranith
+
+On 22 March 2017 at 14:55, Pranith Kumar <address@hidden> wrote:
+>
+On Mon, Mar 20, 2017 at 10:46 AM, Peter Maydell wrote:
+>
+> On 20 March 2017 at 14:36, Jann Horn <address@hidden> wrote:
+>
+>> This is an issue in QEMU's system emulation for X86 in TCG mode.
+>
+>> The issue permits an attacker who can execute code in guest ring 3
+>
+>> with normal user privileges to inject code into other processes that
+>
+>> are running in guest ring 3, in particular root-owned processes.
+>
+>
+>
+>> I am sending this to qemu-devel because a QEMU security contact
+>
+>> told me that QEMU does not consider privilege escalation inside a
+>
+>> TCG VM to be a security concern.
+>
+>
+>
+> Correct; it's just a bug. Don't trust TCG QEMU as a security boundary.
+>
+>
+>
+> We should really fix the crossing-a-page-boundary code for x86.
+>
+> I believe we do get it correct for ARM Thumb instructions.
+>
+>
+How about doing the instruction size check as follows?
+>
+>
+diff --git a/target/i386/translate.c b/target/i386/translate.c
+>
+index 72c1b03a2a..94cf3da719 100644
+>
+--- a/target/i386/translate.c
+>
++++ b/target/i386/translate.c
+>
+@@ -8235,6 +8235,10 @@ static target_ulong disas_insn(CPUX86State
+>
+*env, DisasContext *s,
+>
+default:
+>
+goto unknown_op;
+>
+}
+>
++    if (s->pc - pc_start > 15) {
+>
++        s->pc = pc_start;
+>
++        goto illegal_op;
+>
++    }
+>
+return s->pc;
+>
+illegal_op:
+>
+gen_illegal_opcode(s);
+This doesn't look right because it means we'll check
+only after we've emitted all the code to do the
+instruction operation, so the effect will be
+"execute instruction, then take illegal-opcode
+exception".
+
+We should check what the x86 architecture spec actually
+says and implement that.
+
+thanks
+-- PMM
+
+On Wed, Mar 22, 2017 at 11:04 AM, Peter Maydell
+<address@hidden> wrote:
+>
+>
+>
+> How about doing the instruction size check as follows?
+>
+>
+>
+> diff --git a/target/i386/translate.c b/target/i386/translate.c
+>
+> index 72c1b03a2a..94cf3da719 100644
+>
+> --- a/target/i386/translate.c
+>
+> +++ b/target/i386/translate.c
+>
+> @@ -8235,6 +8235,10 @@ static target_ulong disas_insn(CPUX86State
+>
+> *env, DisasContext *s,
+>
+>      default:
+>
+>          goto unknown_op;
+>
+>      }
+>
+> +    if (s->pc - pc_start > 15) {
+>
+> +        s->pc = pc_start;
+>
+> +        goto illegal_op;
+>
+> +    }
+>
+>      return s->pc;
+>
+>   illegal_op:
+>
+>      gen_illegal_opcode(s);
+>
+>
+This doesn't look right because it means we'll check
+>
+only after we've emitted all the code to do the
+>
+instruction operation, so the effect will be
+>
+"execute instruction, then take illegal-opcode
+>
+exception".
+>
+The pc is restored to original address (s->pc = pc_start), so the
+exception will overwrite the generated illegal instruction and will be
+executed first.
+
+But yes, it's better to follow the architecture manual.
+
+Thanks,
+--
+Pranith
+
+On 22 March 2017 at 15:14, Pranith Kumar <address@hidden> wrote:
+>
+On Wed, Mar 22, 2017 at 11:04 AM, Peter Maydell
+>
+<address@hidden> wrote:
+>
+> This doesn't look right because it means we'll check
+>
+> only after we've emitted all the code to do the
+>
+> instruction operation, so the effect will be
+>
+> "execute instruction, then take illegal-opcode
+>
+> exception".
+>
+The pc is restored to original address (s->pc = pc_start), so the
+>
+exception will overwrite the generated illegal instruction and will be
+>
+executed first.
+s->pc is the guest PC -- moving that backwards will
+not do anything about the generated TCG IR that's
+already been written. You'd need to rewind the
+write pointer in the IR stream, which there is
+no support for doing AFAIK.
+
+thanks
+-- PMM
+
+On Wed, Mar 22, 2017 at 11:21 AM, Peter Maydell
+<address@hidden> wrote:
+>
+On 22 March 2017 at 15:14, Pranith Kumar <address@hidden> wrote:
+>
+> On Wed, Mar 22, 2017 at 11:04 AM, Peter Maydell
+>
+> <address@hidden> wrote:
+>
+>> This doesn't look right because it means we'll check
+>
+>> only after we've emitted all the code to do the
+>
+>> instruction operation, so the effect will be
+>
+>> "execute instruction, then take illegal-opcode
+>
+>> exception".
+>
+>
+> The pc is restored to original address (s->pc = pc_start), so the
+>
+> exception will overwrite the generated illegal instruction and will be
+>
+> executed first.
+>
+>
+s->pc is the guest PC -- moving that backwards will
+>
+not do anything about the generated TCG IR that's
+>
+already been written. You'd need to rewind the
+>
+write pointer in the IR stream, which there is
+>
+no support for doing AFAIK.
+Ah, OK. Thanks for the explanation. May be we should check the size of
+the instruction while decoding the prefixes and error out once we
+exceed the limit. We would not generate any IR code.
+
+--
+Pranith
+
+On 03/23/2017 02:29 AM, Pranith Kumar wrote:
+On Wed, Mar 22, 2017 at 11:21 AM, Peter Maydell
+<address@hidden> wrote:
+On 22 March 2017 at 15:14, Pranith Kumar <address@hidden> wrote:
+On Wed, Mar 22, 2017 at 11:04 AM, Peter Maydell
+<address@hidden> wrote:
+This doesn't look right because it means we'll check
+only after we've emitted all the code to do the
+instruction operation, so the effect will be
+"execute instruction, then take illegal-opcode
+exception".
+The pc is restored to original address (s->pc = pc_start), so the
+exception will overwrite the generated illegal instruction and will be
+executed first.
+s->pc is the guest PC -- moving that backwards will
+not do anything about the generated TCG IR that's
+already been written. You'd need to rewind the
+write pointer in the IR stream, which there is
+no support for doing AFAIK.
+Ah, OK. Thanks for the explanation. May be we should check the size of
+the instruction while decoding the prefixes and error out once we
+exceed the limit. We would not generate any IR code.
+Yes.
+It would not enforce a true limit of 15 bytes, since you can't know that until
+you've done the rest of the decode.  But you'd be able to say that no more than
+14 prefix + 1 opc + 6 modrm+sib+ofs + 4 immediate = 25 bytes is used.
+Which does fix the bug.
+
+
+r~
+
+On 22/03/2017 21:01, Richard Henderson wrote:
+>
+>
+>
+> Ah, OK. Thanks for the explanation. May be we should check the size of
+>
+> the instruction while decoding the prefixes and error out once we
+>
+> exceed the limit. We would not generate any IR code.
+>
+>
+Yes.
+>
+>
+It would not enforce a true limit of 15 bytes, since you can't know that
+>
+until you've done the rest of the decode.  But you'd be able to say that
+>
+no more than 14 prefix + 1 opc + 6 modrm+sib+ofs + 4 immediate = 25
+>
+bytes is used.
+>
+>
+Which does fix the bug.
+Yeah, that would work for 2.9 if somebody wants to put together a patch.
+ Ensuring that all instruction fetching happens before translation side
+effects is a little harder, but perhaps it's also the opportunity to get
+rid of s->rip_offset which is a little ugly.
+
+Paolo
+
+On Thu, Mar 23, 2017 at 6:27 AM, Paolo Bonzini <address@hidden> wrote:
+>
+>
+>
+On 22/03/2017 21:01, Richard Henderson wrote:
+>
+>>
+>
+>> Ah, OK. Thanks for the explanation. May be we should check the size of
+>
+>> the instruction while decoding the prefixes and error out once we
+>
+>> exceed the limit. We would not generate any IR code.
+>
+>
+>
+> Yes.
+>
+>
+>
+> It would not enforce a true limit of 15 bytes, since you can't know that
+>
+> until you've done the rest of the decode.  But you'd be able to say that
+>
+> no more than 14 prefix + 1 opc + 6 modrm+sib+ofs + 4 immediate = 25
+>
+> bytes is used.
+>
+>
+>
+> Which does fix the bug.
+>
+>
+Yeah, that would work for 2.9 if somebody wants to put together a patch.
+>
+Ensuring that all instruction fetching happens before translation side
+>
+effects is a little harder, but perhaps it's also the opportunity to get
+>
+rid of s->rip_offset which is a little ugly.
+How about the following?
+
+diff --git a/target/i386/translate.c b/target/i386/translate.c
+index 72c1b03a2a..67c58b8900 100644
+--- a/target/i386/translate.c
++++ b/target/i386/translate.c
+@@ -4418,6 +4418,11 @@ static target_ulong disas_insn(CPUX86State
+*env, DisasContext *s,
+     s->vex_l = 0;
+     s->vex_v = 0;
+  next_byte:
++    /* The prefixes can atmost be 14 bytes since x86 has an upper
++       limit of 15 bytes for the instruction */
++    if (s->pc - pc_start > 14) {
++        goto illegal_op;
++    }
+     b = cpu_ldub_code(env, s->pc);
+     s->pc++;
+     /* Collect prefixes.  */
+
+--
+Pranith
+
+On 23/03/2017 17:50, Pranith Kumar wrote:
+>
+On Thu, Mar 23, 2017 at 6:27 AM, Paolo Bonzini <address@hidden> wrote:
+>
+>
+>
+>
+>
+> On 22/03/2017 21:01, Richard Henderson wrote:
+>
+>>>
+>
+>>> Ah, OK. Thanks for the explanation. May be we should check the size of
+>
+>>> the instruction while decoding the prefixes and error out once we
+>
+>>> exceed the limit. We would not generate any IR code.
+>
+>>
+>
+>> Yes.
+>
+>>
+>
+>> It would not enforce a true limit of 15 bytes, since you can't know that
+>
+>> until you've done the rest of the decode.  But you'd be able to say that
+>
+>> no more than 14 prefix + 1 opc + 6 modrm+sib+ofs + 4 immediate = 25
+>
+>> bytes is used.
+>
+>>
+>
+>> Which does fix the bug.
+>
+>
+>
+> Yeah, that would work for 2.9 if somebody wants to put together a patch.
+>
+>  Ensuring that all instruction fetching happens before translation side
+>
+> effects is a little harder, but perhaps it's also the opportunity to get
+>
+> rid of s->rip_offset which is a little ugly.
+>
+>
+How about the following?
+>
+>
+diff --git a/target/i386/translate.c b/target/i386/translate.c
+>
+index 72c1b03a2a..67c58b8900 100644
+>
+--- a/target/i386/translate.c
+>
++++ b/target/i386/translate.c
+>
+@@ -4418,6 +4418,11 @@ static target_ulong disas_insn(CPUX86State
+>
+*env, DisasContext *s,
+>
+s->vex_l = 0;
+>
+s->vex_v = 0;
+>
+next_byte:
+>
++    /* The prefixes can atmost be 14 bytes since x86 has an upper
+>
++       limit of 15 bytes for the instruction */
+>
++    if (s->pc - pc_start > 14) {
+>
++        goto illegal_op;
+>
++    }
+>
+b = cpu_ldub_code(env, s->pc);
+>
+s->pc++;
+>
+/* Collect prefixes.  */
+Please make the comment more verbose, based on Richard's remark.  We
+should apply it to 2.9.
+
+Also, QEMU usually formats comments with stars on every line.
+
+Paolo
+
+On Thu, Mar 23, 2017 at 1:37 PM, Paolo Bonzini <address@hidden> wrote:
+>
+>
+>
+On 23/03/2017 17:50, Pranith Kumar wrote:
+>
+> On Thu, Mar 23, 2017 at 6:27 AM, Paolo Bonzini <address@hidden> wrote:
+>
+>>
+>
+>>
+>
+>> On 22/03/2017 21:01, Richard Henderson wrote:
+>
+>>>>
+>
+>>>> Ah, OK. Thanks for the explanation. May be we should check the size of
+>
+>>>> the instruction while decoding the prefixes and error out once we
+>
+>>>> exceed the limit. We would not generate any IR code.
+>
+>>>
+>
+>>> Yes.
+>
+>>>
+>
+>>> It would not enforce a true limit of 15 bytes, since you can't know that
+>
+>>> until you've done the rest of the decode.  But you'd be able to say that
+>
+>>> no more than 14 prefix + 1 opc + 6 modrm+sib+ofs + 4 immediate = 25
+>
+>>> bytes is used.
+>
+>>>
+>
+>>> Which does fix the bug.
+>
+>>
+>
+>> Yeah, that would work for 2.9 if somebody wants to put together a patch.
+>
+>>  Ensuring that all instruction fetching happens before translation side
+>
+>> effects is a little harder, but perhaps it's also the opportunity to get
+>
+>> rid of s->rip_offset which is a little ugly.
+>
+>
+>
+> How about the following?
+>
+>
+>
+> diff --git a/target/i386/translate.c b/target/i386/translate.c
+>
+> index 72c1b03a2a..67c58b8900 100644
+>
+> --- a/target/i386/translate.c
+>
+> +++ b/target/i386/translate.c
+>
+> @@ -4418,6 +4418,11 @@ static target_ulong disas_insn(CPUX86State
+>
+> *env, DisasContext *s,
+>
+>      s->vex_l = 0;
+>
+>      s->vex_v = 0;
+>
+>   next_byte:
+>
+> +    /* The prefixes can atmost be 14 bytes since x86 has an upper
+>
+> +       limit of 15 bytes for the instruction */
+>
+> +    if (s->pc - pc_start > 14) {
+>
+> +        goto illegal_op;
+>
+> +    }
+>
+>      b = cpu_ldub_code(env, s->pc);
+>
+>      s->pc++;
+>
+>      /* Collect prefixes.  */
+>
+>
+Please make the comment more verbose, based on Richard's remark.  We
+>
+should apply it to 2.9.
+>
+>
+Also, QEMU usually formats comments with stars on every line.
+OK. I'll send a proper patch with updated comment.
+
+Thanks,
+--
+Pranith
+

@@ -1,0 +1,120 @@
+peripherals: 0.824
+kernel: 0.805
+register: 0.787
+boot: 0.782
+arm: 0.780
+performance: 0.764
+permissions: 0.750
+TCG: 0.748
+alpha: 0.718
+VMM: 0.712
+risc-v: 0.707
+device: 0.706
+mistranslation: 0.699
+hypervisor: 0.697
+PID: 0.685
+network: 0.682
+vnc: 0.680
+debug: 0.672
+graphic: 0.671
+operating system: 0.670
+KVM: 0.669
+user-level: 0.663
+semantic: 0.662
+architecture: 0.649
+x86: 0.647
+virtual: 0.630
+files: 0.623
+ppc: 0.615
+socket: 0.607
+i386: 0.533
+assembly: 0.486
+--------------------
+kernel: 0.931
+boot: 0.878
+operating system: 0.260
+virtual: 0.196
+debug: 0.165
+x86: 0.081
+hypervisor: 0.065
+TCG: 0.062
+register: 0.027
+PID: 0.021
+files: 0.020
+i386: 0.020
+performance: 0.019
+device: 0.018
+risc-v: 0.018
+VMM: 0.017
+architecture: 0.009
+semantic: 0.009
+assembly: 0.008
+arm: 0.007
+ppc: 0.006
+socket: 0.004
+user-level: 0.004
+KVM: 0.003
+alpha: 0.003
+network: 0.003
+permissions: 0.003
+vnc: 0.002
+peripherals: 0.002
+graphic: 0.001
+mistranslation: 0.001
+
+[BUG] scsi: vmw_pvscsi: Boot hangs during scsi under qemu, post commit e662502b3a78
+
+Hi,
+
+Commit e662502b3a78 ("scsi: vmw_pvscsi: Set correct residual data length"),
+and its backports to stable trees, makes kernel hang during boot, when
+ran as a VM under qemu with following parameters:
+
+  -drive file=$DISKFILE,if=none,id=sda
+  -device pvscsi
+  -device scsi-hd,bus=scsi.0,drive=sda
+
+Diving deeper, commit e662502b3a78
+
+  @@ -585,7 +585,13 @@ static void pvscsi_complete_request(struct 
+pvscsi_adapter *adapter,
+                case BTSTAT_SUCCESS:
+  +                     /*
+  +                      * Commands like INQUIRY may transfer less data than
+  +                      * requested by the initiator via bufflen. Set residual
+  +                      * count to make upper layer aware of the actual amount
+  +                      * of data returned.
+  +                      */
+  +                     scsi_set_resid(cmd, scsi_bufflen(cmd) - e->dataLen);
+
+assumes 'e->dataLen' is properly armed with actual num of bytes
+transferred; alas qemu's hw/scsi/vmw_pvscsi.c never arms the 'dataLen'
+field of the completion descriptor (kept zero).
+
+As a result, the residual count is set as the *entire* 'scsi_bufflen' of a
+good transfer, which makes upper scsi layers repeatedly ignore this
+valid transfer.
+
+Not properly arming 'dataLen' seems as an oversight in qemu, which needs
+to be fixed.
+
+However, since kernels with commit e662502b3a78 (and backports) now fail
+to boot under qemu's "-device pvscsi", a suggested workaround is to set
+the residual count *only* if 'e->dataLen' is armed, e.g:
+
+  @@ -588,7 +588,8 @@ static void pvscsi_complete_request(struct pvscsi_adapter 
+*adapter,
+                           * count to make upper layer aware of the actual 
+amount
+                           * of data returned.
+                           */
+  -                       scsi_set_resid(cmd, scsi_bufflen(cmd) - e->dataLen);
+  +                       if (e->dataLen)
+  +                               scsi_set_resid(cmd, scsi_bufflen(cmd) - 
+e->dataLen);
+
+in order to make kernels boot on old qemu binaries.
+
+Best,
+Shmulik
+
