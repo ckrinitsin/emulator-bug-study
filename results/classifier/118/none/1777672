@@ -1,0 +1,140 @@
+permissions: 0.796
+peripherals: 0.769
+performance: 0.763
+semantic: 0.748
+risc-v: 0.747
+graphic: 0.734
+user-level: 0.732
+hypervisor: 0.728
+register: 0.726
+virtual: 0.724
+assembly: 0.712
+device: 0.708
+mistranslation: 0.707
+PID: 0.689
+files: 0.684
+arm: 0.683
+architecture: 0.678
+debug: 0.663
+x86: 0.657
+i386: 0.649
+vnc: 0.645
+boot: 0.643
+network: 0.620
+KVM: 0.613
+ppc: 0.554
+kernel: 0.552
+VMM: 0.551
+TCG: 0.529
+socket: 0.500
+
+QEMU raspi virtual/physical frame buffer not implemented
+
+I fully recognize that the error here could be mine, but the code is pretty simple and straightforward; When emulating a Raspberry PI 3 using aarch64 and allocating a virtual framebuffer larger than the physical frambuffer (for double-buffering purposes), the QEMU window shows the full size of the *virtual* framebuffer rather than the size of the *physical* framebuffer.
+
+You can replicate this with code such as:
+
+
+#define FBWIDTH 1024
+#define FBHEIGHT 768
+
+void lfb_init()
+{
+    uart_puts("Initializing Framebuffer\n");
+    mbox[0] = 35*4;
+    mbox[1] = MBOX_REQUEST;
+
+    mbox[2] = 0x48003;  //set phy wh
+    mbox[3] = 8;
+    mbox[4] = 8;
+    mbox[5] = FBWIDTH;         //FrameBufferInfo.width
+    mbox[6] = FBHEIGHT;          //FrameBufferInfo.height
+
+    mbox[7] = 0x48004;  //set virt wh
+    mbox[8] = 8;
+    mbox[9] = 8;
+    mbox[10] = FBWIDTH;        //FrameBufferInfo.virtual_width
+    mbox[11] = FBHEIGHT * 2;         //FrameBufferInfo.virtual_height
+    
+    mbox[12] = 0x48009; //set virt offset
+    mbox[13] = 8;
+    mbox[14] = 8;
+    mbox[15] = 0;           //FrameBufferInfo.x_offset
+    mbox[16] = 0;           //FrameBufferInfo.y.offset
+    
+    mbox[17] = 0x48005; //set depth
+    mbox[18] = 4;
+    mbox[19] = 4;
+    mbox[20] = 32;          //FrameBufferInfo.depth
+
+    mbox[21] = 0x48006; //set pixel order
+    mbox[22] = 4;
+    mbox[23] = 4;
+    mbox[24] = 1;           //RGB, not BGR preferably
+
+    mbox[25] = 0x40001; //get framebuffer, gets alignment on request
+    mbox[26] = 8;
+    mbox[27] = 8;
+    mbox[28] = 4096;        //FrameBufferInfo.pointer
+    mbox[29] = 0;           //FrameBufferInfo.size
+
+    mbox[30] = 0x40008; //get pitch
+    mbox[31] = 4;
+    mbox[32] = 4;
+    mbox[33] = 0;           //FrameBufferInfo.pitch
+
+    mbox[34] = MBOX_TAG_LAST;
+
+    if(mbox_call(MBOX_CH_PROP) && mbox[20]==32 && mbox[28]!=0) {
+        mbox[28]&=0x3FFFFFFF;
+        fbwidth=mbox[5];
+        fbheight=mbox[6];
+        pitch=mbox[33];
+        lfb=(void*)((unsigned long)mbox[28]);
+    }
+}
+
+I will assume, for the sake of this posting, that the reader understands the mailbox architecture and the appropriate address definitions for them.  The key point is that allocating a virtual buffer twice the height of the physical buffer results in QEMU improperly displaying a double-height window.
+
+Can you provide a test binary and QEMU command line that reproduce this, please ?
+
+
+Certainly!  Attached.
+
+
+If you start the attached on a piece of hardware, it will start and display fine.. If you start it in QEMU, it will start but display a double-height screen rather than limiting the physical screen to the specified dimensions.
+
+(The virtual display is double-height in preparation for double buffering)
+
+Whoops.. Forgot to include the QEMU command line:
+
+qemu-system-aarch64 -M raspi3 --kernel kernel8.img -serial stdio
+
+
+Thanks for the test case. I'm having difficulty matching up your guest code with the documentation of the fb mbox tags in https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface ...
+
+Your code sets the physical height to FBHEIGHT via tag 0x48003, and the virtual height to FBHEIGHT * 2 via tag 0x48004. The documentation in the wiki link agrees that 48003 is phys w/h and 48004 is virt w/h, but it says that the physical size is the size of the buffer in memory, and the virtual size is the size of the viewport sent to the display device, ie the virtual size should be smaller than the physical, not vice-versa. Which is correct ?
+
+
+The virtual size must be at least the size of the physical display.  One approach toward double-buffering is to make the virtual height twice the physical height.  To "flip" the displays you simply change the start of the visible view port.
+
+See these:
+
+https://lb.raspberrypi.org/forums/viewtopic.php?t=47329
+https://www.raspberrypi.org/forums/viewtopic.php?f=67&t=19073&p=324866#p324866
+
+
+Mmm. I guess the wiki page is just wrong, then. I have some prototype patches that work, but I need to check somehow what the real hardware's response to various edge cases is:
+ * trying to set a virtual screen size that's smaller than the physical screen size
+ * trying to set the virtual x/y offsets to values that put the physical viewport partially outside the virtual screen (eg setting height = vheight = 480, width = vwidth = 640, xoffset = yoffset = 50)
+
+There's a mechanism in the mbox API for saying "can't do that" but I don't know whether that sort of thing actually does result in failure to set the height or the offset or whatever...
+
+
+Just submitted this patchset to the list which should fix this bug:
+https://patchwork.ozlabs.org/project/qemu-devel/list/?series=60775
+
+
+This should now be fixed in git master as of commit f4e8428b9a6ea440bb.
+
+

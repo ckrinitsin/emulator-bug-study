@@ -1,0 +1,307 @@
+mistranslation: 0.933
+user-level: 0.926
+risc-v: 0.917
+performance: 0.916
+graphic: 0.916
+device: 0.914
+architecture: 0.913
+assembly: 0.909
+permissions: 0.907
+files: 0.907
+debug: 0.902
+semantic: 0.902
+register: 0.902
+socket: 0.897
+arm: 0.896
+virtual: 0.895
+PID: 0.890
+kernel: 0.879
+i386: 0.876
+peripherals: 0.876
+boot: 0.875
+x86: 0.871
+vnc: 0.868
+network: 0.866
+hypervisor: 0.864
+KVM: 0.854
+TCG: 0.847
+VMM: 0.842
+ppc: 0.836
+
+Assertion failure in bdrv_aio_cancel, through ide
+
+Hello,
+While fuzzing, I found an input that triggers an assertion failure in bdrv_aio_cancel, through ide:
+
+#1  0x00007ffff685755b in __GI_abort () at abort.c:79
+#2  0x0000555556a8d396 in bdrv_aio_cancel (acb=0x607000061290) at /home/alxndr/Development/qemu/block/io.c:2746
+#3  0x0000555556a58525 in blk_aio_cancel (acb=0x2) at /home/alxndr/Development/qemu/block/block-backend.c:1540
+#4  0x0000555556552f5b in ide_reset (s=<optimized out>) at /home/alxndr/Development/qemu/hw/ide/core.c:1318
+#5  0x0000555556552aeb in ide_bus_reset (bus=0x62d000017398) at /home/alxndr/Development/qemu/hw/ide/core.c:2422
+#6  0x0000555556579ba5 in ahci_reset_port (s=<optimized out>, port=<optimized out>) at /home/alxndr/Development/qemu/hw/ide/ahci.c:650
+#7  0x000055555657bd8d in ahci_port_write (s=0x61e000014d70, port=0x2, offset=<optimized out>, val=0x10) at /home/alxndr/Development/qemu/hw/ide/ahci.c:360
+#8  0x000055555657bd8d in ahci_mem_write (opaque=<optimized out>, addr=<optimized out>, val=<optimized out>, size=<optimized out>) at /home/alxndr/Development/qemu/hw/ide/ahci.c:513
+#9  0x00005555560028d7 in memory_region_write_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at /home/alxndr/Development/qemu/memory.c:483
+#10 0x0000555556002280 in access_with_adjusted_size (addr=<optimized out>, value=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=<optimized out>, mr=0x61e000014da0, attrs=...) at /home/alxndr/Development/qemu/memory.c:544
+#11 0x0000555556002280 in memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=0x10, op=<optimized out>, attrs=...) at /home/alxndr/Development/qemu/memory.c:1476
+#12 0x0000555555f171d4 in flatview_write_continue (fv=<optimized out>, addr=0xe106c22c, attrs=..., ptr=<optimized out>, len=0x1, addr1=0x7fffffffb8d0, l=<optimized out>, mr=0x61e000014da0) at /home/alxndr/Development/qemu/exec.c:3137
+#13 0x0000555555f0fb98 in flatview_write (fv=0x60600003b180, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+
+I can reproduce it in qemu 5.0 using:
+
+cat << EOF | ~/Development/qemu/build/i386-softmmu/qemu-system-i386 -qtest stdio -monitor none -serial none -M pc-q35-5.0  -nographic
+outl 0xcf8 0x8000fa24
+outl 0xcfc 0xe106c000
+outl 0xcf8 0x8000fa04
+outw 0xcfc 0x7
+outl 0xcf8 0x8000fb20
+write 0x0 0x3 0x2780e7
+write 0xe106c22c 0xd 0x1130c218021130c218021130c2
+write 0xe106c218 0x15 0x110010110010110010110010110010110010110010
+EOF
+
+I also attached the commands to this launchpad report, in case the formatting is broken:
+
+qemu-system-i386 -qtest stdio -monitor none -serial none -M pc-q35-5.0  -nographic < attachment
+
+Please let me know if I can provide any further info.
+-Alex
+
+
+
+(gdb) fr 4
+#4  0x000056378b63e3aa in ide_reset (s=0x56378d64d730) at hw/ide/core.c:1318
+1318            blk_aio_cancel(s->pio_aiocb);
+(gdb) p *s->pio_aiocb
+$1 = {aiocb_info = 0x56378bb55520 <blk_aio_em_aiocb_info>, bs = 0x0, cb = 0x56378b63d9f8 <ide_flush_cb>, opaque = 0x56378d64d730, refcnt = 2}
+
+void bdrv_aio_cancel(BlockAIOCB *acb)
+{
+    qemu_aio_ref(acb);
+    bdrv_aio_cancel_async(acb);
+    while (acb->refcnt > 1) {
+        if (acb->aiocb_info->get_aio_context) {
+            ...
+        } else if (acb->bs) {
+            ...
+        } else {
+            abort();
+        }
+
+
+Hi John,
+Looks like an AHCI emulation issue. I have subscribed you to this bug report.
+
+outl 0xcf8 0x8000fa24
+outl 0xcfc 0xe106c000 (Writes e106c00 to BAR5 for 0:31:2)
+
+outl 0xcf8 0x8000fa04
+outw 0xcfc 0x7 (Enables BM, Memory IO and PIO for 0:31:2)
+
+outl 0xcf8 0x8000fb20 (Enables 0:31:3, I guess? My PCI knowledge is iffy. We set the enable bit and select BAR4, but then we don't actually write to 0xcfc again to set anything.) 
+
+
+write 0x0 0x3 0x2780e7
+- write these three bytes to addr 0 in memory.
+
+write 0xe106c22c 0xd 0x1130c218021130c218021130c2
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSCTL] @ 0x2c: 0x18c23011
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSERR] @ 0x30: 0xc2301102
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSACT] @ 0x34: 0x30110218
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxCI] @ 0x38: 0x000000c2
+
+write 0xe106c218 0x15 0x110010110010110010110010110010110010110010
+
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxCMD] @ 0x18: 0x11100011
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:Reserved] @ 0x1c: 0x00111000
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxTFD] @ 0x20: 0x10001110
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSIG] @ 0x24: 0x11100011
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSSTS] @ 0x28: 0x00111000
+- ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSCTL] @ 0x2c: 0x00000010
+
+Not all of those register writes are actually important for the bug, so I simplified them to the fewest writes and fewest bits.
+
+outl 0xcf8 0x8000fa24
+outl 0xcfc 0xe106c000
+outl 0xcf8 0x8000fa04
+outw 0xcfc 0x7
+outl 0xcf8 0x8000fb20
+write 0x0 0x3 0x2780e7
+write 0xe106c22c 0x4 0x01000000
+write 0xe106c238 0x2 0x02
+write 0xe106c218 0x4 0x11000000
+write 0xe106c22c 0x1 0x00
+
+
+1. PxSCTL write arms the DET bit. It isn't intended to be left on when PxCMD.ST (Start) is issued. It's not clear what should happen if this DOES occur. (Undefined behavior, at the very least.)
+See AHCI 1.3 section 3.3.1.1 "Offset 2Ch: PxSCTL – Port x Serial ATA Control (SCR2: SControl)"
+
+This bit is intended to send a reset signal to attached SATA drives. QEMU just synchronously resets the drive because we can.
+
+
+2. PxCI is not intended to be written to when PxCMD.ST is unset. The spec suggests that when ST transitions from '1' to '0' that this field is cleared, but it does not suggest what happens when it transitions from '0' to '1'. QEMU will happily set the register.
+
+
+3. PxCMD write: This sets PxCMD.ST and PxCMD.FRE, which engages the AHCI device in earnest.
+
+At this point, AHCI sees outstanding commands and tries to process them. The FIS receive address is never programmed, so it's at zero. We start reading a FIS there:
+
+15712@1590789960.784835:handle_cmd_fis_dump ahci(0x55b4c56621a0)[2]: FIS:
+0x00: 27 80 e7 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x10: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x30: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x40: 34 40 70 01 01 14 eb 20 00 00 00 00 01 00 00 00 
+0x50: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x60: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+0x70: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+
+This is translated as:
+0x27 SATA_FIS_TYPE_REGISTER_H2D
+0x80 SATA_FIS_REG_H2D_UPDATE_COMMAND_REGISTER
+0xe7 command = FLUSH CACHE
+
+This will engage ide_flush_cache() (core.c)
+
+
+At this point I get a little confused. I wouldn't think we'd have a BlockBackend here for ide_flush to work on, but it seems to think we do and allows the flush command to proceed. We then immediately try to cancel this flush, but bdrv_aio_cancel can't tolerate an aiocb with a null BDS and panics.
+
+...Hm, it should be the case that blk_do_flush detects this as ENOMEDIUM, but are we maybe just canceling this request too fast? I actually can't trigger this through the console, but I can trigger it by redirecting input from a .txt file.
+
+Yup, OK: if you look in blk_aio_prwv, we schedule a oneshot to invoke the callback on a synchronous failure, but we are managing to inject the reset command before the oneshot gets a chance to run.
+
+I think either blk_aio_cancel or bdrv_aio_cancel needs to check that there isn't a dangling BH callback -- it seems wrong to make it as far as bdrv_aio_cancel when there's no BDS, but the IDE device no longer has any idea why its callback hasn't returned yet, and blk_aio_cancel is the only mechanism it has to kick the state machine forward.
+
+On 5/30/20 12:59 AM, John Snow wrote:
+> outl 0xcf8 0x8000fa24
+> outl 0xcfc 0xe106c000 (Writes e106c00 to BAR5 for 0:31:2)
+
+We might eventually display this in the reproducer output.
+
+> 
+> outl 0xcf8 0x8000fa04
+> outw 0xcfc 0x7 (Enables BM, Memory IO and PIO for 0:31:2)
+> 
+> outl 0xcf8 0x8000fb20 (Enables 0:31:3, I guess? My PCI knowledge is
+> iffy. We set the enable bit and select BAR4, but then we don't actually
+> write to 0xcfc again to set anything.)
+> 
+> 
+> write 0x0 0x3 0x2780e7
+> - write these three bytes to addr 0 in memory.
+> 
+> write 0xe106c22c 0xd 0x1130c218021130c218021130c2
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSCTL] @ 0x2c: 0x18c23011
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSERR] @ 0x30: 0xc2301102
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSACT] @ 0x34: 0x30110218
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxCI] @ 0x38: 0x000000c2
+> 
+> write 0xe106c218 0x15 0x110010110010110010110010110010110010110010
+> 
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxCMD] @ 0x18: 0x11100011
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:Reserved] @ 0x1c: 0x00111000
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxTFD] @ 0x20: 0x10001110
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSIG] @ 0x24: 0x11100011
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSSTS] @ 0x28: 0x00111000
+> - ahci_port_write ahci(0x555c950f71a0)[2]: port write [reg:PxSCTL] @ 0x2c: 0x00000010
+> 
+> Not all of those register writes are actually important for the bug, so
+> I simplified them to the fewest writes and fewest bits.
+> 
+> outl 0xcf8 0x8000fa24
+> outl 0xcfc 0xe106c000
+> outl 0xcf8 0x8000fa04
+> outw 0xcfc 0x7
+> outl 0xcf8 0x8000fb20
+> write 0x0 0x3 0x2780e7
+> write 0xe106c22c 0x4 0x01000000
+> write 0xe106c238 0x2 0x02
+> write 0xe106c218 0x4 0x11000000
+> write 0xe106c22c 0x1 0x00
+> 
+> 
+> 1. PxSCTL write arms the DET bit. It isn't intended to be left on when PxCMD.ST (Start) is issued. It's not clear what should happen if this DOES occur. (Undefined behavior, at the very least.)
+> See AHCI 1.3 section 3.3.1.1 "Offset 2Ch: PxSCTL – Port x Serial ATA Control (SCR2: SControl)"
+> 
+> This bit is intended to send a reset signal to attached SATA drives.
+> QEMU just synchronously resets the drive because we can.
+> 
+> 
+> 2. PxCI is not intended to be written to when PxCMD.ST is unset. The spec suggests that when ST transitions from '1' to '0' that this field is cleared, but it does not suggest what happens when it transitions from '0' to '1'. QEMU will happily set the register.
+> 
+> 
+> 3. PxCMD write: This sets PxCMD.ST and PxCMD.FRE, which engages the AHCI device in earnest.
+> 
+> At this point, AHCI sees outstanding commands and tries to process them.
+> The FIS receive address is never programmed, so it's at zero. We start
+> reading a FIS there:
+> 
+> 15712@1590789960.784835:handle_cmd_fis_dump ahci(0x55b4c56621a0)[2]: FIS:
+> 0x00: 27 80 e7 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x10: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x20: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x30: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x40: 34 40 70 01 01 14 eb 20 00 00 00 00 01 00 00 00 
+> 0x50: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x60: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 0x70: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 
+> 
+> This is translated as:
+> 0x27 SATA_FIS_TYPE_REGISTER_H2D
+> 0x80 SATA_FIS_REG_H2D_UPDATE_COMMAND_REGISTER
+> 0xe7 command = FLUSH CACHE
+> 
+> This will engage ide_flush_cache() (core.c)
+> 
+> 
+> At this point I get a little confused. I wouldn't think we'd have a BlockBackend here for ide_flush to work on, but it seems to think we do and allows the flush command to proceed. We then immediately try to cancel this flush, but bdrv_aio_cancel can't tolerate an aiocb with a null BDS and panics.
+> 
+> ...Hm, it should be the case that blk_do_flush detects this as
+> ENOMEDIUM, but are we maybe just canceling this request too fast? I
+> actually can't trigger this through the console, but I can trigger it by
+> redirecting input from a .txt file.
+> 
+> Yup, OK: if you look in blk_aio_prwv, we schedule a oneshot to invoke
+> the callback on a synchronous failure, but we are managing to inject the
+> reset command before the oneshot gets a chance to run.
+
+What is not clear to me is, can this be reproduced by a real guest, or
+only replaying the fuzzer payload (via the qtest chardev)?
+
+Very nicely detailed analysis btw!
+
+Various parts are worth being copied in the fix commit description.
+
+> 
+> I think either blk_aio_cancel or bdrv_aio_cancel needs to check that
+> there isn't a dangling BH callback -- it seems wrong to make it as far
+> as bdrv_aio_cancel when there's no BDS, but the IDE device no longer has
+> any idea why its callback hasn't returned yet, and blk_aio_cancel is the
+> only mechanism it has to kick the state machine forward.
+> 
+
+
+
+Forgot to mention:
+
+4. the last write to PxSCTL is what actually causes the reset by clearing the DET bit that was armed.
+
+In response to Philippe: Yes, if you had a malicious kernel or root access to the guest, you could emit a sequence of PIO and memory write operations to trip this. Even the reproducer CLI omits -accel qtest, so at a minimum a malicious firmware image that's guaranteed not to be interrupted could trigger the race condition.
+
+
+> Not all of those register writes are actually important for the bug, so I simplified them to the fewest writes and fewest bits.
+
+Thanks for bringing this up. I tried to trim long write commands from both "sides", but there can still be useless data in the middle. I'll work on something that can split them up so only the relevant data remains in the future.
+
+Proposed fix:
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg05595.html
+
+Here is another patch that attempts to fix this:
+https://lists.gnu.org/archive/html/qemu-devel/2020-07/msg05758.html
+
+
+Thank you, Stefan!
+
+Fix: https://gitlab.com/qemu-project/qemu/-/commit/1d719ddc35e9827b6e5df771555874df34301a0d
+
+

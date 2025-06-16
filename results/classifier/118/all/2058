@@ -1,0 +1,82 @@
+user-level: 0.969
+debug: 0.964
+arm: 0.963
+device: 0.962
+assembly: 0.962
+network: 0.961
+virtual: 0.961
+performance: 0.960
+permissions: 0.959
+register: 0.958
+graphic: 0.957
+semantic: 0.955
+architecture: 0.953
+ppc: 0.951
+vnc: 0.951
+TCG: 0.951
+peripherals: 0.951
+x86: 0.949
+kernel: 0.948
+PID: 0.947
+socket: 0.947
+KVM: 0.947
+files: 0.947
+mistranslation: 0.945
+boot: 0.940
+hypervisor: 0.939
+risc-v: 0.935
+VMM: 0.935
+i386: 0.900
+
+QEMU should pad Ethernet frames from vmnet.framework on macOS hosts
+Description of problem:
+When using a `vmnet` network device on a macOS host, the host’s [ARP](https://en.wikipedia.org/wiki/Address_Resolution_Protocol) replies are smaller than the 64-octet minimum frame size defined for Ethernet in IEEE Std 802.3-2022 (subclause 4.2.3.3 and Table 4–2).
+
+When QEMU presents such frames to a guest, the guest’s Ethernet device driver may drop them with “frame too short” or “runt” errors, since they are smaller than actual Ethernet frames should ever be. This prevents the guest from resolving the host’s MAC address, so the guest and host can’t communicate as expected.
+
+I observed this problem with a Mac OS X 10.4.11 guest using a `sungem` or `rtl8139` virtual network device, but it might also affect other guests and virtual network devices.
+Additional information:
+To prevent this problem, QEMU should pad Ethernet frames received from `vmnet` to the minimum size, 60 bytes before the frame check sequence, before handing them off to a guest. (QEMU’s virtual network devices used to add such padding, but that was changed earlier this year in commits such as 63b901bf and aee87b43.)
+
+Here is a patch for `net/vmnet-common.m` that calls `eth_pad_short_frame()` for this, as `net/tap.c` and `net/slirp.c` already do:
+
+```
+--- net/vmnet-common.m.orig	2023-12-19 13:24:34.000000000 -0800
++++ net/vmnet-common.m	2023-12-27 13:30:15.000000000 -0800
+@@ -18,6 +18,7 @@
+ #include "qemu/error-report.h"
+ #include "qapi/error.h"
+ #include "sysemu/runstate.h"
++#include "net/eth.h"
+ 
+ #include <vmnet/vmnet.h>
+ #include <dispatch/dispatch.h>
+@@ -150,10 +151,23 @@
+  */
+ static void vmnet_write_packets_to_qemu(VmnetState *s)
+ {
++    uint8_t *pkt;
++    size_t pktsz;
++    uint8_t min_pkt[ETH_ZLEN];
++    size_t min_pktsz = sizeof(min_pkt);
++
+     while (s->packets_send_current_pos < s->packets_send_end_pos) {
+-        ssize_t size = qemu_send_packet_async(&s->nc,
+-                                      s->iov_buf[s->packets_send_current_pos].iov_base,
+-                                      s->packets_buf[s->packets_send_current_pos].vm_pkt_size,
++        pkt = s->iov_buf[s->packets_send_current_pos].iov_base;
++        pktsz = s->packets_buf[s->packets_send_current_pos].vm_pkt_size;
++
++        if (net_peer_needs_padding(&s->nc)) {
++            if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pktsz)) {
++                pkt = min_pkt;
++                pktsz = min_pktsz;
++            }
++        }
++
++        ssize_t size = qemu_send_packet_async(&s->nc, pkt, pktsz,
+                                       vmnet_send_completed);
+ 
+         if (size == 0) {
+
+```

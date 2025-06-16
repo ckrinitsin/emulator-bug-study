@@ -1,0 +1,237 @@
+user-level: 0.793
+VMM: 0.694
+permissions: 0.669
+risc-v: 0.638
+ppc: 0.629
+boot: 0.609
+TCG: 0.575
+device: 0.565
+peripherals: 0.564
+KVM: 0.557
+mistranslation: 0.550
+arm: 0.544
+register: 0.544
+debug: 0.536
+kernel: 0.535
+vnc: 0.531
+network: 0.525
+files: 0.517
+architecture: 0.513
+semantic: 0.506
+assembly: 0.504
+performance: 0.500
+PID: 0.477
+virtual: 0.453
+hypervisor: 0.442
+graphic: 0.436
+socket: 0.418
+x86: 0.360
+i386: 0.245
+
+qemu-system-aarch64: regression in 3.1: breakpoint instructions always routed to EL_D even when current EL is higher
+
+Affects 3.1.0 (latest stable release) and latest commit (893dc8300c80e3dc32f31e968cf7aa0904da50c3) but did *not* affect 2.11 (qemu from bionic ubuntu LTS).
+
+With the following code and shell commands:
+
+test.s:
+
+.text
+mov x0, #0x60000000
+msr vbar_el2, x0
+dsb sy
+isb sy
+
+$ aarch64-none-elf-as test.s -o test.o
+$ aarch64-none-elf-objcopy -S -O binary test.o test.bin
+$ qemu-system-aarch64 -nographic -machine virt,virtualization=on -cpu cortex-a57 -kernel test.bin -s -S
+
+vbar_el2 is still 0 after the code, instead of being the expected 0x60000000. (see screenshot).
+
+This regression doesn't seem to happen for vbar_el1 & virtualization=off.
+
+
+
+Err, my bad. The following code does seem to work fine (somehow?), but the bug in my code is currently being caused by a JIT failure in mov sp, x8 (aligned value), causing a crash (with the same version considerations).
+
+If you can provide a repro case for that I'll have a look...
+
+Right, so basically I was working on https://github.com/Atmosphere-NX/Atmosphere/tree/hyp/thermosphere (make PLATFORM=qemu qemudbg). This uses Arm Trusted Firmware.
+
+While gdb now reports $VBAR_EL2 correctly (as opposed to what the title says), I observed the following effects:
+
+- at least before I fixed a bug in my exception handlers, I needed to add this JIT workaround I found by accident: https://github.com/Atmosphere-NX/Atmosphere/blob/hyp/thermosphere/src/start.s#L62 to get to main. Otherwise mov sp, x8 (with x8 aligned) crashed for no reason.
+
+- VBAR_EL2 is/was loaded before msr VBAR_EL2, x8 despite data and instruction barriers
+
+- From 3.1 onwards (or after 2.11): VBAR_EL2 is correctly reported (p $VBAR_EL2 gives $1 = 0x60001000 as exepected, and the read value of PSTATE is 0x3c5) but **QEMU acts as if VBAR_EL2 was 0** depending on crash site (but still reports it correctly when jumping to 0+0x200) (there's a __builtin_trap() call in function main)
+
+Attached elf and binary & built Arm TF build. Run flags: -nographic -machine virt,secure=on,virtualization=on,gic-version=2 -cpu cortex-a57 -smp 4 -m 1024 -bios bl1.bin -d unimp -semihosting-config enable,target=native -serial mon:stdio
+
+For me that test binary seems to work (with a QEMU built from upstream git commit 893dc8300c80e3dc32f3) : at least it boots and prints various messages ending with "Hello from Thermosphere!".
+
+
+If you want me to investigate whatever the issue with 'mov sp, x8' crashing is you'll need to provide a binary that demonstrates that problem, not one with a workaround in it.
+
+
+> For me that test binary seems to work (with a QEMU built from upstream git commit 893dc8300c80e3dc32f3) : at least it boots and prints various messages ending with "Hello from Thermosphere!"
+
+my bad, I wasn't precise enough. Right now, test binary should display a crash dump (=> exceptions.c) following __builtin_trap() but doesn't.
+
+Here is what happens:
+
+Expected behavior: code steps into $VBAR_EL2+0x200, $VBAR_EL2 being reported to be its expected value
+Actual behavior: code steps into 0+0x200
+
+(gdb) disas
+Dump of assembler code for function main:
+   0x00000000600000e8 <+0>:     ldr     w1, [x18, #16]
+   0x00000000600000ec <+4>:     str     x30, [sp, #-16]!
+   0x00000000600000f0 <+8>:     cbnz    w1, 0x60000110 <main+40>
+   0x00000000600000f4 <+12>:    mov     w0, #0xc200                     // #49664
+   0x00000000600000f8 <+16>:    movk    w0, #0x1, lsl #16
+   0x00000000600000fc <+20>:    bl      0x60000d10 <uartInit>
+   0x0000000060000100 <+24>:    adrp    x0, 0x60001000 <unknown_exception>
+   0x0000000060000104 <+28>:    add     x0, x0, #0x8be
+   0x0000000060000108 <+32>:    bl      0x60000128 <serialLog>
+=> 0x000000006000010c <+36>:    brk     #0x3e8
+   0x0000000060000110 <+40>:    adrp    x0, 0x60001000 <unknown_exception>
+   0x0000000060000114 <+44>:    add     x0, x0, #0x8d8
+   0x0000000060000118 <+48>:    bl      0x60000128 <serialLog>
+   0x000000006000011c <+52>:    mov     w0, #0x0                        // #0
+   0x0000000060000120 <+56>:    ldr     x30, [sp], #16
+   0x0000000060000124 <+60>:    ret
+End of assembler dump.
+(gdb) stepi
+^C
+Thread 1 received signal SIGINT, Interrupt.
+0x0000000000000200 in ?? ()
+(gdb) p $VBAR_EL2
+$10 = 0x60001000
+
+
+For the x20/mov sp, x8 crash, it happens on the previous commit, 511a9d86cd2de93f3a9956d248e54e46a89eabb9 (build attached).
+
+Workaround, not in the build, is to comment out start.s:45 (but not line 43). This time it goes into my exception handlers even before I set vbar_el2.
+
+Only one target "core" is on when the code runs.
+
+Can you please provide clear and exact reproduction instructions and binaries for whatever the bugs you think you're seeing are? Bear in mind that I know nothing at all about your guest binary or how it is supposed to behave, and I am not going to build versions of your binary from source. If I need to look at things via the gdb interface, give exact sequences of gdb commands I need to use to reproduce the behaviour and say what you were expecting the behaviour to be.
+
+
+Sure. 
+
+* For both: extract the archive in the same folder, chmod to it & run
+
+qemu-system-aarch64 -nographic -machine virt,secure=on,virtualization=on,gic-version=2 -cpu cortex-a57 -smp 2 -m 1024 -bios bl1.bin -d unimp -semihosting-config enable,target=native -serial mon:stdio -s -S
+
+* In another terminal window, same folder:
+
+aarch64-none-elf-gdb thermosphere.elf
+
+* while in GDB:
+
+target remote :1234
+
+This .elf corresponds to bl33.bin which runs in EL2 (the other binary files are Arm Trusted Firmware).
+
+===================
+
+For https://bugs.launchpad.net/qemu/+bug/1838277/+attachment/5279996/+files/example.zip:
+
+* in GDB:
+
+b *0x6000010C
+
+* GDB should report it placed a breakpoint in main.c, line 11 (this is on a brk instruction). Then:
+
+continue
+disas
+
+* Here you should see => 0x000000006000010c <+36>:    brk     #0x3e8
+
+* Notice VBAR_EL2 has a valid, non-zero value:
+
+p $VBAR_EL2
+
+* gdb reports: $1 = 0x60001000
+
+* Step the instruction, the control-C:
+
+stepi
+
+__Expected behavior__: qemu should have jumped to 0x60001000+0x200
+__Actual behavior__: qemu jumps to 0+0x200
+
+
+====================
+
+Erratum: there was an issue in example #2, which was a bug on my part. Above regression still stands
+
+ie. there's x20 being wrongly used in start.s in some places, meaning #8 can be discarded, but this does not explain the vbar_el2 bug (the repro steps for which are above).
+
+qemu *did* correctly jump to 0x60001200 (synchronous exception from same EL with vbar_el2=0x60001000) in version 2.11, but not anymore.
+
+s/pstate is 0x3c5/pstate is whatever | 0x3c9, ie. qemu correctly reports the code is executing as EL2h
+
+Your example_x20_mov_sp_x8 binary performs an illegal-exception-return because it does an eret from EL2 to EL1 without having set HCR_EL2.RW to 1. That means that the CPU will continue execution from the exception-return "link address" in ELR_EL2 (and remain in EL2). That is 0, because we just loaded it from address +0x1938 in the binary, which is all-zeroes. Attempting to execute from 0x0 in EL2 triggers a prefetch abort which is taken to EL2 at entry point 0x60001200 (which is where we expect to enter given that VBAR_EL2 is 0x60001000 and this is a synchronous exception to the current EL). The earlier "mov sp, x8" seems to have executed as expected and the SP at the 'eret' is 0x60002ff0.
+
+This seems to me to be correct execution of a buggy guest binary.
+
+Note that if you are trying to debug this via the gdbstub you may be being misled by a bug in our handling of "single step" -- if you single step an instruction and it causes an exception (eg it is a load from a bad address) then instead of stopping execution at the exception-entry-point, we will execute one instruction at the exception-entry-point and then stop after that. So you get back control in gdb one instruction later than you expect.
+
+
+Thanks for your repro instructions of comment #10. Something weird is indeed going on: the -d int logging reports:
+
+Taking exception 7 [Breakpoint]
+...from EL2 to EL1
+...with ESR 0x3c/0xf20003e8
+...with ELR 0x6000010c
+...to EL1 PC 0x200 PSTATE 0x3c5
+
+but an exception should *never* get taken from a higher to a lower exception level. I will investigate further.
+
+
+As I said, you should have ignored example_x20_mov_sp_x8 totally -- this was a bug on my end, which I fixed.
+
+What about https://bugs.launchpad.net/qemu/+bug/1838277/+attachment/5279996/+files/example.zip, the steps for which are in #10? This one does not return from exception, and executes a brk instruction in function main. It is supposed to jump to 0x60001200 but doesn't (does on version 2.11). The instruction following the brk is valid (adrp) & the instruction at 0x60001200 is mrs x18, esr_el2.
+
+Sorry, didn't saw #14 when I was posting #15.
+
+Thank you again for your patience. 
+
+This bug is specific to our handling of the 'brk' insn (and other debug exceptions within the guest like singlestep or watchpoints or breakpoints) at EL2, so you can work around it for the moment by avoiding using hardcoded brk insns in your EL2 code.
+
+
+To be precise, as I was doing my own investigation, this only happens when *both* the following hold:
+
+- a breakpoint instruction is executed in EL2 (as you mentionned).
+- ELD is EL1. This does **not** happen **if ELD is EL2**, after setting e.g. MDCR_EL2.TDE to 1.
+
+As mentionned above, it's a regression in implementing "AArch64 Self-hosted Debug, D2.3 Routing debug exceptions".
+
+I'm not familiar with QEMU's codebase enough & I haven't tested the code below, but I think:
+
+raise_exception(env, EXCP_BKPT, syndrome, arm_debug_target_el(env));
+
+should be replaced with something along the lines of:
+
+int debug_el = arm_debug_target_el(env);
+int current_el = arm_current_el(env); 
+raise_exception(env, EXCP_BKPT, syndrome, debug_el >= current_el ? debug_el : current_el);
+
+
+Just sent a patch out for review which I think should fix this:
+https://<email address hidden>/
+
+
+Thanks a lot for the patch!
+
+Just nitpicking here, but commit message and in particular wiki changelog message (in 4.1/Planning) make it seem it was only an EL2 issue. I think it was also affecting EL3 (patch fixes both, anyway).
+
+The fix for this is now in git and will be in the 4.1.0 release.
+
+
+Fix included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=987a23224218fa3bb
+

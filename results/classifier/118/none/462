@@ -1,0 +1,73 @@
+peripherals: 0.680
+architecture: 0.602
+risc-v: 0.595
+register: 0.575
+performance: 0.566
+debug: 0.566
+graphic: 0.540
+assembly: 0.519
+device: 0.516
+mistranslation: 0.486
+network: 0.479
+semantic: 0.479
+files: 0.477
+permissions: 0.472
+ppc: 0.469
+PID: 0.462
+virtual: 0.461
+TCG: 0.434
+vnc: 0.429
+VMM: 0.425
+socket: 0.417
+kernel: 0.415
+KVM: 0.402
+hypervisor: 0.400
+arm: 0.381
+x86: 0.379
+boot: 0.375
+user-level: 0.370
+i386: 0.303
+
+mirror: the block-job-cancel command can put qemu to the endless error loop
+Description of problem:
+If the destination VM will crash (or network is down) right before the completion of the block device mirroring job (`block-job-cancel`), then there will be a possibility to put QEMU in the error loop.
+Steps to reproduce:
+1. Run both QEMU VMs: source + target.
+2. On the target side prepare NBD server for blockdev mirroring process by using QMP commands similar to the one below:
+```
+{"execute": "nbd-server-start", "arguments": { "addr": { "data": { "host": "::", "port": "49153" }, "type": "inet" } } }
+{ "execute": "nbd-server-add", "arguments": { "device": "drive_main01", "writable": true } }
+```
+3. On the source side, prepare VM for the migration and start driver mirror job:
+```
+{"execute":"migrate-set-capabilities","arguments":{"capabilities":[{"capability":"pause-before-switchover","state":true}]}}
+{ "execute": "drive-mirror", "arguments": { "device": "drive_main01", "mode": "existing", "job-id": "job0", "target": "nbd:127.0.0.1:49153:exportname=drive_main01", "sync": "top", "on-source-error": "stop", "on-target-error": "stop", "format": "raw", "speed": 0 } }
+```
+4. On the source side wait for the `BLOCK_JOB_READY` event:
+```
+{"timestamp": {"seconds": 1625586327, "microseconds": 833805}, "event": "BLOCK_JOB_READY", "data": {"device": "job0", "len": 21474836480, "offset": 21474836480, "speed": 0, "type": "mirror"}}
+```
+5. Start migration on the source side:
+```
+{ "execute": "migrate", "arguments": { "uri": "tcp:127.0.0.1:8091" } }
+```
+6. Wait for the `pre-switchover` state of the migration:
+```
+{ "execute": "query-migrate" }
+{"return": {"expected-downtime": 300, "status": "pre-switchover", "setup-time": 3, "total-time": 11343, "ram": {"total": 8725020672, "postcopy-requests": 0, "dirty-sync-count": 2, "multifd-bytes": 0, "pages-per-second": 39550, "page-size": 4096, "remaining": 2871296, "mbps": 1073.7734399999999, "transferred": 963647065, "duplicate": 1899491, "dirty-pages-rate": 84, "skipped": 0, "normal-bytes": 944705536, "normal": 230641}}}
+```
+7. Kill target QEMU to reproduce an issue.
+8. Cancel the job on the source side:
+```
+{ "execute": "block-job-cancel", "arguments": { "device": "job0" } }
+```
+
+Got the endless errror loop:
+```
+...
+{"timestamp": {"seconds": 1625586487, "microseconds": 413847}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+{"timestamp": {"seconds": 1625586487, "microseconds": 413865}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+{"timestamp": {"seconds": 1625586487, "microseconds": 413885}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+...
+```
+Source qemu could be stopped only by using SIGKILL.

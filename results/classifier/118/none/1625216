@@ -1,0 +1,115 @@
+assembly: 0.787
+hypervisor: 0.781
+architecture: 0.777
+graphic: 0.752
+permissions: 0.748
+peripherals: 0.746
+TCG: 0.737
+semantic: 0.736
+arm: 0.724
+device: 0.722
+debug: 0.714
+network: 0.700
+PID: 0.691
+register: 0.686
+user-level: 0.671
+ppc: 0.667
+risc-v: 0.619
+vnc: 0.618
+virtual: 0.615
+performance: 0.613
+VMM: 0.609
+socket: 0.562
+x86: 0.538
+i386: 0.525
+KVM: 0.511
+files: 0.490
+boot: 0.440
+kernel: 0.402
+mistranslation: 0.340
+
+memory writes via gdb don't work for memory mapped hardware
+
+When I remote-debug a qemu-guest and attempt to write to a memory mapped location, the
+write-handler for the concerned device will not be called. All write-requiests from
+gdb are delegated to cpu_physical_memory_write_rom(...). a function that writes to the 
+underlying ram-block.
+
+I believe requests to memory mapped hardware should be delegated to 
+address_space_rw(). 
+
+example:
+;; a memory mapped device. No effect, the write-handler is not called
+(gdb) set *0xfff3c000 = 48
+
+;; a ram or rom-block. Thos works. The value is changed.
+(gdb) set *0x100000 = 48
+
+
+----------------------------------------
+
+Here's my suggested patch. As noted in the comment, it could perhaps be
+improved for the (rare) case when the write-request from gdb spans multiple 
+memory regions.
+
+$ git diff   85bc2a15121e8bcd9f15eb75794a1eacca9d84bd HEAD ../exec.c
+diff --git a/exec.c b/exec.c
+index c4f9036..45ef896 100644
+--- a/exec.c
++++ b/exec.c
+@@ -3676,6 +3676,7 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
+     int l;
+     hwaddr phys_addr;
+     target_ulong page;
++    bool is_memcpy_access;
+ 
+     while (len > 0) {
+         int asidx;
+@@ -3691,13 +3692,32 @@ int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
+         if (l > len)
+             l = len;
+         phys_addr += (addr & ~TARGET_PAGE_MASK);
++
+         if (is_write) {
++            /* if ram/rom region we access the memory 
++               via memcpy instead of via the cpu */
++            hwaddr mr_len, addr1;
++            AddressSpace *as = cpu->cpu_ases[asidx].as;
++            MemoryRegion *mr = address_space_translate(as, phys_addr, &addr1, &mr_len, is_write);
++            is_memcpy_access  = memory_region_is_ram(mr) || memory_region_is_romd(mr);
++            if(mr_len < len) {
++                /* TODO, mimic more of the loop over mr chunks as 
++                   done in cpu_physical_memory_write_internal */ 
++                printf("warning: we dont know whether all bytes "
++                       "to be written are ram/rom or io\n");
++            }
++        }
++        else {
++            is_memcpy_access = false;
++        }
++        
++        if (is_write && is_memcpy_access) {
+             cpu_physical_memory_write_rom(cpu->cpu_ases[asidx].as,
+                                           phys_addr, buf, l);
+         } else {
+             address_space_rw(cpu->cpu_ases[asidx].as, phys_addr,
+                              MEMTXATTRS_UNSPECIFIED,
+-                             buf, l, 0);
++                             buf, l, is_write);
+         }
+         len -= l;
+         buf += l;
+
+The code has moved around somewhat, but it's still true that writes by gdb don't go to devices -- cpu_memory_rw_debug() calls address_space_write_rom() which calls address_space_write_rom_internal() which simply skips writing for non-ram/rom regions.
+
+I'm not sure if the gdb accesses should be special cased or if we should just make address_space_write_rom() write to devices (which would also affect eg ELF file loading, which is useful in some odd corner cases).
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/213
+
+

@@ -1,0 +1,162 @@
+semantic: 0.816
+permissions: 0.811
+ppc: 0.796
+virtual: 0.790
+PID: 0.783
+debug: 0.783
+peripherals: 0.769
+risc-v: 0.769
+device: 0.755
+assembly: 0.754
+graphic: 0.736
+architecture: 0.721
+hypervisor: 0.718
+mistranslation: 0.713
+register: 0.712
+socket: 0.701
+vnc: 0.691
+performance: 0.681
+user-level: 0.671
+arm: 0.664
+files: 0.658
+KVM: 0.624
+TCG: 0.608
+kernel: 0.592
+VMM: 0.578
+network: 0.577
+x86: 0.523
+boot: 0.510
+i386: 0.463
+--------------------
+virtual: 0.913
+debug: 0.895
+x86: 0.886
+hypervisor: 0.365
+PID: 0.067
+user-level: 0.057
+ppc: 0.040
+TCG: 0.039
+files: 0.027
+performance: 0.027
+register: 0.021
+kernel: 0.019
+device: 0.006
+assembly: 0.006
+semantic: 0.006
+boot: 0.003
+socket: 0.003
+risc-v: 0.002
+network: 0.002
+graphic: 0.002
+KVM: 0.002
+i386: 0.002
+VMM: 0.002
+architecture: 0.002
+vnc: 0.001
+arm: 0.001
+permissions: 0.001
+peripherals: 0.001
+mistranslation: 0.001
+
+[ppa 2.0~git-20140225] SIGABRT with -virtfs
+
+As requested on u-devel@, I tested QEMU 2.0~git-20140225.aa0d1f4-0ubuntu2 from ppa:ubuntu-virt/candidate. This has a regression with virtfs.
+
+I created a simple cloud-image based VM with autopkgtest:
+
+  $ sudo apt-get install autopkgtest
+  $ adt-buildvm-ubuntu-cloud
+  $ mkdir -p /tmp/shared
+  $ qemu-system-x86_64 -enable-kvm -m 1024 -nographic -virtfs local,id=autopkgtest,path=/tmp/shared,security_model=none,mount_tag=myshare -snapshot adt-trusty-amd64-cloud.img
+**
+ERROR:/build/buildd/qemu-2.0~git-20140225.aa0d1f4/qom/object.c:331:object_initialize_with_type: assertion failed: (type != NULL)
+Abgebrochen (Speicherabzug geschrieben)
+
+It should be easy enough to reproduce and the assertion message already should be clear, but this is the intersting part of the (unretraced) stack trace:
+
+ #2  0x00007fe3329a9195 in g_assertion_message (domain=domain@entry=0x0, file=file@entry=0x7fe334c5a8e8 "/build/buildd/qemu-2.0~git-20140225.aa0d1f4/qom/object.c", line=line@entry=331, func=func@entry=0x7fe334c5ac40 "object_initialize_with_type", message=message@entry=0x7fe336e06e40 "assertion failed: (type != NULL)") at /build/buildd/glib2.0-2.39.90/./glib/gtestutils.c:2291
+         lstr = "331\000\377\177\000\000\320ޠF\377\177\000\000\220\026\321\066\343\177\000\000R\252\305\064\343\177\000"
+         s = 0x7fe336e06e70 "pp\340\066\343\177"
+ #3  0x00007fe3329a922a in g_assertion_message_expr (domain=0x0, file=0x7fe334c5a8e8 "/build/buildd/qemu-2.0~git-20140225.aa0d1f4/qom/object.c", line=331, func=0x7fe334c5ac40 "object_initialize_with_type", expr=<optimized out>) at /build/buildd/glib2.0-2.39.90/./glib/gtestutils.c:2306
+         s = 0x7fe336e06e40 "assertion failed: (type != NULL)"
+
+Thanks, trivially reproduced.  Will bisect.
+
+Actually, the interesting bit of the stack trace starts just below where you cut it off, because object_initialize_with_type() is just asserting that it wasn't called with a NULL pointer, so what we really want to know is what the caller was...
+
+Hm, sadly bisect gives me:
+
+ubuntu@c-trusty-0:~/qemu$ git bisect good
+ba1183da9a10b94611cad88c44a5c6df005f9b55 is the first bad commit
+commit ba1183da9a10b94611cad88c44a5c6df005f9b55
+Author: Fam Zheng <email address hidden>
+Date:   Mon Feb 10 14:48:52 2014 +0800
+
+    rules.mak: fix $(obj) to a real relative path
+    
+    Makefile.target includes rule.mak and unnested common-obj-y, then prefix
+    them with '../', this will ignore object specific QEMU_CFLAGS in subdir
+    Makefile.objs:
+    
+        $(obj)/curl.o: QEMU_CFLAGS += $(CURL_CFLAGS)
+    
+    Because $(obj) here is './block', instead of '../block'. This doesn't
+    hurt compiling because we basically build all .o from top Makefile,
+    before entering Makefile.target, but it will affact arriving per-object
+    libs support.
+    
+    The starting point of $(obj) is passed in as argument of unnest-vars, as
+    well as nested variables, so that different Makefiles can pass in a
+    right value.
+    
+    Signed-off-by: Fam Zheng <email address hidden>
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+:100644 100644 807054b3a1797c911c81c58ae04c15cc599551f6 52b1958b4b43e9e90c68a6339b818f7893ba2551 M      Makefile
+:100644 100644 ac1d0e1c285073e1dc881061a3395189074289d0 1914080134d2559c63e76fe0650c9b86e57d3cd8 M      Makefile.objs
+:100644 100644 af6ac7eaa19f922cf5d006ee7eebd8ef2dfde3d4 9a6e7dd1b85e75baed2580d51456e614a0ba096f M      Makefile.target
+:100755 100755 4648117957465e554bd0005dc51d7e1750b97526 66b1d30c99a83a8856ecfa72bceb55a17928c70c M      configure
+:100644 100644 391d6eb8e612e5f7361249fe68040f50eb1c7bcc a95fb76626d5e30b5ac1b4ef5528ba5383f3ccd0 M      rules.mak
+
+
+gdb stack dump: 
+
+Program received signal SIGABRT, Aborted.
+0x00007ffff2849f79 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+56      ../nptl/sysdeps/unix/sysv/linux/raise.c: No such file or directory.
+(gdb) where
+#0  0x00007ffff2849f79 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007ffff284d388 in __GI_abort () at abort.c:89
+#2  0x00007ffff793c195 in g_assertion_message () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#3  0x00007ffff793c22a in g_assertion_message_expr () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#4  0x0000555555783d09 in object_initialize_with_type (data=data@entry=0x7fffe27fd910, 
+    size=size@entry=6300032, type=0x0) at qom/object.c:331
+#5  0x0000555555783d78 in object_initialize (data=data@entry=0x7fffe27fd910, size=size@entry=6300032, 
+    typename=typename@entry=0x555555914f28 "virtio-9p-device") at qom/object.c:350
+#6  0x0000555555735153 in virtio_9p_pci_instance_init (obj=0x7fffe27fd010) at hw/virtio/virtio-pci.c:943
+#7  0x0000555555783c23 in object_initialize_with_type (data=data@entry=0x7fffe27fd010, 
+    size=<optimized out>, type=type@entry=0x5555561c0580) at qom/object.c:342
+#8  0x0000555555783dc0 in object_new_with_type (type=0x5555561c0580) at qom/object.c:441
+#9  0x0000555555783e55 in object_new (typename=typename@entry=0x5555561c79b0 "virtio-9p-pci")
+    at qom/object.c:451
+#10 0x0000555555768d2d in qdev_device_add (opts=0x5555561c7900) at qdev-monitor.c:526
+#11 0x00005555557b8289 in device_init_func (opts=<optimized out>, opaque=<optimized out>) at vl.c:2259
+#12 0x00005555558da5fb in qemu_opts_foreach (list=<optimized out>, 
+    func=0x5555557b8270 <device_init_func>, opaque=0x0, abort_on_failure=<optimized out>)
+    at util/qemu-option.c:1149
+#13 0x00005555555e9743 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>)
+    at vl.c:4249
+
+
+type passed to type_get_by_name() was "virtio-9p-device".  It returned NULL.
+
+Looking at the compile output, in fact  ./hw/9pfs/virtio-9p-device.o did not get compiled after commit ba1183da9a10b94611cad88c44a5c6df005f9b55.
+
+@pitti,
+
+the version now in ppa should fix your virtfs problem.
+
+Confirmed, this works now. Thanks! Closing, as this only affected the PPA.
+
+If I get the last two comments right, the problem was only about the Ubuntu PPA package, so I'm closing this for upstream QEMU, too. If you still have problems with upstream QEMU here, please feel free to open the ticket again.
+

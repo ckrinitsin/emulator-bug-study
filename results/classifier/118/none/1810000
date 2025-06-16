@@ -1,0 +1,149 @@
+graphic: 0.730
+hypervisor: 0.705
+peripherals: 0.704
+KVM: 0.683
+user-level: 0.680
+risc-v: 0.678
+register: 0.662
+TCG: 0.649
+permissions: 0.627
+performance: 0.627
+arm: 0.579
+debug: 0.576
+virtual: 0.567
+VMM: 0.566
+device: 0.565
+vnc: 0.563
+mistranslation: 0.563
+ppc: 0.560
+semantic: 0.540
+assembly: 0.533
+network: 0.507
+architecture: 0.503
+x86: 0.495
+boot: 0.474
+socket: 0.453
+PID: 0.433
+files: 0.396
+kernel: 0.368
+i386: 0.296
+
+qemu system emulator crashed when using xhci usb controller
+
+I am testing usb-bt-dongle device on xchi host controller, and found
+that the qemu crashed directly with an assertion failer.
+
+Here is the information to reproduce the crash:
+
+Qemu git revision: 9b2e891ec5ccdb4a7d583b77988848282606fdea
+System emulator: qemu-x86_64
+VM image: https://people.debian.org/~aurel32/qemu/amd64/debian_squeeze_amd64_desktop.qcow2
+CommandLine: qemu-system-x86_64 -M q35 -device qemu-xhci,id=xhci -enable-kvm -device usb-bt-dongle  -hda ./debian_wheezy_amd64_standard.qcow2
+
+Error message: 
+
+qemu-system-x86_64: /build/qemu-Eap4uc/qemu-2.11+dfsg/hw/usb/core.c:592: usb_packet_copy: Assertion `p->actual_length + bytes <= iov->size' failed.
+
+Thanks for the bug report! Unfortunately, the bluetooth code in QEMU is completely unmaintained and quite bit-rotten already, so it is already marked as deprecated and will be removed soon unless somebody steps up and volunteers to maintain it:
+
+ https://qemu.weilnetz.de/doc/qemu-doc.html#bluetooth-_0028since-3_002e1_0029
+
+For the time being, you likely have to use "-device pci-ohci" instead of "-device qemu-xhci" if you want to try to use it...
+
+This issue has nothing to do with bluetooth rather something with xhci. I've got the same error while trying to pass through a usb device to a Windows VM, once the guest driver is loaded in the the assert fires so probably it's trying to send something that's not handled correctly. A similar (same?) issue is also mentioned in this bug tracker: 
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=849884
+
+For me it happens with both qemu-xhci and nec-usb-xhci
+
+Here are some debug infos I could gather, not sure if it helps:
+
+qemu-system-x86_64: hw/usb/core.c:591: usb_packet_copy: Assertion `p->actual_length + bytes <= iov->size' failed.
+(gdb) bt
+#0  0x00007ffff6b85a7a in raise () at /lib64/libc.so.6
+#1  0x00007ffff6b6e524 in abort () at /lib64/libc.so.6
+#2  0x00007ffff6b6e40f in _nl_load_domain.cold.0 () at /lib64/libc.so.6
+#3  0x00007ffff6b7a9a2 in  () at /lib64/libc.so.6
+#4  0x0000555555bd1c93 in usb_packet_copy (p=0x7fff680fc8f8, ptr=0x55555772d63c, bytes=5) at hw/usb/core.c:591
+#5  0x0000555555bd10ba in usb_generic_async_ctrl_complete (s=0x55555772d550, p=0x7fff680fc8f8) at hw/usb/core.c:332
+#6  0x0000555555c0dc54 in usb_host_req_complete_ctrl (xfer=0x7fff681a6430) at hw/usb/host-libusb.c:416
+#7  0x00007ffff7c68082 in  () at /lib64/libusb-1.0.so.0
+#8  0x00007ffff7c6bd1a in  () at /lib64/libusb-1.0.so.0
+#9  0x00007ffff7c6daa8 in  () at /lib64/libusb-1.0.so.0
+#10 0x00007ffff7c67a28 in  () at /lib64/libusb-1.0.so.0
+#11 0x00007ffff7c68b13 in libusb_handle_events_timeout_completed () at /lib64/libusb-1.0.so.0
+#12 0x0000555555c0d4a6 in usb_host_handle_fd (opaque=0x5555568eeb70) at hw/usb/host-libusb.c:226
+#13 0x0000555555e2099c in aio_dispatch_handler (ctx=0x555556614530, node=0x5555570c06c0) at util/aio-posix.c:339
+[...]
+(gdb) up
+#4  0x0000555555bd1c93 in usb_packet_copy (p=0x7fff680fc8f8, ptr=0x55555772d63c, bytes=5) at hw/usb/core.c:591
+591	    assert(p->actual_length + bytes <= iov->size);
+(gdb) list
+586	void usb_packet_copy(USBPacket *p, void *ptr, size_t bytes)
+587	{
+588	    QEMUIOVector *iov = p->combined ? &p->combined->iov : &p->iov;
+589	
+590	    assert(p->actual_length >= 0);
+591	    assert(p->actual_length + bytes <= iov->size);
+(gdb) p/x *p
+$3 = {pid = 0x69, id = 0x1a20f5c0, ep = 0x55555772e650, stream = 0x0,
+     iov = {iov = 0x7fff680fc200, niov = 0x0, {{nalloc = 0x1, local_iov = {iov_base = 0x0, iov_len = 0x0}}, {__pad = {
+     0x1, 0x0 <repeats 11 times>}, size = 0x0}}}, parameter = 0x500000f000680, short_not_ok = 0x0, int_req = 0x1,
+     status = 0x0, actual_length = 0x0, state = 0x3, combined = 0x0,
+     queue = {tqe_next = 0x0, tqe_circ = {tql_next = 0x0, tql_prev = 0x55555772e668}},
+     combined_entry = {tqe_next = 0x0, tqe_circ = {tql_next = 0x0, tql_prev = 0x0}}}
+
+
+We found a reproducer during fuzzing:
+
+```
+qemu-system-x86_64 -cdrom hypertrash_os_bios_crash.iso -nographic -m 100 -enable-kvm -device virtio-gpu-pci -device nec-usb-xhci -device usb-audio
+```
+
+ISO is available under:
+https://ruhr-uni-bochum.sciebo.de/s/3UyxvIAB3FeCJ8r?path=%2Fxhci_assert2
+
+Here's a QTest reproducer:
+
+cat << EOF | ./i386-softmmu/qemu-system-i386 \
+-device nec-usb-xhci -trace usb\* \
+-device usb-audio -device usb-storage,drive=mydrive \
+-drive id=mydrive,file=null-co://,size=2M,format=raw,if=none \
+-nodefaults -nographic -qtest stdio
+outl 0xcf8 0x80001016
+outl 0xcfc 0x3c319f0d
+outl 0xcf8 0x80001004
+outl 0xcfc 0xc77695e
+writel 0x9f0d000000000040 0xffffd855
+writeq 0x9f0d000000002000 0xff2f9e0000000000
+write 0x1d 0x1 0x27
+write 0x2d 0x1 0x2e
+write 0x17232 0x1 0x03
+write 0x17254 0x1 0x05
+write 0x17276 0x1 0x72
+write 0x17278 0x1 0x02
+write 0x3d 0x1 0x27
+write 0x40 0x1 0x2e
+write 0x41 0x1 0x72
+write 0x42 0x1 0x01
+write 0x4d 0x1 0x2e
+write 0x4f 0x1 0x01
+writel 0x9f0d000000002000 0x0
+write 0x2007d 0x1 0x2e
+writeq 0x9f0d000000002000 0x514ef013d000009
+write 0x20096 0x1 0x23
+write 0x20098 0x1 0x08
+write 0x2009c 0x1 0xfe
+write 0x2009d 0x1 0x08
+write 0x200ad 0x1 0x10
+writeq 0x9f0d000000002000 0x100ef0100000009
+EOF
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/158
+
+

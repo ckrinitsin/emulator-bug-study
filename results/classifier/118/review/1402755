@@ -1,0 +1,136 @@
+user-level: 0.914
+architecture: 0.906
+assembly: 0.901
+permissions: 0.896
+peripherals: 0.892
+register: 0.891
+kernel: 0.891
+device: 0.883
+debug: 0.882
+KVM: 0.874
+network: 0.873
+performance: 0.873
+vnc: 0.871
+mistranslation: 0.870
+ppc: 0.867
+risc-v: 0.864
+virtual: 0.856
+graphic: 0.854
+PID: 0.851
+semantic: 0.846
+VMM: 0.842
+TCG: 0.838
+files: 0.838
+socket: 0.830
+hypervisor: 0.822
+arm: 0.821
+boot: 0.803
+x86: 0.733
+i386: 0.557
+--------------------
+KVM: 0.940
+debug: 0.879
+virtual: 0.806
+network: 0.757
+x86: 0.592
+hypervisor: 0.408
+kernel: 0.317
+semantic: 0.051
+register: 0.033
+files: 0.032
+vnc: 0.027
+i386: 0.022
+TCG: 0.020
+device: 0.018
+PID: 0.015
+user-level: 0.011
+assembly: 0.009
+performance: 0.008
+VMM: 0.008
+socket: 0.008
+architecture: 0.006
+peripherals: 0.006
+risc-v: 0.004
+ppc: 0.004
+graphic: 0.002
+boot: 0.002
+permissions: 0.001
+arm: 0.001
+mistranslation: 0.000
+
+qemu-kvm: e1000 RX ring is filled with partial-pkt of size 0
+
+Hello,
+We are using CentOS 6.5 with qemu-kvm-0.12.1.2-2.415 as a host of or VMs.
+In the VM we use e1000 as the NIC emulation.
+We've modified the e1000 driver to our needs. This modification start the RX engine while the RX ring is empty (RDH == RDT)
+and at a later stage we fill the RX descriptors with buffers. This scheme works well on intel chips and VMware.
+What we observe in this setup is that from time to time the RX ring is filled with "partial packets" of size 0 (meaning, DD bit is set,
+No other status bits are set and packet size is also 0).
+
+Looking at the e1000 RX routine in qemu-kvm you can observe the following flow:
+1. A packet is avail for receive:
+2. The routine checks for RCTL_EN - it is enabled
+3. The routine checks that the RDH equal RDT (they are as the ring is empty) but also checks if rxov is on (it is still off) so it doesn’t
+Exit as it is supposed to.
+4. The routine now updates the descriptor status with the DD bit (and vlan which we don’t care)
+5. The routine checks if a buffer address is not NULL (it is as NULL since we haven’t filled it yet) – so is logs something.
+6. The routine now updates the guest memory with this value (DD is 1) 
+7. The routine updates the check_rxov flag in order to allow ovf check the next time around. 
+(but ovf will not occur since in the next iteration RDH != RDT)
+8. The routine loops over all the descriptors with the NULL buffer (which is all our ring) and writes the DD bit
+9. We get this endless partial packet problem we see.
+
+qemu-kvm-0.12.1.2-2.415.el6_5.3/qemu-kvm-0.12.1.2/hw/e1000.c
+static ssize_t
+e1000_receive(VLANClientState *nc, const uint8_t *buf, size_t size)
+{
+: : :
+if (!(s->mac_reg[RCTL] & E1000_RCTL_EN))
+return -1;
+
+: : :
+do {
+if (s->mac_reg[RDH] == s->mac_reg[RDT] && s->check_rxov) {
+set_ics(s, 0, E1000_ICS_RXO);
+return -1;
+}
+base = ((uint64_t)s->mac_reg[RDBAH] << 32) + s->mac_reg[RDBAL] +
+sizeof(desc) * s->mac_reg[RDH];
+cpu_physical_memory_read(base, (void *)&desc, sizeof(desc));
+desc.special = vlan_special;
+desc.status |= (vlan_status | E1000_RXD_STAT_DD);
+if (desc.buffer_addr) {
+cpu_physical_memory_write(le64_to_cpu(desc.buffer_addr),
+(void *)(buf + vlan_offset), size);
+desc.length = cpu_to_le16(size);
+desc.status |= E1000_RXD_STAT_EOP|E1000_RXD_STAT_IXSM;
+} else // as per intel docs; skip descriptors with null buf addr
+DBGOUT(RX, "Null RX descriptor!!\n");
+cpu_physical_memory_write(base, (void *)&desc, sizeof(desc));
+
+: : :
+if (++s->mac_reg[RDH] * sizeof(desc) >= s->mac_reg[RDLEN])
+s->mac_reg[RDH] = 0;
+s->check_rxov = 1;
+: : :
+} while (desc.buffer_addr == 0);
+}
+
+
+A workaround is to enable the RX machine only after the descriptor ring is filled for the first time.
+
+Moti
+
+On Mon, Dec 15, 2014 at 04:59:55PM -0000, Moti wrote:
+> We are using CentOS 6.5 with qemu-kvm-0.12.1.2-2.415 as a host of or VMs.
+
+Do you see the problem with qemu.git/master?
+
+Stefan
+
+
+Looking through old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,108 @@
+debug: 0.908
+semantic: 0.901
+peripherals: 0.901
+register: 0.890
+permissions: 0.889
+network: 0.887
+graphic: 0.885
+virtual: 0.876
+architecture: 0.867
+assembly: 0.866
+x86: 0.864
+device: 0.863
+kernel: 0.851
+mistranslation: 0.835
+arm: 0.822
+socket: 0.817
+PID: 0.814
+files: 0.807
+user-level: 0.804
+performance: 0.796
+VMM: 0.775
+risc-v: 0.768
+hypervisor: 0.752
+ppc: 0.715
+vnc: 0.704
+KVM: 0.698
+TCG: 0.691
+boot: 0.612
+i386: 0.437
+
+qemu-x86_64 on aarch64 reports "Synchronous External Abort"
+
+Purpose: to run x86_64 utilities on aarch64 platform (Intel/Dell network adapters' firmware upgrade tools)
+System: aarch64 server platform, with ubuntu 16.04 (xenial) Linux 4.13.0-45-generic #50~16.04.1-Ubuntu SMP Wed May 30 11:14:25 UTC 2018 aarch64 aarch64 aarch64 GNU/Linux
+
+Reproduce:
+1) build linux-user qemu-x86_64 static from source (tried both version 1.12.0 & 1.11.02)
+   ./configure --target-list=x86_64-linux-user --disable-system --static --enable-linux-user
+
+2) install the interpreter into binfmt_misc filesystem
+   $ cat /proc/sys/fs/binfmt_misc/qemu-x86_64
+     enabled
+     interpreter /usr/local/bin/qemu-x86_64
+     flags:
+     offset 0
+     magic 7f454c4602010100000000000000000002003e00
+     mask fffffffffffefefcfffffffffffffffffeffffff
+
+3) packaging Intel/Dell upgrade utilities into docker images, I've published two on docker hub:
+   REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
+   heyi/dellupdate     latest              8e013f5511cd        6 hours ago         210MB
+   heyi/nvmupdate64e   latest              9d2de9d0edaa        3 days ago          451MB
+
+4) run the docker container on aarch64 server platform:
+   docker run -it --privileged --network host --volume /usr/local/bin/qemu-x86_64:/usr/local/bin/qemu-x86_64 heyi/dellupdate:latest
+
+5) finally, within docker container run the upgrade tool:
+   # ./Network_Firmware_T6VN9_LN_18.5.17_A00.BIN
+
+Errors: in dmesg it reports excessive 'Synchronous External Abort':
+
+kernel: [242850.159893] Synchronous External Abort: synchronous external abort (0x92000610) at 0x0000000000429958
+kernel: [242850.169199] Unhandled fault: synchronous external abort (0x92000610) at 0x0000000000429958
+
+thanks and best regards, Yi
+
+qemu-x86_64 is just a userspace program. If the kernel is getting Synchronous External Aborts then this is not a QEMU problem. Either there's a bug in the host kernel, or the guest binary is attempting to mmap /dev/mem and do wrong things to it because it's expecting it to be an x86 system. I suspect the latter (it's probably trying to do userspace writes directly to the network controller handware). This sort of binary is never going to be runnable via QEMU.
+
+
+You could confirm this hypothesis by using strace and looking for whether it's doing mmap() of /dev/mem or /dev/kmem. If it's true, then the program would not work even if you had the source and recompiled it for aarch64 -- it would require bugfixes (code changes) to achieve whatever it's trying to do.
+
+
+Thanks very much @Peter Maydell, when invoking these tools through docker/qemu-user I really saw syscall disorders, even strace fails. You are right these tools have x86_64 syscall numbers & perhaps mmaps of /dev/mem to allocate contiguous memory region for DMA transactions.
+
+Then the goal cannot be achieved by docker/qemu-user method (although it is quite convenient :)
+
+strace ./Network_Firmware_T6VN9_LN_18.5.17_A00.BIN
+qemu: Unsupported syscall: 101
+qemu: Unsupported syscall: 101
+/usr/bin/strace: ptrace(PTRACE_TRACEME, ...): Function not implemented
++++ exited with 1 +++
+
+I'll downgrade this bug to a question, and try full qemu-system emulation with PCI device passthrough assignment to achieve the goal of running Intel/Dell firmware upgrading tools on aarch64 servers.
+
+
+> /usr/bin/strace: ptrace(PTRACE_TRACEME, ...): Function not implemented
+
+This indicates that you're trying to run an x86 strace under QEMU. That won't work. You want to either (a) run QEMU + guest binary under the host strace or (b) run QEMU + guest binary with the QEMU -strace option.
+
+
+thanks Peter, yes I tried to run an x86 strace under QEMU.
+
+I'll stop this experiment since you are right this won't work for utilities with device-level I/O and memory operations, I will raise this requirement to Intel support website firstly.
+
+Best Regards, Yi
+
+Hi,
+
+if of interest to anyone...
+we were able to successfully upgrade firmware of Intel XL710 on aarch64 platform.
+
+Two major items were required:
+- small qemu change: https://lists.gnu.org/archive/html/qemu-devel/2021-01/msg00553.html
+- hack in Linux kernel /dev/mem driver in mmap function to catch wrong addresses nvmupdate64e asked for thru qemu. For some reason only lower 32-bit portion of actual physical address came to linux kernel. /dev/mem driver in kernel was changed to add missing upper 32 bits of address
+
+best regards,
+Matevz
+

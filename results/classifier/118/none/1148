@@ -1,0 +1,301 @@
+user-level: 0.785
+permissions: 0.773
+device: 0.772
+architecture: 0.754
+semantic: 0.746
+register: 0.742
+kernel: 0.729
+PID: 0.728
+peripherals: 0.726
+assembly: 0.724
+ppc: 0.721
+performance: 0.716
+debug: 0.715
+i386: 0.715
+TCG: 0.711
+socket: 0.699
+graphic: 0.696
+risc-v: 0.684
+arm: 0.676
+hypervisor: 0.672
+vnc: 0.669
+virtual: 0.669
+mistranslation: 0.667
+KVM: 0.667
+files: 0.655
+x86: 0.645
+network: 0.630
+boot: 0.618
+VMM: 0.543
+
+Support Octal SPI mode and commands for NOR SPI devices
+Additional information:
+A good example of the Octal SPI (OPI) protocol use is in https://www.st.com/resource/en/application_note/dm00407776-octospi-interface-on-stm32-microcontrollers-stmicroelectronics.pdf
+
+It is also supported by the concrete drivers in Linux kernel:
+- `drivers/mtd/spi-nor/core.c`
+- `drivers/mtd/spi-nor/micron-st.c`
+- `drivers/mtd/spi-nor/spansion.c`
+
+I tried to extract the Octal SPI part from that commit and got something like this, though obviously needs more cleaning up/improving:
+```patch
+---
+ hw/block/m25p80.c | 93 ++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 68 insertions(+), 25 deletions(-)
+
+diff --git a/hw/block/m25p80.c b/hw/block/m25p80.c
+index 7d3d8b12e0..0aa46bf280 100644
+--- a/hw/block/m25p80.c
++++ b/hw/block/m25p80.c
+@@ -361,6 +361,8 @@ typedef enum {
+     READ4 = 0x13,
+     FAST_READ = 0x0b,
+     FAST_READ4 = 0x0c,
++    O_FAST_READ = 0x9d,
++    O_FAST_READ4 = 0xfc,
+     DOR = 0x3b,
+     DOR4 = 0x3c,
+     QOR = 0x6b,
+@@ -369,6 +371,11 @@ typedef enum {
+     DIOR4 = 0xbc,
+     QIOR = 0xeb,
+     QIOR4 = 0xec,
++    OOR = 0x8b,
++    OOR4 = 0x8c,
++    OOR4_MT35X = 0x7c, /* according mt35x datasheet */
++    OIOR = 0xcb,
++    OIOR4 = 0xcc,
+ 
+     PP = 0x02,
+     PP4 = 0x12,
+@@ -379,6 +386,8 @@ typedef enum {
+     RDID_90 = 0x90,
+     RDID_AB = 0xab,
+     AAI_WP = 0xad,
++    OPP = 0x82,
++    OPP4 = 0x84,
+ 
+     ERASE_4K = 0x20,
+     ERASE4_4K = 0x21,
+@@ -422,6 +431,7 @@ typedef enum {
+     STATE_COLLECTING_DATA,
+     STATE_COLLECTING_VAR_LEN_DATA,
+     STATE_READING_DATA,
++    DUMMY_CYCLE_WAIT,
+ } CMDState;
+ 
+ typedef enum {
+@@ -654,12 +664,16 @@ static inline int get_addr_length(Flash *s)
+    case QPP_4:
+    case READ4:
+    case QIOR4:
++   case OIOR4:
+    case ERASE4_4K:
+    case ERASE4_32K:
+    case ERASE4_SECTOR:
+    case FAST_READ4:
++   case O_FAST_READ4:
+    case DOR4:
+    case QOR4:
++   case OOR4:
++   case OOR4_MT35X:
+    case DIOR4:
+        return 4;
+    default:
+@@ -670,6 +684,7 @@ static inline int get_addr_length(Flash *s)
+ static void complete_collecting_data(Flash *s)
+ {
+     int i, n;
++    bool dummy_state = false;
+ 
+     n = get_addr_length(s);
+     s->cur_addr = (n == 3 ? s->ear : 0);
+@@ -689,9 +704,12 @@ static void complete_collecting_data(Flash *s)
+     case DPP:
+     case QPP:
+     case QPP_4:
++    case OPP:
+     case PP:
++        s->state = STATE_PAGE_PROGRAM;
++        break;
++    case OPP4:
+     case PP4:
+-    case PP4_4:
+         s->state = STATE_PAGE_PROGRAM;
+         break;
+     case AAI_WP:
+@@ -702,16 +720,27 @@ static void complete_collecting_data(Flash *s)
+     case READ:
+     case READ4:
+     case FAST_READ:
+-    case FAST_READ4:
++    case O_FAST_READ:
+     case DOR:
+-    case DOR4:
+     case QOR:
+-    case QOR4:
++    case OOR:
+     case DIOR:
+-    case DIOR4:
+     case QIOR:
++    case OIOR:
++    case FAST_READ4:
++    case O_FAST_READ4:
++    case DOR4:
++    case QOR4:
++    case OOR4:
++    case OOR4_MT35X:
++    case DIOR4:
+     case QIOR4:
+-        s->state = STATE_READ;
++    case OIOR4:
++        if (dummy_state == false) {
++            s->state = STATE_READ;
++        } else {
++            s->state = DUMMY_CYCLE_WAIT;
++        }
+         break;
+     case ERASE_4K:
+     case ERASE4_4K:
+@@ -744,7 +773,6 @@ static void complete_collecting_data(Flash *s)
+             s->write_enable = false;
+         }
+         break;
+-    case BRWR:
+     case EXTEND_ADDR_WRITE:
+         s->ear = s->data[0];
+         break;
+@@ -1038,6 +1066,7 @@ static void decode_qio_read_cmd(Flash *s)
+         s->needed_bytes += 3;
+         break;
+     default:
++        s->needed_bytes += 5;
+         break;
+     }
+     s->pos = 0;
+@@ -1066,28 +1095,39 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+                       "M25P80: Invalid cmd within AAI programming sequence");
+     }
+ 
++    s->needed_bytes = 0;
++
+     switch (value) {
+ 
++    case ERASE4_SECTOR:
++        if (s->four_bytes_address_mode == false) {
++            s->needed_bytes += 1;
++        }
+     case ERASE_4K:
+-    case ERASE4_4K:
+     case ERASE_32K:
+-    case ERASE4_32K:
+     case ERASE_SECTOR:
+-    case ERASE4_SECTOR:
++    case OPP:
+     case PP:
+-    case PP4:
++    case QOR:
++    case OOR:
++    case FAST_READ:
++    case O_FAST_READ:
++    case DOR:
+     case DIE_ERASE:
+     case RDID_90:
+     case RDID_AB:
+-        s->needed_bytes = get_addr_length(s);
++        s->needed_bytes += get_addr_length(s);
+         s->pos = 0;
+         s->len = 0;
+         s->state = STATE_COLLECTING_DATA;
+         break;
+-    case READ:
+     case READ4:
++        if (s->four_bytes_address_mode == false) {
++            s->needed_bytes += 1;
++        }
++    case READ:
+         if (get_man(s) != MAN_NUMONYX || numonyx_mode(s) == MODE_STD) {
+-            s->needed_bytes = get_addr_length(s);
++            s->needed_bytes += get_addr_length(s);
+             s->pos = 0;
+             s->len = 0;
+             s->state = STATE_COLLECTING_DATA;
+@@ -1098,7 +1138,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+         break;
+     case DPP:
+         if (get_man(s) != MAN_NUMONYX || numonyx_mode(s) != MODE_QIO) {
+-            s->needed_bytes = get_addr_length(s);
++            s->needed_bytes += get_addr_length(s);
+             s->pos = 0;
+             s->len = 0;
+             s->state = STATE_COLLECTING_DATA;
+@@ -1110,8 +1150,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+     case QPP:
+     case QPP_4:
+     case PP4_4:
++        if (s->four_bytes_address_mode == false) {
++            s->needed_bytes += 1;
++        }
+         if (get_man(s) != MAN_NUMONYX || numonyx_mode(s) != MODE_DIO) {
+-            s->needed_bytes = get_addr_length(s);
++            s->needed_bytes += get_addr_length(s);
+             s->pos = 0;
+             s->len = 0;
+             s->state = STATE_COLLECTING_DATA;
+@@ -1121,11 +1164,9 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+         }
+         break;
+ 
+-    case FAST_READ:
+     case FAST_READ4:
+         decode_fast_read_cmd(s);
+         break;
+-    case DOR:
+     case DOR4:
+         if (get_man(s) != MAN_NUMONYX || numonyx_mode(s) != MODE_QIO) {
+             decode_fast_read_cmd(s);
+@@ -1134,14 +1175,13 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+                           "QIO mode\n", s->cmd_in_progress);
+         }
+         break;
+-    case QOR:
+     case QOR4:
+-        if (get_man(s) != MAN_NUMONYX || numonyx_mode(s) != MODE_DIO) {
+-            decode_fast_read_cmd(s);
+-        } else {
+-            qemu_log_mask(LOG_GUEST_ERROR, "M25P80: Cannot execute cmd %x in "
+-                          "DIO mode\n", s->cmd_in_progress);
+-        }
++    case OOR4:
++    case OOR4_MT35X:
++        s->needed_bytes += 4;
++        s->pos = 0;
++        s->len = 0;
++        s->state = STATE_COLLECTING_DATA;
+         break;
+ 
+     case DIOR:
+@@ -1265,6 +1305,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
+         s->four_bytes_address_mode = false;
+         break;
+     case BRRD:
++        s->data_read_loop = false;
+     case EXTEND_ADDR_READ:
+         s->data[0] = s->ear;
+         s->pos = 0;
+@@ -1475,6 +1516,8 @@ static uint32_t m25p80_transfer8(SSIPeripheral *ss, uint32_t tx)
+         }
+         break;
+ 
++    case DUMMY_CYCLE_WAIT:
++        break;
+     default:
+     case STATE_IDLE:
+         decode_new_cmd(s, (uint8_t)tx);
+-- 
+```
+There is also missing **0xfd** command for the DDR Octal I/O Fast Read for Micron MT35X chips. I am not sure if it's the same as the **0xfc** command in the Xilinx code though.
+
+Since I am not the author of the original commit, maybe Xilinx folks could take my patch, update/improve it and send to the mailing list. It will reduce the amount of the changes you have to apply in your fork as well :smile:
+
+cc @alistair23

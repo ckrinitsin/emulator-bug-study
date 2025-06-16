@@ -1,0 +1,216 @@
+risc-v: 0.892
+device: 0.885
+debug: 0.878
+register: 0.878
+virtual: 0.872
+PID: 0.863
+arm: 0.863
+graphic: 0.861
+semantic: 0.855
+performance: 0.855
+permissions: 0.852
+vnc: 0.852
+user-level: 0.852
+ppc: 0.851
+assembly: 0.846
+hypervisor: 0.843
+TCG: 0.841
+x86: 0.840
+peripherals: 0.839
+socket: 0.837
+kernel: 0.831
+architecture: 0.828
+VMM: 0.825
+KVM: 0.824
+network: 0.810
+files: 0.801
+boot: 0.799
+mistranslation: 0.793
+i386: 0.789
+
+Regression - bridged networking broken for Mac OS X guest
+
+Using the instructions at http://www.contrib.andrew.cmu.edu/~somlo/OSXKVM/ for running Mac OS X Snow Leopard under QEMU, bridged networking is broken when using QEMU git. The result is that Mac OS X is unable to obtain an IP address using DHCP. It works in the latest stable release - QEMU 2.3.0.
+
+Replace "-netdev user,id=hub0port0" with "-netdev bridge,br=br0,id=hub0port0" when testing bridged networking.
+
+Bisecting the git repository shows the following bad commit:
+commit a90a7425cf592a3afeff3eaf32f543b83050ee5c
+Author: Fam Zheng <email address hidden>
+Date:   Thu Jun 4 14:45:17 2015 +0800
+
+    tap: Drop tap_can_send
+
+    This callback is called by main loop before polling s->fd, if it returns
+    false, the fd will not be polled in this iteration.
+
+    This is redundant with checks inside read callback. After this patch,
+    the data will be sent to peer when it arrives. If the device can't
+    receive, it will be queued to incoming_queue, and when the device status
+    changes, this queue will be flushed.
+
+    Signed-off-by: Fam Zheng <email address hidden>
+    Message-id: <email address hidden>
+    Signed-off-by: Stefan Hajnoczi <email address hidden>
+
+On Sun, Jun 21, 2015 at 11:26:08AM -0000, Jonathan Liu wrote:
+> Using the instructions at
+> http://www.contrib.andrew.cmu.edu/~somlo/OSXKVM/ for running Mac OS X
+> Snow Leopard under QEMU, bridged networking is broken when using QEMU
+> git. The result is that Mac OS X is unable to obtain an IP address using
+> DHCP. It works in the latest stable release - QEMU 2.3.0.
+> 
+> Replace "-netdev user,id=hub0port0" with "-netdev
+> bridge,br=br0,id=hub0port0" when testing bridged networking.
+> 
+> Bisecting the git repository shows the following bad commit:
+> commit a90a7425cf592a3afeff3eaf32f543b83050ee5c
+> Author: Fam Zheng <email address hidden>
+> Date:   Thu Jun 4 14:45:17 2015 +0800
+> 
+>     tap: Drop tap_can_send
+
+Please confirm that you are using -device e1000-82545em.
+
+Please try the following patch to gather debug output:
+
+diff --git a/hw/net/e1000.c b/hw/net/e1000.c
+index bab8e2a..2f68c6d 100644
+--- a/hw/net/e1000.c
++++ b/hw/net/e1000.c
+@@ -174,6 +174,7 @@ enum {
+ static void
+ e1000_link_down(E1000State *s)
+ {
++    fprintf(stderr, "%s link down\n", __func__);
+     s->mac_reg[STATUS] &= ~E1000_STATUS_LU;
+     s->phy_reg[PHY_STATUS] &= ~MII_SR_LINK_STATUS;
+     s->phy_reg[PHY_STATUS] &= ~MII_SR_AUTONEG_COMPLETE;
+@@ -183,6 +184,7 @@ e1000_link_down(E1000State *s)
+ static void
+ e1000_link_up(E1000State *s)
+ {
++    fprintf(stderr, "%s link up\n", __func__);
+     s->mac_reg[STATUS] |= E1000_STATUS_LU;
+     s->phy_reg[PHY_STATUS] |= MII_SR_LINK_STATUS;
+ }
+@@ -923,6 +925,12 @@ e1000_can_receive(NetClientState *nc)
+ {
+     E1000State *s = qemu_get_nic_opaque(nc);
+ 
++    fprintf(stderr, "%s lu %d rctl_en %d pci_master %d has_rxbufs %d\n",
++            __func__, s->mac_reg[STATUS] & E1000_STATUS_LU,
++            s->mac_reg[RCTL] & E1000_RCTL_EN,
++            s->parent_obj.config[PCI_COMMAND] & PCI_COMMAND_MASTER,
++            e1000_has_rxbufs(s, 1));
++
+     return (s->mac_reg[STATUS] & E1000_STATUS_LU) &&
+         (s->mac_reg[RCTL] & E1000_RCTL_EN) &&
+         (s->parent_obj.config[PCI_COMMAND] & PCI_COMMAND_MASTER) &&
+diff --git a/net/tap.c b/net/tap.c
+index bd01590..07676ce 100644
+--- a/net/tap.c
++++ b/net/tap.c
+@@ -67,6 +67,8 @@ static void tap_writable(void *opaque);
+ 
+ static void tap_update_fd_handler(TAPState *s)
+ {
++    fprintf(stderr, "%s read_poll %d write_poll %d enabled %d\n",
++            __func__, s->read_poll, s->write_poll, s->enabled);
+     qemu_set_fd_handler(s->fd,
+                         s->read_poll && s->enabled ? tap_send : NULL,
+                         s->write_poll && s->enabled ? tap_writable : NULL,
+
+
+Yes, -device e1000-82545em is being used.
+
+Here is the debug output with the patch applied against QEMU git ad7020a7e7b27d468ecc2aacb04ba4eb09017074 after booting to desktop and waiting for DHCP to fallback to automatic private IP address:
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 2 rctl_en 0 pci_master 0 has_rxbufs 0
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 2 rctl_en 0 pci_master 4 has_rxbufs 0
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 2 rctl_en 0 pci_master 4 has_rxbufs 0
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+e1000_link_down link down
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 0 rctl_en 0 pci_master 4 has_rxbufs 0
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 0 rctl_en 0 pci_master 4 has_rxbufs 1
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+e1000_can_receive lu 0 rctl_en 2 pci_master 4 has_rxbufs 1
+tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+e1000_link_up link up
+
+
+On another note, it seems the DHCP server is receiving DHCPDISCOVER message and sending back DHCPOFFER response while the guest is trying to obtain an IP address but it seems the guest doesn't see the DHCPOFFER response because it sends more DHCPDISCOVER messages with a delay of some seconds in between.
+
+On Mon, Jun 22, 2015 at 10:49:29AM -0000, Jonathan Liu wrote:
+> Yes, -device e1000-82545em is being used.
+> 
+> Here is the debug output with the patch applied against QEMU git ad7020a7e7b27d468ecc2aacb04ba4eb09017074 after booting to desktop and waiting for DHCP to fallback to automatic private IP address:
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 2 rctl_en 0 pci_master 0 has_rxbufs 0
+
+The NIC is not ready to receive so incoming packets are queued...
+
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 2 rctl_en 0 pci_master 4 has_rxbufs 0
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 2 rctl_en 0 pci_master 4 has_rxbufs 0
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> e1000_link_down link down
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 0 rctl_en 0 pci_master 4 has_rxbufs 0
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 0 rctl_en 0 pci_master 4 has_rxbufs 1
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> tap_update_fd_handler read_poll 1 write_poll 0 enabled 1
+> e1000_can_receive lu 0 rctl_en 2 pci_master 4 has_rxbufs 1
+
+Now the NIC is ready to receive packets but the link is still down.
+Packets remain queued.
+
+> tap_update_fd_handler read_poll 0 write_poll 0 enabled 1
+> e1000_link_up link up
+
+We should flush queued packets now that the link has come back up.
+
+Please try this patch:
+
+diff --git a/hw/net/e1000.c b/hw/net/e1000.c
+index bab8e2a..ea58373 100644
+--- a/hw/net/e1000.c
++++ b/hw/net/e1000.c
+@@ -185,6 +185,7 @@ e1000_link_up(E1000State *s)
+ {
+     s->mac_reg[STATUS] |= E1000_STATUS_LU;
+     s->phy_reg[PHY_STATUS] |= MII_SR_LINK_STATUS;
++    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+ }
+ 
+ static bool
+
+
+The patch seems to resolve the issue. The guest is able to obtain an IP address and communicate with the network.
+
+Is there anything else you would like me to test?
+
+On Thu, Jun 25, 2015 at 2:10 AM, Jonathan Liu <email address hidden> wrote:
+> Is there anything else you would like me to test?
+
+Thanks, I will submit a final patch and CC you so you can test it.
+
+Stefan
+
+
+Patch had been included here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=5df6a1855b62dc6535
+

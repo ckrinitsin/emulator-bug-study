@@ -1,0 +1,105 @@
+debug: 0.929
+register: 0.926
+performance: 0.922
+graphic: 0.921
+user-level: 0.910
+permissions: 0.907
+virtual: 0.899
+device: 0.887
+mistranslation: 0.883
+risc-v: 0.875
+semantic: 0.873
+peripherals: 0.858
+vnc: 0.845
+architecture: 0.842
+arm: 0.841
+hypervisor: 0.834
+assembly: 0.832
+KVM: 0.828
+ppc: 0.825
+socket: 0.822
+PID: 0.822
+network: 0.811
+x86: 0.807
+TCG: 0.779
+i386: 0.779
+kernel: 0.775
+boot: 0.740
+VMM: 0.739
+files: 0.719
+
+BLKZEROOUT ioct/write requests getting split a weird boundary (and for no apparent reason?)
+Description of problem:
+i was investigating into some performance weirdness with passthrough/directly-mapped SAS vs. SATA disk, which seems to relate to detect_zeroes feature (see https://forum.proxmox.com/threads/disk-passthrough-performance-weirdness.118943/#post-516599 ).
+
+apparently, writing zeroes to passtrough/direct-mapped sas disk ( ST4000NM0034 ) in virtual machine is MUCH slower then sata disk ( HGST HDN728080AL ). 
+
+with detect_zeroes=on (default in proxmox) , qemu converts writes of zeroes into BLKZEROOUT ioctl issued to the target disk, and my sas disk is much much slower with this (<80MB/s in comparison to the sata disk with 200MB/s). 
+
+i found that the sas disk needs 0.01s on average for this ioctl to finish, whereas sata disk needs 0.004s.   
+
+writing zeroes to the device directly is at about 200MB/s for both of them, so having detect_zeroes=on a default does not seem to be an advantage on all circumstances.
+
+anyway, i have made a weird observation during analysis:
+
+inside the virtual machine, i'm writing to the virtual disk like this:
+
+```
+dd if=/dev/zero of=/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive-scsi1 bs=1024k count=1024 oflag=direct 
+
+(scsi-0QEMU_QEMU_HARDDISK_drive-scsi1 mapped to scsi-35000c500836b1c73 / SAS on the host, scsi-0QEMU_QEMU_HARDDISK_drive-scsi2 mapped to ata-HGST_HDN728080ALE604_VJGDNX5X )
+
+```
+
+on the HOST i'm attaching to the kvm process with strace , every time i issue the above dd inside VM, kvm/qemu process issues BLKZEROOUT to the device in a different way, i.e. either 
+
+- within a single ioctl at originating 1048576 byte size (=1024k)
+or
+- split into 2 ioctl with  1040384+8192(=1048576)
+or
+- split into 2 ioctl with 1044480+4096(=1048576)
+
+
+why does kvm/qemu sometimes split the write request and sometimes not ? and why at such a weird boundary just below 1Mb?
+
+
+i don't know if this is a bug, but at least it looks weird to me, that's why i'm reporting
+
+```
+
+root@pve:~/util-linux/sys-utils# strace -T -f -p 18897  -e trace=all 2>&1 |grep BLK|head
+[pid 65413] ioctl(19, BLKZEROOUT, [0, 1048576] <unfinished ...>
+[pid 65412] ioctl(19, BLKZEROOUT, [1048576, 1048576] <unfinished ...>
+[pid 65366] ioctl(19, BLKZEROOUT, [2097152, 1048576] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [3145728, 1048576] <unfinished ...>
+[pid 65412] ioctl(19, BLKZEROOUT, [4194304, 1048576]) = 0 <0.011287>
+[pid 65366] ioctl(19, BLKZEROOUT, [5242880, 1048576]) = 0 <0.012025>
+[pid 65413] ioctl(19, BLKZEROOUT, [6291456, 1048576]) = 0 <0.011377>
+[pid 65412] ioctl(19, BLKZEROOUT, [7340032, 1048576] <unfinished ...>
+[pid 65366] ioctl(19, BLKZEROOUT, [8388608, 1048576] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [9437184, 1048576]) = 0 <0.011705>
+
+# strace -T -f -p 18897  -e trace=all 2>&1 |grep BLK|head
+[pid 65878] ioctl(19, BLKZEROOUT, [0, 1040384] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [1040384, 8192] <unfinished ...>
+[pid 65366] ioctl(19, BLKZEROOUT, [1048576, 1040384] <unfinished ...>
+[pid 65878] ioctl(19, BLKZEROOUT, [2088960, 8192] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [2097152, 1040384] <unfinished ...>
+[pid 65366] ioctl(19, BLKZEROOUT, [3137536, 8192] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [3145728, 1040384] <unfinished ...>
+[pid 65878] ioctl(19, BLKZEROOUT, [4186112, 8192] <unfinished ...>
+[pid 65366] ioctl(19, BLKZEROOUT, [4194304, 1040384] <unfinished ...>
+[pid 65413] ioctl(19, BLKZEROOUT, [5234688, 8192] <unfinished ...>
+
+root@pve:~/util-linux/sys-utils# strace -T -f -p 18897  -e trace=all 2>&1 |grep BLK|head
+[pid 66591] ioctl(19, BLKZEROOUT, [0, 1044480] <unfinished ...>
+[pid 66592] ioctl(19, BLKZEROOUT, [1044480, 4096] <unfinished ...>
+[pid 66593] ioctl(19, BLKZEROOUT, [1048576, 1044480] <unfinished ...>
+[pid 66584] ioctl(19, BLKZEROOUT, [2093056, 4096] <unfinished ...>
+[pid 66585] ioctl(19, BLKZEROOUT, [2097152, 1044480] <unfinished ...>
+[pid 66565] ioctl(19, BLKZEROOUT, [3141632, 4096] <unfinished ...>
+[pid 66591] ioctl(19, BLKZEROOUT, [3145728, 1044480] <unfinished ...>
+[pid 66592] ioctl(19, BLKZEROOUT, [4190208, 4096] <unfinished ...>
+[pid 66584] ioctl(19, BLKZEROOUT, [4194304, 1044480] <unfinished ...>
+[pid 66593] ioctl(19, BLKZEROOUT, [5238784, 4096] <unfinished ...
+```

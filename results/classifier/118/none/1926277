@@ -1,0 +1,244 @@
+x86: 0.765
+graphic: 0.761
+ppc: 0.757
+peripherals: 0.751
+hypervisor: 0.743
+TCG: 0.742
+VMM: 0.733
+risc-v: 0.729
+virtual: 0.715
+vnc: 0.691
+permissions: 0.679
+files: 0.645
+KVM: 0.644
+register: 0.629
+device: 0.622
+semantic: 0.619
+performance: 0.618
+architecture: 0.616
+user-level: 0.593
+mistranslation: 0.588
+socket: 0.577
+debug: 0.546
+assembly: 0.541
+arm: 0.517
+PID: 0.502
+i386: 0.496
+network: 0.480
+boot: 0.457
+kernel: 0.435
+
+MIPS MT dvpe does not regard VPEConf0.MVP  
+
+Hi,
+
+According to MIPS32® Architecture for Programmers VolumeIV-f: The MIPS® MT Application-Speciﬁc Extension to the MIPS32® Architecture, for instruction: dvpe, evpe:
+
+If the VPE executing the instruction is not a Master VPE, with the MVP bit of the VPEConf0 register set, the EVP bit is unchanged by the instruction.
+
+The pseudo code is:
+
+data ←  MVPControl
+GPR[rt] ←  data
+if(VPEConf0.MVP = 1) then
+  MVPControl.EVP ←  sc
+endif
+
+However the helper functions of dvpe, evpe does not regard the VPEConf0.MVP bit, namely, it does not check if the VPE is a master VPE. Code is copied below as:
+
+target_ulong helper_dvpe(CPUMIPSState *env)
+{
+    CPUState *other_cs = first_cpu;
+    target_ulong prev = env->mvp->CP0_MVPControl;
+
+    CPU_FOREACH(other_cs) {
+        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+        /* Turn off all VPEs except the one executing the dvpe.  */
+        if (&other_cpu->env != env) {
+            other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
+            mips_vpe_sleep(other_cpu);
+        }
+    }
+    return prev;
+}
+
+Is this a bug?
+
+QEMU head commit: 0cef06d18762374c94eb4d511717a4735d668a24 is checked.
+
+According to the 'MIPS MT Application-Speciﬁc Extension' manual:
+
+  If the VPE executing the instruction is not a Master VPE,
+  with the MVP bit of the VPEConf0 register set, the EVP bit
+  is unchanged by the instruction.
+
+Add the VPEConf0.MVP bit and modify the DVPE/EVPE opcodes to only
+update the MVPControl.EVP bit if executed on a master VPE.
+
+Reported-by: Hansni Bu
+Buglink: https://bugs.launchpad.net/qemu/+bug/1926277
+Fixes: f249412c749 ("mips: Add MT halting and waking of VPEs")
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+ target/mips/cpu.h        |  1 +
+ target/mips/cp0_helper.c | 32 ++++++++++++++++++--------------
+ 2 files changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/target/mips/cpu.h b/target/mips/cpu.h
+index 075c24abdad..bd22fac6959 100644
+--- a/target/mips/cpu.h
++++ b/target/mips/cpu.h
+@@ -114,6 +114,7 @@ struct CPUMIPSMVPContext {
+ #define CP0MVPC0_PTLBE  16
+ #define CP0MVPC0_TCA    15
+ #define CP0MVPC0_PVPE   10
++#define CP0MVPC0_MVP    1
+ #define CP0MVPC0_PTC    0
+     int32_t CP0_MVPConf1;
+ #define CP0MVPC1_CIM    31
+diff --git a/target/mips/cp0_helper.c b/target/mips/cp0_helper.c
+index aae2af6eccc..1e39e28808a 100644
+--- a/target/mips/cp0_helper.c
++++ b/target/mips/cp0_helper.c
+@@ -1635,12 +1635,14 @@ target_ulong helper_dvpe(CPUMIPSState *env)
+     CPUState *other_cs = first_cpu;
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+-    CPU_FOREACH(other_cs) {
+-        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+-        /* Turn off all VPEs except the one executing the dvpe.  */
+-        if (&other_cpu->env != env) {
+-            other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
+-            mips_vpe_sleep(other_cpu);
++    if (env->mvp->CP0_MVPConf0 & (1 << CP0MVPC0_MVP)) {
++        CPU_FOREACH(other_cs) {
++            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
++            /* Turn off all VPEs except the one executing the dvpe.  */
++            if (&other_cpu->env != env) {
++                other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
++                mips_vpe_sleep(other_cpu);
++            }
+         }
+     }
+     return prev;
+@@ -1651,15 +1653,17 @@ target_ulong helper_evpe(CPUMIPSState *env)
+     CPUState *other_cs = first_cpu;
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+-    CPU_FOREACH(other_cs) {
+-        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
++    if (env->mvp->CP0_MVPConf0 & (1 << CP0MVPC0_MVP)) {
++        CPU_FOREACH(other_cs) {
++            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+ 
+-        if (&other_cpu->env != env
+-            /* If the VPE is WFI, don't disturb its sleep.  */
+-            && !mips_vpe_is_wfi(other_cpu)) {
+-            /* Enable the VPE.  */
+-            other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
+-            mips_vpe_wake(other_cpu); /* And wake it up.  */
++            if (&other_cpu->env != env
++                /* If the VPE is WFI, don't disturb its sleep.  */
++                && !mips_vpe_is_wfi(other_cpu)) {
++                /* Enable the VPE.  */
++                other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
++                mips_vpe_wake(other_cpu); /* And wake it up.  */
++            }
+         }
+     }
+     return prev;
+-- 
+2.26.3
+
+
+
+Hi Philippe,
+
+Instead of checking with MVPConf0, I think we should check with VPEConf0.
+
+Oops you are right. The problem is I don't have reproducer, so I rely on your testing :)
+
+According to the 'MIPS MT Application-Speciﬁc Extension' manual:
+
+  If the VPE executing the instruction is not a Master VPE,
+  with the MVP bit of the VPEConf0 register set, the EVP bit
+  is unchanged by the instruction.
+
+Modify the DVPE/EVPE opcodes to only update the MVPControl.EVP bit
+if executed on a master VPE.
+
+Reported-by: Hansni Bu <https://launchpad.net/%7Ehansni/+contactuser>
+Buglink: https://bugs.launchpad.net/qemu/+bug/1926277
+Fixes: f249412c749 ("mips: Add MT halting and waking of VPEs")
+Signed-off-by: Philippe Mathieu-Daudé <email address hidden>
+---
+Supersedes: <email address hidden>
+v2: Check VPEConf0.MVP bit (hansni)
+---
+ target/mips/cp0_helper.c | 32 ++++++++++++++++++--------------
+ 1 file changed, 18 insertions(+), 14 deletions(-)
+
+diff --git a/target/mips/cp0_helper.c b/target/mips/cp0_helper.c
+index aae2af6eccc..d5f274f5cdf 100644
+--- a/target/mips/cp0_helper.c
++++ b/target/mips/cp0_helper.c
+@@ -1635,12 +1635,14 @@ target_ulong helper_dvpe(CPUMIPSState *env)
+     CPUState *other_cs = first_cpu;
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+-    CPU_FOREACH(other_cs) {
+-        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+-        /* Turn off all VPEs except the one executing the dvpe.  */
+-        if (&other_cpu->env != env) {
+-            other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
+-            mips_vpe_sleep(other_cpu);
++    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
++        CPU_FOREACH(other_cs) {
++            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
++            /* Turn off all VPEs except the one executing the dvpe.  */
++            if (&other_cpu->env != env) {
++                other_cpu->env.mvp->CP0_MVPControl &= ~(1 << CP0MVPCo_EVP);
++                mips_vpe_sleep(other_cpu);
++            }
+         }
+     }
+     return prev;
+@@ -1651,15 +1653,17 @@ target_ulong helper_evpe(CPUMIPSState *env)
+     CPUState *other_cs = first_cpu;
+     target_ulong prev = env->mvp->CP0_MVPControl;
+ 
+-    CPU_FOREACH(other_cs) {
+-        MIPSCPU *other_cpu = MIPS_CPU(other_cs);
++    if (env->CP0_VPEConf0 & (1 << CP0VPEC0_MVP)) {
++        CPU_FOREACH(other_cs) {
++            MIPSCPU *other_cpu = MIPS_CPU(other_cs);
+ 
+-        if (&other_cpu->env != env
+-            /* If the VPE is WFI, don't disturb its sleep.  */
+-            && !mips_vpe_is_wfi(other_cpu)) {
+-            /* Enable the VPE.  */
+-            other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
+-            mips_vpe_wake(other_cpu); /* And wake it up.  */
++            if (&other_cpu->env != env
++                /* If the VPE is WFI, don't disturb its sleep.  */
++                && !mips_vpe_is_wfi(other_cpu)) {
++                /* Enable the VPE.  */
++                other_cpu->env.mvp->CP0_MVPControl |= (1 << CP0MVPCo_EVP);
++                mips_vpe_wake(other_cpu); /* And wake it up.  */
++            }
+         }
+     }
+     return prev;
+-- 
+2.26.3
+
+
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'invalid' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/244
+
+

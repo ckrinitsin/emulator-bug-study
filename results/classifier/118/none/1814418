@@ -1,0 +1,560 @@
+user-level: 0.685
+VMM: 0.684
+KVM: 0.671
+risc-v: 0.670
+x86: 0.660
+virtual: 0.653
+vnc: 0.652
+ppc: 0.649
+permissions: 0.648
+TCG: 0.647
+hypervisor: 0.644
+boot: 0.639
+i386: 0.635
+mistranslation: 0.635
+network: 0.635
+peripherals: 0.631
+debug: 0.626
+performance: 0.625
+register: 0.625
+files: 0.625
+architecture: 0.618
+assembly: 0.617
+socket: 0.617
+device: 0.616
+arm: 0.615
+PID: 0.615
+kernel: 0.611
+semantic: 0.610
+graphic: 0.609
+
+persistent bitmap will be inconsistent when qemu  crash, 
+
+Follow these steps to reappear the bug:
+
+1. start qemu
+2. add persistent bitmap: '{ "execute": "block-dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name": "bitmap0", "persistent":true }}'
+3. kill -9 qemu (simulate Host crash, eg. lose power)
+4. restart qemu
+
+Now, the '{ "execute": "query-block" }' can't find the bitmap0. I can understand at this point, because the bitmap0 has not been synchronized yet.
+
+But, when I try to add persistent bitmap0 again: '{ "execute": "block-dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name": "bitmap0", "persistent":true }}', It failed:
+
+{"id":"libvirt-42","error":{"class":"GenericError","desc":"Can't make bitmap 'bitmap0' persistent in 'drive-virtio-disk1': Bitmap with the same name is already stored"}}
+
+In other word, when qemu crash, the qcow2 image remain the incomplete persistent bitmap.
+
+---
+
+qemu version: 2.12.0 and 3.1.0, other version I does not test yet.
+qemu command: qemu-system-x86_64 -name guest=test,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-190-test./master-key.aes -machine pc-i440fx-3.1,accel=kvm,usb=off,dump-guest-core=off,mem-merge=off -m 1024 -mem-prealloc -mem-path /dev/hugepages1G/libvirt/qemu/190-test -realtime mlock=off -smp 1,sockets=1,cores=1,threads=1 -uuid 1c8611c2-a18a-4b1c-b40b-9d82040eafa4 -smbios type=1,manufacturer=IaaS -no-user-config -nodefaults -chardev socket,id=charmonitor,fd=31,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc -no-shutdown -boot menu=on,strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x3 -drive file=/opt/vol/sas/fb0c7c37-13e7-41fe-b3f8-f0fbaaeec7ce,format=qcow2,if=none,id=drive-virtio-disk0,cache=writeback -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x5,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on -drive file=/opt/vol/sas/bde66671-536d-49cd-8b46-a4f1ea7be513,format=qcow2,if=none,id=drive-virtio-disk1,cache=writeback -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x7,drive=drive-virtio-disk1,id=virtio-disk1,write-cache=on -netdev tap,fd=33,id=hostnet0,vhost=on,vhostfd=34 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=00:85:45:3e:d4:3a,bus=pci.0,addr=0x6 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -chardev socket,id=charchannel0,fd=35,server,nowait -device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=org.qemu.guest_agent.0 -device usb-tablet,id=input0,bus=usb.0,port=1 -vnc 0.0.0.0:0,password -device cirrus-vga,id=video0,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x4 -msg timestamp=on
+
+On 2/2/19 11:52 PM, Cheng Chen wrote:
+> Public bug reported:
+> 
+> Follow these steps to reappear the bug:
+> 
+> 1. start qemu
+> 2. add persistent bitmap: '{ "execute": "block-dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name": "bitmap0", "persistent":true }}'
+> 3. kill -9 qemu (simulate Host crash, eg. lose power)
+> 4. restart qemu
+> 
+> Now, the '{ "execute": "query-block" }' can't find the bitmap0. I can
+> understand at this point, because the bitmap0 has not been synchronized
+> yet.
+
+This matches my observations here:
+https://lists.gnu.org/archive/html/qemu-devel/2019-01/msg07700.html
+
+I'm of the opinion that updating the qcow2 headers any time a persistent
+bitmap is created or destroyed is worthwhile, even if the headers must
+still mark the bitmap as in-use.  True, the crash will leave the bitmap
+as inconsistent, which is no different than if the bitmap is never
+written to the qcow2 header (when booting a new qemu, an inconsistent
+bitmap on disk has the same status as a missing bitmap - both imply that
+an incremental backup is not possible, and so a full backup is needed
+instead).  But the creation of bitmaps is not a common occasion, and
+having the metadata track that a persistent bitmap has been requested
+seems like it would be useful information during a debugging session.
+
+
+> 
+> But, when I try to add persistent bitmap0 again: '{ "execute": "block-
+> dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name":
+> "bitmap0", "persistent":true }}', It failed:
+> 
+> {"id":"libvirt-42","error":{"class":"GenericError","desc":"Can't make
+> bitmap 'bitmap0' persistent in 'drive-virtio-disk1': Bitmap with the
+> same name is already stored"}}
+> 
+> In other word, when qemu crash, the qcow2 image remain the incomplete
+> persistent bitmap.
+
+Does Andrey's proposed patch adding persistent bitmap details to
+'qemu-img info' show anything after you first kill qemu?
+
+/me goes and tests...
+
+Oh weird - with Andrey's patch, we get semi-duplicated information
+during query-block (at least, after an initial clean shutdown prior to
+attempting an abrupt shutdown):
+
+{"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+"removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+"image": {"virtual-size": 104857600, "filename": "file5",
+"cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+"format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+"lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+"name": "b2", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+"#block172", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+"bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+"bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+"/machine/unattached/device[18]", "dirty-bitmaps": [{"name": "b2",
+"status": "active", "granularity": 65536, "count": 0}, {"name": "b",
+"status": "active", "granularity": 65536, "count": 0}], "type": "unknown"}]}
+
+Note that the "format-specific" listing has a "bitmaps" entry resulting
+from Andrey's patch (which shows "auto" as one of the "flags" for any
+persistent bitmap) showing the state of the persistent bitmaps on disk;
+as well as the "dirty-bitmaps" entry that shows the state of the bitmaps
+in memory. Annoyingly, the "dirty-bitmaps" section does NOT state which
+bitmaps are persistent, and if a persistent bitmap has not yet been
+flushed to disk, then there is NO way to quickly determine which bitmaps
+are persistent and which are transient.
+
+At any rate, with qemu.git master + Andrey's patches for qemu-img info,
+I was able to reproduce a related oddity: attempting to
+block-dirty-bitmap-add a transient bitmap that has the same name as an
+existing in-use persistent bitmap succeeds; when it should have failed:
+
+$ qemu-img create -f qcow2 file5 100m
+$ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+file5
+{'execute':'qmp_capabilities'}
+{'execute':'query-block'} # learn the node name...
+{'execute':'block-dirty-bitmap-add','arguments':{'node':'#block111','name':'b1','persistent':true}}
+{'execute':'quit'}
+$ ./qemu-img info -U file5
+image: file5
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 204K
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    bitmaps:
+        [0]:
+            flags:
+                [0]: auto
+            name: b1
+            granularity: 65536
+    refcount bits: 16
+    corrupt: false
+$ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+file5
+{'execute':'qmp_capabilities'}
+{'execute':'query-block'}
+{"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+"removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+"image": {"virtual-size": 104857600, "filename": "file5",
+"cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+"format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+"lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+"name": "b1", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+"#block157", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+"bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+"bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+"/machine/unattached/device[18]", "dirty-bitmaps": [{"name": "b1",
+"status": "active", "granularity": 65536, "count": 0}], "type": "unknown"}]}
+$ kill -9 $qemupid
+$ ./qemu-img info -U file5
+image: file5
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 204K
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    bitmaps:
+        [0]:
+            flags:
+                [0]: in-use
+                [1]: auto
+            name: b1
+            granularity: 65536
+    refcount bits: 16
+    corrupt: false
+$ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+file5
+{'execute':'qmp_capabilities'}
+{'execute':'query-block'}
+{"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+"removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+"image": {"virtual-size": 104857600, "filename": "file5",
+"cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+"format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+"lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+"name": "b1", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+"#block141", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+"bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+"bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+"/machine/unattached/device[18]", "type": "unknown"}]}
+
+Note - after the unclean death, the "dirty-bitmaps" entry in query-block
+is NOT present, and as a result:
+
+{'execute':'block-dirty-bitmap-add','arguments':{'node':'#block141','name':'b1'}}
+{"return": {}}
+
+Oops - we were able to add a temporary bitmap that overrides the still
+in-use persistent bitmap (which we properly ignored on loading, because
+it was marked in-use).
+
+
+> 
+> ---
+> 
+> qemu version: 2.12.0 and 3.1.0, other version I does not test yet.
+
+qemu 4.0 promotes various dirty bitmap interfaces from experimental to
+supported; flaws in 3.1 are somewhat expected, but we want to make sure
+4.0 fixes such problems, so we indeed have a bug here.
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+On 2/4/19 8:55 AM, Eric Blake wrote:
+
+> 
+> Note that the "format-specific" listing has a "bitmaps" entry resulting
+> from Andrey's patch (which shows "auto" as one of the "flags" for any
+> persistent bitmap) showing the state of the persistent bitmaps on disk;
+> as well as the "dirty-bitmaps" entry that shows the state of the bitmaps
+> in memory. Annoyingly, the "dirty-bitmaps" section does NOT state which
+> bitmaps are persistent, and if a persistent bitmap has not yet been
+> flushed to disk, then there is NO way to quickly determine which bitmaps
+> are persistent and which are transient.
+
+I've posted a patch for this side-issue:
+
+https://lists.gnu.org/archive/html/qemu-devel/2019-02/msg00759.html
+
+-- 
+Eric Blake, Principal Software Engineer
+Red Hat, Inc.           +1-919-301-3226
+Virtualization:  qemu.org | libvirt.org
+
+
+Thanks, all:
+
+I only want to know:
+
+1. Is this a bug?
+2. Which qemu version will fix the bug?
+
+
+
+On 2/4/19 11:22 AM, Vladimir Sementsov-Ogievskiy wrote:
+> 04.02.2019 17:55, Eric Blake wrote:
+>> On 2/2/19 11:52 PM, Cheng Chen wrote:
+>>> Public bug reported:
+>>>
+>>> Follow these steps to reappear the bug:
+>>>
+>>> 1. start qemu
+>>> 2. add persistent bitmap: '{ "execute": "block-dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name": "bitmap0", "persistent":true }}'
+>>> 3. kill -9 qemu (simulate Host crash, eg. lose power)
+>>> 4. restart qemu
+>>>
+>>> Now, the '{ "execute": "query-block" }' can't find the bitmap0. I can
+>>> understand at this point, because the bitmap0 has not been synchronized
+>>> yet.
+>>
+>> This matches my observations here:
+>> https://lists.gnu.org/archive/html/qemu-devel/2019-01/msg07700.html
+>>
+>> I'm of the opinion that updating the qcow2 headers any time a persistent
+>> bitmap is created or destroyed is worthwhile, even if the headers must
+>> still mark the bitmap as in-use.  True, the crash will leave the bitmap
+>> as inconsistent, which is no different than if the bitmap is never
+>> written to the qcow2 header (when booting a new qemu, an inconsistent
+>> bitmap on disk has the same status as a missing bitmap - both imply that
+>> an incremental backup is not possible, and so a full backup is needed
+>> instead).  But the creation of bitmaps is not a common occasion, and
+>> having the metadata track that a persistent bitmap has been requested
+>> seems like it would be useful information during a debugging session.
+> 
+> Even if we store them, following query-block will not show them, as
+> in-use bitmaps are not loaded on open (or, we should load them too).
+> 
+>>
+>>
+>>>
+>>> But, when I try to add persistent bitmap0 again: '{ "execute": "block-
+>>> dirty-bitmap-add", "arguments": {"node": "drive-virtio-disk1","name":
+>>> "bitmap0", "persistent":true }}', It failed:
+>>>
+>>> {"id":"libvirt-42","error":{"class":"GenericError","desc":"Can't make
+>>> bitmap 'bitmap0' persistent in 'drive-virtio-disk1': Bitmap with the
+>>> same name is already stored"}}
+>>>
+>>> In other word, when qemu crash, the qcow2 image remain the incomplete
+>>> persistent bitmap.
+> 
+> Yes (if it was stored at least once, may be on previous qemu run).
+> 
+>>
+>> Does Andrey's proposed patch adding persistent bitmap details to
+>> 'qemu-img info' show anything after you first kill qemu?
+>>
+>> /me goes and tests...
+>>
+>> Oh weird - with Andrey's patch, we get semi-duplicated information
+>> during query-block (at least, after an initial clean shutdown prior to
+>> attempting an abrupt shutdown):
+>>
+>> {"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+>> "removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+>> "image": {"virtual-size": 104857600, "filename": "file5",
+>> "cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+>> "format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+>> "lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+>> "name": "b2", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+>> false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+>> "#block172", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+>> "bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+>> "bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+>> true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+>> "/machine/unattached/device[18]", "dirty-bitmaps": [{"name": "b2",
+>> "status": "active", "granularity": 65536, "count": 0}, {"name": "b",
+>> "status": "active", "granularity": 65536, "count": 0}], "type": "unknown"}]}
+>>
+>> Note that the "format-specific" listing has a "bitmaps" entry resulting
+>> from Andrey's patch (which shows "auto" as one of the "flags" for any
+>> persistent bitmap) showing the state of the persistent bitmaps on disk;
+>> as well as the "dirty-bitmaps" entry that shows the state of the bitmaps
+>> in memory. Annoyingly, the "dirty-bitmaps" section does NOT state which
+>> bitmaps are persistent, and if a persistent bitmap has not yet been
+>> flushed to disk, then there is NO way to quickly determine which bitmaps
+>> are persistent and which are transient.
+>>
+>> At any rate, with qemu.git master + Andrey's patches for qemu-img info,
+>> I was able to reproduce a related oddity: attempting to
+>> block-dirty-bitmap-add a transient bitmap that has the same name as an
+>> existing in-use persistent bitmap succeeds; when it should have failed:
+>>
+>> $ qemu-img create -f qcow2 file5 100m
+>> $ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+>> file5
+>> {'execute':'qmp_capabilities'}
+>> {'execute':'query-block'} # learn the node name...
+>> {'execute':'block-dirty-bitmap-add','arguments':{'node':'#block111','name':'b1','persistent':true}}
+>> {'execute':'quit'}
+>> $ ./qemu-img info -U file5
+>> image: file5
+>> file format: qcow2
+>> virtual size: 100M (104857600 bytes)
+>> disk size: 204K
+>> cluster_size: 65536
+>> Format specific information:
+>>      compat: 1.1
+>>      lazy refcounts: false
+>>      bitmaps:
+>>          [0]:
+>>              flags:
+>>                  [0]: auto
+>>              name: b1
+>>              granularity: 65536
+>>      refcount bits: 16
+>>      corrupt: false
+>> $ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+>> file5
+>> {'execute':'qmp_capabilities'}
+>> {'execute':'query-block'}
+>> {"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+>> "removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+>> "image": {"virtual-size": 104857600, "filename": "file5",
+>> "cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+>> "format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+>> "lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+>> "name": "b1", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+>> false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+>> "#block157", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+>> "bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+>> "bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+>> true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+>> "/machine/unattached/device[18]", "dirty-bitmaps": [{"name": "b1",
+>> "status": "active", "granularity": 65536, "count": 0}], "type": "unknown"}]}
+>> $ kill -9 $qemupid
+>> $ ./qemu-img info -U file5
+>> image: file5
+>> file format: qcow2
+>> virtual size: 100M (104857600 bytes)
+>> disk size: 204K
+>> cluster_size: 65536
+>> Format specific information:
+>>      compat: 1.1
+>>      lazy refcounts: false
+>>      bitmaps:
+>>          [0]:
+>>              flags:
+>>                  [0]: in-use
+>>                  [1]: auto
+>>              name: b1
+>>              granularity: 65536
+>>      refcount bits: 16
+>>      corrupt: false
+>> $ ./x86_64-softmmu/qemu-system-x86_64 -nodefaults -nographic -qmp stdio
+>> file5
+>> {'execute':'qmp_capabilities'}
+>> {'execute':'query-block'}
+>> {"return": [{"io-status": "ok", "device": "ide0-hd0", "locked": false,
+>> "removable": false, "inserted": {"iops_rd": 0, "detect_zeroes": "off",
+>> "image": {"virtual-size": 104857600, "filename": "file5",
+>> "cluster-size": 65536, "format": "qcow2", "actual-size": 208896,
+>> "format-specific": {"type": "qcow2", "data": {"compat": "1.1",
+>> "lazy-refcounts": false, "bitmaps": [{"flags": ["in-use", "auto"],
+>> "name": "b1", "granularity": 65536}], "refcount-bits": 16, "corrupt":
+>> false}}, "dirty-flag": false}, "iops_wr": 0, "ro": false, "node-name":
+>> "#block141", "backing_file_depth": 0, "drv": "qcow2", "iops": 0,
+>> "bps_wr": 0, "write_threshold": 0, "encrypted": false, "bps": 0,
+>> "bps_rd": 0, "cache": {"no-flush": false, "direct": false, "writeback":
+>> true}, "file": "file5", "encryption_key_missing": false}, "qdev":
+>> "/machine/unattached/device[18]", "type": "unknown"}]}
+>>
+>> Note - after the unclean death, the "dirty-bitmaps" entry in query-block
+>> is NOT present, and as a result:
+>>
+>> {'execute':'block-dirty-bitmap-add','arguments':{'node':'#block141','name':'b1'}}
+>> {"return": {}}
+>>
+>> Oops - we were able to add a temporary bitmap that overrides the still
+>> in-use persistent bitmap (which we properly ignored on loading, because
+>> it was marked in-use).
+> 
+> Yes, but you will not be able to create persistent bitmap with the same name as
+> in-use bitmap in the image, so, there is no actual collision.. But is not good
+> too.
+> 
+> In-use bitmaps in the image may appear only after some kind of qemu crash. Isn't
+> it a good reason to call qemu-img check? So, haw about just forbid to start qemu
+> if there are any in-use bitmaps?
+> 
+
+I have wondered this recently.
+
+I am against just silently loading and deleting the bitmaps because I
+don't want any chance for data corruption if the bitmap gets lost
+accidentally. I like the loud failure.
+
+I kind of like the idea of just failing to load the image at all,
+because it does necessitate user action, but it feels a little user hostile.
+
+Maybe we can do some kind of soft-load for corrupted bitmaps where they
+will remain "locked" and cannot be re-written to disk until the user
+issues a clear command to reset them -- so the user knows full well the
+backup chain is broken. Maybe this is a good solution to the problem?
+
+What do you think?
+
+--js
+
+
+
+
+On 2/12/19 5:56 AM, Vladimir Sementsov-Ogievskiy wrote:
+> 12.02.2019 4:10, John Snow wrote:
+>> On 2/4/19 11:22 AM, Vladimir Sementsov-Ogievskiy wrote:
+
+>>> In-use bitmaps in the image may appear only after some kind of qemu crash. Isn't
+>>> it a good reason to call qemu-img check? So, haw about just forbid to start qemu
+>>> if there are any in-use bitmaps?
+>>>
+>>
+>> I have wondered this recently.
+>>
+>> I am against just silently loading and deleting the bitmaps because I
+>> don't want any chance for data corruption if the bitmap gets lost
+>> accidentally. I like the loud failure.
+>>
+>> I kind of like the idea of just failing to load the image at all,
+>> because it does necessitate user action, but it feels a little user hostile.
+> 
+> Yes, it may be to noisy to have to call qemu-img check after any unexpected process
+> kill, and it's not like real machine behave.
+> 
+>>
+>> Maybe we can do some kind of soft-load for corrupted bitmaps where they
+>> will remain "locked" and cannot be re-written to disk until the user
+>> issues a clear command to reset them -- so the user knows full well the
+>> backup chain is broken. Maybe this is a good solution to the problem?
+>>
+>> What do you think?
+> 
+> It should not be just "locked", it should be visibly "corrupted", for user to understand
+> the reason of why bitmap is unusable. So, it should be a new state of flag.
+> 
+
+Right, sure. It will behave similarly to a locked, disabled bitmap. You
+can't do anything to it, it doesn't record writes, etc. A new flag is
+helpful for the purpose.
+
+> So, instead of just ignoring in-use bitmaps on start, we load them, benefit of
+> having them in list, but the only thing which can be done with them is
+> block-dirty-bitmap-remove (and it's additional reason, why it can't be "locked" state).
+> 
+
+I'd say remove or clear, both would make sense. I suppose we only *need*
+one and remove covers all cases, so I'll go with this suggestion and
+offer clear as an additional patch that we could take or leave.
+
+> I'm not sure that we should load data for such bitmaps, so they may be loaded as
+> BdrvDirtyBitmaps with .corrupted = true and .bitmap = NULL.
+> 
+
+Probably doesn't hurt to just load a blank bitmap instead of trying to
+special case it with the NULL, but understood: we don't have to load the
+data because it's junk.
+
+> 
+> Hmm, go and check that it will not break bitmaps migration related logic, which is described
+> in BIG comment in block/qcow2.c. Looks like all is ok, and in only valid case when we could
+> see in-use bitmaps is
+> 
+>       * One remaining possible case when we don't want load bitmaps:
+>       *
+>       * 4. Open disk in inactive mode in target vm (bitmaps are migrating or
+>       *    will be loaded on invalidation, no needs try loading them before)
+> 
+> 
+> and we don't try loading bitmaps in this case:
+> 
+>      if (!(bdrv_get_flags(bs) & BDRV_O_INACTIVE)) {
+>         < load bitmaps >
+> 
+> So the only thing to do additionally here is enhance the comment, to
+> s/no needs/must not do it, as they will be loaded as corrupted/.
+> 
+> 
+
+Sounds good to me, I'll get cooking.
+
+
+This has been checked in upstream and is pending release for 4.0;
+
+QEMU will now load inconsistent bitmaps and expose them with a status of "Inconsistent" and an extra boolean inconsistent = true.
+
+You can remove them with block-dirty-bitmap-remove.
+

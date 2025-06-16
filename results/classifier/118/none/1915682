@@ -1,0 +1,177 @@
+mistranslation: 0.756
+user-level: 0.681
+graphic: 0.678
+semantic: 0.675
+peripherals: 0.655
+register: 0.653
+risc-v: 0.651
+assembly: 0.650
+device: 0.648
+architecture: 0.645
+virtual: 0.642
+debug: 0.632
+permissions: 0.631
+hypervisor: 0.629
+i386: 0.624
+PID: 0.619
+arm: 0.616
+vnc: 0.592
+VMM: 0.578
+KVM: 0.563
+kernel: 0.562
+performance: 0.561
+TCG: 0.557
+files: 0.547
+x86: 0.539
+boot: 0.536
+socket: 0.520
+ppc: 0.478
+network: 0.456
+
+i386-linux-user wine exception regression tests fail
+
+When trying to run wine (latest devel from git) regression tests for ntdll in a statically linked qemu-i386 (commit 392b9a74b9b621c52d05e37bc6f41f1bbab5c6f8) on arm32 (raspberry pi 4) in a debian buster chroot, the exception tests fail at the first test with an infinite exception loop.
+
+WINEDEBUG=+seh wine wine/dlls/ntdll/tests/ntdll_test.exe exception
+
+
+Working x86_64 system running 32-bit code
+
+0024:warn:seh:dispatch_exception EXCEPTION_ACCESS_VIOLATION exception (code=c0000005) raised
+0024:trace:seh:dispatch_exception  eax=00000000 ebx=7ffc2000 ecx=004e0ef4 edx=003c0004 esi=003c0000 edi=00000000
+0024:trace:seh:dispatch_exception  ebp=0085fa08 esp=0085f9ac cs=0023 ds=002b es=002b fs=0063 gs=006b flags=00010246
+0024:trace:seh:call_vectored_handlers calling handler at 7B00B460 code=c0000005 flags=0
+0024:trace:seh:call_vectored_handlers handler at 7B00B460 returned 0
+0024:trace:seh:call_stack_handlers calling handler at 004178B0 code=c0000005 flags=0
+0024:trace:seh:call_stack_handlers handler at 004178B0 returned 0
+0024:trace:seh:dispatch_exception  call_stack_handlers continuing
+0024:trace:seh:NtGetContextThread 0xfffffffe: dr0=42424240 dr1=00000000 dr2=126bb070 dr3=0badbad0 dr6=00000000 dr7=ffff0115
+
+
+Non-working qemu
+
+0024:warn:seh:dispatch_exception EXCEPTION_ACCESS_VIOLATION exception (code=c0000005) raised
+0024:trace:seh:dispatch_exception  eax=00000000 ebx=3ffe2000 ecx=004e0ef4 edx=003c0004 esi=003c0000 edi=00000000
+0024:trace:seh:dispatch_exception  ebp=0085fa08 esp=0085f9ac cs=0023 ds=002b es=002b fs=003b gs=0033 flags=00000246
+0024:trace:seh:call_vectored_handlers calling handler at 7B00B460 code=c0000005 flags=0
+0024:trace:seh:call_vectored_handlers handler at 7B00B460 returned 0
+0024:trace:seh:call_stack_handlers calling handler at 004178B0 code=c0000005 flags=0
+0024:trace:seh:call_stack_handlers handler at 004178B0 returned 0
+0024:trace:seh:dispatch_exception  call_stack_handlers continuing
+0024:trace:seh:dispatch_exception  call_stack_handlers ret status = 0
+0024:trace:seh:dispatch_exception code=0 flags=1 addr=7BC2389C ip=7bc2389c tid=0024
+
+The non-working verion is never managing to set the CPU context using NtContinue/SetContextThread back to the correct running thread stack and IP. It executes as if the context restore just returns to the function that called NtContinue() (dispatch_exception(), not the function that raised the exception or one of its parent exception handlers).
+
+It looks like NtSetContextThread(), specifically the asm function set_full_cpu_context() is being handled incorrectly.
+
+wine code below. note interesting use of iret with no previous interrupt call. The exception handler is called with a jmp.
+
+/***********************************************************************
+ *           set_full_cpu_context
+ *
+ * Set the new CPU context.
+ */
+extern void set_full_cpu_context( const CONTEXT *context );
+__ASM_GLOBAL_FUNC( set_full_cpu_context,
+                   "movl $0,%fs:0x1f8\n\t"     /* x86_thread_data()->syscall_frame = NULL */
+                   "movl 4(%esp),%ecx\n\t"
+                   "movw 0x8c(%ecx),%gs\n\t"  /* SegGs */
+                   "movw 0x90(%ecx),%fs\n\t"  /* SegFs */
+                   "movw 0x94(%ecx),%es\n\t"  /* SegEs */
+                   "movl 0x9c(%ecx),%edi\n\t" /* Edi */
+                   "movl 0xa0(%ecx),%esi\n\t" /* Esi */
+                   "movl 0xa4(%ecx),%ebx\n\t" /* Ebx */
+                   "movl 0xb4(%ecx),%ebp\n\t" /* Ebp */
+                   "movw %ss,%ax\n\t"
+                   "cmpw 0xc8(%ecx),%ax\n\t"  /* SegSs */
+                   "jne 1f\n\t"
+                   /* As soon as we have switched stacks the context structure could
+                    * be invalid (when signal handlers are executed for example). Copy
+                    * values on the target stack before changing ESP. */
+                   "movl 0xc4(%ecx),%eax\n\t" /* Esp */
+                   "leal -4*4(%eax),%eax\n\t"
+                   "movl 0xc0(%ecx),%edx\n\t" /* EFlags */
+                   ".byte 0x36\n\t"
+                   "movl %edx,3*4(%eax)\n\t"
+                   "movl 0xbc(%ecx),%edx\n\t" /* SegCs */
+                   ".byte 0x36\n\t"
+                   "movl %edx,2*4(%eax)\n\t"
+                   "movl 0xb8(%ecx),%edx\n\t" /* Eip */
+                   ".byte 0x36\n\t"
+                   "movl %edx,1*4(%eax)\n\t"
+                   "movl 0xb0(%ecx),%edx\n\t" /* Eax */
+                   ".byte 0x36\n\t"
+                   "movl %edx,0*4(%eax)\n\t"
+                   "pushl 0x98(%ecx)\n\t"     /* SegDs */
+                   "movl 0xa8(%ecx),%edx\n\t" /* Edx */
+                   "movl 0xac(%ecx),%ecx\n\t" /* Ecx */
+                   "popl %ds\n\t"
+                   "movl %eax,%esp\n\t"
+                   "popl %eax\n\t"
+                   "iret\n"
+                   /* Restore the context when the stack segment changes. We can't use
+                    * the same code as above because we do not know if the stack segment
+                    * is 16 or 32 bit, and 'movl' will throw an exception when we try to
+                    * access memory above the limit. */
+                   "1:\n\t"
+                   "movl 0xa8(%ecx),%edx\n\t" /* Edx */
+                   "movl 0xb0(%ecx),%eax\n\t" /* Eax */
+                   "movw 0xc8(%ecx),%ss\n\t"  /* SegSs */
+                   "movl 0xc4(%ecx),%esp\n\t" /* Esp */
+                   "pushl 0xc0(%ecx)\n\t"     /* EFlags */
+                   "pushl 0xbc(%ecx)\n\t"     /* SegCs */
+                   "pushl 0xb8(%ecx)\n\t"     /* Eip */
+                   "pushl 0x98(%ecx)\n\t"     /* SegDs */
+                   "movl 0xac(%ecx),%ecx\n\t" /* Ecx */
+                   "popl %ds\n\t"
+                   "iret" )
+
+Be aware that most of the regression test failures are caused by lack of ptrace() support. 
+
+The wine traces above show one of these cases. I will provide traces of an actual relevant failure.
+
+However the failure to restart the correct thread is in some way related to the use of iret in set_full_cpu_context(). 
+
+That was a complete misdiaagnsis. The IRET works fine in user space, at the lowest privlege level.
+
+The wrong thread is not restarted. The correct thread continues execution, at the correct address, but with the wrong thread-local data.
+
+Thread-local data is accessed via the segment loaded in the fs register in wine. The segment selector is set the same in each thread, but each thread should have a unique GDT entry pointing to its thread-local data.
+
+The issue is that clone() copies the pointer reference to the process's GDT without creating a new GDT area. All threads wind up sharing the same GDT. As the selector is the same, all threads share the same threa-local data. Oddly enough, this has fewer ill effects than excpected. Unless SEH (Structured Exception Handling) is invoked, at which point threads start unwinding the stack frames of other threads...
+
+Copying the GDT during clone() results in a workig system with correct exception handling. 
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

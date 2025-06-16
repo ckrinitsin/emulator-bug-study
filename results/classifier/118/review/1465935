@@ -1,0 +1,349 @@
+user-level: 0.881
+ppc: 0.819
+x86: 0.818
+KVM: 0.818
+i386: 0.814
+vnc: 0.808
+hypervisor: 0.805
+mistranslation: 0.802
+register: 0.792
+virtual: 0.789
+debug: 0.788
+peripherals: 0.773
+VMM: 0.746
+TCG: 0.746
+arm: 0.741
+performance: 0.738
+risc-v: 0.730
+device: 0.728
+graphic: 0.711
+assembly: 0.711
+semantic: 0.706
+architecture: 0.706
+permissions: 0.684
+kernel: 0.664
+PID: 0.661
+boot: 0.656
+network: 0.643
+socket: 0.618
+files: 0.581
+--------------------
+x86: 0.940
+debug: 0.933
+hypervisor: 0.885
+kernel: 0.839
+KVM: 0.808
+virtual: 0.655
+files: 0.103
+user-level: 0.067
+performance: 0.058
+TCG: 0.024
+PID: 0.023
+architecture: 0.020
+device: 0.015
+register: 0.011
+assembly: 0.005
+semantic: 0.005
+boot: 0.004
+socket: 0.004
+ppc: 0.003
+VMM: 0.002
+peripherals: 0.002
+graphic: 0.002
+network: 0.002
+permissions: 0.002
+vnc: 0.001
+risc-v: 0.001
+arm: 0.001
+mistranslation: 0.001
+i386: 0.000
+
+kvm_irqchip_commit_routes: Assertion `ret == 0'	failed
+
+Several my QEMU instances crashed, and in the  qemu log, I can see this assertion failure, 
+
+   qemu-system-x86_64: /build/buildd/qemu-2.0.0+dfsg/kvm-all.c:984: kvm_irqchip_commit_routes: Assertion `ret == 0' failed. 
+
+The QEMU version is 2.0.0, HV OS is ubuntu 12.04, kernel 3.2.0-38. Guest OS is RHEL 6.3.
+
+The problem can be re-produced by the script in the below in link.
+http://lists.nongnu.org/archive/html/qemu-devel/2014-12/msg03739.html
+
+i.e.
+vda_irq_num=25
+vdb_irq_num=27
+while [ 1 ]
+do
+    for irq in {1,2,4,8,10,20,40,80}
+        do
+            echo $irq > /proc/irq/$vda_irq_num/smp_affinity
+            echo $irq > /proc/irq/$vdb_irq_num/smp_affinity
+            dd if=/dev/vda of=/dev/zero bs=4K count=100 iflag=direct
+            dd if=/dev/vdb of=/dev/zero bs=4K count=100 iflag=direct
+        done
+done
+
+http://lists.nongnu.org/archive/html/qemu-devel/2014-12/msg03739.html
+
+Seems that this patch hasn't been accpeted yet, and also no comments for it.
+
+From the debug log, we can see that virq is only 1008, but irq route table has been full, i.e. 1024. 
+In kvm_irqchip_get_virq(), it only calls kvm_flush_dynamic_msi_routes() when all virqs(total gsi_count, 1024 too) have been allocated,  but irq route table has two kind of entry type,  KVM_IRQ_ROUTING_IRQCHIP and KVM_IRQ_ROUTING_MSI. Seems that 16 KVM_IRQ_ROUTING_IRQCHIP entries has been reserved, if max gsi_count is still 1024, then irq route table is possible to be overflow.
+The fix could be either set gsi_cout=1008 or increase max irq route count to 1040.
+
+kvm_irqchip_send_msi, virq=1008, nr=1024
+kvm_irqchip_commit_routes, ret=-22
+kvm_irqchip_commit_routes, irq_routes nr=1024
+
+From kvm_pc_setup_irq_routing() function, we can see that 15 routes from PIC and 23 routes from IOAPIC are added into irq route table, but only 23 irq(gsi) are reserved. This leads to irq route table has been full but there are still tens of free gsi. So the "retry" part of  kvm_irqchip_get_virq() shall never have chance to be executed.
+
+
+
+void kvm_pc_setup_irq_routing(bool pci_enabled)
+{
+    KVMState *s = kvm_state;
+    int i;
+
+    if (kvm_check_extension(s, KVM_CAP_IRQ_ROUTING)) {
+        for (i = 0; i < 8; ++i) {
+            if (i == 2) {
+                continue;
+            }
+            kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_PIC_MASTER, i);
+        }
+        for (i = 8; i < 16; ++i) {
+            kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_PIC_SLAVE, i - 8);
+        }
+        if (pci_enabled) {
+            for (i = 0; i < 24; ++i) {
+                if (i == 0) {
+                    kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_IOAPIC, 2);
+                } else if (i != 2) {
+                    kvm_irqchip_add_irq_route(s, i, KVM_IRQCHIP_IOAPIC, i);
+                }
+            }
+        }
+        kvm_irqchip_commit_routes(s);
+    }
+}
+
+static int kvm_irqchip_get_virq(KVMState *s)
+{
+    uint32_t *word = s->used_gsi_bitmap;
+    int max_words = ALIGN(s->gsi_count, 32) / 32;
+    int i, bit;
+    bool retry = true;
+
+again:
+    /* Return the lowest unused GSI in the bitmap */
+    for (i = 0; i < max_words; i++) {
+        bit = ffs(~word[i]);
+        if (!bit) {
+            continue;
+        }
+
+        return bit - 1 + i * 32;
+    }
+    if (!s->direct_msi && retry) {
+        retry = false;
+        kvm_flush_dynamic_msi_routes(s);
+        goto again;
+    }
+    return -ENOSPC;
+
+}
+
+
+
+Thank you for taking the time to report this bug and helping to make Ubuntu better. Please execute the following command, as it will automatically gather debugging information, in a terminal:
+
+apport-collect 1465935
+
+When reporting bugs in the future please use apport by using 'ubuntu-bug' and the name of the package affected. You can learn more about this functionality at https://wiki.ubuntu.com/ReportingBugs.
+
+It appears that the latest version of the patch is here:
+
+http://lists.gnu.org/archive/html/qemu-devel/2015-01/msg00822.html
+
+However, this hasn't yet be accepted upstream.  The most recent discussion requires the submitter to respond to the maintainers questions here:
+
+http://lists.gnu.org/archive/html/qemu-devel/2015-01/msg00623.html
+
+
+
+Have you be able to reproduce this issue on a wily host?  What about a different guest?  Or is only RHEL6.3 affected?
+
+Ryan, 
+Our Hypervisors are running in the internal network which can't access to Launchpad, 
+# apport-collect 1465935
+ERROR: connecting to Launchpad failed: [Errno 110] Connection timed out
+
+We saw this qemu crash on 18 Hypervisor nodes. So far all our hypervisors are ubuntu 12.04, qemu-2.0.0+dfsg, and guest OS is only RHEL6.3
+
+
+http://lists.gnu.org/archive/html/qemu-devel/2015-01/msg00822.html
+
+Seems that the latest version code has answered maintainers questions.
+
+
+-----Original Message-----
+From: Paolo Bonzini [mailto:<email address hidden>] 
+Sent: 2015年7月1日 21:39
+To: Li, Chengyuan
+Cc: <email address hidden>
+Subject: Re: [Qemu-devel] [PATCH] Fix irq route entries exceed KVM_MAX_IRQ_ROUTES
+
+On 30/06/2015 05:47, Li, Chengyuan wrote:
+> Here is my understanding,
+> 
+> 1) why isn't the existing check in kvm_irqchip_get_virq enough to fix 
+> the bug?
+> 
+> From kvm_pc_setup_irq_routing() function, we can see that 15 routes 
+> from PIC and 23 routes from IOAPIC are added into irq route table, but 
+> only
+> 23 irq(gsi) are reserved. This leads to irq route table has been full 
+> but there are still 15 free gsi. So the "retry" part of
+> kvm_irqchip_get_virq() shall never have chance to be executed.
+> 
+> 2) If you introduce this extra call to kvm_flush_dynamic_msi_routes, 
+> does the existing check become obsolete?
+> 
+> As gsi_count is the max number of irq route table, if below code is 
+> merged, then existing check is obsolete and can be removed.
+> 
+> +    if (!s->direct_msi && s->irq_routes->nr == s->gsi_count) {
+> +        kvm_flush_dynamic_msi_routes(s);
+> +    }
+> 
+> Please let me know if you have some other comments for the patch? Thanks!
+
+Thanks for finally clearing up my doubts about the patch!  I'll apply it soon.
+
+Paolo
+
+
+The proposed fix seems not yet part of any qemu release but applied as
+
+commit bdf026317daa3b9dfa281f29e96fbb6fd48394c8
+Author: 马文霜 <email address hidden>
+Date:   Wed Jul 1 15:41:41 2015 +0200
+
+    Fix irq route entries exceeding KVM_MAX_IRQ_ROUTES
+
+to v2.4.0-rc0. So this would affect all current releases and the current development release (Wily/15.10). I would start there with reproduction/verification and work backwards from there.
+
+Unfortunately I seem to be unable to get this bug triggered with the reproducer. It could be a detail of the guest setup I am missing. Since I do not have access to RHEL I used CentOS 6.3 in a 8core guest with 2 virtio disks. Host was 14.04. Left the script running for quite a bit but no crash happened.
+So it would be up to you to confirm that with a current 14.04 host you still can trigger the bug and with the patched version of qemu from http://people.canonical.com/~smb/lp1465935/ it would be gone. Thanks.
+
+Bader, 
+
+Sorry to response late. 
+We patch our QEMU 2.0 and running on ubuntu 12.04, and shall keep it running for a while. 
+I'll let you know if this problem is gone after weeks.
+
+Regards,
+CY.
+
+Marking as incomplete while waiting for test feedback.
+
+Bader,
+
+We don't see this problem after the patch is applied.  I think we can close this case. 
+
+Regards,
+CY.
+
+Utopic is out of support now.
+
+SRU Justification:
+
+Impact: Moving around interrupt handling on SMP (like irqbalance does) in qemu instances can cause the qemu guest to crash due to an internal accounting mismatch.
+
+Fix: Backported patch from upstream qemu
+
+Testcase: See above. Verified for Trusty with provided test qemu package(s).
+
+@Li Chengyuan, is your host OS really 12.04 (aka Precise)? Because in 12.04 the qemu version is 1.0 and the fix would not apply. I am not sure that old qemu is even affected since the code is very different. Backports of the fix seem only to make sense up (or back) to 14.04 (aka Trusty) which would also match the qemu version 2.0 which you mentioned.
+
+Just saw kernel version 3.2 mentioned. So this seems to be a mix of older base OS (Precise) and a more recent qemu (maybe from Trusty). I am trying to clarify how far this needs to be backported. So I think the original qemu version in Precise is unaffected.
+
+This bug was fixed in the package qemu - 1:2.3+dfsg-5ubuntu9
+
+---------------
+qemu (1:2.3+dfsg-5ubuntu9) wily; urgency=low
+
+  * debian/patches/upstream-fix-irq-route-entries.patch
+    Fix "kvm_irqchip_commit_routes: Assertion 'ret == 0' failed"
+    (LP: #1465935)
+
+ -- Stefan Bader <email address hidden>  Fri, 09 Oct 2015 15:38:53 +0200
+
+@Stefan Bader,
+The host OS is ubuntu 12.04, and we upgraded the QEMU to 2.0.0 from ubuntu cloud-archive repo.
+https://wiki.ubuntu.com/ServerTeam/CloudArchive
+
+@Li Chengyuan, thank you for the clarification. So just formally I will mark the Precise task of this report as invalid (since the qemu in Precise is actually a different source package and also not affected as far as I can tell). I will need to figure out how to ensure this fix is also pulled into the cloud-archive after it landed in the Trusty/Vivid main archive.
+
+Hello Li, or anyone else affected,
+
+Accepted qemu into trusty-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/2.0.0+dfsg-2ubuntu1.20 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Hello Li, or anyone else affected,
+
+Accepted qemu into vivid-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/1:2.2+dfsg-5expubuntu9.6 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+@chengyuanli
+
+could you please verify this?
+
+This package is causing a regression in lp:qa-regression-testing's
+scripts/test-qemu.py.
+
+I'm running the testcase one more time (after having verified that the
+current package did not suffer the same failure), then I'm going to mark this
+verification-failed.
+
+
+Hm, a second run did not reproduce the error.  If I can't get it to happen again in a few hours of re-trying, I'll assume it was a fluke or related to the host.
+
+I could not reproduce the original issue, but the new qemu packages appear to be regression-free, so marked this verification-done on that grounds.  If the SRU team prefers to kick this package I'm ok with that as well.
+
+Fixed in QEMU 2.4.
+
+This bug was fixed in the package qemu - 2.0.0+dfsg-2ubuntu1.20
+
+---------------
+qemu (2.0.0+dfsg-2ubuntu1.20) trusty; urgency=low
+
+  * debian/patches/upstream-fix-irq-route-entries.patch
+    Fix "kvm_irqchip_commit_routes: Assertion 'ret == 0' failed"
+    (LP: #1465935)
+
+ -- Stefan Bader <email address hidden>  Fri, 09 Oct 2015 17:16:30 +0200
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+
+This bug was fixed in the package qemu - 1:2.2+dfsg-5expubuntu9.6
+
+---------------
+qemu (1:2.2+dfsg-5expubuntu9.6) vivid; urgency=low
+
+  * debian/patches/upstream-fix-irq-route-entries.patch
+    Fix "kvm_irqchip_commit_routes: Assertion 'ret == 0' failed"
+    (LP: #1465935)
+
+ -- Stefan Bader <email address hidden>  Fri, 09 Oct 2015 17:04:26 +0200
+

@@ -1,0 +1,133 @@
+register: 0.889
+graphic: 0.888
+user-level: 0.854
+mistranslation: 0.833
+virtual: 0.826
+risc-v: 0.822
+permissions: 0.820
+vnc: 0.811
+arm: 0.809
+i386: 0.807
+TCG: 0.800
+device: 0.800
+assembly: 0.796
+architecture: 0.785
+semantic: 0.782
+peripherals: 0.779
+debug: 0.779
+ppc: 0.777
+KVM: 0.771
+performance: 0.766
+VMM: 0.742
+PID: 0.739
+hypervisor: 0.736
+kernel: 0.718
+network: 0.692
+boot: 0.688
+x86: 0.677
+socket: 0.661
+files: 0.554
+--------------------
+x86: 0.841
+kernel: 0.837
+debug: 0.526
+device: 0.474
+peripherals: 0.178
+i386: 0.106
+files: 0.055
+user-level: 0.036
+TCG: 0.026
+assembly: 0.025
+virtual: 0.023
+VMM: 0.017
+hypervisor: 0.016
+semantic: 0.016
+ppc: 0.015
+PID: 0.014
+register: 0.011
+KVM: 0.009
+architecture: 0.009
+performance: 0.009
+arm: 0.009
+boot: 0.005
+risc-v: 0.003
+socket: 0.002
+network: 0.001
+vnc: 0.001
+graphic: 0.001
+permissions: 0.001
+mistranslation: 0.001
+
+acpi-erst: divide by zero in make_erst_storage_header()
+Description of problem:
+When we gives `0` to `record_size` for `acpi-erst` device, below code may triggers divide-by-zero.
+
+```c
+static void make_erst_storage_header(ERSTDeviceState *s)
+    ...
+    header->magic = cpu_to_le64(ERST_STORE_MAGIC);
+    header->record_size = cpu_to_le32(s->default_record_size);
+    header->version = cpu_to_le16(0x0100);
+    header->reserved = cpu_to_le16(0x0000);
+
+    /* Compute mapsize */
+    mapsz = s->storage_size / s->default_record_size; // devide-by-zero occurs
+```
+
+`acpi-erst` device refuses invalid value for `record_size` and does appropriate condition check in `check_erst_backend_storage()`, but this check is placed before the function triggering the error when `header->magic` is 0.
+
+```c
+static void check_erst_backend_storage(ERSTDeviceState *s, Error **errp)
+    ...
+    /*
+     * Check if header is uninitialized; HostMemoryBackend inits to 0
+     */
+    if (le64_to_cpu(header->magic) == 0UL) {
+        make_erst_storage_header(s);
+    }
+
+    /* Validity check record_size */
+    record_size = le32_to_cpu(header->record_size);
+    if (!(
+        (record_size) && /* non zero */
+        (record_size >= UEFI_CPER_RECORD_MIN_SIZE) &&
+        (((record_size - 1) & record_size) == 0) && /* is power of 2 */
+        (record_size >= 4096) /* PAGE_SIZE */
+        )) {
+        error_setg(errp, "ERST record_size %u is invalid", record_size);
+        return;
+    }
+```
+Steps to reproduce:
+1. make sure `acpi-erst.backing` doesn't exist in current folder.
+2. run qemu command.
+```bash
+./build/qemu-system-i386 -object memory-backend-file,id=erstnvram,mem-path=acpi-erst.backing,size=0x10000,share=on -device acpi-erst,memdev=erstnvram,record_size=0
+```
+Additional information:
+I built qemu from source code with `--enable-sanitizers`, and backtrace is as follows:
+```bash
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==401519==ERROR: AddressSanitizer: FPE on unknown address 0x55bd0616fd53 (pc 0x55bd0616fd53 bp 0x61f000000e80 sp 0x7fffd16e5d90 T0)
+    #0 0x55bd0616fd53 in make_erst_storage_header /home/xxx/qemu/build/../hw/acpi/erst.c:401
+    #1 0x55bd0616fd53 in check_erst_backend_storage /home/xxx/qemu/build/../hw/acpi/erst.c:431
+    #2 0x55bd0616fd53 in erst_realizefn /home/xxx/qemu/build/../hw/acpi/erst.c:973
+    #3 0x55bd06268426 in pci_qdev_realize /home/xxx/qemu/build/../hw/pci/pci.c:2093
+    #4 0x55bd06557629 in device_set_realized /home/xxx/qemu/build/../hw/core/qdev.c:510
+    #5 0x55bd0655ecc8 in property_set_bool /home/xxx/qemu/build/../qom/object.c:2362
+    #6 0x55bd0655cec4 in object_property_set /home/xxx/qemu/build/../qom/object.c:1471
+    #7 0x55bd06560dec in object_property_set_qobject /home/xxx/qemu/build/../qom/qom-qobject.c:28
+    #8 0x55bd0655d30a in object_property_set_bool /home/xxx/qemu/build/../qom/object.c:1541
+    #9 0x55bd0632f8cf in qdev_device_add_from_qdict /home/xxx/qemu/build/../system/qdev-monitor.c:719
+    #10 0x55bd0632fc91 in qdev_device_add /home/xxx/qemu/build/../system/qdev-monitor.c:738
+    #11 0x55bd0633ae7e in device_init_func /home/xxx/qemu/build/../system/vl.c:1203
+    #12 0x55bd066e7a50 in qemu_opts_foreach /home/xxx/qemu/build/../util/qemu-option.c:1135
+    #13 0x55bd06335421 in qemu_create_cli_devices /home/xxx/qemu/build/../system/vl.c:2640
+    #14 0x55bd06335421 in qmp_x_exit_preconfig /home/xxx/qemu/build/../system/vl.c:2709
+    #15 0x55bd06338f42 in qemu_init /home/xxx/qemu/build/../system/vl.c:3742
+    #16 0x55bd06553e35 in main /home/xxx/qemu/build/../system/main.c:47
+    #17 0x7efcdb919d8f in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58
+    #18 0x7efcdb919e3f in __libc_start_main_impl ../csu/libc-start.c:392
+    #19 0x55bd060ecb24 in _start (/home/xxx/qemu/build/qemu-system-i386+0x32db24)
+```

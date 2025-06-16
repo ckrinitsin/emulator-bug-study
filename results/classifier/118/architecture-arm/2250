@@ -1,0 +1,104 @@
+architecture: 0.917
+performance: 0.910
+peripherals: 0.901
+mistranslation: 0.876
+arm: 0.855
+virtual: 0.852
+kernel: 0.842
+device: 0.836
+PID: 0.828
+KVM: 0.821
+ppc: 0.814
+debug: 0.803
+hypervisor: 0.799
+graphic: 0.776
+permissions: 0.773
+semantic: 0.760
+vnc: 0.733
+register: 0.729
+network: 0.711
+user-level: 0.691
+VMM: 0.690
+socket: 0.675
+files: 0.672
+risc-v: 0.668
+TCG: 0.593
+x86: 0.565
+boot: 0.562
+assembly: 0.492
+i386: 0.453
+--------------------
+arm: 0.975
+virtual: 0.718
+user-level: 0.393
+assembly: 0.366
+debug: 0.343
+kernel: 0.092
+KVM: 0.064
+hypervisor: 0.058
+files: 0.055
+performance: 0.051
+TCG: 0.041
+architecture: 0.024
+PID: 0.023
+device: 0.023
+semantic: 0.022
+register: 0.019
+boot: 0.016
+peripherals: 0.014
+permissions: 0.011
+vnc: 0.010
+VMM: 0.010
+risc-v: 0.008
+network: 0.007
+graphic: 0.005
+socket: 0.003
+mistranslation: 0.003
+ppc: 0.002
+x86: 0.000
+i386: 0.000
+
+FEAT_RME: NS EL1/0 Address Translation from EL3 fails
+Description of problem:
+I'm playing around with the QEMU RME Stack (TF-A, TF-RMM, Linux/KVM) for a research project.  
+For this I want to access some virtual normal world memory address from within EL3.
+To translate the address to the physical address I use the `AT` instructions (e.g., `ats1e2r`).  
+If the NW memory is initially mapped in the GPT as `GPT_GPI_ANY`, this works fine, however, if the NW memory is mapped as `GPT_GPI_NS` the address translation fails with the error `0b100101`/GPT on PTW.  
+However, EL3/Root World should be able to access memory from all PAS, and therefore, if I understand the ARM documentation correctly, should also be able to execute a PTW for an address marked NS in the GPT.
+Steps to reproduce:
+1. Setup GPT with some memory marked as `GPT_GPI_NS`
+2. Forward some NW virtual address from the kernel to EL3
+3. Execute a PTW on this address via the `AT` instructions.
+Additional information:
+I also took a look into the QEMU source code and potentially found the issue.  
+When executing a PTW we execute `target/arm/ptw.c:granule_protection_check`.  
+The function extracts the target page's GPI (`ptw.c:440'):  
+```c 
+ switch (gpi) {
+    case 0b0000: /* no access */
+        break;
+    case 0b1111: /* all access */
+        return true;
+    case 0b1000:
+    case 0b1001:
+    case 0b1010:
+    case 0b1011:
+        if (pspace == (gpi & 3)) {
+            return true;
+        }
+        break;
+    default:
+        goto fault_walk; /* reserved */
+    }
+```
+The if statement checks if the current `pstate` (previously set to `ptw->in_space`) is the same security state as the one contained in the GPI.  
+If this is not the case, we generate a GPF.  
+However, I think the code misses the fact, that EL3/Root world can access memory from each PAS, meaning that the if statement should be something like
+```c
+if (pspace == (gpi & 3) || (pspace == ARMSS_Root)) {
+            return true;
+}
+```
+Additionally, as both Secure and Realm World can also access Normal World memory, similar checks should also be added in such cases.  
+ 
+I have a patch prepared for this, however, I first want to check in if I'm in line with the Arm ARM or if I'm missing something and EL3 is indeed not supposed to execute PTWs for NS memory.

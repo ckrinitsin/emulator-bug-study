@@ -1,0 +1,95 @@
+debug: 0.884
+risc-v: 0.873
+register: 0.871
+device: 0.868
+ppc: 0.863
+permissions: 0.862
+performance: 0.862
+virtual: 0.861
+graphic: 0.857
+semantic: 0.850
+files: 0.847
+arm: 0.839
+assembly: 0.839
+network: 0.832
+socket: 0.828
+kernel: 0.827
+architecture: 0.824
+hypervisor: 0.823
+VMM: 0.822
+KVM: 0.813
+x86: 0.811
+mistranslation: 0.807
+PID: 0.798
+TCG: 0.788
+vnc: 0.787
+peripherals: 0.783
+boot: 0.761
+user-level: 0.760
+i386: 0.581
+
+Run testpmd in VM on virtio-net cause qemu crash/assert
+Description of problem:
+Run testpmd in VM on virtio-net device(vhost-user), dpdk virtio pmd as backend. Qemu crash as:
+```
+qemu-system-x86_64: ../accel/kvm/kvm-all.c:1717: kvm_irqchip_commit_routes: Assertion `ret == 0' failed.
+2023-10-11 04:44:51.058+0000: shutting down, reason=crashed
+```
+If revert this commit `1680542862 virtio-pci: add support for configure interrupt  <Cindy Lu>`, no issue observed.
+And previous hash `cd336e8346 virtio-mmio: add support for configure interrupt  <Cindy Lu>` also tested fine.
+Steps to reproduce:
+1. Run dpdk-testpmd as vhost-user backend in HV.
+```
+build/app/dpdk-testpmd -a 0000:00:00.0  -l 0-3 -n 4 --vdev 'net_vhost0,iface=/tmp/vfe-net0,queues=4'
+```
+2. Prepare virtio device inside VM
+
+```
+ifconfig eth1 down 
+echo 1024 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+mount -t hugetlbfs nodev /mnt/huge
+modprobe uio
+
+insmod dpdk-kmods/linux/igb_uio/igb_uio.ko
+
+dpdk/usertools/dpdk-devbind.py --bind=igb_uio 00:06.0 
+```
+3. Run testpmd inside VM
+
+```
+dpdk/build/app/dpdk-testpmd -a 00:06.0  -- --txd=128 --rxd=128 --txq=4 --rxq=4 --nb-cores=1 --forward-mode=txonly --stats-period=1 
+```
+4. QEMU crashed
+Additional information:
+Testpmd is working on polling mode, so no VQ interrupt enable. Not sure about config interrupt. 
+
+[dpdk.log.txt](/uploads/d98d6eb959f16c24fc4ebfefbc56b98b/dpdk.log.txt)
+```
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:50
+#1  0x00007fab56c7ddb5 in __GI_abort () at abort.c:79
+#2  0x00007fab56c7dc89 in __assert_fail_base (fmt=0x7fab56de65f8 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=0x5611b5df95e3 "ret == 0", 
+    file=0x5611b5df9202 "../accel/kvm/kvm-all.c", line=1717, function=<optimized out>) at assert.c:92
+#3  0x00007fab56c8ba76 in __GI___assert_fail (assertion=0x5611b5df95e3 "ret == 0", file=0x5611b5df9202 "../accel/kvm/kvm-all.c", line=1717, 
+    function=0x5611b5df9fd0 <__PRETTY_FUNCTION__.37261> "kvm_irqchip_commit_routes") at assert.c:101
+#4  0x00005611b5a5094b in kvm_irqchip_commit_routes (s=0x5611b7ba2150) at ../accel/kvm/kvm-all.c:1717
+#5  0x00005611b573d00a in virtio_pci_one_vector_unmask (proxy=0x5611b8d6b460, queue_no=4294967295, vector=0, msg=..., n=0x5611b8d73a10) at ../hw/virtio/virtio-pci.c:980
+#6  0x00005611b573d276 in virtio_pci_vector_unmask (dev=0x5611b8d6b460, vector=0, msg=...) at ../hw/virtio/virtio-pci.c:1045
+#7  0x00005611b567eb78 in msix_fire_vector_notifier (dev=0x5611b8d6b460, vector=0, is_masked=false) at ../hw/pci/msix.c:118
+#8  0x00005611b567ebe9 in msix_handle_mask_update (dev=0x5611b8d6b460, vector=0, was_masked=true) at ../hw/pci/msix.c:131
+#9  0x00005611b567efe3 in msix_table_mmio_write (opaque=0x5611b8d6b460, addr=12, val=0, size=4) at ../hw/pci/msix.c:222
+#10 0x00005611b59ae141 in memory_region_write_accessor (mr=0x5611b8d6ba90, addr=12, value=0x7fab3b7fd348, size=4, shift=0, mask=4294967295, attrs=...) at ../softmmu/memory.c:493
+#11 0x00005611b59ae37c in access_with_adjusted_size (addr=12, value=0x7fab3b7fd348, size=4, access_size_min=1, access_size_max=4, 
+    access_fn=0x5611b59ae04f <memory_region_write_accessor>, mr=0x5611b8d6ba90, attrs=...) at ../softmmu/memory.c:555
+#12 0x00005611b59b1470 in memory_region_dispatch_write (mr=0x5611b8d6ba90, addr=12, data=0, op=MO_32, attrs=...) at ../softmmu/memory.c:1515
+#13 0x00005611b59bef55 in flatview_write_continue (fv=0x5611b7ea2860, addr=4273815564, attrs=..., ptr=0x7fab5d980028, len=4, addr1=12, l=4, mr=0x5611b8d6ba90)
+    at ../softmmu/physmem.c:2825
+#14 0x00005611b59bf0b8 in flatview_write (fv=0x5611b7ea2860, addr=4273815564, attrs=..., buf=0x7fab5d980028, len=4) at ../softmmu/physmem.c:2867
+#15 0x00005611b59bf46a in address_space_write (as=0x5611b6752f80 <address_space_memory>, addr=4273815564, attrs=..., buf=0x7fab5d980028, len=4) at ../softmmu/physmem.c:2963
+#16 0x00005611b59bf4d7 in address_space_rw (as=0x5611b6752f80 <address_space_memory>, addr=4273815564, attrs=..., buf=0x7fab5d980028, len=4, is_write=true)
+    at ../softmmu/physmem.c:2973
+#17 0x00005611b5a53435 in kvm_cpu_exec (cpu=0x5611b7e4b5f0) at ../accel/kvm/kvm-all.c:2900
+#18 0x00005611b5a560c6 in kvm_vcpu_thread_fn (arg=0x5611b7e4b5f0) at ../accel/kvm/kvm-accel-ops.c:51
+#19 0x00005611b5c42e9b in qemu_thread_start (args=0x5611b7e537d0) at ../util/qemu-thread-posix.c:505
+#20 0x00007fab580d814a in start_thread (arg=<optimized out>) at pthread_create.c:479
+#21 0x00007fab56d58dc3 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+```

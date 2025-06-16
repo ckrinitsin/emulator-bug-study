@@ -1,0 +1,127 @@
+KVM: 0.392
+risc-v: 0.281
+register: 0.225
+virtual: 0.221
+TCG: 0.214
+user-level: 0.186
+ppc: 0.183
+hypervisor: 0.177
+x86: 0.172
+device: 0.172
+mistranslation: 0.170
+VMM: 0.162
+vnc: 0.159
+i386: 0.136
+peripherals: 0.133
+arm: 0.122
+performance: 0.112
+debug: 0.109
+PID: 0.104
+boot: 0.102
+architecture: 0.101
+network: 0.099
+permissions: 0.091
+assembly: 0.091
+socket: 0.086
+kernel: 0.085
+semantic: 0.084
+graphic: 0.079
+files: 0.075
+
+Windows VM crashes when restoring from file if balloon stats polling is enabled
+
+[Impact]
+
+ * Windows VMs BSOD when restoring from QEMUfile or during live migration if the virtio balloon stats polling is enabled.
+
+[Test Case]
+
+ * Install a Windows VM with virtio balloon drivers
+ * Start the VM and enable stats polling [1]   
+ * Save the VM to savefile [2]
+ * Restore the VM [3] 
+ * Enable stats polling [1] and VM will BSOD 
+
+QMP examples:
+ [1] {"execute":"qom-set","arguments":{"path":"//machine/i440fx/pci.0/child[7]","property":"guest-stats-polling-interval","value":10}} 
+ [2] {"execute": "migrate", "arguments": {"uri":"exec:gzip -c > /storage/cases/VM/savefiles/testVM3save.gz"}}
+ [3] {"execute":"migrate-incoming","arguments":{"uri":"exec:gzip -c -d /storage/cases/VM/savefiles/testVM3save.gz"}}
+
+[Other Info]
+
+ * This has been fixed upstream with commit 4a1e48becab81020adfb74b22c76a595f2d02a01
+
+[Regression Potential]
+
+ *
+
+Please make sure to use the right target for downstream bugs ==> Re-assigned this to qemu-ubuntu
+
+Thanks Thomas!
+
+To confirm the issue described in the original fix, I traced the virtio balloon subsystem (using QEMU simpletracing) while the VM:
+
+1.) Loaded from a QEMUFile
+virtio_set_status 0.000 pid=6248 vdev=0x55dcc49cf968 val=0x0
+balloon_event 31433104.748 pid=6248 opaque=0x55dcc49cf968 addr=0x100000000
+virtio_balloon_to_target 341.343 pid=6248 target=0x100000000 num_pages=0x0
+virtio_set_status 5017492.910 pid=6248 vdev=0x55dcc49cf968 val=0x7
+# Driver negotiation finished; running balloon_stats_cb() -> virtqueue_push()
+virtqueue_fill 16176215.480 pid=6248 vq=0x55dcc4a4c9b0 elem=0x55dcc49cfa98 len=0x0 idx=0x0
+virtqueue_flush 6.821 pid=6248 vq=0x55dcc4a4c9b0 count=0x1
+virtqueue_flush_vt 2.050 pid=6248 old=0xc4 new=0xc5 inuse=0x1
+virtio_notify 1.380 pid=6248 vdev=0x55dcc49cf968 vq=0x55dcc4a4c9b0
+
+Here stats_vq_offset is 0 and elem->index is invalid, making the guest BSOD.
+
+2.) Booted normally
+...
+virtio_set_status 0.754 pid=1133 vdev=0x55c2aec27888 val=0x0
+virtio_set_status 21.646 pid=1133 vdev=0x55c2aec27888 val=0x3
+virtio_set_status 297.769 pid=1133 vdev=0x55c2aec27888 val=0x7
+virtio_queue_notify 20.924 pid=1133 vdev=0x55c2aec27888 n=0x2 vq=0x55c2ae39cb60
+virtqueue_pop 29.931 pid=1133 vq=0x55c2ae39cb60 elem=0x55c2aec279b8 in_num=0x0 out_num=0x1
+virtio_balloon_get_config 357.561 pid=1133 num_pages=0x0 acutal=0x0
+virtio_balloon_get_config 10.239 pid=1133 num_pages=0x0 acutal=0x0
+virtio_balloon_get_config 2.862 pid=1133 num_pages=0x0 acutal=0x0
+virtio_balloon_get_config 2.761 pid=1133 num_pages=0x0 acutal=0x0
+virtio_balloon_set_config 171.747 pid=1133 acutal=0x0 oldacutal=0x0
+virtio_balloon_set_config 135.158 pid=1133 acutal=0x0 oldacutal=0x0
+virtio_balloon_set_config 103.806 pid=1133 acutal=0x0 oldacutal=0x0
+virtio_balloon_set_config 95.435 pid=1133 acutal=0x0 oldacutal=0x0
+# Driver negotiation finished; running balloon_stats_cb() -> virtqueue_push()
+virtqueue_fill 24115244.041 pid=1133 vq=0x55c2ae39cb60 elem=0x55c2aec279b8 len=0x3c idx=0x0
+virtqueue_flush 7.069 pid=1133 vq=0x55c2ae39cb60 count=0x1
+virtqueue_lol 1.712 pid=1133 old=0x0 new=0x1 inuse=0x1
+virtio_notify 1.120 pid=1133 vdev=0x55c2aec27888 vq=0x55c2ae39cb60
+virtio_queue_notify 1907.429 pid=1133 vdev=0x55c2aec27888 n=0x2 vq=0x55c2ae39cb60
+virtqueue_pop 9.840 pid=1133 vq=0x55c2ae39cb60 elem=0x55c2aec279b8 in_num=0x0 out_num=0x1
+...
+
+Here stats_vq_offset is 0x3c (the size of stats_vq_elem), and the request proceeds without problem.
+
+I'm currently working on the SRU
+
+Thanks Victor for bringing this up and working on it!
+
+For Documentation, the fix is in qemu 2.8, therefore >=Zesty is good in regard to the bug.
+
+Parts of the description sounded familiar to me and I found bug 1604010 - this was a rather ugly update regression, so you might want to read through it just to know that context as well.
+
+Once you have a ppa working please ping me here or on IRC (cpaelzer) so I can give it some extra regressions checks before we push things to the SRU queue.
+
+Hi Victor,
+I'm currently updating bugs on our virt-stack that are open but seem dormant.
+
+Is work on this going on or is Xenial/Trusty activity that was nominated dropped for a reason?
+As I can't reproduce lacking the special guest and env that was needed I'd rely on you to do so.
+And since you drove the other fixes for the cloud archive you have the needed changes.
+
+For now I'm setting these tasks to incomplete to time them out if no feedback was provided when I clear out old bugs the next time.
+
+Hi Christian,
+
+Sorry for the lack of updates, I've been trying to reproduce this behavior using Linux guests and it seems that those VMs work perfectly. I'm currently checking the virtio balloon driver for Windows, as it might be the real culprit of the VM crash. 
+
+I'll update the case with my findings, thanks!
+

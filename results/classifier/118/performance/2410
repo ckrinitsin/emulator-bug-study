@@ -1,0 +1,122 @@
+performance: 0.930
+graphic: 0.926
+hypervisor: 0.918
+user-level: 0.912
+register: 0.905
+assembly: 0.901
+peripherals: 0.899
+device: 0.898
+arm: 0.893
+architecture: 0.890
+permissions: 0.885
+virtual: 0.877
+risc-v: 0.876
+network: 0.875
+debug: 0.868
+files: 0.864
+vnc: 0.855
+PID: 0.847
+ppc: 0.844
+boot: 0.833
+semantic: 0.828
+TCG: 0.825
+socket: 0.823
+kernel: 0.818
+KVM: 0.814
+VMM: 0.801
+mistranslation: 0.774
+i386: 0.648
+x86: 0.575
+
+linux-user: `Setsockopt` with IP_OPTIONS returns "Protocol not available" error
+Description of problem:
+It seems that call to `setsockopt(sd, SOL_IP, IP_OPTIONS,_)` behaves differently on RISC-V Qemu than on x64 Linux. 
+On Linux syscall returns 0, but on Qemu it fails with `Protocol not available`.
+According [man](https://man7.org/linux/man-pages/man7/ip.7.html) `IP_OPTIONS` on `SOCK_STREAM` socket "should work".
+Steps to reproduce:
+1. Use below toy program `setsockopt.c` and compile it without optimizations like:
+```
+    gcc -Wall -W -Wextra -std=gnu17 -pedantic setsockopt.c -o setsockopt
+```
+
+```
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main() {
+    {
+        int sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if(sd < 0) {
+            perror("Opening stream socket error");
+            exit(1);
+        }
+        else
+            printf("Opening stream socket....OK.\n");
+
+        struct sockaddr_in local_address = {AF_INET, htons(1234), {inet_addr("255.255.255.255")}, {0}};
+        int err = connect(sd, (struct sockaddr*)&local_address, (socklen_t)16);
+
+        if (err < 0) {
+            perror("Connect error");
+            close(sd);
+        }
+        else
+            printf("Connect...OK.\n");
+    }
+    {
+        int sd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if(sd < 0) {
+            perror("Opening stream socket error");
+            exit(1);
+        }
+        else
+            printf("Opening stream socket....OK.\n");
+
+        char option[4] = {0};
+        if(setsockopt(sd, SOL_IP, IP_OPTIONS, (char *)option, sizeof(option)) < 0) {
+            perror("setsockopt error");
+            close(sd);
+            exit(1);
+        }
+        else
+            printf("setsockopt...OK.\n");
+
+        struct sockaddr_in local_address = {AF_INET, htons(1234), {inet_addr("255.255.255.255")}, {0}};
+        int err = connect(sd, (struct sockaddr*)&local_address, (socklen_t)16);
+
+        if (err < 0) {
+            perror("Connect error");
+            close(sd);
+        }
+        else
+            printf("Connect...OK.\n");
+    }
+    return 0;
+}
+```
+
+
+2. Run program on Qemu and compare output with output from x64 build. In my case it looks like:
+```
+root@AMDC4705:~/runtime/connect$ ./setsockopt-x64
+Opening stream socket....OK.
+Connect error: Network is unreachable
+Opening stream socket....OK.
+setsockopt...OK.
+Connect error: Network is unreachable
+
+root@AMDC4705:/runtime/connect# ./setsockopt-riscv
+Opening stream socket....OK.
+Connect error: Network is unreachable
+Opening stream socket....OK.
+setsockopt error: Protocol not available
+```
+Additional information:
+In above demo option `value` is quite artificial. However I tried passing many different `option` arguments (with same `SOL_IP` + `IP_OPTIONS` combination) but always ended up with `setsockopt` failure. 
+From the other hand on x64 it worked fine. Then I realized that appropriate path in Qemu was unimplemented: https://github.com/qemu/qemu/blob/master/linux-user/syscall.c#L2141

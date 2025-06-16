@@ -1,0 +1,138 @@
+permissions: 0.961
+peripherals: 0.930
+debug: 0.928
+mistranslation: 0.927
+device: 0.926
+semantic: 0.925
+graphic: 0.920
+user-level: 0.919
+register: 0.913
+virtual: 0.903
+arm: 0.899
+risc-v: 0.896
+architecture: 0.895
+VMM: 0.888
+files: 0.876
+x86: 0.874
+vnc: 0.873
+socket: 0.872
+assembly: 0.869
+performance: 0.856
+ppc: 0.854
+PID: 0.842
+KVM: 0.836
+TCG: 0.806
+hypervisor: 0.796
+network: 0.793
+boot: 0.793
+kernel: 0.788
+i386: 0.615
+
+qemu 4.2.0 arm  segmentation fault with gcc 9.2
+
+As discussed with f4bug yesterday on IRC here comes the bug description.
+
+I'm building/configured qemu-4.2.0 on an x86_64 (gcc (Debian 6.3.0-18+deb9u1) 6.3.0 20170516) with target-list "arm-softmmu,arm-linux-user" and debug enabled. I use the arm-linux-user variant, "qemu-arm".
+
+Then i'm trying to cross-compile (arm gcc) an old version of googles v8 (as i need this version of the lib for binary compatibility) which uses qemu during build.
+
+It worked with gcc 5.4.0 but not with 9.2.0. I also tried with 6.5.0, 7.4.0 and 8.3.0 but those are also causing the same segmentation fault.
+
+The executed command wich breaks qemu is:
+
+ qemu-arm /tmp/build/out/arm.release/mksnapshot.arm --log-snapshot-positions --logfile /tmp/build/out/arm.release/obj.host/v8_snapshot/geni/snapshot.log --random-seed 314159265 /tmp/build/out/arm.release/obj.host/v8_snap
+
+The printed error message is:
+
+ARMv7=1 VFP3=1 VFP32DREGS=1 NEON=0 SUDIV=0 UNALIGNED_ACCESSES=1 MOVW_MOVT_IMMEDIATE_LOADS=0 USE_EABI_HARDFLOAT=1
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+
+Calling qemu with gdb gives the following information:
+
+ Thread 1 "qemu-arm" received signal SIGSEGV, Segmentation fault.
+ 0x0000555555d63d11 in static_code_gen_buffer ()
+
+and
+
+ (gdb) bt
+ #0  0x0000555555d63d11 in static_code_gen_buffer ()
+ #1  0x0000555555628d58 in cpu_tb_exec (itb=<optimized out>, cpu=0x555557c33930) at 
+ /tmp/build/qemu/accel/tcg/cpu-exec.c:172
+ #2  cpu_loop_exec_tb (tb_exit=<synthetic pointer>, last_tb=<synthetic pointer>, tb=<optimized out>, 
+ cpu=0x555557c33930) at /tmp/build/qemu/accel/tcg/cpu-exec.c:618
+ #3  cpu_exec (cpu=cpu@entry=0x555557c2b660) at /tmp/build/qemu/accel/tcg/cpu-exec.c:731
+ #4  0x0000555555661578 in cpu_loop (env=0x555557c33930) at /tmp/build/qemu/linux-user/arm/cpu_loop.c:219
+#5  0x00005555555d6d76 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /tmp/build/qemu/linux-user/main.c:865
+
+Calling qemu-arm with debug switch "-d in_asm,int,op_opt" shows the log in the attached file.
+
+Thanks for any hints!
+Fabian
+
+
+
+Can you provide a repro case (attach binary/etc to the bug) so we can investigate?
+
+Note that QEMU will produce that segfault message both for bugs in QEMU (where it unexpectedly segfaults) but also for bugs in the guest binary itself where we're correctly emulating "guest did something causing a segfault".
+
+
+Sorry for the delay. I added the sysroot, the binary and the files causing the segfault.
+Please let me know if there is something missing.
+
+I used the following commands to let it run:
+
+export LD_LIBRARY_PATH=/opt/qemu-test/test1/lib
+/opt/qemu-test/test1/bin/qemu-arm "/opt/qemu-test/test1/files/mksnapshot.arm" --log-snapshot-positions --logfile "/tmp/snapshot.log" --random-seed 314159265 "/tmp/snapshot.cc"
+
+
+Thanks again!
+Fabian
+
+At the point of the segfault, QEMU is correctly delivering a segfault to the guest because it has attempted to dereference a NULL pointer. You can see this if you run QEMU with the '-g 1234' option and connect an arm-aware gdb to it:
+
+(gdb) disas $pc-32,$pc+32
+Dump of assembler code from 0x2bf24c to 0x2bf28c:
+   0x002bf24c:  ldr     r4, [r0, #296]  ; 0x128
+   0x002bf250:  mov     r6, r1
+   0x002bf254:  add     r8, r0, #40     ; 0x28
+   0x002bf258:  mov     r5, #0
+   0x002bf25c:  b       0x2bf268
+   0x002bf260:  cmp     r5, r6
+   0x002bf264:  bge     0x2bf2d4
+   0x002bf268:  mov     r12, r4
+=> 0x002bf26c:  ldr     r4, [r4]
+   0x002bf270:  ldr     r3, [r12, #12]
+   0x002bf274:  tst     r3, #512        ; 0x200
+   0x002bf278:  bne     0x2bf2c0
+   0x002bf27c:  tst     r3, #1024       ; 0x400
+   0x002bf280:  ubfx    r1, r3, #11, #1
+   0x002bf284:  bne     0x2bf2c0
+   0x002bf288:  tst     r3, #2048       ; 0x800
+End of assembler dump.
+(gdb) print /x $r4
+$3 = 0x0
+
+It looks like this is in the middle of somebody's garbage collector (the elf symbol is _ZN2v88internal10PagedSpace14AdvanceSweeperEi).
+
+The next step would be to find out what was going on in the run-up to that that resulted in the NULL pointer. That's a bit of guest-level debugging work that would be much easier with the source code. If you can debug where something unexpected happens to the guest that would probably help -- this is likely to be a much longer piece of debugging than I'm afraid I have time to do.
+
+
+Thanks, this helps a lot! We will now check the code again and see what causes the behaviour.
+
+Fabian
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

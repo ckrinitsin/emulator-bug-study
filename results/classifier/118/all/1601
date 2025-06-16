@@ -1,0 +1,110 @@
+permissions: 0.974
+risc-v: 0.973
+virtual: 0.972
+device: 0.971
+semantic: 0.971
+architecture: 0.969
+user-level: 0.969
+socket: 0.969
+PID: 0.967
+graphic: 0.967
+debug: 0.966
+arm: 0.965
+assembly: 0.964
+performance: 0.960
+peripherals: 0.958
+KVM: 0.955
+network: 0.953
+register: 0.952
+hypervisor: 0.950
+TCG: 0.950
+vnc: 0.947
+files: 0.946
+ppc: 0.945
+mistranslation: 0.945
+VMM: 0.937
+kernel: 0.934
+x86: 0.926
+boot: 0.916
+i386: 0.866
+
+QEMU Guest Agent (qga) high CPU usage (1 core at 100%). May happen with guest-network-get-interfaces. Strace says: EAGAIN (Resource temporarily unavailable)
+Description of problem:
+I have a VM that has the QEMU guest agent installed. I use the QGA to get information periodically about the network interfaces. Meaning, I execute the `guest-network-get-interfaces` in a period around 1-2 seconds each.
+
+After a while (maybe a day or so) the QGA seems to lock up with the CPU at 100% in 1 core. It does not reply to more commands, and restarting the service sometimes doesn't work, so a hard reboot it is.
+
+`dmesg` doesn't show anything useful/relevant. When attempting to edit the `qemu-guest-agent.service` and append `/usr/bin/strace` to it, I can get this in a loop:
+
+```
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+strace[114154]: write(4, "{\"return\": [{\"name\": \"lo\", \"ip-a"..., 2047) = -1 EAGAIN (Resource temporarily unavailable)
+```
+
+I don't have more knowledge to debug this further. I can help to provide more info if some guidance is provided.
+
+**Don't know if it helps/affects**, but the guest VM is running Docker with around 10 containers or so, so when QGA works, I get around 18 network interfaces, counting loopback, docker `veth`s and `br` interfaces.
+Steps to reproduce:
+1. Create a VM with Fedora 37
+2. Install the QEMU Guest Agent
+3. Call `guest-network-get-interfaces` in a loop every 1-2 seconds (after it finishes) through QGA using the unix socket using the provided python script, called as: `python qga.py --socket /run/test-vm-108.qga '{ "execute": "guest-network-get-interfaces" }'`
+4. Eventually, the guest agent will lock up at 100% CPU usage on 1 core
+Additional information:
+Python script used to call QGA:
+```
+import argparse
+import socket
+import sys
+
+def main():
+    buf_size = 1024
+    timeout_secs = .5
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--socket', required=True, help='Path to Unix socket')
+    parser.add_argument('request', help='Request to send')
+    args = parser.parse_args()
+
+    unix_socket_path = args.socket
+    request = args.request
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout_secs)
+            sock.connect(unix_socket_path)
+
+            request_bytes = request.encode('utf-8')
+            sock.sendall(request_bytes)
+
+            response_bytes = b''
+            received_bytes = sock.recv(buf_size)
+            response_bytes += received_bytes
+
+            sock.setblocking(False)
+            while True:
+                try:
+                    received_bytes = sock.recv(buf_size)
+                    if not received_bytes:
+                        break
+                    response_bytes += received_bytes
+                except (BlockingIOError, TimeoutError):
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    sock.close()
+                    sys.exit()
+
+            response = response_bytes.decode('utf-8').strip()
+            print(response)
+
+    except (TimeoutError, FileNotFoundError, BlockingIOError, ConnectionRefusedError):
+        sys.exit()
+
+if __name__ == "__main__":
+    main()
+```

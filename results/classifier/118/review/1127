@@ -1,0 +1,189 @@
+mistranslation: 0.922
+peripherals: 0.903
+graphic: 0.897
+TCG: 0.848
+hypervisor: 0.820
+risc-v: 0.819
+VMM: 0.819
+arm: 0.814
+permissions: 0.813
+user-level: 0.810
+device: 0.805
+ppc: 0.799
+semantic: 0.791
+vnc: 0.784
+register: 0.783
+debug: 0.759
+boot: 0.726
+network: 0.720
+PID: 0.693
+KVM: 0.686
+socket: 0.648
+virtual: 0.627
+architecture: 0.598
+assembly: 0.584
+performance: 0.583
+x86: 0.576
+files: 0.542
+kernel: 0.446
+i386: 0.284
+--------------------
+boot: 0.739
+debug: 0.637
+kernel: 0.421
+assembly: 0.208
+user-level: 0.147
+register: 0.054
+virtual: 0.043
+PID: 0.024
+TCG: 0.019
+device: 0.018
+files: 0.018
+x86: 0.011
+semantic: 0.006
+VMM: 0.006
+i386: 0.004
+hypervisor: 0.003
+performance: 0.003
+architecture: 0.002
+peripherals: 0.002
+network: 0.002
+ppc: 0.002
+risc-v: 0.002
+socket: 0.002
+KVM: 0.001
+graphic: 0.001
+vnc: 0.001
+permissions: 0.001
+mistranslation: 0.001
+arm: 0.001
+
+Various problems with running SunOS 4.1.4
+Description of problem:
+Yes, I know, SunOS 4.1.4 is ancient, but I happened to find an original Solaris 1.1.2/SunOS 4.1.4 installation CD, and nostalgia got the better of me.
+
+It used to be possible to run SunOS 4.1.4 in QEMU 5.0.0, but starting with 6.0.0, whenever you try to boot, you see the following whenever SunOS tries to access a SCSI disk:
+
+```
+ok boot disk
+Boot device: /iommu/sbus/espdma@f,400000/esp@f,800000/sd@3,0  File and args: 
+root on /iommu@f,e0000000/sbus@f,e0001000/espdma@f,400000/esp@f,800000/sd@3,0:a fstype 4.2
+Boot: vmunix
+Size: 1548288+463688+225704 bytes
+SuperSPARC: PAC ENABLED
+SunOS Release 4.1.4 (GENERIC) #2: Fri Oct 14 11:09:47 PDT 1994
+Copyright (c) 1983-1993, Sun Microsystems, Inc.
+cpu = SUNW,SPARCstation-20
+mod0 = TI,TMS390Z50 (mid = 8)
+mem = 523836K (0x1ff8f000)
+avail mem = 510947328
+cpu0 at Mbus 0x8 0x240000
+entering uniprocessor mode
+Ethernet address = 52:54:0:12:34:56
+espdma0 at  SBus slot f 0x400000
+esp0 at  SBus slot f 0x800000 pri 4 (onboard)
+esp0:   data transfer overrun
+        State=DATA Last State=DATA_DONE
+        Latched stat=0x11<XZERO,IO> intr=0x10<BUS> fifo 0x0
+        last msg out: EXTENDED; last msg in: COMMAND COMPLETE
+        DMA csr=0xa4240030<FLSH,INTEN>
+        addr=fff00034 last=fff00010 last_count=24
+        Cmd dump for Target 3 Lun 0:
+        cdb=[ 0x12 0x0 0x0 0x0 0x24 0x0 ]
+        pkt_state 0xf<XFER,CMD,SEL,ARB> pkt_flags 0x9 pkt_statistics 0x0
+        cmd_flags=0x5 cmd_timeout 0
+        Mapped Dma Space:
+                Base = 0x10 Count = 0x24
+        Transfer History:
+                Base = 0x10 Count = 0x24
+        current phase 0x26=DATAIN       stat=0x11       0x24
+        current phase 0x1=CMD_START     stat=0x12       0x12
+        current phase 0x60=SELECT_SNDMSG        stat=0x7        0x3     0x0
+        current phase 0x23=SYNCHOUT     stat=0x7        0x19    0xf
+        current phase 0xb=CMD_CMPLT     stat=0x7        0x0
+        current phase 0x27=STATUS       stat=0x7        0x0
+        current phase 0xb=CMD_CMPLT     stat=0x13
+        current phase 0x80=SEL_NO_ATN   stat=0x0        0x3     0x0
+        current phase 0x1=CMD_START     stat=0x0        0x0     0x80
+        current phase 0x1c=RESET        stat=0x0        0x1f
+```
+
+This causes SunOS to ignore the disk, and later it tries to boot via ethernet instead.
+
+After some digging, I *think* I tracked down the problem.
+
+This commit seems to be what did it:
+
+commit 799d90d818ba38997e9f5de2163bbfc96256ac0b
+Author: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+Date:   Thu Mar 4 22:10:58 2021 +0000
+
+    esp: transition to message out phase after SATN and stop command
+    
+    The SCSI bus should remain in the message out phase after the SATN and stop
+    command rather than transitioning to the command phase. A new ESPState variable
+    cmdbuf_cdb_offset is added which stores the offset of the CDB from the start
+    of cmdbuf when accumulating extended message out phase data.
+    
+    Currently any extended message out data is discarded in do_cmd() before the CDB
+    is processed in do_busid_cmd().
+    
+    Signed-off-by: Mark Cave-Ayland <mark.cave-ayland@ilande.co.uk>
+    Reviewed-by: Laurent Vivier <laurent@vivier.eu>
+    Message-Id: <20210304221103.6369-38-mark.cave-ayland@ilande.co.uk>
+
+I determined this by rummaging through the changes to the esp.c driver between 5.0.0 and 6.0.0 until I stumbled across this one. I can make the problem go away with this simple change:
+
+```
+--- esp.c.orig  2022-04-19 12:10:27.000000000 -0700
++++ esp.c       2022-07-25 19:57:06.602665000 -0700
+@@ -433,7 +433,7 @@
+         trace_esp_handle_satn_stop(fifo8_num_used(&s->cmdfifo));
+         s->do_cmd = 1;
+         s->cmdfifo_cdb_offset = 1;
+-        s->rregs[ESP_RSTAT] = STAT_MO;
++        s->rregs[ESP_RSTAT] = STAT_TC | STAT_CD /*STAT_MO*/;
+         s->rregs[ESP_RINTR] |= INTR_BS | INTR_FC;
+         s->rregs[ESP_RSEQ] = SEQ_MO;
+         esp_raise_irq(s);
+```
+
+NOTE: I am not sure if this is a proper fix, as I don't know enough about SCSI or the esp controller. All I know is putting this back the way it was makes SunOS happy again. Unfortunately it may also break something else, so somebody more knowledgeable than I should investigate further.
+
+If you're worried that reproducing this will be difficult, don't be. I prepared detailed instructions, scripts and all the images you should need to create a virtual SunOS disk and install the OS on it. This includes the OpenProm images and installation ISO. 
+
+You can find everything here (consult readme.txt for details):
+
+http://people.freebsd.org/~wpaul/sunos-qemu
+
+The quick install option is very simple. Once you finish writing the OS to the disk and try to boot off it the first time, you should encounter the error above.
+
+But wait, there's more.
+
+SunOS 4 has this quirk where it only works with CD-ROM drives that report a block size of 512 bytes, instead of the default of 2048. Now, I realize that just recently, there was a change committed that allows the guest to change the block size with the MODE SELECT command. However this doesn't seem to be good enough for SunOS (I tried it, it still hates the drive). Note that scsi-disk.c hard codes the block size for CD-ROMs to 2058 in scsi_cd_realize(). What would be really nice is if was possible to override this from the command line, and that addresses the problem quite nicely.
+
+At the same URL above, I also provided a small patch to scsi-disk.c which implements this feature. This allows the user to set the initial block size with logical_block_size=512 when specifying the device parameters. The qemu_sparc5.sh and qemu_sparc20.sh scripts show an example of this.
+
+One more thing: I wanted to simulate a SPARCstation 20, but I found that SunOS 4 would panic when I tried to boot it with this configuration, even if I used the correct SS20 OpenProm image. The problem here has to do with the SUNW,DBRIe device. QEMU doesn't simulate this device, but it creates dummy resources for it, including a PROM space. The problem is that this space is empty. This causes the OpenProm to create a node with an empty "name" property, which is a condition the SunOS kernel doesn't expect. The result is that the kernel tries to dereference a NULL pointer and panics. (The OpenProm code itself seems to let it slide.)
+
+To work around this, I patched the sun4m.c code to create the SUNW,DBRIe device such that its PROM space can actually be populated with an FCode image, and I created a simple one with a valid name property so that the kernel doesn't panic. SunOS complains later that it can't find the audio device because it's not actually implemented, but at least it doesn't crash.
+
+I don't know how this would actually be addressed in QEMU proper since the existing FCode images that QEMU uses come from OpenBios.
+
+Finally, one thing I haven't figured out is that using the -smp flag with SunOS 4 never seems to work. The OpenProms and the SunOS kernel only ever seem to detect one CPU. I am not that broken up about this though, because SunOS 4 never really did SMP very well to begin with.
+Steps to reproduce:
+Download all the files at:
+
+http://people.freebsd.org/~wpaul/sunos-qemu
+
+You can download just:
+
+http://people.freebsd.org/~wpaul/sunos-qemu/sunos-qemu.tar.gz
+
+if you want everything in one shot.
+
+Read the readme.txt file. This will walk you through trying to create a bootable SunOS system. You should apply the CD-ROM patch to scsi-disk.c and use the qemu_sparc5.sh script initially. This should allow you to install the miniroot from the CD image onto the virtual hard drive, but it will fail booting due to the esp controller problem. The qemu_sparc20.sh script will only boot successfully if you apply the sun4m.c patch and copy QEMU,dbri.bin to the QEMU firmware directory.
+Additional information:
+I'm not planning to provide a pull request for any of this. As I said, I'm not sure if my fixes are necessarily correct (especially the esp.c one). I'm satisfied that they work for me, but I want to leave it to the appropriate maintainers do decide how to best deal with these things.
+
+I would be happy to answer questions and test candidate fixes though.

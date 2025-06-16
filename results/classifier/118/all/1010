@@ -1,0 +1,108 @@
+user-level: 0.975
+semantic: 0.974
+graphic: 0.971
+assembly: 0.968
+peripherals: 0.966
+architecture: 0.965
+debug: 0.964
+register: 0.960
+performance: 0.960
+risc-v: 0.960
+device: 0.959
+arm: 0.958
+permissions: 0.958
+PID: 0.954
+ppc: 0.952
+virtual: 0.951
+vnc: 0.948
+mistranslation: 0.948
+network: 0.946
+socket: 0.946
+VMM: 0.941
+hypervisor: 0.936
+kernel: 0.932
+boot: 0.925
+TCG: 0.924
+x86: 0.922
+KVM: 0.913
+files: 0.905
+i386: 0.875
+
+Errors on 9p mounts
+Description of problem:
+I'm trying to run Docker VMs with [Lima](https://github.com/lima-vm/lima), which uses QEMU. I'm trying to expose my home directory on macOS to the Ubuntu VM using `9p`. This is how the mount point looks like inside the Ubuntu VM:
+
+```
+root@lima-docker:~# mount | grep Users
+mount0 on /Users/carlos type 9p (rw,relatime,dirsync,fscache,cachetag=4294894070,access=user,trans=virtio,version=9p2000.u)
+root@lima-docker:~#
+```
+
+The problem I'm seeing is that doing an `ls -l /Users/carlos` gives a "Timer expired" error, and no output:
+
+```
+root@lima-docker:~# ls -l /Users/carlos
+ls: reading directory '/Users/carlos': Timer expired
+total 0
+```
+
+Under `strace`, it seems that the timer error is raised by the `getdents64` system call:
+
+```
+root@lima-docker:~# strace -f ls -l /Users/carlos
+[..]
+openat(AT_FDCWD, "/Users/carlos", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+newfstatat(3, "", {st_mode=S_IFDIR|0755, st_size=1984, ...}, AT_EMPTY_PATH) = 0
+mmap(NULL, 135168, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0xffffa16bf000
+getdents64(3, 0xffffa16bf040, 131072)   = -1 ETIME (Timer expired)
+[..]
+```
+
+I've also tried the `9p2000.L` protocol instead, and the results are a bit better. I do get a directory listing, but I see "xxx" errors:
+
+```
+root@lima-docker:~# ls -l /Users/carlos
+ls: /Users/carlos: Network dropped connection on reset
+ls: /Users/carlos/Music: Network dropped connection on reset
+ls: /Users/carlos/Pictures: Network dropped connection on reset
+ls: /Users/carlos/Desktop: Network dropped connection on reset
+ls: /Users/carlos/Library: Network dropped connection on reset
+ls: /Users/carlos/Public: Network dropped connection on reset
+ls: /Users/carlos/Movies: Network dropped connection on reset
+ls: /Users/carlos/Applications: Network dropped connection on reset
+ls: /Users/carlos/Dropbox: Network dropped connection on reset
+ls: /Users/carlos/Maildir: Network dropped connection on reset
+ls: /Users/carlos/Documents: Network dropped connection on reset
+ls: /Users/carlos/Downloads: Network dropped connection on reset
+total 0
+drwx------   5 carlos dialout  160 Dec  6 10:31  Applications
+drwx------   4 carlos dialout  128 Apr 28 14:40  Desktop
+drwx------  12 carlos dialout  384 Apr 30 08:44  Documents
+drwx------ 164 carlos dialout 5248 Apr 29 13:50  Downloads
+drwx------   8 carlos dialout  256 Sep  4  2021  Dropbox
+drwx------  82 carlos dialout 2624 Apr  8 14:05  Library
+drwxr-xr-x   3 carlos dialout   96 Nov 12 12:28  Maildir
+drwx------   4 carlos dialout  128 Jul 19  2021  Movies
+drwx------   4 carlos dialout  128 Aug 19  2021  Music
+drwx------   4 carlos dialout  128 Jul 19  2021  Pictures
+drwxr-xr-x   4 carlos dialout  128 Jul 19  2021  Public
+```
+
+The errors in this case seem to come from the `lgetxattr`system call:
+
+```
+root@lima-docker:~# strace -f ls -l /Users/carlos
+[..]
+statx(AT_FDCWD, "/Users/carlos/Downloads", AT_STATX_SYNC_AS_STAT|AT_SYMLINK_NOFOLLOW, STATX_MODE|STATX_NLINK|STATX_UID|STATX_GID|STATX_MTIME|STATX_SIZE, {stx_mask=STATX_BASIC_STATS|STATX_MNT_ID, stx_attributes=0, stx_mode=S_IFDIR|0700, stx_size=5248, ...}) = 0
+lgetxattr("/Users/carlos/Downloads", "security.selinux", 0xaaaaec72da70, 255) = -1 ENETRESET (Network dropped connection on reset)
+write(2, "ls: ", 4ls: )                     = 4
+write(2, "/Users/carlos/Downloads", 23/Users/carlos/Downloads) = 23
+write(2, ": Network dropped connection on "..., 37: Network dropped connection on reset) = 37
+[..]
+```
+
+I've reported this to the Lima folks at https://github.com/lima-vm/lima/issues/831, and they suggested opening an issue here. Any ideas?
+Steps to reproduce:
+1. If you have Lima installed (I'm using version 0.10.0): `limactl start --name=docker ./lima-templates/docker.yaml`
+Additional information:
+

@@ -1,0 +1,107 @@
+KVM: 0.903
+user-level: 0.900
+register: 0.878
+virtual: 0.869
+hypervisor: 0.866
+boot: 0.863
+permissions: 0.858
+x86: 0.856
+performance: 0.853
+VMM: 0.846
+TCG: 0.841
+arm: 0.838
+ppc: 0.831
+device: 0.831
+risc-v: 0.830
+peripherals: 0.830
+graphic: 0.828
+vnc: 0.826
+architecture: 0.824
+mistranslation: 0.819
+network: 0.817
+debug: 0.817
+assembly: 0.807
+files: 0.804
+i386: 0.793
+PID: 0.789
+kernel: 0.785
+semantic: 0.781
+socket: 0.772
+
+usb passthrough not resetting on host after vm shutdown if started with -daemonize
+
+Below is the full Qemu command used to launch the VM. Have been using this same setup since Qemu 2.12, plus a couple of cherry picked patch commits fixing ide-hd and e1000e in Windows guests. Both sets of patches have now been merged to 3.0, so decided to update to 3.0.
+
+The VM launches and runs fine, but after shutting down, the usb devices that are passed through from the host (keyboard, mouse) do not work until unplugged and plugged in again. Have narrowed this down to the -daemonize -pidfile arguments.. if those lines are removed, usb devices work in the host again right away after VM shutdown.
+
+CPU: Intel(R) Core(TM) i5-6600K CPU @ 3.50GHz
+OS: Linux dev 4.18.6-arch1-1-ARCH #1 SMP PREEMPT Wed Sep 5 11:54:09 UTC 2018 x86_64 GNU/Linux
+
+Thank you for looking into this!
+
+
+#!/usr/bin/env bash
+
+echo vfio-pci > /sys/bus/pci/devices/0000:04:00.0/driver_override
+echo 0000:04:00.0 > /sys/bus/pci/devices/0000:04:00.0/driver/unbind
+echo 0000:04:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+echo > /sys/bus/pci/devices/0000:04:00.0/driver_override
+
+/usr/bin/qemu-system-x86_64 \
+-name winnt \
+-daemonize \
+-pidfile /run/vms/qemu/winnt.pid \
+-boot menu=on \
+-drive if=pflash,format=raw,readonly,file=/opt/vms/qemu/machines/ovmf_code_patched.fd \
+-drive if=pflash,format=raw,file=/opt/vms/qemu/machines/winnt/ovmf_vars_patched.fd \
+-machine pc-q35-3.0,accel=kvm \
+-nodefaults \
+-cpu host,kvm=off,hv_vendor_id=RedHat,hv_time,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff \
+-accel kvm \
+-smp 4,sockets=1,cores=4,threads=1 \
+-m 16G \
+-nic bridge,br=br0,mac=52:54:00:12:34:77,model=e1000e \
+-device vfio-pci,host=01:00.0,multifunction=on \
+-device vfio-pci,host=01:00.1 \
+-vga none \
+-display none \
+-monitor none \
+-blockdev raw,node-name=ide-hd.0,cache.direct=on,discard=unmap,file.driver=host_device,file.aio=native,file.filename=/dev/disk/by-id/ata-WDC_WDS500G2B0A-00SM50_181265803048 \
+-device ide-hd,drive=ide-hd.0,bus=ide.0,rotation_rate=1 \
+-blockdev raw,node-name=ide-hd.1,cache.direct=on,file.driver=host_device,file.aio=native,file.filename=/dev/disk/by-id/ata-TOSHIBA_HDWE160_X746K8ZTF56D-part1 \
+-device ide-hd,drive=ide-hd.1,bus=ide.1 \
+-device vfio-pci,host=04:00.0 \
+-device qemu-xhci \
+-device usb-host,vendorid=0x04d9,productid=0x0171 \
+-device usb-host,vendorid=0x1532,productid=0x005c \
+-device usb-host,vendorid=0x1b1c,productid=0x0c09
+
+echo 0000:04:00.0 > /sys/bus/pci/devices/0000:04:00.0/driver/unbind
+echo 0000:04:00.0 > /sys/bus/pci/drivers_probe
+
+To clarify, are the problematic USB passthrough devices these:
+
+-device usb-host,vendorid=0x04d9,productid=0x0171 \
+-device usb-host,vendorid=0x1532,productid=0x005c \
+-device usb-host,vendorid=0x1b1c,productid=0x0c09
+
+or this:
+
+-device vfio-pci,host=04:00.0 \
+
+Without knowing what the vfio-pci devices are (assuming 1:00.x is GPU+audio), I don't know if passthrough is being used as a colloquial for device assignment or if the issue is really with the usb-host devices.
+
+The usb-host devices have the problem.
+
+It does not seem to matter if 1 or all 3 are specified.. I had thought maybe only one of them was causing the issue.. but all of them are affected if '-daemonize' is specified at startup.
+
+Correct, the vfio-pci device 1:00.x is an Nvidia GPU+audio, and 4:00.0 is an Asmedia USB controller.
+
+But all of the vfio arguments and binding parts of this script can be removed, and replaced with '-vga std -display gtk' arguments, and the host has the same behavior of not regaining control of the usb-host devices until they are unplugged and plugged back in after the VM shuts down.
+
+No messages appear in dmesg or any stdout from Qemu related to errors or USB that stand out to me as a problem.. I am happy to try any suggestions to further narrow down the cause.
+
+Thanks for replying!
+
+I tested this again on the latest Qemu and Linux kernel and cannot reproduce it anymore, so this can be closed now..
+

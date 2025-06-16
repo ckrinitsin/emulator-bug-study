@@ -1,0 +1,230 @@
+debug: 0.959
+device: 0.956
+semantic: 0.956
+PID: 0.955
+performance: 0.953
+graphic: 0.950
+network: 0.949
+files: 0.949
+user-level: 0.948
+TCG: 0.947
+register: 0.946
+virtual: 0.945
+architecture: 0.944
+mistranslation: 0.938
+arm: 0.934
+socket: 0.934
+risc-v: 0.931
+assembly: 0.926
+permissions: 0.922
+vnc: 0.916
+ppc: 0.896
+peripherals: 0.884
+hypervisor: 0.881
+kernel: 0.873
+boot: 0.872
+KVM: 0.823
+x86: 0.809
+i386: 0.802
+VMM: 0.751
+
+incomplete emulation of fstenv under TCG
+
+Steps to reproduce:
+
+1) Install Windows (tried XP and 7) in qemu (tried qemu without kvm and qemu-kvm).
+
+2) Get OllyDbg ( http://ollydbg.de/odbg200.zip ).
+
+3) Use some Metasploit-encoded file, example included.
+
+It is not a virus!
+
+File was generated with Metasploit, command (if i remember it right): `msfpayload windows/exec cmd=notepad R | msfencode -e x86/shikata_ga_nai -t exe -o cmd_exec_notepad.shikata_ga_nai.exe`.
+
+4) Launch the file under Windows in qemu, make sure it opens a notepad.
+
+5) Open file under OllyDbg, run (F9) it there. It opens a notpad. Close OllyDbg.
+
+6) Open file under OllyDbg, trace over (Ctrl+F12) it there. It fails with `Access violation when writing to [some address]`.
+Command: 316A 13, XOR DWORD PTR DS:[EDX+13],EBP 
+
+Under native Windows, the trace over command works fine.
+
+Under VMware the trace works fine.
+Under VirtualBox it also fails (checked in the spring).
+
+$ qemu-kvm --version
+QEMU PC emulator version 0.12.5 (qemu-kvm-0.12.5), Copyright (c) 2003-2008 Fabrice Bellard
+
+
+
+
+
+http://imagebin.ca/view/zue0YNZ.html - This is VMware screenshot just before executing that command.
+
+Looks like something is wrong with EDX register in OllyDbg under QEMU. That register was popped as a result of FSTENV command.
+
+linux-user testcase:
+
+extern void *x;
+
+int main()
+{
+	int a;
+	asm volatile ("x: fldz\n\
+	     push %%edx\n\
+	     .byte 0xd9,0x74,0x24,0xf4\n\
+	     pop %%edx\n" : "=d" (a) : : "memory");
+	printf ("%x %x\n", a, &x);
+}
+
+yakj:~ pbonzini$ ./a.out 
+80483d9 80483d9
+yakj:~ pbonzini$ qemu-i386 ./a.out 
+0 80483d9
+
+
+On Sat, Oct 16, 2010 at 3:24 PM, Paolo Bonzini <email address hidden> wrote:
+> linux-user testcase:
+>
+> extern void *x;
+>
+> int main()
+> {
+>        int a;
+>        asm volatile ("x: fldz\n\
+>             push %%edx\n\
+>             .byte 0xd9,0x74,0x24,0xf4\n\
+>             pop %%edx\n" : "=d" (a) : : "memory");
+>        printf ("%x %x\n", a, &x);
+> }
+>
+> yakj:~ pbonzini$ ./a.out
+> 80483d9 80483d9
+> yakj:~ pbonzini$ qemu-i386 ./a.out
+> 0 80483d9
+>
+>
+> ** Summary changed:
+>
+> - Ollydbg under Windows in qemu does not work as it does under native Windows.
+> + incomplete emulation of fstenv under TCG
+
+Each FP instruction should store the needed data into new env fields,
+including IP, CS and opcode. These are known at translation time. Data
+pointers need to be saved at execution time.
+
+The new env fields would be then used by FSTENV, FSAVE, FXSAVE (which
+also suffer from the problem) etc.
+
+Any news on this bug?
+
+The full testcase:
+
+#include <stdio.h>
+extern void *x;
+int main() {
+   int a;
+   asm volatile ("x: fldz\n\
+   push %%edx\n\
+   fnstenv -0xc(%%esp)\n\
+   pop %%edx\n" : "=d" (a) : : "memory");
+   printf ("%x %x\n", a, &x);
+   return 0;
+}
+
+$ gcc -m32 test.c -o test
+$ ./test
+80483ae 80483ae
+$ ./qemu/i386-linux-user/qemu-i386 ./test
+0 80483ae
+
+Cleaned up .byte row.
+
+Example patch.
+Works only for FLDZ and only in -singlestep mode.
+Based on version 0.12.5.
+
+This was just an example of how it could be done.
+
+$ ./qemu-0.12.5/i386-linux-user/qemu-i386 -singlestep ./test
+80483b4 80483b4
+
+
+Ok. Here is a full patch to QEMU 0.13.
+
+Works with and without -singlestep.
+Works with all fpu instructions.
+
+Should also work with fsave.
+
+I've had quite some problems with this bug as well. It would be really nice if it could be fixed.
+
+I have ported Chalkerx's patch to QEMU-1.5.0. The patch is attached.
+
+// MOKI
+
+The bug is still present in the newly released QEMU-1.5.1. I've ported Chalkerx's patch to this release as well. See attached patch.
+
+Is there a problem with this patch, since it has not been committed?
+
+// MOKI
+
+Thanks for porting the patch.
+
+This is the mailing thread I started back in 2010 with that patch:
+http://lists.gnu.org/archive/html/qemu-devel/2010-11/msg02497.html
+That thread has some problems noted.
+
+Sadly, I did not have enough free time to investigate all the other
+places that should be fixed for proper fpip/etc. support.
+
+That patch seems to be related:
+https://patchwork.kernel.org/patch/871232/, but is kvm only. You could
+try contacting the person that did the patch for kvm.
+
+Nikita Skovoroda.
+
+2013/6/29 Morten Shearman Kirkegaard <email address hidden>:
+> The bug is still present in the newly released QEMU-1.5.1. I've ported
+> Chalkerx's patch to this release as well. See attached patch.
+>
+> Is there a problem with this patch, since it has not been committed?
+>
+> // MOKI
+>
+> ** Patch added: "patch-qemu-1.5.1-fpip.diff"
+>    https://bugs.launchpad.net/qemu/+bug/661696/+attachment/3718352/+files/patch-qemu-1.5.1-fpip.diff
+
+
+Thanks for the links Nikita.
+
+I'll see if I can add the missing features (fpop, fpdp) to the patch. Since I don't depend on those features, it will be relatively low priority for me, and I will probably not get to it before late August.
+
+// MOKI
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+Test case in comment #7 still fails -- still a bug.
+
+
+
+This is an automated cleanup. This bug report has been moved
+to QEMU's new bug tracker on gitlab.com and thus gets marked
+as 'expired' now. Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/67
+
+

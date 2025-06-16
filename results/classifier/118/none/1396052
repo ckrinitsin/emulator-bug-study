@@ -1,0 +1,204 @@
+virtual: 0.751
+KVM: 0.747
+permissions: 0.687
+graphic: 0.675
+vnc: 0.672
+TCG: 0.671
+hypervisor: 0.669
+register: 0.658
+arm: 0.658
+VMM: 0.649
+x86: 0.649
+debug: 0.644
+device: 0.640
+boot: 0.622
+ppc: 0.618
+risc-v: 0.615
+performance: 0.614
+peripherals: 0.608
+semantic: 0.607
+architecture: 0.595
+user-level: 0.594
+mistranslation: 0.582
+i386: 0.575
+assembly: 0.573
+kernel: 0.568
+socket: 0.564
+PID: 0.557
+network: 0.550
+files: 0.503
+
+migration failed when running BurnInTest in guest
+
+Hi,  
+I found a live migration problem and have found out the reason, but I can't fix it up myself. I really need help.
+When live migration vm and it's block device in save time, it will occur probabilistic .
+
+Step:
+1.  start a windows vm,and run burnInTest(it will write dirty data to block device in migration)
+2.  migrate vm with it's block device.
+3.  a few minutes later,  dest vm was killed and migration will be failed (probabilistic )
+
+Reason:
+    when migraion start, in source host libvirt will send command to qemu,and qemu will call mirror_run coroutine to copy blcok device data to dest vm block device.    mirror_run running in qemu main thread.   When this finished(actually it still running because in following steps,there may generate dirty data by vm), qemu will  start migration_thread to migration ram and other device.
+    In dest vm, qemu will call "bdrv_invalidate_cache --> qcow2_invalidate_cache" function after vm read "QEMU_VM_EOF" byte. qcow2_invalidate_cache fuction call qcow2_close ,  in qcow2_close fuction set "s->l1_table = NULL" and then call qcow2_cache_flush fuction.   In qcow2_cache_flush fuction will call "bdrv_flush-->bdrv_flush_co_entry-->bdrv_co_flush-->qemu_coroutine_yield".   This will let itself back to mian loop.   If source vm send block device dirty data to dest vm at this time, in dest vm will occur the following segmentation fault.
+    The primary reason is mirror_run and migration run in two thread.  although qemu stopping vm before write "QEMU_VM_EOF" byte, it still can't ensure mirror_run coroutine do not write dirty data  after migration thread  sending "QEMU_VM_EOF" byte.
+
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00007f90d250db24 in get_cluster_table (bs=0x7f90d493f500, offset=1832189952, new_l2_table=0x7f8fbd6faa88, 
+    new_l2_index=0x7f8fbd6faaa0) at block/qcow2-cluster.c:573
+573         l2_offset = s->l1_table[l1_index] & L1E_OFFSET_MASK;
+(gdb) bt
+#0  0x00007f90d250db24 in get_cluster_table (bs=0x7f90d493f500, offset=1832189952, new_l2_table=0x7f8fbd6faa88, 
+    new_l2_index=0x7f8fbd6faaa0) at block/qcow2-cluster.c:573
+#1  0x00007f90d250e577 in handle_copied (bs=0x7f90d493f500, guest_offset=1832189952, host_offset=0x7f8fbd6fab18, 
+    bytes=0x7f8fbd6fab20, m=0x7f8fbd6fabc8) at block/qcow2-cluster.c:927
+#2  0x00007f90d250ef45 in qcow2_alloc_cluster_offset (bs=0x7f90d493f500, offset=1832189952, num=0x7f8fbd6fabfc, 
+    host_offset=0x7f8fbd6fabc0, m=0x7f8fbd6fabc8) at block/qcow2-cluster.c:1269
+#3  0x00007f90d250445f in qcow2_co_writev (bs=0x7f90d493f500, sector_num=3578496, remaining_sectors=2040, 
+    qiov=0x7f8fbd6fae90) at block/qcow2.c:1171
+#4  0x00007f90d24d4764 in bdrv_aligned_pwritev (bs=0x7f90d493f500, req=0x7f8fbd6facd0, offset=1832189952, bytes=1044480, 
+    qiov=0x7f8fbd6fae90, flags=0) at block.c:3321
+#5  0x00007f90d24d4d21 in bdrv_co_do_pwritev (bs=0x7f90d493f500, offset=1832189952, bytes=1044480, qiov=0x7f8fbd6fae90, 
+    flags=0) at block.c:3447
+#6  0x00007f90d24d3115 in bdrv_rw_co_entry (opaque=0x7f8fbd6fae10) at block.c:2710
+#7  0x00007f90d24d31e7 in bdrv_prwv_co (bs=0x7f90d493f500, offset=1832189952, qiov=0x7f8fbd6fae90, is_write=true, flags=0)
+    at block.c:2746
+#8  0x00007f90d24d32eb in bdrv_rw_co (bs=0x7f90d493f500, sector_num=3578496, 
+    buf=0x7f90d4e3d400 "\004\005\006\a\b\t\n\v\f\r\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037 !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307\310\311\312", <incomplete sequence \313>..., nb_sectors=2040, is_write=true, flags=0) at block.c:2776
+#9  0x00007f90d24d3429 in bdrv_write (bs=0x7f90d493f500, sector_num=3578496, 
+    buf=0x7f90d4e3d400 "\004\005\006\a\b\t\n\v\f\r\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037 !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307\310\311\312", <incomplete sequence \313>..., nb_sectors=2040) at block.c:2810
+#10 0x00007f90d24cc2b5 in nbd_trip (opaque=0x7f90d4ba9aa0) at nbd.c:1191
+#11 0x00007f90d24e86fb in coroutine_trampoline (i0=-725586416, i1=32656) at coroutine-ucontext.c:118
+#12 0x00007f90d0449310 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#13 0x00007fff3fcfda10 in ?? ()
+#14 0x0000000000000000 in ?? ()
+(gdb) p bs
+$1 = (BlockDriverState *) 0x7f90d493f500
+(gdb) p *s
+$3 = {cluster_bits = 16, cluster_size = 65536, cluster_sectors = 128, l2_bits = 13, l2_size = 8192, l1_size = 40, 
+  l1_vm_state_index = 40, csize_shift = 54, csize_mask = 255, cluster_offset_mask = 18014398509481983, 
+  l1_table_offset = 196608, l1_table = 0x0, l2_table_cache = 0x7f90d493eee0, refcount_block_cache = 0x7f90d493ef30, 
+  cluster_cache = 0x7f90d4a84350 "", cluster_data = 0x7f90ce4de010 "", cluster_cache_offset = 18446744073709551615, 
+  cluster_allocs = {lh_first = 0x0}, refcount_table = 0x7f90d4a94360, refcount_table_offset = 65536, 
+  refcount_table_size = 8192, free_cluster_index = 209420, free_byte_offset = 0, lock = {locked = true, queue = {entries = {
+        tqh_first = 0x0, tqh_last = 0x7f90d4942c60}}}, crypt_method = 0, crypt_method_header = 0, aes_encrypt_key = {
+    rd_key = {0 <repeats 60 times>}, rounds = 0}, aes_decrypt_key = {rd_key = {0 <repeats 60 times>}, rounds = 0}, 
+  snapshots_offset = 0, snapshots_size = 0, nb_snapshots = 0, snapshots = 0x0, flags = 10338, qcow_version = 3, 
+  use_lazy_refcounts = false, refcount_order = 4, discard_passthrough = {false, true, false, true, false}, 
+  overlap_check = 127, incompatible_features = 0, compatible_features = 0, autoclear_features = 0, 
+  unknown_header_fields_size = 0, unknown_header_fields = 0x0, unknown_header_ext = {lh_first = 0x0}, discards = {
+    tqh_first = 0x0, tqh_last = 0x7f90d4942ec8}, cache_discards = false}
+(gdb) p s->l1_table
+$4 = (uint64_t *) 0x0
+
+actually, I have met this issue in earlier qemu version, and it expose frankly. 
+The BDRVQcowState *s was memset to zero in qcow2_invalidate_cache().
+So there is a dead-loop in qcow2_grow_l1_table 
+        while (min_size > new_l1_size) {
+            new_l1_size = (new_l1_size * 3 + 1) / 2;
+        }
+The dead-loop stack as follow:
+
+#0  qcow2_grow_l1_table () at block/qcow2-cluster.c:59
+#1  0x00007f8ef635dafe in get_cluster_table () at block/qcow2-cluster.c:542
+#2  0x00007f8ef635e981 in handle_copied () at block/qcow2-cluster.c:1252
+#4  0x00007f8ef6363257 in qcow2_co_writev () at block/qcow2.c:828
+#5  0x00007f8ef63500d5 in bdrv_co_do_writev ) at block.c:2623
+#6  0x00007f8ef63508d4 in bdrv_rw_co_entry (opaque=<optimized out>) at block.c:2133
+#7  0x00007f8ef6350a3a in bdrv_rwv_co() 
+#8  0x00007f8ef6350c06 in bdrv_rw_co ) at block.c:2215
+#9  0x00007f8ef6457df2 in nbd_trip (opaque=0x7f8efb3195a0) at nbd.c:1139
+#10 0x00007f8ef6382a1b in coroutine_trampoline (i0=<optimized out>, i1=<optimized 
+
+frame 2
+p *s
+$4 = {cluster_bits = 0, cluster_size = 0, cluster_sectors = 0, l2_bits = 0, l2_size = 0, l1_size = 0, l1_vm_state_index = 0, 
+  csize_shift = 0, csize_mask = 0, cluster_offset_mask = 0, l1_table_offset = 0, l1_table = 0x0, l2_table_cache = 0x0, 
+  refcount_block_cache = 0x0, cluster_cache = 0x0, cluster_data = 0x0, cluster_cache_offset = 18446744073709551615, 
+  cluster_allocs = {lh_first = 0x0}, refcount_table = 0x0, refcount_table_offset = 0, refcount_table_size = 0, 
+  free_cluster_index = 0, free_byte_offset = 0, lock = {locked = true, queue = {entries = {tqh_first = 0x0, tqh_last = 0x0}, 
+      ctx = 0x0}}, crypt_method = 0, crypt_method_header = 0, aes_encrypt_key = {rd_key = {0 <repeats 60 times>}, 
+    rounds = 0}, aes_decrypt_key = {rd_key = {0 <repeats 60 times>}, rounds = 0}, snapshots_offset = 0, snapshots_size = 0, 
+  nb_snapshots = 0, snapshots = 0x0, flags = 0, qcow_version = 0, use_lazy_refcounts = false, incompatible_features = 0, 
+  compatible_features = 0, autoclear_features = 0, unknown_header_fields_size = 0, unknown_header_fields = 0x0, 
+  unknown_header_ext = {lh_first = 0x0}}
+
+Looking through old bug tickets... can you still reproduce this issue with the latest version of QEMU? Or could we close this ticket nowadays?
+
+I think the bug is still there. And I have repaired it myself.  
+Migration process need wait all nbd-flying-data completion before bdrv_invalidate_cache_all was called.  The solution is working well but not graceful,so I didn't commit to open source community.
+
+So I think the primary problem is a user error: You can't start the destination VM while the source is still sending data. The mirror operation must have completed or the guest will see a corrupted disk. This means that the destination has to be started with -S, after migration has completed the mirror job must be completed on the source, and only if successful completion of the mirror job is reported, you can resume the VM on the destination.
+
+However, a crash is always a bug, even if it can be triggered only by a user error. The correct solution there would be used a drained_begin/end section for the node around bdrv_invalidate_cache(), and to implement draining in the NBD server (so it would just wait with processing new requests until the drain section ends).
+
+But I want to be clear that even if we fix the crash, resuming the destination VM while the source is still sending updates can cause data corruption.
+
+Thanks for your reply.
+
+I didn't start dest vm. The vm just in pause state and crash. 
+static void process_incoming_migration_co(void *opaque)
+{
+    ------
+    ret = qemu_loadvm_state(mis->from_src_file);               ------ return when recieve "QEMU_VM_EOF"
+    ------
+    mis->bh = qemu_bh_new(process_incoming_migration_bh, mis);
+    qemu_bh_schedule(mis->bh);
+}
+
+static void process_incoming_migration_bh(void *opaque)
+{
+    ------
+    bdrv_invalidate_cache_all(&local_err);                  ------- maybe yield in this process and nbd write will access invailed bdrv, and crash
+    ------
+
+    if (!global_state_received() ||
+        global_state_get_runstate() == RUN_STATE_RUNNING) {
+        if (autostart) {
+            vm_start();                                      ------ resume vm here
+        } else {
+            runstate_set(RUN_STATE_PAUSED);
+        }
+    } else {
+        runstate_set(global_state_get_runstate());
+    }
+    /*
+     * This must happen after any state changes since as soon as an external
+     * observer sees this event they might start to prod at the VM assuming
+     * it's ready to use.
+     */
+    migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,
+                      MIGRATION_STATUS_COMPLETED);
+    qemu_bh_delete(mis->bh);
+    migration_incoming_state_destroy();
+}
+
+You are right, the correct solution should be some like drain around bdrv_invalidate_cache().
+My solution;
+static void process_incoming_migration_co(void *opaque)
+{
+    ------
+    ret = qemu_loadvm_state(mis->from_src_file); 
+    ------
+    wait for all nbd client closed.
+    mis->bh = qemu_bh_new(process_incoming_migration_bh, mis);
+    qemu_bh_schedule(mis->bh);
+}
+
+The QEMU project is currently considering to move its bug tracking to
+another system. For this we need to know which bugs are still valid
+and which could be closed already. Thus we are setting older bugs to
+"Incomplete" now.
+
+If you still think this bug report here is valid, then please switch
+the state back to "New" within the next 60 days, otherwise this report
+will be marked as "Expired". Or please mark it as "Fix Released" if
+the problem has been solved with a newer version of QEMU already.
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

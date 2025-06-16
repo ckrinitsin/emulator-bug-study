@@ -1,0 +1,98 @@
+peripherals: 0.814
+ppc: 0.794
+permissions: 0.789
+risc-v: 0.789
+debug: 0.787
+virtual: 0.783
+user-level: 0.783
+register: 0.780
+device: 0.776
+KVM: 0.765
+performance: 0.763
+x86: 0.757
+graphic: 0.754
+architecture: 0.752
+hypervisor: 0.745
+TCG: 0.742
+arm: 0.740
+assembly: 0.728
+network: 0.721
+vnc: 0.710
+semantic: 0.709
+VMM: 0.706
+mistranslation: 0.694
+PID: 0.688
+files: 0.679
+boot: 0.664
+socket: 0.648
+kernel: 0.633
+i386: 0.591
+
+I/O errors occur when qcow2 files created via gluster fuse mount are accessed via libgfapi (gluster://)
+Description of problem:
+Environment: a Gluster volume 'v0' (Gluster versions tested were 9.2-1 and 10.1) is built on 3 nodes on top of 3 ZFS pools. It is mounted to check fuse mount functionality. Mount point is `/mnt/gl`.
+When an empty qcow2 is created via fuse mount (qemu-img create -f qcow2 /mnt/gl/123.qcow2 10G) and then this qcow2 is attached to qemu guest -- error appears:
+```
+qemu-system-x86_64: -blockdev {"node-name":"libvirt-2-format","read-only":false,"cache":{"direct":true,"no-flush":false},"driver":"qcow2","file":"libvirt-2-storage","backing":null}: Could not read L1 table: Input/output error
+```
+When the same file is attached to qemu guest via fuse mount there is no error. When the same file is created via GFAPI (gluster://) there is no error too.
+Steps to reproduce:
+1. Create file via fuse-mount: `qemu-img create -f qcow2 /mnt/gl/123.qcow2 10G`
+2. Attach this file via gluster:// to qemu guest and observe an error
+3. Attach this file via fuse mount, run a guest -- no error.
+4. Create file via gluster:// : `qemu-img create -f qcow2 gluster://v0/234.qcow2 10g`
+5. Attach this file (via GFAPI or via fuse mount) to qemu guest and run guest -- there is no error.
+Additional information:
+When an empty qcow2 file with virtual size 10G with default cluster size is created, its proper size is 196768 (0x300a0) bytes. If file is created via fuse mount, that is true and file size is 0x300a0 bytes.
+In the end of file L1 table resides, its offset is 0x30000 and size is 0xa0. When this qcow2 is attached via fuse mount it seems that i/o requests are conforming to file size and file is read without errors. 
+But when file with size 0x300a0 is attached via gluster://, qemu aligns i/o requests by 0x200 bytes boundary (see dump below, frame #12. NB: dump is taken from qemu-img create cmd so there are write requests). Thus, request goes beyond the file end and read error occurs.
+
+When file is created via gluster:// its size is 197120 (0x30200) bytes because write requests are aligned to 512 bytes too. And guest runs normally with it regardless of connection type.
+
+```
+Thread 1 "qemu-img" hit Breakpoint 1, 0x00007fffec014f10 in ec_gf_writev () from /usr/lib64/glusterfs/11dev/xlator/cluster/disperse.so
+(gdb) bt
+#0  0x00007fffec014f10 in ec_gf_writev () from /usr/lib64/glusterfs/11dev/xlator/cluster/disperse.so
+#1  0x00007ffff68eeea6 in default_writev () from /lib64/libglusterfs.so.0
+#2  0x00007ffff4024ab8 in gf_utime_writev (frame=0x555556126aa8, this=0x7fffe40113d8, fd=0x555556126b88, vector=0x555556130868, count=1, off=196608, flags=0, iobref=0x555556130608, xdata=0x0) at utime-autogen-fops.c:81
+#3  0x00007ffff68eeea6 in default_writev () from /lib64/libglusterfs.so.0
+#4  0x00007ffff4013c39 in ob_writev (frame=frame@entry=0x555556126aa8, this=0x7fffe4012408, fd=fd@entry=0x555556126b88, iov=iov@entry=0x555556130868, count=count@entry=1, offset=offset@entry=196608, flags=0,
+    iobref=0x555556130608, xdata=0x0) at open-behind.c:584
+#5  0x00007fffdff37774 in mdc_writev (frame=frame@entry=0x5555561522d8, this=0x7fffe40139e8, fd=fd@entry=0x555556126b88, vector=vector@entry=0x555556130868, count=count@entry=1, offset=offset@entry=196608, flags=0,
+    iobref=0x555556130608, xdata=0x0) at md-cache.c:2151
+#6  0x00007fffdff143fb in io_stats_writev (frame=0x55555611dc08, this=0x7fffe4015468, fd=0x555556126b88, vector=0x555556130868, count=1, offset=196608, flags=0, iobref=0x555556130608, xdata=0x0) at io-stats.c:2952
+#7  0x00007ffff68eeea6 in default_writev () from /lib64/libglusterfs.so.0
+#8  0x00007fffdfee88ca in meta_writev (frame=0x55555611dc08, this=0x7fffe40173d8, fd=0x555556126b88, iov=0x555556130868, count=1, offset=196608, flags=0, iobref=0x555556130608, xdata=0x0) at meta.c:131
+#9  0x00007ffff6942f22 in glfs_pwritev_async_common () from /lib64/libgfapi.so.0
+#10 0x00007ffff69462f6 in glfs_pwritev_async () from /lib64/libgfapi.so.0
+#11 0x00007ffff7fc5839 in qemu_gluster_co_writev () from /usr/lib64/qemu/block-gluster.so
+#12 0x0000555555623b7e in bdrv_driver_pwritev (bs=bs@entry=0x55555611eda0, offset=offset@entry=196608, bytes=bytes@entry=512, qiov=qiov@entry=0x7ffff5e9cb40, qiov_offset=qiov_offset@entry=0, flags=flags@entry=0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:1243
+#13 0x00005555556244d2 in bdrv_aligned_pwritev (child=child@entry=0x55555611e3a0, req=req@entry=0x7ffff5e9ca80, offset=196608, bytes=512, align=align@entry=512, qiov=0x7ffff5e9cb40, qiov_offset=0, flags=0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:2020
+#14 0x0000555555625433 in bdrv_co_pwritev_part (child=0x55555611e3a0, offset=<optimized out>, bytes=<optimized out>, qiov=<optimized out>, qiov_offset=<optimized out>, flags=0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:2188
+#15 0x00005555556267a0 in bdrv_run_co (opaque=0x7ffff5e9cbb0, entry=0x5555556260a0 <bdrv_rw_co_entry>, bs=0x55555611eda0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:915
+#16 bdrv_prwv_co (flags=0, is_write=true, qiov=0x7ffff5e9cbd0, offset=196608, child=0x55555611e3a0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:966
+#17 bdrv_pwritev (qiov=0x7ffff5e9cbd0, offset=196608, child=0x55555611e3a0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:1048
+#18 bdrv_pwrite (bytes=160, buf=0x555556116000, offset=196608, child=0x55555611e3a0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:1070
+#19 bdrv_pwrite_sync (child=0x55555611e3a0, offset=offset@entry=196608, buf=buf@entry=0x555556116000, count=count@entry=160) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:1084
+#20 0x00005555555f60de in qcow2_grow_l1_table (bs=bs@entry=0x55555610d0a0, min_size=min_size@entry=20, exact_size=exact_size@entry=true) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/qcow2-cluster.c:161
+#21 0x00005555555ec252 in qcow2_co_truncate (bs=0x55555610d0a0, offset=<optimized out>, exact=<optimized out>, prealloc=PREALLOC_MODE_OFF, flags=0, errp=0x7ffff5e9cfa0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/qcow2.c:4172
+#22 0x000055555562758d in bdrv_co_truncate (child=0x55555617b290, offset=10737418240, exact=<optimized out>, prealloc=PREALLOC_MODE_OFF, flags=0, errp=0x7ffff5e9cfa0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:3394
+#23 0x0000555555627a01 in bdrv_truncate_co_entry (opaque=0x7ffff5e9ceb0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:3437
+#24 bdrv_run_co (opaque=0x7ffff5e9ceb0, entry=0x555555627980 <bdrv_truncate_co_entry>, bs=0x55555610d0a0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:915
+#25 bdrv_truncate (child=<optimized out>, offset=<optimized out>, exact=<optimized out>, prealloc=<optimized out>, flags=flags@entry=0, errp=errp@entry=0x7ffff5e9cfa0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/io.c:3453
+#26 0x0000555555611d32 in blk_truncate (blk=blk@entry=0x55555611e420, offset=<optimized out>, exact=exact@entry=false, prealloc=<optimized out>, flags=flags@entry=0, errp=errp@entry=0x7ffff5e9cfa0)
+    at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/block-backend.c:2184
+#27 0x00005555555e9a0f in qcow2_co_create (create_options=0x55555612c000, errp=errp@entry=0x7ffff5e9cfa0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/qcow2.c:3614
+#28 0x00005555555ea0ec in qcow2_co_create_opts (drv=<optimized out>, filename=<optimized out>, opts=0x5555557a3f90, errp=0x7ffff5e9cfa0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block/qcow2.c:3795
+#29 0x00005555555bd631 in bdrv_create_co_entry (opaque=0x7fffffffdff0) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/block.c:487
+#30 0x00005555556a7d8b in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at /usr/src/debug/qemu-5.1.0-9.fc33.x86_64/util/coroutine-ucontext.c:173
+#31 0x00007ffff76a01c0 in ?? () at ../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91 from /lib64/libc.so.6
+#32 0x00007fffffffd820 in ?? ()
+#33 0x0000000000000000 in ?? ()
+```

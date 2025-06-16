@@ -1,0 +1,101 @@
+risc-v: 0.913
+device: 0.895
+hypervisor: 0.889
+graphic: 0.881
+register: 0.874
+i386: 0.872
+x86: 0.861
+TCG: 0.860
+VMM: 0.860
+peripherals: 0.860
+vnc: 0.859
+user-level: 0.856
+virtual: 0.852
+assembly: 0.851
+KVM: 0.851
+debug: 0.850
+semantic: 0.848
+arm: 0.843
+performance: 0.842
+permissions: 0.839
+architecture: 0.837
+ppc: 0.836
+PID: 0.822
+kernel: 0.813
+boot: 0.792
+mistranslation: 0.751
+socket: 0.749
+files: 0.742
+network: 0.727
+
+i386/sev: Crash in pc_system_parse_ovmf_flash caused by bad firmware file
+Description of problem:
+A specially-crafted flash file can cause the `memcpy()` call in
+`pc_system_parse_ovmf_flash` (`hw/i386/pc_sysfw_ovmf.c`) to READ out-of-bounds
+memory, because there's no check on the `tot_len` field which is read
+from the flash file.  In such case, `ptr - tot_len` will point to a
+memory location *below* `flash_ptr` (hence the out-of-bounds read).
+
+This path is only taken when SEV is enabled (which requires 
+KVM and x86_64).
+Steps to reproduce:
+1. Create `bad_ovmf.fd` using the following python script:
+   ```
+   from uuid import UUID
+   OVMF_TABLE_FOOTER_GUID = "96b582de-1fb2-45f7-baea-a366c55a082d"
+   b = bytearray(4096)
+   b[4046:4048] = b'\xff\xff'   # tot_len field
+   b[4048:4064] = UUID("{" + OVMF_TABLE_FOOTER_GUID + "}").bytes_le
+   with open("bad_ovmf.fd", "wb") as f:
+       f.write(b)
+   ```
+2. Build QEMU with `--enable-sanitizers`
+3. Start QEMU with SEV and the bad flash file:
+   ```
+   qemu-system-x86_64 -enable-kvm -cpu host -machine q35 \
+                      -drive if=pflash,format=raw,unit=0,file=bad_ovmf.fd,readonly=on \
+                      -machine confidential-guest-support=sev0 \
+                      -object sev-guest,id=sev0,cbitpos=47,reduced-phys-bits=1,policy=0x0
+   ```
+4. QEMU crashes with: `SUMMARY: AddressSanitizer: stack-buffer-underflow`
+Additional information:
+Crash example:
+
+```
+$ sudo build/qemu-system-x86_64 -enable-kvm -cpu host -machine q35 \
+                                -drive if=pflash,format=raw,unit=0,file=bad_ovmf.fd,readonly=on \
+                                -machine confidential-guest-support=sev0 \
+                                -object sev-guest,id=sev0,cbitpos=47,reduced-phys-bits=1,policy=0x0
+==523314==WARNING: ASan doesn't fully support makecontext/swapcontext functions and may produce false positives in some cases!
+=================================================================
+==523314==ERROR: AddressSanitizer: stack-buffer-underflow on address 0x7f05305fb180 at pc 0x7f0548d89480 bp 0x7ffed44a1980 sp 0x7ffed44a1128
+READ of size 65517 at 0x7f05305fb180 thread T0
+    #0 0x7f0548d8947f  (/usr/lib/x86_64-linux-gnu/libasan.so.5+0x9b47f)
+    #1 0x556127c3331e in memcpy /usr/include/x86_64-linux-gnu/bits/string_fortified.h:34
+    #2 0x556127c3331e in pc_system_parse_ovmf_flash ../hw/i386/pc_sysfw_ovmf.c:82
+    #3 0x556127c21a0c in pc_system_flash_map ../hw/i386/pc_sysfw.c:203
+    #4 0x556127c21a0c in pc_system_firmware_init ../hw/i386/pc_sysfw.c:258
+    #5 0x556127c1ddd9 in pc_memory_init ../hw/i386/pc.c:902
+    #6 0x556127bdc387 in pc_q35_init ../hw/i386/pc_q35.c:207
+    #7 0x5561273bfdd6 in machine_run_board_init ../hw/core/machine.c:1181
+    #8 0x556127f77de1 in qemu_init_board ../softmmu/vl.c:2652
+    #9 0x556127f77de1 in qmp_x_exit_preconfig ../softmmu/vl.c:2740
+    #10 0x556127f7f24d in qemu_init ../softmmu/vl.c:3775
+    #11 0x556126f947ac in main ../softmmu/main.c:49
+    #12 0x7f05470e80b2 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x270b2)
+    #13 0x556126fa639d in _start (/home/dmurik/git/qemu/build/qemu-system-x86_64+0x2a5739d)
+
+Address 0x7f05305fb180 is located in stack of thread T3 at offset 0 in frame
+    #0 0x556128a96f1f in qemu_sem_timedwait ../util/qemu-thread-posix.c:293
+
+
+  This frame has 1 object(s):
+    [32, 48) 'ts' (line 295) <== Memory access at offset 0 partially underflows this variable
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+      (longjmp and C++ exceptions *are* supported)
+Thread T3 created by T0 here:
+    #0 0x7f0548d28805 in pthread_create (/usr/lib/x86_64-linux-gnu/libasan.so.5+0x3a805)
+    #1 0x556128a97ecf in qemu_thread_create ../util/qemu-thread-posix.c:596
+
+SUMMARY: AddressSanitizer: stack-buffer-underflow (/usr/lib/x86_64-linux-gnu/libasan.so.5+0x9b47f)
+```

@@ -1,0 +1,208 @@
+graphic: 0.907
+debug: 0.900
+mistranslation: 0.880
+semantic: 0.875
+permissions: 0.872
+architecture: 0.869
+assembly: 0.867
+peripherals: 0.867
+virtual: 0.863
+risc-v: 0.860
+PID: 0.857
+arm: 0.857
+ppc: 0.853
+kernel: 0.850
+user-level: 0.847
+performance: 0.842
+socket: 0.830
+device: 0.829
+files: 0.823
+vnc: 0.822
+KVM: 0.818
+boot: 0.811
+x86: 0.805
+network: 0.804
+register: 0.804
+hypervisor: 0.800
+VMM: 0.781
+TCG: 0.731
+i386: 0.664
+
+qemu-arm stalls on a GCC sanitizer test since qemu-2.7
+
+Hi,
+
+I have noticed that several GCC/sanitizer tests fail with timeout when executed under QEMU.
+
+After a bit of investigation, I have noticed that this worked with qemu-2.7, and started failing with qemu-2.8, and still fails with qemu-2.10.1
+
+I'm attaching a tarball containing:
+alloca_instruments_all_paddings.exe : the testcase, and the needed libs:
+lib/librt.so.1
+lib/libdl.so.2
+lib/ld-linux-armhf.so.3
+lib/libasan.so.5
+lib/libc.so.6
+lib/libgcc_s.so.1
+lib/libpthread.so.0
+lib/libm.so.6
+
+To reproduce the problem:
+$ qemu-arm -cpu any -R 0 -L $PWD $PWD/alloca_instruments_all_paddings.exe
+returns in less than a second with qemu-2.7, and never with qemu-2.8
+
+Using -d in_asm suggests that the program "almost" completes and qemu seems to stall on:
+0x40b6eb44: e08f4004 add r4, pc, r4
+
+
+
+Hi. Your test case doesn't run for me:
+
+qemu-arm -cpu any -R 0 -L $PWD $PWD/alloca_instruments_all_paddings.exe 
+/tmp/bug1727737/alloca_instruments_all_paddings.exe: error while loading shared libraries: libstdc++.so.6: cannot open shared object file: No such file or directory
+
+Did you forget to include one of the needed libs in the tarball?
+
+
+Right, it worked for me because of the encoded rpath.
+Here is the missing libstdc++.so.6
+
+
+Thanks. With that extra library, if I run with QEMU_STRACE=1 the following looks very suspicious:
+
+28865 getpid() = 28865
+28865 mmap2(NULL,2101248,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0) = 0x43234000
+28865 mprotect(0x43234000,4096,PROT_NONE) = 0
+28865 rt_sigprocmask(SIG_BLOCK,0x40e077bc,0x40e0783c) = 0
+28865 clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_UNTRACED,child_stack=0x43434ff8,parent_tidptr=0x00000000,tl
+s=0x00000000,child_tidptr=0x00000000) = -1 errno=22 (Invalid argument)
+28865 rt_sigprocmask(SIG_SETMASK,0x40e0783c,NULL) = 0
+28865 getpid() = 28865
+28865 sched_yield(1082131140,0,0,0,1084256812,1084256808) = 0
+28865 sched_yield(0,0,0,0,1084256812,1084256808) = 0
+28865 sched_yield(0,0,0,0,1084256812,1084256808) = 0
+28865 sched_yield(0,0,0,0,1084256812,1084256808) = 0
+
+
+It looks like the test case is (a) calling clone() with non-standard flags and (b) not checking whether it failed (presumably it then hangs forever waiting for the non-existent second thread to do something).
+
+This has started failing because we tightened up the handling of flags in our clone() syscall implementation: instead of blithely accepting any combination of flags but only giving you the behaviour that glibc pthread_create() gives, we now fail the clone() syscall if you ask for some behaviour we can't implement with pthread_create() or fork(). In this case you've asked for CLONE_VM|CLONE_FS|CLONE_FILES, which is very nearly a pthread thread but you also need CLONE_SIGHAND|CLONE_THREAD|CLONESYSVSEM. Also you ask for CLONE_UNTRACED, which we can't support.
+
+It's unfortunate that this tightening up of the checks means that some programs which ask for things we can't do but don't actually care about them will no longer run, but I think this is overall better than behaving wrongly for guest programs which do care, since we can't tell which is which.
+
+
+I suspect this happens when the sanitizer library calls StopTheWorld() (in libsanitizer/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc in GCC sources).
+
+It does:
+  uptr tracer_pid = internal_clone(
+      TracerThread, tracer_stack.Bottom(),
+      CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_UNTRACED,
+      &tracer_thread_argument, nullptr /* parent_tidptr */,
+      nullptr /* newtls */, nullptr /* child_tidptr */);
+
+See: https://gcc.gnu.org/viewcvs/gcc/trunk/libsanitizer/sanitizer_common/sanitizer_stoptheworld_linux_libcdep.cc?revision=253887&view=markup#l383
+
+The recent merge with the upstream libsanitizer means that stoptheworld is now enabled on arm as well, leading to this call to internal_clone().
+
+This matches the comment I received on the gcc-patches list: https://gcc.gnu.org/ml/gcc-patches/2017-10/msg02215.html
+"LSan sets atexit handler that calls internal_clone function that's not supported in QEMU"
+
+I'm wondering why this works on aarch64? (I am also using QEMU for validations of aarch64 gcc). I mean the validations do not timeout. That being said, on aarch64 the test exits with 4 as return-code (like it did on arm with qemu-2.7)
+
+It also seems to me that the sanitizer lib is trying to handle the error (see if (internal_iserror(tracer_pid, &local_errno)) line 427).
+
+As a side note, doing
+$ qemu-arm -E ASAN_OPTIONS=detect_leaks=0 blah
+does not affect the execution, while
+$ env ASAN_OPTIONS=detect_leaks=0 qemu-arm blah
+does
+(my question here being: why doesn't -E do what I want?)
+
+
+
+My bad: on aarch64 it does not "work", the test actually exits with a LeakSanitizer error message ("fatal error").
+
+Using QEMU_STRACE=1 shows that clone() fails in the same way as for arm (which is expected), but apparently this error is handled better on aarch64, maybe because the internal_clone implementation is different.
+
+
+I looked a bit more at the sanitizers source code, to understand the differences between arm and aarch64. And it turns out that on aarch64, we have:
+
+sanitizer_common/sanitizer_syscall_linux_aarch64.inc:
+133	// Helper function used to avoid cobbler errno.
+134	bool internal_iserror(uptr retval, int *rverrno) {
+135	  if (retval >= (uptr)-4095) {
+
+but on arm, in the GCC version, we use:
+
+sanitizer_common/sanitizer_syscall_generic.inc:
+54	bool internal_iserror(uptr retval, int *rverrno) {
+55	  if (retval == (uptr)-1) {
+
+But recently (Nov 8th), the upstream sanitizer repo got a new file:
+
+sanitizer_common/sanitizer_syscall_linux_arm.inc
+133	// Helper function used to avoid cobbler errno.
+134	bool internal_iserror(uptr retval, int *rverrno) {
+135	  if (retval >= (uptr)-4095) {
+
+With that change, I now observe the same behaviour with qemu-aarch64 and qemu-arm.
+
+
+I also looked at QEMU's code, and I am suprised that do_syscall() returns the value of errno rather than the return code from the syscall. So for instance, if clone() fails, do_syscall() returns get_errno(do_fork(...)) instead of -1. I thought the target code expects -1 in case of failure, but I'm not familiar with QEMU sources, so I'm probably missing something.
+
+Looking at QEMU's linux-user/syscall.c:do_fork(), I noticed several places with return -TARGET_EXXXX: should this be:
+errno = TARGET_EXXX;
+return -1;
+instead?
+But given than most (if not all) syscalls in do_syscall actually use 'ret = get_errno(xxxx)' I must be wrong :-)
+
+
+Hmm, the do_fork() code is a bit inconsistent there. Generally in linux-user/ functions should either:
+(1) return -1 with host errno set to a host errno; the caller then must use get_errno() to convert to the negative-target-errno that we need to return from do_syscall()
+(2) return negative-target-errno; the caller then need do nothing
+
+In this case do_fork() is supposed to be using approach 2, but some code paths are using approach 1 and the callers are all using get_errno(). This hybrid approach works OK as long as none of the negative-target-errno values returned are -1 (which happens to be TARGET_EPERM for all architectures, and which we only use once in linux-user, in the sigaltstack handling). In an ideal world we'd clean this up to consistently use approach 2, but I don't think the code as it stands is actually buggy.
+
+
+Thanks for the clarification.
+
+But how does the target get the actual syscall return code, if do_syscall() is supposed to return negative-target-errno?
+
+I mean, in general the target code will check if the syscall returned -1, and only then query errno?
+But if QEMU's do_syscall returns -errno, and put this value in r0 (for arm) how is the target code supposed to work?
+
+
+The kernel syscall ABI is "returns negative-errno". In the target code, if the libc ABI says "return -1 with errno set", it's the target libc code's job to move the return value into the TLS errno variable and return -1 from the library function. (Some target architectures have slightly weird ABIs like SPARC's "sets the carry flag on syscall failure" one; QEMU handles that kind of detail in the linux-user/main.c code which calls do_syscall().)
+
+
+Thanks fixing my ignorance :-)
+
+So it really seems this is a feature, not a bug here.
+
+This was a bit off-topic, but I have a pending question in comment #5:
+As a side note, doing
+$ qemu-arm -E ASAN_OPTIONS=detect_leaks=0 blah
+does not affect the execution, while
+$ env ASAN_OPTIONS=detect_leaks=0 qemu-arm blah
+does
+(my question here being: why doesn't -E propagate ASA_OPTIONS to the target code?)
+
+No idea about the environment variable thing -- it seems to work for me. In a chroot:
+# qemu-arm-static -E ASAN_OPTIONS=bar=baz /usr/bin/env 
+ASAN_OPTIONS=bar=baz
+[...  other things ...]
+
+shows that -E is being passed into the child process's environment as would be expected.
+
+
+Ha! I think I found the problem.... the sanitizer reads /proc/self/environ, which is not where QEMU wrote the target environment...
+
+Thanks a lot for your support, I think you can close this report as: "it's a feature, not a bug".
+
+
+
+It would be nice if we got /proc/self/environ right, though...
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

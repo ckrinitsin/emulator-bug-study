@@ -1,0 +1,115 @@
+graphic: 0.982
+debug: 0.979
+permissions: 0.979
+architecture: 0.977
+performance: 0.976
+register: 0.976
+virtual: 0.974
+device: 0.971
+semantic: 0.971
+assembly: 0.971
+files: 0.968
+arm: 0.967
+mistranslation: 0.967
+PID: 0.960
+network: 0.956
+ppc: 0.954
+VMM: 0.951
+socket: 0.950
+user-level: 0.950
+vnc: 0.948
+boot: 0.948
+risc-v: 0.945
+hypervisor: 0.942
+kernel: 0.942
+peripherals: 0.935
+KVM: 0.932
+TCG: 0.928
+i386: 0.912
+x86: 0.880
+
+A bug in AArch64 FJCVTZS instruction
+Description of problem:
+fjcvtzs instruction converts a double-precision floating-point value in the source register into a 32-bit signed integer, and stores the result in the destination register. The contents of the FPCR register influence the exception result. Especially, when FPCR.FZ (Flushing denormalized numbers to Zero) is set and an input is a denormalized number, the PSTATE.Z flag should be cleared even if the conversion result is zero.
+
+However, because the helper function for this instruction does not properly check the denormalized case, the Z flag will have an incorrect value:
+```
+// target/arm/vfp_helper.c
+uint64_t HELPER(fjcvtzs)(float64 value, void *vstatus)
+{
+    float_status *status = vstatus;
+    uint32_t inexact, frac;
+    uint32_t e_old, e_new;
+
+    e_old = get_float_exception_flags(status);
+    set_float_exception_flags(0, status);
+    frac = float64_to_int32_modulo(value, float_round_to_zero, status);
+    e_new = get_float_exception_flags(status);
+    set_float_exception_flags(e_old | e_new, status);
+
+    if (value == float64_chs(float64_zero)) {
+        /* While not inexact for IEEE FP, -0.0 is inexact for JavaScript. */
+        inexact = 1;
+    } else {
+        /* Normal inexact or overflow or NaN */
+        inexact = e_new & (float_flag_inexact | float_flag_invalid); // float_flag_input_denormal should also be checked.
+    }
+
+    /* Pack the result and the env->ZF representation of Z together.  */
+    return deposit64(frac, 32, 32, inexact);
+}
+```
+Steps to reproduce:
+1. Write `test.c`.
+```
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+char i_D27[8] = { 0x0, 0xff, 0xfc, 0x0, 0x0, 0x0, 0x0, 0x0 };
+uint64_t i_fpcr = 0x01000000; // FZ = 1;
+char o_X28[8];
+uint64_t o_nzcv;
+
+void __attribute__ ((noinline)) show_state() {
+    char Z = ((o_nzcv >> 30) & 1);
+
+    printf("PSTATE.Z: %d\n", Z);
+    printf("X28: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%02x ", o_X28[i]);
+    }
+    printf("\n");
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        "adrp x29, i_D27\n"
+        "add x29, x29, :lo12:i_D27\n"
+        "ldr d27, [x29]\n"
+        "adrp x29, i_fpcr\n"
+        "add x29, x29, :lo12:i_fpcr\n"
+        "ldr x29, [x29]\n"
+        "msr fpcr, x29\n"
+        ".inst 0x1e7e037c\n" // fjcvtzs w28, d27
+        "mrs x26, nzcv\n"
+        "adrp x29, o_nzcv\n"
+        "add x29, x29, :lo12:o_nzcv\n"
+        "str x26, [x29]\n"
+        "adrp x29, o_X28\n"
+        "add x29, x29, :lo12:o_X28\n"
+        "str x28, [x29]\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+    return 0;
+}
+```
+2. Compile `test.bin` using this command: `aarch64-linux-gnu-gcc-12 -O2 -no-pie ./test.c -o ./test.bin`.
+3. Run QEMU using this command: `qemu-aarch64 -L /usr/aarch64-linux-gnu/ ./test.bin`.
+4. The program, runs on top of the buggy QEMU, prints the value of Z as `01`. It should print `00` after the bug is fixed.
+Additional information:
+

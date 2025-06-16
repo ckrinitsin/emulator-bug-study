@@ -1,0 +1,104 @@
+risc-v: 0.625
+virtual: 0.589
+graphic: 0.582
+semantic: 0.571
+permissions: 0.565
+arm: 0.563
+register: 0.559
+performance: 0.557
+PID: 0.553
+architecture: 0.541
+device: 0.526
+hypervisor: 0.521
+VMM: 0.521
+assembly: 0.520
+debug: 0.520
+ppc: 0.518
+user-level: 0.517
+socket: 0.498
+TCG: 0.481
+vnc: 0.474
+network: 0.465
+boot: 0.436
+kernel: 0.416
+mistranslation: 0.414
+KVM: 0.406
+peripherals: 0.394
+files: 0.366
+x86: 0.336
+i386: 0.285
+
+ARM QEMU doesn't enforce that RES0 bits in FPSCR are non-writeable
+
+Hi all, we systematically tested the QEMU implementation for emulating arm user mode programs. We found that QEMU incorrectly emulate the FPSCR register. The following the proof of code:
+
+/*********** Beginning of the bug: arm.c **********/
+
+int printf(const char *format, ...);
+unsigned char i0[0x10];
+unsigned char o[0x10];
+int main() {
+    int k = 0;
+    asm("mov r2, %0\n"
+        "ldr r0, [r2]\n"::"r"((char *)(i0)));;
+    asm("vmsr fpscr, r0");
+    asm("mov r2, %0\n"
+        "vmrs r4, fpscr\n"
+        "str r4, [r2]\n"::"r"((char *)(o)));;
+    for (k = 0; k < 0x10; k++)
+        printf("%02x", o[0x10 - 1 - k]);
+    printf("\n");
+}
+unsigned char i0[0x10] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x28, 0x1c, 0xc7, 0x01, 0x00, 0x00, 0x00, 0x00};
+
+/*********** End fo the bug **********/
+
+When the program is compiled into arm binary code and running on a real arm machine, and running in qemu, we have the following result
+
+$ arm-linux-gnueabihf-gcc arm.c -o arm -static
+$ ./arm
+000000000000000000000000fff7009f
+$ qemu-arm arm
+000000000000000000000000ffffffff
+
+According to the ARM manual, bits[19, 14:13, 6:5] of FPSCR should be reserved as zero. However, arm qemu fails to keep these bits to be zero: these bits can be actually modified in QEMU.
+
+Thanks!
+
+Hi. The v8 ARM ARM defines these bits of the FPSCR as "RES0". The glossary definition of "RES0" says that for bits in a RW register it is an implementation choice whether the bits should be "hardwired to 0" (ie writes are ignored) or whether the bit can be written and read back (but has no effect on behaviour). QEMU has gone for the "can be written and read back" option.
+
+(Previous versions of the architecture like v7 required implementations to provide the "hardwired to 0" behaviour. In any case correctly behaving guest code should never write 1s to these bits.)
+
+This is a specific example of a general situation: QEMU doesn't really pay very much attention to the edge cases of behaviour in IMPDEF or UNPREDICTABLE cases, especially where they vary between architecture versions, and we don't try to enforce "unimplemented always RAZ/RAO" bits in registers. So while it might be nice to have these bits RAZ0 it's really very low priority for us -- I'd happily review and accept a patch to do this, but am unlikely to write one myself.
+
+
+QEMU now does enforce these RES0 bits. I had to fix up the inline asm syntax in the example guest program (which was missing a clobbers list and generally didn't work with newer gcc):
+
+int printf(const char *format, ...);
+unsigned char i0[0x10];
+unsigned char o[0x10];
+int main() {
+    int k;
+    asm volatile ("mov r2, %0\n"
+        "ldr r0, [r2]\n"
+        "vmsr fpscr, r0\n"
+        "mov r2, %1\n"
+        "vmrs r4, fpscr\n"
+        "str r4, [r2]\n" :: "r"((char *)(i0)), "r"((char *)(o)) : "r2", "r4", "memory");
+
+    for (k = 0; k < 0x10; k++) {
+        printf("%02x", o[0x10 - 1 - k]);
+    }
+    printf("\n");
+}
+unsigned char i0[0x10] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x28, 0x1c, 0xc7, 0x01, 0x00, 0x00, 0x00, 0x00};
+
+but it now prints:
+000000000000000000000000ffff009f
+
+which is the same as the quoted hardware value except that QEMU supports fp16 arithmetic and so bit 19 (FZ16) is writable. CPUs without fp16 behave as expected:
+qemu-arm -cpu cortex-a9 /tmp/arm
+000000000000000000000000fff7009f
+
+
+

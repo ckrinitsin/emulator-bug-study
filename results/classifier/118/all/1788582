@@ -1,0 +1,104 @@
+KVM: 0.946
+device: 0.945
+debug: 0.940
+mistranslation: 0.940
+graphic: 0.938
+ppc: 0.937
+user-level: 0.937
+register: 0.937
+boot: 0.935
+architecture: 0.934
+virtual: 0.932
+semantic: 0.931
+risc-v: 0.931
+permissions: 0.930
+kernel: 0.929
+TCG: 0.929
+assembly: 0.927
+PID: 0.927
+socket: 0.927
+x86: 0.925
+vnc: 0.924
+arm: 0.924
+performance: 0.924
+hypervisor: 0.916
+network: 0.916
+VMM: 0.913
+files: 0.904
+peripherals: 0.889
+i386: 0.818
+
+Race condition during shutdown
+
+I ran into a bug when I started several VMs in parallel using
+libvirt. The VMs are using only a kernel and a initrd (which includes a
+minimal OS). The guest OS itself does a 'poweroff -f' as soon as the
+login prompt shows up. So the expectaction is that the VMs will start,
+the shutdown will be initiated, and the QEMU processes will then
+end. But instead some of the QEMU processes get stuck in ppoll().
+
+A bisect showed that the first bad commit was
+0f12264e7a41458179ad10276a7c33c72024861a ("block: Allow graph changes in
+bdrv_drain_all_begin/end sections").
+
+I've already tried the current master (13b7b188501d419a7d63c016e00065bcc693b7d4) 
+since the problem might be related
+to the commit a1405acddeb0af6625dd9c30e8277b08e0885bd3 ("aio: Do
+aio_notify_accept only during blocking aio_poll"). But the bug is still
+there. I’ve reproduced the bug on x86_64 and on s390x.
+
+The backtrace of a hanging QEMU process:
+
+(gdb) bt
+#0  0x00007f5d0e251b36 in ppoll () from target:/lib64/libc.so.6
+#1  0x0000560191052014 in qemu_poll_ns (fds=0x560193b23d60, nfds=5, timeout=55774838936000) at /home/user/git/qemu/util/qemu-timer.c:334
+#2  0x00005601910531fa in os_host_main_loop_wait (timeout=55774838936000) at /home/user/git/qemu/util/main-loop.c:233
+#3  0x0000560191053119 in main_loop_wait (nonblocking=0) at /home/user/git/qemu/util/main-loop.c:497
+#4  0x0000560190baf454 in main_loop () at /home/user/git/qemu/vl.c:1866
+#5  0x0000560190baa552 in main (argc=71, argv=0x7ffde10e41c8, envp=0x7ffde10e4408) at /home/user/git/qemu/vl.c:4644
+
+The used domain definition is:
+
+<domain type='kvm'>
+  <name>test</name>
+  <memory unit='KiB'>716800</memory>
+  <vcpu placement='static'>2</vcpu>
+  <iothreads>8</iothreads>
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-3.0'>hvm</type>
+    <kernel>/var/lib/libvirt/images/vmlinuz-4.14.13-200.fc26.x86_64</kernel>
+    <initrd>/var/lib/libvirt/images/test-image-qemux86_64+modules-4.14.13-200.fc26.x86_64.cpio.gz</initrd>
+    <cmdline>console=hvc0 STARTUP=shutdown.sh</cmdline>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+  </features>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>preserve</on_crash>
+  <devices>
+    <emulator>/usr/local/qemu/master/bin/qemu-system-x86_64</emulator>
+    <controller type='usb' index='0' model='piix3-uhci'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x2'/>
+    </controller>
+    <controller type='pci' index='0' model='pci-root'/>
+    <controller type='virtio-serial' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </controller>
+    <console type='pty'>
+      <target type='virtio' port='0'/>
+    </console>
+    <input type='mouse' bus='ps2'/>
+    <input type='keyboard' bus='ps2'/>
+    <memballoon model='none'/>
+  </devices>
+</domain>
+
+Do you find the cause of the bug and fix it?
+
+It was fixed with commit 4cf077b59fc73eec29f8b7 (see patch series https://lists.gnu.org/archive/html/qemu-block/2018-09/msg00504.html).
+
+Ok, so marking this bug as "fixed" according to Marc's comment.
+

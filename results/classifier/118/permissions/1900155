@@ -1,0 +1,124 @@
+permissions: 0.881
+register: 0.856
+device: 0.845
+graphic: 0.813
+assembly: 0.812
+KVM: 0.801
+TCG: 0.799
+VMM: 0.799
+performance: 0.796
+semantic: 0.793
+peripherals: 0.788
+boot: 0.781
+arm: 0.779
+user-level: 0.779
+socket: 0.775
+architecture: 0.775
+vnc: 0.771
+PID: 0.763
+risc-v: 0.762
+hypervisor: 0.758
+network: 0.755
+debug: 0.749
+virtual: 0.744
+mistranslation: 0.743
+files: 0.736
+x86: 0.729
+kernel: 0.728
+ppc: 0.684
+i386: 0.617
+
+MIPS Malta fails booting due to IDE error
+
+As of commit 3e407488349:
+
+$ avocado --show=console run -t machine:malta tests/acceptance/boot_linux_console.py    
+console: [    0.000000] Linux version 4.5.0-2-4kc-malta (<email address hidden>) (gcc version 5.3.1 20160519 (Debian 5.3.1-20) ) #1 Debian 4.5.5-1 (2016-05-29)
+console: [    0.000000] earlycon: Early serial console at I/O port 0x3f8 (options '38400n8')
+console: [    0.000000] bootconsole [uart0] enabled
+console: [    0.000000] CPU0 revision is: 00019300 (MIPS 24Kc)
+console: [    0.000000] FPU revision is: 00739300
+console: [    0.000000] MIPS: machine is mti,malta
+[...]
+console: ata2.00: ATAPI: QEMU DVD-ROM, 2.5+, max UDMA/100
+console: ata2.00: Drive reports diagnostics failure. This may indicate a drive
+console: ata2.00: fault or invalid emulation. Contact drive vendor for information.
+console: ata2.00: configured for UDMA/33
+console: scsi 1:0:0:0: CD-ROM            QEMU     QEMU DVD-ROM     2.5+ PQ: 0 ANSI: 5
+console: Freeing unused kernel memory: 412K (80979000 - 809e0000)
+console: do_page_fault(): sending SIGSEGV to mount for invalid write access to 0018a000
+console: epc = 775cca54 in libc-2.27.so[775b3000+177000]
+console: ra  = 77754618 in ld-2.27.so[77743000+24000]
+console: do_page_fault(): sending SIGSEGV to klogd for invalid write access to 0018a000
+console: epc = 770f0a54 in libc-2.27.so[770d7000+177000]
+console: ra  = 77278618 in ld-2.27.so[77267000+24000]
+console: do_page_fault(): sending SIGSEGV to S20urandom for invalid write access to 0018a000
+console: epc = 77d0ca54 in libc-2.27.so[77cf3000+177000]
+console: ra  = 77e94618 in ld-2.27.so[77e83000+24000]
+console: do_page_fault(): sending SIGSEGV to mkdir for invalid write access to 0018a000
+console: epc = 776b8a54 in libc-2.27.so[7769f000+177000]
+console: ra  = 77840618 in ld-2.27.so[7782f000+24000]
+console: do_page_fault(): sending SIGSEGV to sh for invalid write access to 0018a000
+console: epc = 77364a54 in libc-2.27.so[7734b000+177000]
+console: ra  = 774ec618 in ld-2.27.so[774db000+24000]
+console: do_page_fault(): sending SIGSEGV to sh for invalid write access to 0018a000
+console: epc = 77bd4a54 in libc-2.27.so[77bbb000+177000]
+console: ra  = 77d5c618 in ld-2.27.so[77d4b000+24000]
+console: do_page_fault(): sending SIGSEGV to awk for invalid write access to 0018a000
+console: epc = 76f44a54 in libc-2.27.so[76f2b000+177000]
+console: ra  = 770cc618 in ld-2.27.so[770bb000+24000]
+console: do_page_fault(): sending SIGSEGV to cat for invalid write access to 0018a000
+console: epc = 770cca54 in libc-2.27.so[770b3000+177000]
+console: ra  = 77254618 in ld-2.27.so[77243000+24000]
+$ echo $?
+8
+
+55adb3c45620c31f29978f209e2a44a08d34e2da is the first bad commit
+commit 55adb3c45620c31f29978f209e2a44a08d34e2da
+Author: John Snow <email address hidden>
+Date:   Fri Jul 24 01:23:00 2020 -0400
+
+    ide: cancel pending callbacks on SRST
+
+    The SRST implementation did not keep up with the rest of IDE; it is
+    possible to perform a weak reset on an IDE device to remove the BSY/DRQ
+    bits, and then issue writes to the control/device registers which can
+    cause chaos with the state machine.
+
+    Fix that by actually performing a real reset.
+
+Yup. Mark Cave-Ayland pointed this out to me. I have a patch ready for it:
+
+diff --git a/hw/ide/core.c b/hw/ide/core.c
+index 693b352d5e..98cea7ad45 100644
+--- a/hw/ide/core.c
++++ b/hw/ide/core.c
+@@ -2254,10 +2254,8 @@ static void ide_perform_srst(IDEState *s)
+      /* Cancel PIO callback, reset registers/signature, etc */
+      ide_reset(s);
+
+-    if (s->drive_kind == IDE_CD) {
+-        /* ATAPI drives do not set READY or SEEK */
+-        s->status = 0x00;
+-    }
++    /* perform diagnostic */
++    cmd_exec_dev_diagnostic(s, WIN_DIAGNOSE);
+  }
+
+  static void ide_bus_perform_srst(void *opaque)
+@@ -2282,9 +2280,7 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
+
+      /* Device0 and Device1 each have their own control register,
+       * but QEMU models it as just one register in the controller. */
+-    if ((bus->cmd & IDE_CTRL_RESET) &&
+-        !(val & IDE_CTRL_RESET)) {
+-        /* SRST triggers on falling edge */
++    if (!(bus->cmd & IDE_CTRL_RESET) && (val & IDE_CTRL_RESET)) {
+          for (i = 0; i < 2; i++) {
+              s = &bus->ifs[i];
+              s->status |= BUSY_STAT; 
+
+Fixed by commits 4ac4e7281a2..1a9925e3390.
+
+Released with QEMU v5.2.0.
+

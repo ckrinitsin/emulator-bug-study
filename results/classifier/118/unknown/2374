@@ -1,0 +1,141 @@
+debug: 0.896
+TCG: 0.886
+performance: 0.885
+user-level: 0.885
+permissions: 0.878
+device: 0.878
+arm: 0.876
+graphic: 0.876
+hypervisor: 0.874
+vnc: 0.873
+semantic: 0.872
+architecture: 0.872
+assembly: 0.865
+risc-v: 0.862
+register: 0.852
+i386: 0.852
+VMM: 0.851
+PID: 0.846
+kernel: 0.835
+boot: 0.833
+virtual: 0.832
+peripherals: 0.820
+ppc: 0.819
+network: 0.812
+KVM: 0.804
+mistranslation: 0.792
+socket: 0.782
+files: 0.773
+x86: 0.755
+
+A bug in AArch64 FMOPA/FMOPS (non-widening) instruction
+Description of problem:
+fmopa computes the multiplication of two matrices in the source registers and accumulates the result to the destination register. Depending on the instruction encoding, the element size of operands is either 32 bits or 64 bits. When the computation produces a NaN as a result, the default NaN should be generated.
+
+However, the current implementation of 32-bit variant of this instruction does not generate default NaNs, because invalid float_status pointer is passed:
+```
+// target/arm/tcg/sme_helper.c
+void HELPER(sme_fmopa_s)(void *vza, void *vzn, void *vzm, void *vpn,
+                         void *vpm, void *vst, uint32_t desc)
+{
+...
+    float_status fpst;
+
+    /*
+     * Make a copy of float_status because this operation does not
+     * update the cumulative fp exception status.  It also produces
+     * default nans.
+     */
+    fpst = *(float_status *)vst;
+    set_default_nan_mode(true, &fpst);
+
+...
+                            *a = float32_muladd(n, *m, *a, 0, vst); // &fpst should be used
+...
+}
+```
+Steps to reproduce:
+1. Write `test.c`.
+```
+#include <stdio.h>
+
+char i_P0[4] = { 0xff, 0xff, 0xff, 0xff };
+char i_P6[4] = { 0xff, 0xff, 0xff, 0xff };
+char i_Z9[32] = { // Set only the first element as NaN, but it is not default NaN.
+    0xff, 0xff, 0xff, 0xff, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+};
+char i_Z27[32] = {
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+};
+char i_ZA1H[128] = { 0x0, };
+char o_ZA1H[128];
+
+void __attribute__ ((noinline)) show_state() {
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 16; j++) {
+            printf("%02x ", o_ZA1H[16*i+j]);
+        }
+        printf("\n");
+    }
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        ".arch armv9.3-a+sme\n"
+        "smstart\n"
+        "adrp x29, i_P0\n"
+        "add x29, x29, :lo12:i_P0\n"
+        "ldr p0, [x29]\n"
+        "adrp x29, i_P6\n"
+        "add x29, x29, :lo12:i_P6\n"
+        "ldr p6, [x29]\n"
+        "adrp x29, i_Z9\n"
+        "add x29, x29, :lo12:i_Z9\n"
+        "ldr z9, [x29]\n"
+        "adrp x29, i_Z27\n"
+        "add x29, x29, :lo12:i_Z27\n"
+        "ldr z27, [x29]\n"
+        "adrp x29, i_ZA1H\n"
+        "add x29, x29, :lo12:i_ZA1H\n"
+        "mov x15, 0\n"
+        "ld1w {za1h.s[w15, 0]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "ld1w {za1h.s[w15, 1]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "mov x15, 2\n"
+        "ld1w {za1h.s[w15, 0]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "ld1w {za1h.s[w15, 1]}, p0, [x29]\n"
+        ".inst 0x809bc121\n" // fmopa   za1.s, p0/m, p6/m, z9.s, z27.s
+        "adrp x29, o_ZA1H\n"
+        "add x29, x29, :lo12:o_ZA1H\n"
+        "mov x15, 0\n"
+        "st1w {za1h.s[w15, 0]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "st1w {za1h.s[w15, 1]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "mov x15, 2\n"
+        "st1w {za1h.s[w15, 0]}, p0, [x29]\n"
+        "add x29, x29, 32\n"
+        "st1w {za1h.s[w15, 1]}, p0, [x29]\n"
+        ".arch armv8-a\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+    return 0;
+}
+```
+2. Compile `test.bin` using this command: `aarch64-linux-gnu-gcc-12 -O2 -no-pie ./test.c -o ./test.bin`.
+3. Run QEMU using this command: `qemu-aarch64 -L /usr/aarch64-linux-gnu/ -cpu max,sme256=on ./test.bin`.
+4. The program, runs on top of the buggy QEMU, prints 8 non-default NaNs (ff ff ff ff). It should print 8 default NaNs (00 00 c0 7f) after the bug is fixed.
+Additional information:
+

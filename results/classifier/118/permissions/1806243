@@ -1,0 +1,168 @@
+permissions: 0.935
+debug: 0.930
+peripherals: 0.917
+hypervisor: 0.912
+arm: 0.912
+device: 0.907
+graphic: 0.905
+semantic: 0.893
+architecture: 0.886
+performance: 0.882
+x86: 0.878
+network: 0.862
+user-level: 0.844
+boot: 0.844
+PID: 0.842
+assembly: 0.836
+files: 0.823
+VMM: 0.815
+ppc: 0.797
+kernel: 0.795
+virtual: 0.792
+risc-v: 0.787
+register: 0.775
+mistranslation: 0.775
+TCG: 0.774
+vnc: 0.750
+socket: 0.740
+KVM: 0.705
+i386: 0.692
+
+ARM conditional branch after if-then instruction not working
+
+Hello
+
+There seems to be an issue with QEMU when debugging if-then condition blocks from the thumb2 instruction set. The following snippet runs fine during normal execution, but keeps hanging at the conditional branch when debugging. The jump at the branch should only be executed as long as $r0 is lower than $r1. Problem is that once both are equal, the execution is not continued past the branch and the program counter never gets popped.
+
+2000407a:   push    {lr}
+2000407c:   movs    r0, r6
+2000407e:   ldmia   r7!, {r1, r6}
+20004080:   push    {r0, r1}
+20004082:   str.w   r6, [r7, #-4]!
+20004086:   ldr     r6, [sp, #0]
+20004088:   pop     {r0, r1}
+2000408a:   adds    r0, #1
+2000408c:   cmp     r0, r1
+2000408e:   itt     lt
+20004090:   pushlt  {r0, r1}
+20004092:   blt.w   0x20004082      ; unpredictable <IT:lt>  // <-- GDB hangs here
+20004096:   pop     {pc}
+
+I have tried to reproduce the problem with inline assembly but for some reason the following example just worked:
+
+void f() {
+  static uint8_t stack[256]{};
+  stack[255] = 4;
+
+  asm volatile("\n\t"
+               "push    {lr}"
+               "\n\t"
+
+               // pre-conditions
+               "movs    r7, %[stack]"
+               "\n\t"
+               "movs    r6, #1"
+               "\n\t"
+
+               "movs    r0, r6"
+               "\n\t"
+               "ldmia   r7!, {r1, r6}"
+               "\n\t"
+               "push    {r0, r1}"
+               "\n\t"
+               "1:"
+               "\n\t"
+               "str.w   r6, [r7, #-4]!"
+               "\n\t"
+               "ldr     r6, [sp, #0]"
+               "\n\t"
+               "pop     {r0, r1}"
+               "\n\t"
+               "adds    r0, #1"
+               "\n\t"
+               "cmp     r0, r1"
+               "\n\t"
+               "itt     lt"
+               "\n\t"
+               "pushlt  {r0, r1}"
+               "\n\t"
+
+               // Original instruction
+               //"blt.w   0x20004082"  //   ; unpredictable <IT:lt>
+
+               // Trying to fake it
+               "blt.w   1b"
+               "\n\t"
+
+               "pop     {pc}"
+               "\n\t"
+               :
+               : [stack] "r"(&stack[255]));
+}
+
+The only real major difference I see to the other code snipped is that the inline assembly is running from flash memory where as the original code runs in ram? Maybe that's a clue somehow? 
+
+Quickly reading through already reported ARM bugs I think this might be related:
+https://bugs.launchpad.net/qemu/+bug/1364501
+At least the symptoms sound identical.
+
+
+The versions I'm running are:
+QEMU 3.0.0
+arm-none-eabi-gdb 8.2
+
+I've also captured some trace output for single stepping from the pushlt to the blt.w instruction with the trace arguments unimp, guest_errors, op, int, exec.
+
+
+
+The disassembler is giving you a hint here:
+
+2000408e: itt lt
+20004090: pushlt {r0, r1}
+20004092: blt.w 0x20004082 ; unpredictable <IT:lt> // <-- GDB hangs here
+
+Your code has a "blt" instruction inside an IT block in a way that is archictecturally UNPREDICTABLE, and the CPU is allowed to not behave in the way you might expect it to.
+
+Your attempt to reproduce the problem is likely generating different instructions (specifically probably a different encoding of the branch instruction).
+
+On the other hand having QEMU behave differently in singlestep mode and just hang (rather than, say, making the insn UNDEF or treating it as a condition-failed or a condition-passed) is not ideal.
+
+Do you have a sample binary and QEMU command line that reproduces this?
+
+
+Oh damn it, you're right. Apparently encoding T3 of the branch instruction inside an IT block is always unpredictable... Guess the inline assembly version ignores the .w extension and creates some other encoding that simply works.
+
+I've attached the .elf which is causing GDB to halt.
+
+Currently I'm invoking QEMU GNU MCU (some fork with small CortexM extensions) with
+qemu-system-gnuarmeclipse -S -s -verbose -semihosting-config enable=on,target=native -mcu STM32F407VG --image arm_unpredictable_branch.elf
+
+QEMU GNU MCU is currently at version 2.8.0.
+
+But as I mentioned before I've also tried it with 3.0.0 from the ARCH repository and both versions did the same thing. I think the only difference is the "--image" option which translates to "--kernel" in the original.
+
+I think this was probably fixed by commit c2d9644e6d517170b, which was in QEMU 3.1.0 -- that commit certainly fixes some kinds of crash if guest code tried to do an UNPREDICTABLE conditional instruction inside an IT block.
+
+Could you try again with that version of QEMU, or at least provide a repro case with a command line which demonstrates the problem with upstream QEMU?
+
+
+Jesus... I'm sorry about the delay. Eclipse kept dying on me when launching gdb so I had to first set up another IDE since I really really didn't want to single-step through with the command line.
+
+Anyhow. The behavior of QEMU during debugging is now identical to the one when running it. Even with the unpredictable branch I could step through the code.
+
+That's great -- thanks for confirming that we've fixed the bug.
+
+
+There might still be some issues...
+
+Single-stepping works as long as I don't let GDB display the assembly with "display/i $pc". Once GDB decodes and displays every instruction the debugging session gets canceled when I hit the unpredictable branch. I'm not sure if this has anything to do with QEMU though?
+
+That sounds odd (and also like it might be a gdb bug, since 'display /i' is just implemented as memory reads from QEMU's point of view). I can have a look if you provide repro instructions.
+
+
+I honestly wouldn't know where to start. The wrong branch instructions were created by an embedded forth compiler. I just tried mem-copying a single definition containing one of those erroneous branches to some ram array and then call into it with a pointer. The problem is that the definition assumes certain preconditions like a register pointing to forth's stack and all... Without those preconditions calling the definition immediately hardfaults the core at the very first load instruction.
+
+After playing around with it for like ~2h I think that's not worth the trouble. I'm glad the QEMU inconsistency is fixed, let's leave it at that (I tested with 3.1.0 btw). :)
+
+Thank you for all your trouble.
+

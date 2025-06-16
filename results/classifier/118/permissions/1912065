@@ -1,0 +1,115 @@
+permissions: 0.916
+semantic: 0.889
+peripherals: 0.869
+assembly: 0.849
+graphic: 0.845
+kernel: 0.844
+debug: 0.842
+register: 0.842
+device: 0.818
+network: 0.816
+arm: 0.802
+TCG: 0.801
+PID: 0.796
+risc-v: 0.784
+socket: 0.774
+virtual: 0.761
+architecture: 0.743
+vnc: 0.719
+mistranslation: 0.702
+ppc: 0.679
+user-level: 0.678
+files: 0.672
+KVM: 0.654
+boot: 0.643
+VMM: 0.625
+performance: 0.609
+hypervisor: 0.608
+x86: 0.602
+i386: 0.572
+
+Segfaults in tcg/optimize.c:212 after commit 7c79721606be11b5bc556449e5bcbc331ef6867d
+
+QEMU segfaults to NULL dereference in tcg/optimize.c:212 semi-randomly after commit 7c79721606be11b5bc556449e5bcbc331ef6867d
+
+Exception Type:        EXC_BAD_ACCESS (SIGSEGV)
+Exception Codes:       KERN_INVALID_ADDRESS at 0x0000000000000020
+Exception Note:        EXC_CORPSE_NOTIFY
+
+...
+
+Thread 4 Crashed:
+0   qemu-system-ppc               	0x0000000109cd26d2 tcg_opt_gen_mov + 178 (optimize.c:212)
+1   qemu-system-ppc               	0x0000000109ccf838 tcg_optimize + 5656
+2   qemu-system-ppc               	0x0000000109c27600 tcg_gen_code + 64 (tcg.c:4490)
+3   qemu-system-ppc               	0x0000000109c17b6d tb_gen_code + 493 (translate-all.c:1952)
+4   qemu-system-ppc               	0x0000000109c16085 tb_find + 41 (cpu-exec.c:454) [inlined]
+5   qemu-system-ppc               	0x0000000109c16085 cpu_exec + 2117 (cpu-exec.c:810)
+6   qemu-system-ppc               	0x0000000109c09ac3 tcg_cpus_exec + 35 (tcg-cpus.c:57)
+7   qemu-system-ppc               	0x0000000109c75edd rr_cpu_thread_fn + 445 (tcg-cpus-rr.c:217)
+8   qemu-system-ppc               	0x0000000109e41fae qemu_thread_start + 126 (qemu-thread-posix.c:521)
+9   libsystem_pthread.dylib       	0x00007fff2038e950 _pthread_start + 224
+10  libsystem_pthread.dylib       	0x00007fff2038a47b thread_start + 15
+
+Here the crash is in tcg/optimize.c line 212:
+
+  mask = si->mask;
+
+"si" is NULL. The NULL value arises from tcg/optimize.c line 198:
+
+ si = ts_info(src_ts);
+
+I did not attempt to determine the root cause of this issue, however. It clearly is related to the "tcg/optimize" changes in this commit. The previous commit c0dd6654f207810b16a75b673258f5ce2ceffbf0 doesn't crash.
+
+Thanks for reporting it. Just found it as well and reported on the mailing 
+list. It's currently being investigated. List thread is here:
+
+https://lists.nongnu.org/archive/html/qemu-devel/2021-01/msg03936.html
+
+
+The problem is that we're now generating many more temporaries
+than before, and running out of the statically allocated amount.
+Changing a debug assert to a full assert will change the SEGV
+into an ABRT.  :-)
+
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index 8f8badb61c..c376afe56a 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -1207,7 +1207,7 @@ void tcg_func_start(TCGContext *s)
+ static inline TCGTemp *tcg_temp_alloc(TCGContext *s)
+ {
+     int n = s->nb_temps++;
+-    tcg_debug_assert(n < TCG_MAX_TEMPS);
++    g_assert(n < TCG_MAX_TEMPS);
+     return memset(&s->temps[n], 0, sizeof(TCGTemp));
+ }
+ 
+
+The problem can be worked around temporarily by increasing the
+number of temporaries:
+
+diff --git a/include/tcg/tcg.h b/include/tcg/tcg.h
+index 504c5e9bb0..8fe32bb03c 100644
+--- a/include/tcg/tcg.h
++++ b/include/tcg/tcg.h
+@@ -275,7 +275,7 @@ typedef struct TCGPool {
+ 
+ #define TCG_POOL_CHUNK_SIZE 32768
+ 
+-#define TCG_MAX_TEMPS 512
++#define TCG_MAX_TEMPS 2048
+ #define TCG_MAX_INSNS 512
+ 
+ /* when the size of the arguments of a called function is smaller than
+
+
+But a proper solution is to dynamically allocate the temps.
+
+Richard, thanks for providing the workaround. It helps.
+
+A full solution to the problem:
+https://<email address hidden>/
+
+https://gitlab.com/qemu-project/qemu/-/commit/ae30e86661b0f4
+

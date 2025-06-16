@@ -1,0 +1,738 @@
+semantic: 0.793
+permissions: 0.728
+register: 0.712
+debug: 0.697
+graphic: 0.683
+virtual: 0.679
+architecture: 0.674
+PID: 0.669
+peripherals: 0.638
+risc-v: 0.619
+device: 0.616
+network: 0.615
+performance: 0.606
+user-level: 0.582
+hypervisor: 0.570
+assembly: 0.569
+VMM: 0.560
+vnc: 0.550
+arm: 0.548
+mistranslation: 0.543
+TCG: 0.533
+boot: 0.532
+files: 0.512
+socket: 0.491
+ppc: 0.485
+x86: 0.471
+kernel: 0.430
+KVM: 0.321
+i386: 0.115
+
+4.1.0: qcow2 corruption on savevm/quit/loadvm cycle
+
+I'm seeing massive corruption of qcow2 images with qemu 4.1.0 and git master as of 7f21573c822805a8e6be379d9bcf3ad9effef3dc after a few savevm/quit/loadvm cycles. I've narrowed it down to the following reproducer (further notes below):
+
+# qemu-img check debian.qcow2
+No errors were found on the image.
+251601/327680 = 76.78% allocated, 1.63% fragmented, 0.00% compressed clusters
+Image end offset: 18340446208
+# bin/qemu/bin/qemu-system-x86_64 -machine pc-q35-4.0.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=debian.qcow2,id=d -S
+qemu-system-x86_64: warning: dbind: Couldn't register with accessibility bus: Did not receive a reply. Possible causes include: the remote application did not send a reply, the message bus security policy blocked the reply, the reply timeout expired, or the network connection was broken.
+QEMU 4.1.50 monitor - type 'help' for more information
+(qemu) loadvm foo
+(qemu) c
+(qemu) qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+quit
+[m@nargothrond:~] qemu-img check debian.qcow2
+Leaked cluster 85179 refcount=2 reference=1
+Leaked cluster 85180 refcount=2 reference=1
+ERROR cluster 266150 refcount=0 reference=2
+[...]
+ERROR OFLAG_COPIED data cluster: l2_entry=422840000 refcount=1
+
+9493 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+2 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+259266/327680 = 79.12% allocated, 1.67% fragmented, 0.00% compressed clusters
+Image end offset: 18340446208
+
+This is on a x86_64 Linux 5.3.1 Gentoo host with qemu-system-x86_64 and accel=kvm. The compiler is gcc-9.2.0 with the rest of the system similarly current.
+
+Reproduced with qemu-4.1.0 from distribution package as well as vanilla git checkout of tag v4.1.0 and commit 7f21573c822805a8e6be379d9bcf3ad9effef3dc (today's master). Does not happen with qemu compiled from vanilla checkout of tag v4.0.0. Build sequence:
+
+./configure --prefix=$HOME/bin/qemu-bisect --target-list=x86_64-softmmu --disable-werror --disable-docs
+[...]
+CFLAGS            -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -g
+[...] (can provide full configure output if helpful)
+make -j8 install
+
+The kind of guest OS does not matter: seen with Debian testing 64bit, Windows 7 x86/x64 BIOS and Windows 7 x64 EFI.
+
+The virtual storage controller does not seem to matter: seen with VirtIO SCSI, emulated SCSI and emulated SATA AHCI.
+
+Caching modes (none, directsync, writeback), aio mode (threads, native) or discard (ignore, unmap) or detect-zeroes (off, unmap) does not influence occurence either.
+
+Having more RAM in the guest seems to increase odds of corruption: With 512MB to the Debian guest problem hardly occurs at all, with 4GB RAM it happens almost instantly.
+
+An automated reproducer works as follows:
+
+- the guest *does* mount its root fs and swap with option discard and my testing leaves me with the impression that file deletion rather than reading is causing the issue
+
+- foo is a snapshot of the running Debian VM which is already running command
+
+# while true ; do dd if=/dev/zero of=foo bs=10240k count=400 ; done
+
+to produce some I/O to the disk (4GB file with 4GB of RAM).
+
+- on the host a loop continuously resumes and saves the guest state and quits qemu inbetween:
+
+# while true ; do (echo loadvm foo ; echo c ; sleep 10 ; echo stop ; echo savevm foo ; echo quit ) | bin/qemu-bisect/bin/qemu-system-x86_64 -machine pc-q35-3.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=debian.qcow2,id=d -S -display none ; done
+
+- quitting qemu inbetween saves and loads seems to be necessary for the problem to occur. Just continusouly in one session saving and loading guest state does not trigger it.
+
+- For me, after about 2 to 6 iterations of above loop the image is corrupted.
+
+- corruption manifests with other messages from qemu as well, e.g.:
+
+(qemu) loadvm foo
+Error: Device 'd' does not have the requested snapshot 'foo'
+
+Using above reproducer I have to the be best of my ability bisected the introduction of the problem to commit 69f47505ee66afaa513305de0c1895a224e52c45 (block: avoid recursive block_status call if possible). qemu compiled from the commit before does not exhibit the issue, from that commit on it does and reverting the commit off of current master makes it disappear.
+
+cc'd in kwolf since he signed off on that change.
+
+> I'm seeing massive corruption of qcow2 images with qemu 4.1.0 and git master
+> as of 7f21573c822805a8e6be379d9bcf3ad9effef3dc after a few
+> savevm/quit/loadvm cycles.
+[...]
+> bisected the introduction of the problem to commit 
+> 69f47505ee66afaa513305de0c1895a224e52c45
+> (block: avoid recursive block_status call if possible).
+
+In case it got lost in all the blurb: qemu 4.1.0 is essentially eating VMs by corrupting their images in very short order. Asumming no aggravating circumstances on my end I'd expect this to have the potential to hit a lot of users very hard once qemu 4.1.0 starts appearing in distros.
+
+Having downgraded to 4.0.0 works around the problem for me for now.
+
+Just let me know if there's anything I can do to assist.
+
+Hi Michael,
+  How sure are you that it's that commit - have you checked the commit before it?
+
+
+Yes. As said:
+
+> qemu compiled from the commit before does not exhibit the issue, from that
+> commit on it does and reverting the commit off of current master makes it
+> disappear.
+
+In my tests the problem only occurs with that commit in the code. I used git bisect to narrow it down to that commit. Even just reverting it off of current master made it go away with my automated reproducer.
+
+If helpful I can retest manually with a real-world VM. OTOH it would certainly be helpful if someone else said they can or cannot reproduce the problem based on my description of the reproducer.
+
+I just quickly retested with today's master (commit 69b81893bc28feb678188fbcdce52eff1609bdad) and the automated reproducer. With the attached revert patch applied the loadvm/sleep 10/savevm/quit loop ran 50 times without problem. As soon as I removed the patch, recompiled and replaced the qemu binary with the unpatched, newly compiled one it took another two runs of the loop to produce this output:
+
+QEMU 4.1.50 monitor - type 'help' for more information
+(qemu) loadvm foo
+(qemu) c
+(qemu) stop
+(qemu) savevm foo
+(qemu) quit
+QEMU 4.1.50 monitor - type 'help' for more information
+(qemu) loadvm foo
+(qemu) c
+(qemu) stop
+(qemu) savevm foo
+Error: Error while deleting snapshot on device 'd': Failed to free the cluster and L1 table: Invalid argument
+(qemu) quit
+QEMU 4.1.50 monitor - type 'help' for more information
+(qemu) loadvm foo
+Error: Device 'd' does not have the requested snapshot 'foo'
+(qemu) c
+(qemu) qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+^Cqemu-system-x86_64: terminating on signal 2
+
+qemu-img check then reports:
+
+48857 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+115210 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+259259/327680 = 79.12% allocated, 2.51% fragmented, 0.00% compressed clusters
+Image end offset: 17942052864
+
+$ qemu-img check debian.qcow2 2>&1 | grep OFLAG_COPIED | wc -l
+17592
+$ qemu-img check debian.qcow2 2>&1 | grep ERROR | wc -l
+48857
+$ qemu-img check debian.qcow2 2>&1 | grep Leaked | wc -l
+115210
+
+
+I haven't done any sort of "narrowing down", but recent QEMUs (built from the master branch, post-v4.1) have corrupted at least two VM disk images (qcow2) for me as well. I had to reinstall both VMs.
+
+I didn't make any noise because I was sure that, if I wasn't seeing ghosts, then others must have encountered the symptom earlier than I did, and file bug reports with more details than I had time for.
+
+Perhaps relevant: my use case lacks savevm/loadvm. I only boot and shutdown VMs.
+
+My symptoms have been:
+- qemu refusing to start, due to the qcow2 image being corrupt
+- qemu-img reporting the image as corrupt
+- applications in guests that checksum data reporting problems (such as RPM complaining about RPMDB corruption)
+
+I think the affected qcow2 images may have had compressed clusters. (I no longer have the images.)
+
+I can confirm exactly the same issue on Arch linux running qemu-4.1.0.
+
+After downgrading from 4.1.0 => 4.0.0 everything is running normal again, no corruption detected and all qcow2 images stays healthy.
+
+
+After reading the message of commit 69f47505ee66 ("block: avoid
+recursive block_status call if possible", 2019-06-04), I'm none the
+wiser. But, I can at least confirm that all my qcow2 images are
+pre-allocated, as a norm. I create them with the following command:
+
+qemu-img create \
+  -f qcow2 \
+  -o compat=1.1 \
+  -o cluster_size=65536 \
+  -o preallocation=metadata \
+  -o lazy_refcounts=on \
+  $FILENAME \
+  100G
+
+Perhaps this helps reproducing the issue. The commit message says,
+"However, lseek is needed when we have metadata-preallocated image", so
+that might be a special case that I've hit with some frequency.
+
+I do have a vague suspicion that the following idea:
+
+    The idea is to compare allocation size in POV of filesystem with
+    allocations size in POV of Qcow2 (by refcounts). If allocation in fs is
+    significantly lower, consider it as metadata-preallocation case.
+
+is not robust enough. From the description, the "metadata-preallocation
+case" appears to be determined with *heuristics*, but then again, "lseek
+is needed when we have metadata-preallocated image". So if there is a
+clear requirement to behave differently / particularly for
+metadata-preallocated images, why is it safe to (basically) *guess*
+whether a given image had its metadata pre-allocated?
+
++    threshold = MAX(real_clusters * 10 / 9, real_clusters + 2);
+
+Where do those constants come from?
+
+... Not sure if it matters: the host filesystem holding my qcow2 images
+is "ext4". Filesystem features (dumped with the fs being mounted r/w at
+the moment): has_journal, ext_attr resize_inode, dir_index, filetype,
+needs_recovery, extent, flex_bg, sparse_super, large_file, huge_file,
+uninit_bg, dir_nlink, extra_isize. Filesystem flags:
+signed_directory_hash.
+
+Thanks.
+
+
+(See also / possible duplicate: <https://bugs.launchpad.net/qemu/+bug/1847793>.)
+
+My qcow2 images also reside on an ext4 with features "has_journal ext_attr dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file dir_nlink extra_isize metadata_csum" on a luks-encrypt(ed|ing) device mapper device backed by a partition on an NVMe SSD. The setup is rock solid and I had no other indications of it causing corruption or being corrupted.
+
+I did a quick test with a 32GB USB3 flash drive formatted as a super floppy (without partitions nor encryption) as XFS and saw the same corruption though less heavily so, likely because the drive is much slower (~ 60MB/s write instead of ~600MB/s write for the NVMe SSD).
+
+The savevm/loadvm cycle was basically the first reliable and fast reproducer I was able to find. I have a dim recollection that some of my corruptions also did not involve any loadvm/savevm but were much rarer and not as easily reproducible.
+
+
+Not sure if i have exactly the same problem, as my qcow2 corruption seems to be limited to windows10 guests - win2019 and debian10 guests with the same virtio-scsi setup are fine (as are various virtio-blk or ide/sata images from linux/solaris/macos guests).
+
+I find that i randomly have disk image corruption from little more than boot/shutdown cycles - no heavy usage or anything is required. "qemu-img check -r all" usually makes things worse, as does chkdsk.
+
+host filesystem is an ssd with ext4 on top of luks, discard not used (fstrim.timer instead) with features: has_journal ext_attr resize_inode dir_index filetype needs_recovery extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum
+
+Reported to redhat as assumed it was a virtio-win bug: https://bugzilla.redhat.com/show_bug.cgi?id=1762944 - includes virt-install method to reproduce my test vm's (i don't use qemu directly).
+
+Host is debian sid running qemu version 4.1.0 (Debian 1:4.1-1+b3), libvirt 5.6.0-2, kernel 5.2.0-3 (5.2.17-1)
+
+Can't seem to reproduce if I convert the qcow2 image to raw+sparse.
+
+After reading some related code, I have more questions than before, but let's see... As more qcow2 code was merged since, I would suggest that we debug the problem on commit 69f4750 (the bisection result) rather than on anything newer.
+
+
+First of all: Michael, you didn't specify explicitly how your images were created, but can I assume that the test image is not preallocated (in contrast to Laszlo's)?
+
+I find Laszlo's case with a preallocated image particularly surprising because the behaviour isn't supposed to have changed at all for preallocated images, at least if the heuristics still detects them as such. Once a preallocated image becomes almost fully allocated, it's expected that we won't detect it any more. So, Laszlo, do you know how much of your images was allocated? 'qemu-img check' prints the allocation statistics.
+
+
+The next mystery is why bdrv_co_block_status() is even called. I found only a single call that happens with normal guest I/O and savevm/loadvm, and that's the one in handle_alloc_space(). This function is suspicious because it's relatively new, but commit 69f4750 shouldn't have any effect on it because BDRV_BLOCK_ALLOCATED is set independently of BDRV_BLOCK_RECURSE - and even if the change had an effect, it would be that the function is used less, so if anything, a bug could be expected to be hidden rather than become visible.
+
+I think it might be worth a try reproducing with the handle_alloc_space() call commented out. If that doesn't fix/hide the bug, it would be interesting to see what else calls qcow2_detect_metadata_preallocation(), e.g. by setting a breakpoint there in gdb and getting the stack backtrace when it triggers.
+
+
+Another caller I see in the code, but didn't get run in my guest, is qcow2_co_pwrite_zeroes(). This is not discard, but maybe the discard mount option does cause a write_zeroes call (WRITE SAME in SCSI) sometimes? But then, your reproducer seems to use AHCI and I can't see a write_zeroes call in the AHCI or IDE device emulation.
+
+The possible (intended) effect of commit 69f4750 is that a block that was previously detected as containing only zeros (BDRV_BLOCK_ZERO) doesn't get this flag any more. This could cause unaligned qcow2_co_pwrite_zeroes() to fail, but then we'd just get a fallback to a normal write, which wouldn't explain any metadata-level corruption.
+
+
+Michael, would you like to give it a try and figure out in which code path qcow2_detect_metadata_preallocation() is even called in your reproducer and if handle_alloc_space() is linked to this bug somehow?
+
+In reply to Kevin's comment#13:
+
+> I find Laszlo's case with a preallocated image particularly surprising
+> because the behaviour isn't supposed to have changed at all for
+> preallocated images, at least if the heuristics still detects them as
+> such.
+
+But isn't that "if" at the core of this problem? What happens if the
+detection misfires? (This is not a loaded question, I'm not implying any
+particular circumstances; I'm just surprised that heuristics could be
+considered at all.)
+
+> Once a preallocated image becomes almost fully allocated, it's
+> expected that we won't detect it any more. So, Laszlo, do you know how
+> much of your images was allocated? 'qemu-img check' prints the
+> allocation statistics.
+
+I don't have the images any longer, and since then, I've been running
+qemu 4.0 (for my upstream QEMU binaries).
+
+However, I can say some things (with both affected VMs being Fedora
+installations):
+
+- As noted earlier, the images were formatted for 100GB, with
+  preallocation=metadata.
+
+- I always install Fedora from Live ISOs (never starting with
+  pre-installed images), and right after installation, "du" on the host
+  side always reports 5-8 GB usage. Definitely never more than 10GB. So
+  I'd say these images were very sparsely populated.
+
+- I always use qcow2 images like this, in the domain XMLs:
+
+  <driver name='qemu' type='qcow2' cache='writeback'
+   error_policy='enospace' discard='unmap'/>
+
+  and I always use virtio-scsi so that discard='unmap' actually have an
+  effect.
+
+- I occasionally run "fstrim" in the guest, and / or "virsh domfstrim"
+  on the host. (And re-run "du" on the host side in every such case.)
+
+- Right after installation (with the VM powered down), I might compress
+  the image with "qemu-img convert -c"; but I don't believe I've done
+  that too recently.
+
+- The general idea on my end is that I'd like to limit guest disk usage
+  by the *host* disk's free space, and not by an arbitrary pre-set disk
+  image size. Hence 100GB stands for "infinity" (I might have used 1TB
+  just as well), and error_policy='enospace' lets me act, should a guest
+  actually run out of space, on the host disk. Finally, discard='unmap'
+  prevents waste. I use "preallocation=metadata" because the initial
+  size cost is negligible, but I perceive writes to be faster.
+
+Hopefully this helps at least a tiny bit... Thanks!
+
+> After reading some related code, I have more questions than before, but
+> let's see... As more qcow2 code was merged since, I would suggest that
+> we debug the problem on commit 69f4750 (the bisection result) rather
+> than on anything newer.
+
+Okay, for all of the following I did a fresh compile of qemu 69f4750 and
+ran all commands in this version.
+
+> First of all: Michael, you didn't specify explicitly how your images
+> were created, but can I assume that the test image is not preallocated
+> (in contrast to Laszlo's)?
+
+Actually these were converted from vmdk files using qemu-img and
+previously VMware Fusion VMs. To avoid any suspicion as to what that
+may have brought with it in breakage I just created a fresh image using
+this command:
+
+$ bin/qemu-bisect/bin/qemu-img create -f qcow2 qtest.qcow2 20G
+Formatting 'qtest.qcow2', fmt=qcow2 size=21474836480 cluster_size=65536 lazy_refcounts=off refcount_bits=16
+$ bin/qemu-bisect/bin/qemu-img info qtest.qcow2
+image: qtest.qcow2
+file format: qcow2
+virtual size: 20 GiB (21474836480 bytes)
+disk size: 196 KiB
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+$ ls -la qtest.qcow2
+-rw-r--r-- 1 m m 196928 Oct 21 22:43 qtest.qcow2
+$ du -sk qtest.qcow2
+196     qtest.qcow2
+
+So I guess that means its not preallocated.
+
+Then I installed a minimal Debian buster into it by just entering
+default values:
+
+$ bin/qemu-bisect/bin/qemu-system-x86_64 -machine pc-q35-3.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=qtest.qcow2,id=d -cdrom Downloads/mini.iso
+
+After that the image reported:
+
+$ bin/qemu-bisect/bin/qemu-img check qtest.qcow2
+No errors were found on the image.
+26443/327680 = 8.07% allocated, 17.10% fragmented, 0.00% compressed clusters
+Image end offset: 1734148096
+
+Then I prepared it for the automatic reproducer by running the following
+command in it and saving that running state as snapshot foo using savevm:
+
+$ while true ; do dd if=/dev/zero of=t bs=1024k count=4000 ; done
+
+Then I ran the reproducer using this command:
+
+$ while true ; do (echo loadvm foo ; echo c ; sleep 10 ; echo stop ; echo savevm foo ; echo quit ) |  bin/qemu-bisect/bin/qemu-system-x86_64 -machine pc-q35-3.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=qtest.qcow2,id=d -display none -S ; done
+
+It took nine iterations for the image to corrupt. After that qemu-img
+reads:
+
+$ bin/qemu-bisect/bin/qemu-img check qtest.qcow2 2>&1 | sed -e s,Leaked.*,Leaked, | uniq
+Leaked
+ERROR cluster 163840 refcount=3 reference=4
+ERROR cluster 163841 refcount=3 reference=4
+ERROR cluster 163848 refcount=1 reference=2
+ERROR cluster 163850 refcount=1 reference=2
+ERROR cluster 163921 refcount=1 reference=2
+ERROR cluster 163957 refcount=3 reference=4
+ERROR cluster 163958 refcount=3 reference=4
+Leaked
+ERROR cluster 163962 refcount=1 reference=2
+Leaked
+ERROR cluster 163968 refcount=1 reference=2
+Leaked
+ERROR cluster 163974 refcount=1 reference=2
+Leaked
+
+10 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+129130 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+253326/327680 = 77.31% allocated, 1.77% fragmented, 0.00% compressed clusters
+Image end offset: 18906611712
+
+> Another caller I see in the code, but didn't get run in my guest, is
+> qcow2_co_pwrite_zeroes(). This is not discard, but maybe the discard
+> mount option does cause a write_zeroes call (WRITE SAME in SCSI)
+> sometimes? But then, your reproducer seems to use AHCI and I can't see
+> a write_zeroes call in the AHCI or IDE device emulation.
+
+In above test I had not knowingly configured any discard in the guest.
+Neither /etc/fstab nor /proc/mounts contained the discard option. The
+image also did not shrink when deleting files. Nor did it shrink when
+explicitly calling fstrim / for that matter - presumably because because
+unmap on discard is disabled by default.
+
+So I'd postulate that discard does at most play an aggravating role here
+but is not necessary for the problem to occur.
+
+> I think it might be worth a try reproducing with the
+> handle_alloc_space() call commented out. If that doesn't fix/hide the
+> bug,
+
+I commented out the call to handle_alloc_space() in
+block/qcow2.c:qcow2_co_pwritev() and that certainly hid the bug. The
+reproducer ran for quarter of an hour without any corruption. The image
+was fine after that:
+
+$ bin/qemu-bisect/bin/qemu-img check qtest.qcow2
+No errors were found on the image.
+253376/327680 = 77.32% allocated, 2.00% fragmented, 0.00% compressed clusters
+Image end offset: 16909860864
+
+Commenting handle_alloc_space() back in, recompiling, reinstalling and
+rerunning the reproducer took a single iteration to violently corrupt
+the image.
+
+So I guess it's safe to say that the bug occurs in the
+handle_alloc_space() codepath.
+
+This quick corruption made me think that maybe the level of
+preallocation has something to do with it. So I filled up all disk space
+in the guest by writing zeroes to a file using dd. This yielded a
+preallocation above 80%:
+
+No errors were found on the image.
+266793/327680 = 81.42% allocated, 3.92% fragmented, 0.00% compressed clusters
+Image end offset: 21343764480
+
+Running the reproducer again the image took five iterations to corrupt.
+I'd call that inconclusive.
+
+> Michael, would you like to give it a try and figure out in which code path
+> qcow2_detect_metadata_preallocation() is even called in your reproducer
+
+After letting the VM run for about ten seconds with gdb attached a breakpoint on qcow2_detect_metadata_preallocation triggers and I get this backtrace:
+
+(gdb) bt
+#0  0x0000555555d22bfd in qcow2_detect_metadata_preallocation (bs=0x5555567c69e0) at block/qcow2-refcount.c:3449
+#1  0x0000555555d124b8 in qcow2_co_block_status
+    (bs=0x5555567c69e0, want_zero=false, offset=2148532224, count=4096, pnum=0x7ffee0ae2b28, map=0x7ffee0ae28a0, file=0x7ffee0ae28a8) at block/qcow2.c:1899
+#2  0x0000555555d6124a in bdrv_co_block_status (bs=0x5555567c69e0, want_zero=false, offset=2148532224, bytes=4096, pnum=0x7ffee0ae2b28, map=0x0, file=0x0)
+    at block/io.c:2081
+#3  0x0000555555d6166d in bdrv_co_block_status_above
+    (bs=0x5555567c69e0, base=0x0, want_zero=false, offset=2148532224, bytes=4096, pnum=0x7ffee0ae2b28, map=0x0, file=0x0) at block/io.c:2190
+#4  0x0000555555d61753 in bdrv_block_status_above_co_entry (opaque=0x7ffee0ae2a10) at block/io.c:2220
+#5  0x0000555555d6187e in bdrv_common_block_status_above
+    (bs=0x5555567c69e0, base=0x0, want_zero=false, offset=2148532224, bytes=4096, pnum=0x7ffee0ae2b28, map=0x0, file=0x0) at block/io.c:2255
+#6  0x0000555555d61ae9 in bdrv_is_allocated (bs=0x5555567c69e0, offset=2148532224, bytes=4096, pnum=0x7ffee0ae2b28) at block/io.c:2285
+#7  0x0000555555d61b7b in bdrv_is_allocated_above (top=0x5555567c69e0, base=0x0, offset=2148532224, bytes=4096, pnum=0x7ffee0ae2b80) at block/io.c:2323
+#8  0x0000555555d12d48 in is_unallocated (bs=0x5555567c69e0, offset=2148532224, bytes=4096) at block/qcow2.c:2151
+#9  0x0000555555d12dbc in is_zero_cow (bs=0x5555567c69e0, m=0x555556ed0520) at block/qcow2.c:2162
+#10 0x0000555555d12e9c in handle_alloc_space (bs=0x5555567c69e0, l2meta=0x555556ed0520) at block/qcow2.c:2188
+#11 0x0000555555d13310 in qcow2_co_pwritev (bs=0x5555567c69e0, offset=2148536320, bytes=61440, qiov=0x7fffe83507a0, flags=0) at block/qcow2.c:2301
+#12 0x0000555555d5e6c4 in bdrv_driver_pwritev (bs=0x5555567c69e0, offset=2148536320, bytes=61440, qiov=0x7fffe83507a0, flags=0) at block/io.c:1043
+#13 0x0000555555d6013a in bdrv_aligned_pwritev
+    (child=0x55555675cf80, req=0x7ffee0ae2e50, offset=2148536320, bytes=61440, align=1, qiov=0x7fffe83507a0, flags=0) at block/io.c:1670
+#14 0x0000555555d60d66 in bdrv_co_pwritev (child=0x55555675cf80, offset=2148536320, bytes=61440, qiov=0x7fffe83507a0, flags=0) at block/io.c:1897
+#15 0x0000555555d47cb6 in blk_co_pwritev (blk=0x5555567c6730, offset=2148536320, bytes=61440, qiov=0x7fffe83507a0, flags=0) at block/block-backend.c:1183
+#16 0x0000555555d48499 in blk_aio_write_entry (opaque=0x7fffe8350820) at block/block-backend.c:1382
+#17 0x0000555555e3ff80 in coroutine_trampoline (i0=-402575600, i1=32767) at util/coroutine-ucontext.c:116
+#18 0x00007ffff5fc61a0 in  () at /lib64/libc.so.6
+#19 0x00007ffff17c5920 in  ()
+#20 0x0000000000000000 in  ()
+
+A savevm command does not trigger the breakpoint.
+
+Hope this helps in narrowing down the culprit.
+-- 
+Michael
+
+> But isn't that "if" at the core of this problem? What happens if the
+> detection misfires?
+
+The information that a block driver must give is just whether the given block is allocated by the image or whether it is taken from the backing file. Almost everything else is just a hint that can be given if the driver can be more specific, but that can be omitted.
+
+In the specific case, what commit 69f4750 intends to do is avoid too much effort to determine whether a block is fully zeroed on the filesystem level because the qcow2 metadata should already accurately answer the question. It still keeps the additional checks for metadata preallocation because in this case, the qcow2 metadata says that the whole image is allocated while it's created sparse on the filesystem level, so the check can actually be useful in practice.
+
+If the detection fails (and the code is implemented correctly), we have two cases:
+
+1. Preallocated image detected as non-preallocated: It could happens that a fully zeroed block wouldn't be reported as "fully zeroed", but as "allocated (unknown content)". This could prevent some optimisations, but it's still a correct description of the block.
+
+2. Non-preallocated image detected as preallocated: We waste some cycles on finding out that the filesystem doesn't know more than the qcow2 layer.
+
+> Hopefully this helps at least a tiny bit... Thanks!
+
+Yes, that helps. With an image that is mostly sparse, preallocation detection should work perfectly. It works by comparing the number of allocated qcow2 clusters (the full 100 GB in your case) to the file size (around 10 GB). In other words, your case is one where the behaviour isn't supposed to have changed at all.
+
+I had a thought earlier that maybe the problem isn't with the value returned by bdrv_co_block_status(), but with the fact that bdrv_co_block_status(), and with it preallocation detection, is even running in some code paths. Your cases might support that idea.
+
+> To avoid any suspicion as to what that may have brought with it in
+> breakage I just created a fresh image using this command: [...]
+
+I tried to reproduce the problem locally, on the same commit, with the steps you described, but I wasn't lucky. I tried keeping the image on my home directory (XFS), on tmpfs, and finally on a newly created ext4 filesystem on a spare LVM volume, but the image just wouldn't break even after letting the loop run for a quite a while.
+
+> So I'd postulate that discard does at most play an aggravating role here
+> but is not necessary for the problem to occur.
+
+That makes sense to me because you have internal snapshots. Both discard and snapshots mean that the next write to the block will trigger a cluster allocation (and with it a handle_alloc_space() call) again.
+
+> So I guess it's safe to say that the bug occurs in the
+> handle_alloc_space() codepath.
+
+This is an important finding.
+
+It's a bit odd because the only related thing handle_alloc_space() calls is bdrv_is_allocated_above(), which only cares about BDRV_BLOCK_ALLOCATED. I don't think the commit in question should make any difference as to whether this flag is set or cleared. The only possible difference should be BDRV_BLOCK_ZERO, and we don't even check that flag.
+
+So as the next step I would like to test my theory that the problem isn't bdrv_co_block_status() returning a different value after the commit, but that qcow2_detect_metadata_preallocation() even runs. I think the easiest way to do this would be modifying handle_alloc_space() so that it performs the checks, but skips its optimisation regardless of the is_zero_cow() return value:
+
+        if (!is_zero_cow(bs, m) || true) {
+            continue;
+        }
+
+Unfortunately, as long as I can't reproduce the problem, I'll have to rely on you to actually run the tests I come up with after each step. If you'd prefer some more real-time interaction, feel free to ping me on IRC (kwolf on OFTC or Freenode).
+
+> I tried to reproduce the problem locally, on the same commit, with the
+> steps you described, but I wasn't lucky. I tried keeping the image on my
+> home directory (XFS), on tmpfs, and finally on a newly created ext4
+> filesystem on a spare LVM volume, but the image just wouldn't break even
+> after letting the loop run for a quite a while.
+
+That's certainly an important data point. Is it possible that we're talking about some kind of miscompilation here, maybe because gcc-9.2.0 is just that tiny bit too spanking current?
+
+> So as the next step I would like to test my theory that the problem
+> isn't bdrv_co_block_status() returning a different value after the
+> commit, but that qcow2_detect_metadata_preallocation() even runs. I
+> think the easiest way to do this would be modifying handle_alloc_space()
+> so that it performs the checks, but skips its optimisation regardless of
+> the is_zero_cow() return value:
+
+>         if (!is_zero_cow(bs, m) || true) {
+>             continue;
+>         }
+
+I made the change and the problem went away.
+
+Then, extrapolating the jest of your methodology :), I went ahead and disabled only bdrv_co_pwrite_zeroes() by placing a continue in front of it but let qcow2_pre_write_overlap_check() execute and the problem reappeared. I certainly did not expect that to happen because the function name ends in _check(), suggesting read-only access. And it's not even touched by the commit.
+
+This had me so rattled that I revalidated that the problem does indeed not occur with the commit before. And it does not. I left it running for about half an hour without problems.
+
+After some more tests I finally figured out that even with -g and no -O gcc is smart enough to optimize out (!is_zero_cow() || true) and that corruption only happens if is_zero_cow() is actually called. Corruption also does not occur if I make is_zero_cow() or is_unallocated() return 0 always.
+
+So my first guess was that is_unallocated() sometimes returns false positives, making is_zero_cow() report false positives which is not caught by qcow2_pre_write_overlap_check() and causes bdrv_co_pwrite_zeroes() to zero out actual data. That seemed a bit convoluted to me.
+
+But then I realized that corruption still occurs if the rest of handle_alloc_space() is disabled like so:
+
+--- a/block/qcow2.c
++++ b/block/qcow2.c
+@@ -2185,9 +2185,8 @@ static int handle_alloc_space(BlockDriverState *bs, QCowL2Meta *l2meta)
+             continue;
+         }
+ 
+-        if (!is_zero_cow(bs, m)) {
+-            continue;
+-        }
++        is_zero_cow(bs, m);
++        continue;
+ 
+         /*
+          * instead of writing zero COW buffers,
+
+So it's much more likely that is_zero_cow() has a side-effect that somehow causes corruption later on even without handle_alloc_space() ever calling bdrv_co_pwrite_zeroes(). That would also explain why qcow2_pre_write_overlap_check() does not catch those false positives overwriting metadata because there simply are none.
+
+Putting a breakpoint on handle_alloc_space() and single stepping into is_zero_cow() I do indeed end up in bdrv_co_block_status():
+
+gdb) bt
+#0  0x0000555555d610fd in bdrv_co_block_status (bs=0x5555567c69e0, want_zero=false, offset=5242880, bytes=12288, pnum=0x7ffedffd7b28, map=0x0, file=0x0)
+    at block/io.c:2048
+#1  0x0000555555d6167e in bdrv_co_block_status_above
+    (bs=0x5555567c69e0, base=0x0, want_zero=false, offset=5242880, bytes=12288, pnum=0x7ffedffd7b28, map=0x0, file=0x0) at block/io.c:2190
+#2  0x0000555555d61764 in bdrv_block_status_above_co_entry (opaque=0x7ffedffd7a10) at block/io.c:2220
+#3  0x0000555555d6188f in bdrv_common_block_status_above
+    (bs=0x5555567c69e0, base=0x0, want_zero=false, offset=5242880, bytes=12288, pnum=0x7ffedffd7b28, map=0x0, file=0x0) at block/io.c:2255
+#4  0x0000555555d61afa in bdrv_is_allocated (bs=0x5555567c69e0, offset=5242880, bytes=12288, pnum=0x7ffedffd7b28) at block/io.c:2285
+#5  0x0000555555d61b8c in bdrv_is_allocated_above (top=0x5555567c69e0, base=0x0, offset=5242880, bytes=12288, pnum=0x7ffedffd7b80) at block/io.c:2323
+#6  0x0000555555d12d48 in is_unallocated (bs=0x5555567c69e0, offset=5242880, bytes=12288) at block/qcow2.c:2151
+#7  0x0000555555d12dbc in is_zero_cow (bs=0x5555567c69e0, m=0x5555569d35b0) at block/qcow2.c:2162
+#8  0x0000555555d12e9c in handle_alloc_space (bs=0x5555567c69e0, l2meta=0x5555569d35b0) at block/qcow2.c:2188
+#9  0x0000555555d13321 in qcow2_co_pwritev (bs=0x5555567c69e0, offset=5255168, bytes=4096, qiov=0x7fffe82ec310, flags=0) at block/qcow2.c:2302
+#10 0x0000555555d5e6d5 in bdrv_driver_pwritev (bs=0x5555567c69e0, offset=5255168, bytes=4096, qiov=0x7fffe82ec310, flags=0) at block/io.c:1043
+#11 0x0000555555d6014b in bdrv_aligned_pwritev (child=0x55555675cf80, req=0x7ffedffd7e50, offset=5255168, bytes=4096, align=1, qiov=0x7fffe82ec310, flags=0)
+    at block/io.c:1670
+#12 0x0000555555d60d77 in bdrv_co_pwritev (child=0x55555675cf80, offset=5255168, bytes=4096, qiov=0x7fffe82ec310, flags=0) at block/io.c:1897
+#13 0x0000555555d47cc7 in blk_co_pwritev (blk=0x5555567c6730, offset=5255168, bytes=4096, qiov=0x7fffe82ec310, flags=0) at block/block-backend.c:1183
+#14 0x0000555555d484aa in blk_aio_write_entry (opaque=0x7fffe823f920) at block/block-backend.c:1382
+#15 0x0000555555e3ff91 in coroutine_trampoline (i0=-399759776, i1=32767) at util/coroutine-ucontext.c:116
+#16 0x00007ffff5fc61a0 in  () at /lib64/libc.so.6
+#17 0x00007ffff17c5920 in  ()
+#18 0x0000000000000000 in  ()
+
+At that point it had gotten too late to even attempt to wrap my brain around the whole BDRV_BLOCK_RECURSE logic. But I think the above gives a strong(er|ish) connection between the change and the corruption and how handle_alloc_space() ties into it. Let me know what else I could check to help track this down.
+
+Please ignore the stuff about (!is_zero_cow(bs, m) || true) being optimized out. Of course it isn't. And corruption still occurs with that way of calling only is_zero_cow(). Dunno what I did there. It seems to be even later than I thought. The rest of my testing holds true though.
+
+In reply to <https://bugs.launchpad.net/qemu/+bug/1846427/comments/18>:
+
+> Is it possible that we're talking about some kind of miscompilation
+> here, maybe because gcc-9.2.0 is just that tiny bit too spanking
+> current?
+
+I'm riding the trailing edge here (gcc-4.8 in RHEL7) :)
+
+[...]
+
+> So it's much more likely that is_zero_cow() has a side-effect that somehow
+> causes corruption later on even without handle_alloc_space() ever calling
+> bdrv_co_pwrite_zeroes().
+
+Yes, looks like it. I think we have ruled out that a changing return value is the cause of the problems because the return code was completely ignored and it still broke for you.
+
+Basically the only other thing I see that our commit has changed is that qcow2_detect_metadata_preallocation() runs now. I assume that if you replace its call in qcow2_co_block_status() with a fixed ret = true or ret = false, the problem will still disappear.
+
+Now what is problematic inside qcow2_detect_metadata_preallocation()? At the moment I see two options:
+
+1. qcow2_get_refcount() is the only thing that does something with the qcow2 internals, the other calls are about bs->file->bs (the raw image file), which is pretty certainly harmless. The interesting thing about the qcow2_get_refcount() call is that other code paths call it with s->lock locked, but this one is unlocked. I wonder if moving qemu_co_mutex_lock(&s->lock); in qcow2_co_block_status() to above the qcow2_detect_metadata_preallocation() call would change anything.
+
+2. Or the problem isn't even related to what qcow2_detect_metadata_preallocation() does, but it's a race elsewhere that is just uncovered because of the timing - preallocation detection must be pretty slow because it checks the refcount of every single cluster in the image. In that case, replacing it with something like qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, 100000000); should have the same effect and cause corruption, too.
+
+I finally got an image with which I can reproduce the problem. I think I may have had the wrong image size before because both tmpfs and my spare LVM volume are rather limited in size.
+
+Anyway, so far locking around qcow2_get_refcount() seems to do the trick. I'll try to investigate the details a bit more, but this is something that would actually feel reasonable as a fix.
+
+> I think I may have had the wrong image size before because both tmpfs and
+> my spare LVM volume are rather limited in size.
+
+I also had a hard time to get my image to corrupt on tmpfs because it could not grow to its final size, it seems. Sometimes qemu ran into acutal ENOSPC but most of the time lack of space on tmpfs seemed to trigger early cleanup of unused blocks and in turn prevent corruption. Only after I increased tmpfs size again and again until my machine actually started to swap would I get the spurious corruption. Both facts would seems to support your suspicion of a race condition because qcow2_detect_metadata_preallocation() would run longer the more of the image is/was allocated.
+
+For completeness's sake: All the changes you proposed (replacing call to qcow2_detect_metadata_preallocation() with ret = true and ret = false, moving acquiring s->lock before the call and replacing the call with a sleep) prevent corruption on my system. The latter would suggest that it's not so much a race being exposed by a timing change as a race directly when accessing qcow2 internals without the lock being held.
+
+My understanding is that Kevin has fixed this bug in (as yet unreleased) commit 5e9785505210 ("qcow2: Fix corruption bug in qcow2_detect_metadata_preallocation()", 2019-10-25).
+
+The patch had been posted as a part of the following sets:
+
+[PATCH 0/3] qcow2: Fix image corruption bug in 4.1
+http://<email address hidden>
+
+[PATCH v2 0/2] qcow2: Fix image corruption bug in 4.1
+http://<email address hidden>
+
+Updating the ticket status accordingly.
+
+
+I tried the ArchLinux package that includes three patches applied to qemu 4.1 ( see https://git.archlinux.org/svntogit/packages.git/commit/trunk/PKGBUILD?h=packages/qemu&id=e9707066408de26aa04f8d0ddebe5556aa87e662 ). My Windows 10 qcow2 image got corrupted again after a short time of use. Host filesystem is ext4.
+
+"OFLAG_COPIED data cluster: l2_entry=382c70000 refcount=1"
+
+The Windows installation seems to be fine after repair. At least Windows did not found anything wrong.
+
+Is this a fresh image or is it possible that it already had some latent corruption from a previous run with an unfixed version? If it wasn't fresh, did you run qemu-img check after upgrading QEMU and it still was clean, so we know the corruption was introduced by the new version?
+
+Is the problem easily reproducible or do you hit it only randomly so far? If it is reproducible, can you reproduce it on current qemu.git master or is it only with the Arch package?
+
+I have been dragging my feet exposing my production VMs to a patched 4.1.0 TBH. I have now taken the opportunity to upgrade from 4.0.0 to a 4.1.0 with the fix patches applied. As expected, I can not produce any image corruption with the reproducer I've been using all along. I will now use it in production and report back.
+
+For the record: All my images are intact right now, do not have any corruption and have never had any corruption.
+
+BTW: I have had one image corrupt with identical symptoms (i.e. OFLAG COPIED and such) with an unaffected qemu 4.0.0 because of a completely differrent bug in the host system's Linux kernel causing panics when booting Windows 10: https://bugzilla.kernel.org/show_bug.cgi?id=205247. So identical image corruption can seemingly have different causes...
+
+The image was fine before upgrading qemu. I rechecked the image after the first use and it was fine. But after the larger Windows 1903 -> 1909 upgrade done in qemu 4.1.0 the image was damaged. I will try the git master version of qemu in the coming days and report back.
+
+I've done some security updates on my Debian, Windows 7 64 and 32 Bit VMs and quite intensively used a Windows 1903 VM today without any corruption.
+
+All my images are still fine after some heavy use with qemu-4.1.0 and fix patches applied. Just upgraded to 4.1.1 and will report back. But it's certainly looks like this bug is fixed for good.
+
+My images are still fine after some heavy use with qemu-4.1.1 and no additional patches. I consider this bug fixed for good. Thanks for all your support on this!
+
+I was unable to compile the qemu-git package and I currently have not time to investigate that. But I updated to 4.1.1. I just started my Windows 10 VM with that and after a short time of use the image was corrupted again. Here is my full start parameter set. Maybe there is something wrong or I should change something?
+
+qemu-system-x86_64 -cpu Haswell-noTSX -M q35 -enable-kvm -smp 4,cores=4,threads=1,sockets=1 -net nic,model=virtio -net user,hostname=WindowsKVM.local -drive if=none,id=hd,file=hdd.qcow2,discard=unmap -device virtio-scsi-pci,id=scsi --enable-kvm -device scsi-hd,drive=hd -m 4096 -drive if=pflash,format=raw,readonly,file=/usr/share/ovmf/x64/OVMF_CODE.fd -drive if=pflash,format=raw,file=./OVMF_VARS.fd -drive file=Windows10ISO/Windows.iso,index=0,media=cdrom -drive file=virtio-win-0.1.173.iso,index=1,media=cdrom -no-quit
+
+My Linux VM is still fine.
+
+I don't see anything suspicious in that command line. My only idea for a different configuration to test would be discard=off, which would remove a few code paths that could contain a bug.
+
+Anyway, I think it's pretty clear now that you're hitting a different bug than Michael. Maybe it would be better to create a new report, too, and to continue there.
+
+Did you upgrade from 4.0 to 4.1 when you first hit the bug or was it from an earlier version?
+
+It would be perfect if you could bisect the problem like Michael did with his, but I understand that this might not be possible soon. Alternatively, I could also debug it myself if I had a clear reproducer (that ideally doesn't involve Windows).
+
+The qemu 4.1.0 upgrade killed pretty much all my VMs. I had data corruption (i.e. tar was unable to extract some larger data archives for testing purposes) in all my Linux VMs and other strange errors. The Windows VM was killed after I ran "qemu-img check -r all" on the image. Afterwards Windows was damaged beyond repair and unbootable.
+
+So I reinstalled everything with qemu 4.0, new images and stayed on that version except for testing purposes. Last test was qemu 4.1.1.
+
+Sadly I currently have no time to investigate this error until March next year.
+
+FWIW, my VMs run with SATA and Virtio SCSI with discard=unmap and detect-zeroes=unmap (among the plethora of options from libvirtd) for maximum space savings. No problems since the fix patches went in and had no bearing on the bug occurence before that.
+
+/usr/bin/qemu-system-x86_64 -name guest=win10,debug-threads=on -machine pc-q35-3.1,accel=kvm,usb=off,vmport=off,dump-guest-core=off -m 4096 -smp 2,sockets=2,cores=1,threads=1 -drive file=win10.qcow2,format=qcow2,if=none,id=drive-sata0-0-2,cache=writeback,discard=unmap,detect-zeroes=unmap -device ide-hd,bus=ide.2,drive=drive-sata0-0-2,id=sata0-0-2,bootindex=1,write-cache=on
+
+/usr/bin/qemu-system-x86_64 -name guest=debian,debug-threads=on -machine pc-q35-4.0.1,accel=kvm,usb=off,vmport=off,dump-guest-core=off capabilities=on,ssbd=on,xsaves=on,pdpe1gb=on,hle=off,rtm=off,mpx=off -m 512 -smp 1,sockets=1,cores=1,threads=1 -device virtio-scsi-pci,id=scsi0,bus=pci.8,addr=0x0 -drive file=debian.qcow2,format=qcow2,if=none,id=drive-scsi0-0-0-0,cache=writeback,discard=unmap,detect-zeroes=unmap -device scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=0,device_id=drive-scsi0-0-0-0,drive=drive-scsi0-0-0-0,id=scsi0-0-0-0,bootindex=1,write-cache=on
+
+
+Commit 5e9785505210 was released in v4.2.0; closing this ticket.
+

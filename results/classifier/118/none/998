@@ -1,0 +1,90 @@
+graphic: 0.799
+peripherals: 0.759
+permissions: 0.738
+risc-v: 0.734
+hypervisor: 0.734
+performance: 0.715
+semantic: 0.704
+arm: 0.696
+ppc: 0.682
+user-level: 0.681
+architecture: 0.676
+vnc: 0.671
+virtual: 0.670
+VMM: 0.648
+assembly: 0.637
+PID: 0.637
+device: 0.633
+TCG: 0.598
+register: 0.596
+boot: 0.555
+kernel: 0.542
+mistranslation: 0.539
+files: 0.536
+debug: 0.504
+socket: 0.498
+network: 0.478
+i386: 0.450
+KVM: 0.426
+x86: 0.400
+
+AArch64: SCTLR_EL1.BT0 set incorrectly in user mode
+Description of problem:
+PACIASP normally acts as a BTI landing pad, but not in every situation. When SCTLR_EL1.BT is set, PACIASP checks that the indirect branch originates from X16 or X17 when the indirect branch is taken from a BTI guarded area. Linux sets this bit, ideally QEMU-user should too. This sample program should crash with a SIGILL if QEMU is working correctly, otherwise it will crash with a SIGSEGV.
+
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <unistd.h>
+    #include <string.h>
+    #include <stdio.h>
+    #include <sys/mman.h>
+
+    // PACIASP is a valid BTI landing pad, but there are some conditions
+    // under Linux which sets SCTLR_ELx.BT0 = 1. In this mode, a branch
+    // onto a PACIASP landing pad is only valid if it originates from
+    // x16 or x17 (i.e. br x17 is OK, br x3 is not).
+    // More info on page D5-4851 of the Arm Architecture Reference Manual (ARM DDI 0487H.a).
+
+    // Sample function which starts with a paciasp instruction
+    // (comes from -mbranch-protection=pac-ret+leaf)
+    void indirect_fn(int i) {
+        // paciasp instruction inserted here - should crash with SIGILL here if everything's operating OK.
+        i = i+1;
+        // Can't access this function from the copied location, so will segfault.
+        fprintf(stderr, "reachable\n");
+    }
+
+    int main(int argc, char **argv) {
+        // It's difficult to get a whole binary BTI compatible without the appropriate crtbegin etc
+        // so instead map a page and copy the sample function there.
+        void *e = mmap(0, getpagesize(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (e == MAP_FAILED) {
+            return 1;
+        }
+        memcpy(e, (void*)indirect_fn, 64);
+        mprotect(e, getpagesize(), PROT_READ | PROT_EXEC | PROT_BTI);
+
+        // paciasp is a valid landing pad if the branch comes from an unprotected area,
+        // so to ensure that we're protected - assemble an intermediate shim that's also PROT_BTI.
+        void *f = mmap(0, getpagesize(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (f == MAP_FAILED) {
+            return 1;
+        }
+        uint32_t *x = (uint32_t*)f;
+        x[0] = 0xd503245fuL; // bti c
+        x[1] = 0xd61f0060uL; // br x1 - n.b. must be BR
+        mprotect(f, getpagesize(), PROT_READ | PROT_EXEC | PROT_BTI);
+
+        // Jump to the shim
+        asm volatile (
+            "mov x3, %0\n"
+            "mov x2, %1\n"
+            "blr x2\n"
+        : : "p"(e), "p"(f) : "x2", "x3");
+
+        // Execution should not reach here
+        return 1;
+    }
+Steps to reproduce:
+1. Compile with `clang-12 -g --sysroot=/work/home/fedora-rootfs/fedora_aarch64 -o sample --target=aarch64-linux-gnu -mbranch-protection=pac-ret+leaf -march=armv8-a -O1 -g sample.c` or similar.
+2. Run with `../qemu/build/qemu-aarch64 --cpu max -L ~/fedora-rootfs/fedora_aarch64 sample`

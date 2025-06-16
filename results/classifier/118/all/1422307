@@ -1,0 +1,300 @@
+graphic: 0.984
+debug: 0.978
+arm: 0.971
+performance: 0.967
+ppc: 0.967
+register: 0.967
+assembly: 0.967
+peripherals: 0.966
+virtual: 0.965
+semantic: 0.964
+user-level: 0.961
+PID: 0.961
+device: 0.959
+architecture: 0.959
+mistranslation: 0.959
+hypervisor: 0.956
+socket: 0.954
+TCG: 0.950
+risc-v: 0.944
+files: 0.944
+boot: 0.943
+vnc: 0.941
+kernel: 0.939
+permissions: 0.936
+network: 0.933
+VMM: 0.925
+x86: 0.913
+KVM: 0.890
+i386: 0.868
+
+qemu-nbd corrupts files
+
+Dear all,
+
+On Trusty, in certain situations, try to copy files over a qemu-nbd mounted file system leads to write errors (and thus, file corruption).
+
+Here is the last example I tried:
+-> virtual disk is a VDI disk
+-> It has only one partition, in FAT
+
+Here is my mount process:
+# modprobe nbd max_part=63
+# qemu-nbd -c /dev/nbd0 "virtual_disk.vdi"
+# partprobe /dev/nbd0
+# mount /dev/nbd0p1 /tmp/mnt/
+
+Partition is properly mounted at that point:
+/dev/nbd0p1 on /tmp/mnt type vfat (rw)
+
+Now, when I copy a file (rather big, ~28MB):
+# cp file_to_copy /tmp/mnt/ ; sync
+# md5sum /tmp/mnt/file_to_copy
+2efc9f32e4267782b11d63d2f128a363  /tmp/mnt/file_to_copy
+# umount /tmp/mnt 
+# mount /dev/nbd0p1 /tmp/mnt/
+# md5sum /tmp/mnt/file_to_copy
+42b0a3bf73f704d03ce301716d7654de  /tmp/mnt/file_to_copy
+
+The first hash was obviously the right one.
+
+On a previous attempt I did, I spotted thanks to vbindiff that parts of the file were just filed with 0s instead of actual data.
+It will randomly work after several attempts to write.
+
+Version information:
+# qemu-nbd --version
+qemu-nbd version 0.0.1
+Written by Anthony Liguori.
+
+Cheers,
+
+Hi Pierre,
+
+I can reproduce the bug with a 2 GB VDI image with a single FAT32-formatted partition (on git master):
+
+# cp src.vdi test.vdi
+# ./qemu-nbd -c /dev/nbd0 test.vdi
+# dd if=/dev/urandom of=/dev/nbd0 bs=1M count=64
+64+0 records in
+64+0 records out
+67108864 bytes (67 MB) copied, 3.34091 s, 20.1 MB/s
+# md5sum /dev/nbd0
+bfa6726d0d8fe752c0c7dccbf770fae6  /dev/nbd0
+# sync
+# echo 1 > /proc/sys/vm/drop_caches
+# md5sum /dev/nbd0
+cb4762769e09ed6da5e327710bfb3996  /dev/nbd0
+# ./qemu-nbd -d /dev/nbd0
+/dev/nbd0 disconnected
+
+Using qcow2 or not using NBD I cannot reproduce the issue. Using a qcow2 image and converting it to VDI, the issue appears again.
+
+Using an empty VDI image, or one filled with random data, the issue does not appear either.
+
+I have attached a qcow2 image for others to test:
+
+# ./qemu-img convert -O vdi src.qcow2 test.vdi; ./qemu-nbd -c /dev/nbd0 test.vdi; dd if=/dev/urandom of=/dev/nbd0 bs=1M count=64; md5sum /dev/nbd0; sync; echo 1 > /proc/sys/vm/drop_caches; md5sum /dev/nbd0; ./qemu-nbd -d /dev/nbd0                                                                                                                                                                 
+64+0 records in
+64+0 records out
+67108864 bytes (67 MB) copied, 3.33071 s, 20.1 MB/s
+9f683b4a58cecdd8da04ec2f1b7abc4a  /dev/nbd0
+efb1cdd5ebe1dd326056eb2f2e500944  /dev/nbd0
+/dev/nbd0 disconnected
+
+Unfortunately, I do not yet know the cause of this issue.
+
+Max
+
+
+
+For whatever reason, using an empty image now works for me, too:
+
+$ ./qemu-img create -f vdi test.vdi 64M; ./qemu-nbd -c /dev/nbd0 test.vdi; dd if=/dev/urandom of=/dev/nbd0 bs=1K count=16384; md5sum /dev/nbd0; sync; echo 1 > /proc/sys/vm/drop_caches; md5sum /dev/nbd0; ./qemu-nbd -d /dev/nbd0
+Formatting 'test.vdi', fmt=vdi size=67108864 static=off
+16384+0 records in
+16384+0 records out
+16777216 bytes (17 MB) copied, 0.982225 s, 17.1 MB/s
+216f7abbf90bf2539163396bdb7fd7b9  /dev/nbd0
+a42faf71124c1f6102fa39cea82a1c86  /dev/nbd0
+/dev/nbd0 disconnected
+
+Writing less than 16384 kB, the issue is not always reproducible; for me, it disappears around 16160 kB (it's fuzzy, sometimes it appears, sometimes it doesn't).
+
+So far I was only able to reproduce the issue by connecting qemu-nbd to the the Linux NBD interface; connecting to qemu-nbd via TCP worked fine.
+
+So, a couple of test cases:
+
+VDI and NBD over /dev/nbd0:
+# for i in $(seq 0 9); do ./qemu-img create -f vdi test.vdi 64M > /dev/null; ./qemu-nbd -c /dev/nbd0 test.vdi; sleep 1; ./qemu-img convert -n blob.raw /dev/nbd0; ./qemu-img convert /dev/nbd0 test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert /dev/nbd0 test2.raw; ./qemu-nbd -d /dev/nbd0 > /dev/null; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'
+e5185b807948d65bb4e837d992cea429  test1.raw
+9907ca700f6ee4d4cdb136bb90fd8df1  test2.raw
+6 failed
+done
+
+VDI and NBD over TCP:
+# for i in $(seq 0 9); do ./qemu-img create -f vdi test.vdi 64M > /dev/null; (./qemu-nbd -t test.vdi &); sleep 1; ./qemu-img convert -n blob.raw nbd://localhost; ./qemu-img convert nbd://localhost test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert nbd://localhost test2.raw; killall qemu-nbd; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'      
+done
+
+VDI and NBD over a Unix socket:
+# for i in $(seq 0 9); do ./qemu-img create -f vdi test.vdi 64M > /dev/null; (./qemu-nbd -k /tmp/nbd -t test.vdi &); sleep 1; ./qemu-img convert -n blob.raw nbd+unix:///\?socket=/tmp/nbd; ./qemu-img convert nbd+unix:///\?socket=/tmp/nbd test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert nbd+unix:///\?socket=/tmp/nbd test2.raw; killall qemu-nbd; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'                                     
+done
+
+VDI without NBD:
+# for i in $(seq 0 9); do ./qemu-img create -f vdi test.vdi 64M > /dev/null; ./qemu-img convert -n -O vdi blob.raw test.vdi; ./qemu-img convert test.vdi test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert test.vdi test2.raw; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'
+done
+
+qcow2 and NBD over /dev/nbd0:
+# for i in $(seq 0 9); do ./qemu-img create -f qcow2 test.qcow2 64M > /dev/null; ./qemu-nbd -c /dev/nbd0 test.qcow2; sleep 1; ./qemu-img convert -n blob.raw /dev/nbd0; ./qemu-img convert /dev/nbd0 test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert /dev/nbd0 test2.raw; ./qemu-nbd -d /dev/nbd0 > /dev/null; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'
+done
+
+raw and NBD over /dev/nbd0:
+# for i in $(seq 0 9); do ./qemu-img create -f raw test.raw 64M > /dev/null; ./qemu-nbd -f raw -c /dev/nbd0 test.raw; sleep 1; ./qemu-img convert -n blob.raw /dev/nbd0; ./qemu-img convert /dev/nbd0 test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert /dev/nbd0 test2.raw; ./qemu-nbd -d /dev/nbd0 > /dev/null; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo 'done'
+done
+
+In conclusion, the only combination I can reproduce the issue with is VDI with NBD over the Linux NBD interface. It doesn't seem to be the kernel's fault because other file formats work fine; it doesn't seem to be qemu-nbd's fault because not using the kernel interface works fine; and it doesn't seem to be VDI's fault because not using NBD or at least using NBD over TCP or Unix sockets works fine, too.
+
+I'll keep looking into it.
+
+Max
+
+First insight: Having the VDI image in tmpfs or using --cache=none for qemu-nbd changes nothing, therefore the reason why dropping the caches affects the result is probably Linux's cache for the NBD block device.
+
+Second insight: Using blkverify makes it look very much like qemu's VDI implementation is the culprit:
+
+# for i in $(seq 0 9); do ./qemu-img create -f vdi /tmp/test.vdi 64M > /dev/null; ./qemu-img create -f raw /tmp/test.raw 64M > /dev/null; (./qemu-nbd -v -f raw -c /dev/nbd0 blkverify:/tmp/test.raw:/tmp/test.vdi &); sleep 1; ./qemu-img convert -n blob.raw /dev/nbd0; ./qemu-img convert /dev/nbd0 /tmp/test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert /dev/nbd0 /tmp/test2.raw; ./qemu-nbd -d /dev/nbd0 > /dev/null; if ! ./qemu-img compare -q /tmp/test1.raw /tmp/test2.raw; then md5sum /tmp/test1.raw /tmp/test2.raw; echo "$i failed"; break; fi; done; echo 'done'
+NBD device /dev/nbd0 is now connected to blkverify:/tmp/test.raw:/tmp/test.vdi
+NBD device /dev/nbd0 is now connected to blkverify:/tmp/test.raw:/tmp/test.vdi
+NBD device /dev/nbd0 is now connected to blkverify:/tmp/test.raw:/tmp/test.vdi
+blkverify: read sector_num=27872 nb_sectors=256 contents mismatch in sector 27904
+blkverify: read sector_num=28128 nb_sectors=256 contents mismatch in sector 28128
+qemu-img: error while reading sector 24576: Input/output error
+e5185b807948d65bb4e837d992cea429  /tmp/test1.raw
+b8a195424a240ed77c849d89002fa23b  /tmp/test2.raw
+2 failed
+done
+
+Max
+
+I succeeded to reproduce the bug without NBD:
+
+$ ./qemu-img create -f vdi test.vdi 2G
+Formatting 'test.vdi', fmt=vdi size=2147483648 static=off
+$ ./qemu-img create -f raw test.raw 2G
+Formatting 'test.raw', fmt=raw size=2147483648
+$ x86_64-softmmu/qemu-system-x86_64 -enable-kvm -drive if=virtio,file=blkverify:test.raw:test.vdi,format=raw -drive if=virtio,file=data.img,format=raw,format=raw -cdrom ~/tmp/arch.iso -m 512 -boot d
+blkverify: read sector_num=810976 nb_sectors=256 contents mismatch in sector 811008
+
+Operations in the guest:
+$ dd if=/dev/vdb of=/dev/vda
+$ dd if=/dev/vda of=/dev/null
+
+So it really looks like something's broken in qemu's VDI block driver.
+
+Max
+
+Adding some locking in qemu's VDI implementation makes the bug disappear, at least I can't reproduce it anymore. I'll send a patch.
+
+Max
+
+So, if I understand well, it's "just" some kind of race condition in the handling of writes in the VDI driver of Qemu?
+
+Does that mean it can also affect VMs running with VDI disk(s)?
+
+On Wed, Feb 18, 2015 at 09:11:57AM -0000, Pierre Schweitzer wrote:
+> Does that mean it can also affect VMs running with VDI disk(s)?
+
+Yes, that's what Max's example showed.
+
+Note that only raw, qcow2, and qed support in QEMU is designed for
+running guests.  The other formats like vmdk and vdi are mainly for
+qemu-img convert and will perform poorly because they don't handle
+parallel I/O requests.
+
+Stefan
+
+
+Thanks Max & Stefan.
+
+Could you please let me know when the commit makes it to the QEMU repository? And give me its commit ID?
+
+So that I can ask for a bugfix backport in Trusty.
+
+On Thu, Feb 19, 2015 at 05:48:03PM -0000, Pierre Schweitzer wrote:
+> Thanks Max & Stefan.
+> 
+> Could you please let me know when the commit makes it to the QEMU
+> repository? And give me its commit ID?
+> 
+> So that I can ask for a bugfix backport in Trusty.
+
+Hi Pierre,
+In case I forget, please follow this patch series from Max:
+http://patchwork.ozlabs.org/patch/440713/
+
+Stefan
+
+
+Hi,
+Was the patch abandoned? I haven't seen any further progress on it for a month...
+Cheers,
+
+Hi,
+
+Has this patch already been incorporated? I'm observing the bug as well when copying files into a VDI image.
+
+Kind regards,
+
+Nicolas
+
+Hi Nicolas,
+
+It (that is, its v2) has been merged into upstream master (http://git.qemu.org/?p=qemu.git;a=commit;h=f0ab6f109630940146cbaf47d0cd99993ddba824) and is part of qemu 2.3.0 (and will probably become part of 2.2.2, too).
+
+Max
+
+Thanks for the extra information.
+
+I'll open a new bug report at Ubuntu to get the fix backported to Trusty. Thanks!
+
+Based on Max's comment this is Fix Released upstream.
+
+And since Ubuntu Wily ships 2.3, I presume this is also fixed in Ubuntu in Wily. I'll mark that Fix Released too, and add a task for Trusty.
+
+Please find attach a proposed debdiff for fixing the issue in Ubuntu Trusty by backporting the fix which is now in Wily.
+
+Hello Pierre, or anyone else affected,
+
+Accepted qemu into trusty-proposed. The package will build now and be available at https://launchpad.net/ubuntu/+source/qemu/2.0.0+dfsg-2ubuntu1.18 in a few hours, and then in the -proposed repository.
+
+Please help us by testing this new package.  See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed.  Your feedback will aid us getting this update out to other Ubuntu users.
+
+If this package fixes the bug for you, please add a comment to this bug, mentioning the version of the package you tested, and change the tag from verification-needed to verification-done. If it does not fix the bug for you, please add a comment stating that, and change the tag to verification-failed.  In either case, details of your testing will help us make a better decision.
+
+Further information regarding the verification process can be found at https://wiki.ubuntu.com/QATeam/PerformingSRUVerification .  Thank you in advance!
+
+Tested 2.0.0+dfsg-2ubuntu1.18.
+Cannot reproduce the issue. 
+
+TEST CASE 1:
+Attempt several times to copy files on a VDI disk, and couldn't trigger any corruption (nor deadlock - no regression). Given my test scenario, previously, I would already have hit the corruption.
+
+TEST CASE 2:
+Tested with test scenario provided in comment #4. Couldn't reproduce, and no regression.
+
+TEST CASE 3:
+Tested with test scenario provided in comment #5. Couldn't reproduce, and no regression.
+
+Marking as verification-done
+
+This bug was fixed in the package qemu - 2.0.0+dfsg-2ubuntu1.18
+
+---------------
+qemu (2.0.0+dfsg-2ubuntu1.18) trusty-proposed; urgency=medium
+
+  * qemu-nbd-fix-vdi-corruption.patch:
+    qemu-nbd: fix corruption while writing VDI volumes (LP: #1422307)
+
+ -- Pierre Schweitzer <email address hidden>  Mon, 17 Aug 2015 11:43:39 +0200
+
+The verification of the Stable Release Update for qemu has completed successfully and the package has now been released to -updates.  Subsequently, the Ubuntu Stable Release Updates Team is being unsubscribed and will not receive messages about this bug report.  In the event that you encounter a regression using the package from -updates please report a new bug using ubuntu-bug and tag the bug report regression-update so we can easily find any regressions.
+

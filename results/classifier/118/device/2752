@@ -1,0 +1,307 @@
+device: 0.939
+risc-v: 0.924
+debug: 0.919
+graphic: 0.917
+register: 0.914
+socket: 0.903
+assembly: 0.903
+semantic: 0.903
+permissions: 0.901
+PID: 0.898
+arm: 0.894
+architecture: 0.889
+network: 0.889
+performance: 0.888
+boot: 0.883
+kernel: 0.879
+virtual: 0.871
+files: 0.825
+user-level: 0.794
+ppc: 0.793
+hypervisor: 0.775
+x86: 0.773
+vnc: 0.772
+TCG: 0.771
+mistranslation: 0.770
+peripherals: 0.765
+i386: 0.748
+VMM: 0.743
+KVM: 0.717
+
+Heap use after free in virtio-crypto with vhost-user backend
+Description of problem:
+An heap-use-after-free happens in virtio-crypto device with vhost-user backend created by a dpdk example program.
+Steps to reproduce:
+1.Build dpdk vhost-user crypto backend. Following instructions here: [DPDK installation](https://doc.dpdk.org/guides/prog_guide/build-sdk-meson.html)
+```
+wget https://fast.dpdk.org/rel/dpdk-24.11.tar.xz
+meson setup -Dexamples=all build
+cd build
+ninja
+meson install
+cd examples
+sudo ./dpdk-vhost_crypto --vdev  'crypto_aesni_mb0' -- --config \(7,0,0\) --socket-file=7,/tmp/my-crypto.sock
+```
+After setting up the backend, should see something like:
+```
+EAL: Detected CPU lcores: 48
+EAL: Detected NUMA nodes: 2
+EAL: Detected static linkage of DPDK
+EAL: Multi-process socket /var/run/dpdk/rte/mp_socket
+EAL: Selected IOVA mode 'PA'
+EAL: VFIO support initialized
+CRYPTODEV: Creating cryptodev crypto_aesni_mb0
+CRYPTODEV: Initialisation parameters - name: crypto_aesni_mb0,socket id: 0, max queue pairs: 8
+IPSEC_MB: ipsec_mb_create() line 168: IPSec Multi-buffer library version used: 2.0.0
+USER1: Processing on Core 7 started
+VHOST_CONFIG: (/tmp/my-crypto.sock) logging feature is disabled in async copy mode
+VHOST_CONFIG: (/tmp/my-crypto.sock) vhost-user server: socket created, fd: 213
+VHOST_CONFIG: (/tmp/my-crypto.sock) binding succeeded
+```
+
+2.Build qemu with ASAN (i.e., --enable-asan) and vhost support (i.e., --enable-vhost-user --enable-vhost-crypto)
+
+3.Ensure that /dev/hugemaps and /tmp/my-crypto.sock can be accessed. You may need to change their permissions by chmod, or run qemu-system as root.
+
+4.Run the command below to reproduce UAF. Here, Setting ASAN_OPTIONS=max_malloc_fill_size=0 avoids capturing another unintialized read in vhost_user_backend_init, which happens ealier than the UAF. 
+
+I can reproduce it 7 times in 10 runs, seems to be racing.
+```
+cat << EOF | ASAN_OPTIONS=max_malloc_fill_size=0 \
+./qemu-system-x86_64 --enable-kvm -m 512M \
+-object \
+memory-backend-file,id=mem,size=512M,mem-path=/dev/hugepages,share=on \
+-numa node,memdev=mem -smp cpus=4 -machine q35 -chardev \
+socket,id=chardev0,path=/tmp/my-crypto.sock -object \
+cryptodev-vhost-user,id=cryptodev0,chardev=chardev0 -device \
+virtio-crypto-pci,id=crypto0,cryptodev=cryptodev0 -display none -qtest \
+stdio
+outl 0xcf8 0x80001800
+inw 0xcfc
+outl 0xcf8 0x80001814
+outl 0xcfc 0xffffffff
+outl 0xcf8 0x80001814
+inl 0xcfc
+outl 0xcf8 0x80001814
+outl 0xcfc 0xe0000000
+outl 0xcf8 0x80001820
+outl 0xcfc 0xffffffff
+outl 0xcf8 0x80001820
+inl 0xcfc
+outl 0xcf8 0x80001820
+outl 0xcfc 0xe0004000
+outl 0xcf8 0x80001804
+inw 0xcfc
+outl 0xcf8 0x80001804
+outw 0xcfc 0x7
+outl 0xcf8 0x80001804
+inw 0xcfc
+writeq 0xe0004023 0x5f5f5f5f5f5f0d00
+writeq 0xe0004015 0x10b2d007a210fff
+writeq 0xe0004011 0xb2616007a006425
+writeq 0xe0004011 0x5a5546a2d40b6425
+EOF
+```
+Additional information:
+Here is the information reported by ASAN: 
+```
+==2277232==WARNING: ASan doesn't fully support makecontext/swapcontext functions and may produce false positives in some cases!
+[I 0.000000] OPENED
+qemu-system-x86_64: warning: vhost-user backend supports VHOST_USER_PROTOCOL_F_CONFIG but QEMU does not.
+[R +0.119439] outl 0xcf8 0x80001800
+[S +0.119564] OK
+OK
+[R +0.119607] inw 0xcfc
+[S +0.119667] OK 0x1af4
+OK 0x1af4
+[R +0.119721] outl 0xcf8 0x80001814
+[S +0.119770] OK
+OK
+[R +0.119817] outl 0xcfc 0xffffffff
+[S +0.119889] OK
+OK
+[R +0.119929] outl 0xcf8 0x80001814
+[S +0.119977] OK
+OK
+[R +0.120037] inl 0xcfc
+[S +0.120090] OK 0xfffff000
+OK 0xfffff000
+[R +0.120140] outl 0xcf8 0x80001814
+[S +0.120165] OK
+OK
+[R +0.120193] outl 0xcfc 0xe0000000
+[S +0.120242] OK
+OK
+[R +0.120303] outl 0xcf8 0x80001820
+[S +0.120324] OK
+OK
+[R +0.120343] outl 0xcfc 0xffffffff
+[S +0.120390] OK
+OK
+[R +0.120431] outl 0xcf8 0x80001820
+[S +0.120487] OK
+OK
+[R +0.120541] inl 0xcfc
+[S +0.120578] OK 0xffffc00c
+OK 0xffffc00c
+[R +0.120635] outl 0xcf8 0x80001820
+[S +0.120680] OK
+OK
+[R +0.120747] outl 0xcfc 0xe0004000
+[S +0.120815] OK
+OK
+[R +0.120858] outl 0xcf8 0x80001804
+[S +0.120881] OK
+OK
+[R +0.120930] inw 0xcfc
+[S +0.120975] OK 0x0000
+OK 0x0000
+[R +0.121017] outl 0xcf8 0x80001804
+[S +0.121053] OK
+OK
+[R +0.121081] outw 0xcfc 0x7
+[S +0.132297] OK
+OK
+[R +0.132330] outl 0xcf8 0x80001804
+[S +0.132345] OK
+OK
+[R +0.132357] inw 0xcfc
+[S +0.132373] OK 0x0007
+OK 0x0007
+[R +0.132392] writeq 0xe0004023 0x5f5f5f5f5f5f0d00
+[S +0.132409] OK
+OK
+[R +0.132419] writeq 0xe0004015 0x10b2d007a210fff
+[S +0.132447] OK
+OK
+[R +0.132460] writeq 0xe0004011 0xb2616007a006425
+[S +0.132480] OK
+OK
+[R +0.132489] writeq 0xe0004011 0x5a5546a2d40b6425
+qemu-system-x86_64: Failed initializing vhost-user memory map, consider using -object memory-backend-file share=on
+qemu-system-x86_64: vhost_set_mem_table failed: Invalid argument (22)
+qemu-system-x86_64: Failed to write msg. Wrote -1 instead of 52.
+qemu-system-x86_64: vhost_set_vring_addr failed: Invalid argument (22)
+=================================================================
+==2277232==ERROR: AddressSanitizer: heap-use-after-free on address 0x618000000b28 at pc 0x5570e3541a1b bp 0x7fff627ef550 sp 0x7fff627ef548
+READ of size 8 at 0x618000000b28 thread T0
+    #0 0x5570e3541a1a in vhost_virtqueue_start /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:1359:33
+    #1 0x5570e3562051 in vhost_dev_start /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:2041:13
+    #2 0x5570e37c10c1 in cryptodev_vhost_start_one /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost.c:96:9
+    #3 0x5570e37c067f in cryptodev_vhost_start /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost.c:213:13
+    #4 0x5570e34f06ce in virtio_crypto_vhost_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-crypto.c:1189:13
+    #5 0x5570e34ce991 in virtio_crypto_set_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-crypto.c:1205:5
+    #6 0x5570e49725e5 in virtio_set_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio.c:2242:9
+    #7 0x5570e3496356 in virtio_pci_common_write /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-pci.c:1612:9
+    #8 0x5570e4bbdc93 in memory_region_write_accessor /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:497:5
+    #9 0x5570e4bbd385 in access_with_adjusted_size /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:573:18
+    #10 0x5570e4bbb2f9 in memory_region_dispatch_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:1553:16
+    #11 0x5570e4c64dfe in flatview_write_continue_step /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2786:18
+    #12 0x5570e4c64694 in flatview_write_continue /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2816:19
+    #13 0x5570e4c3b3eb in flatview_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2847:12
+    #14 0x5570e4c3aec8 in address_space_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2967:18
+    #15 0x5570e375da7c in qtest_process_command /mnt/Hypervisor/qemu/build/master/fuzz/../system/qtest.c:532:13
+    #16 0x5570e375856d in qtest_process_inbuf /mnt/Hypervisor/qemu/build/master/fuzz/../system/qtest.c:776:9
+    #17 0x5570e3767b6e in qtest_read /mnt/Hypervisor/qemu/build/master/fuzz/../system/qtest.c:788:5
+    #18 0x5570e564cafd in qemu_chr_be_write_impl /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:214:9
+    #19 0x5570e564cbb9 in qemu_chr_be_write /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:226:9
+    #20 0x5570e5658a35 in fd_chr_read /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-fd.c:72:9
+    #21 0x5570e500cf6c in qio_channel_fd_source_dispatch /mnt/Hypervisor/qemu/build/master/fuzz/../io/channel-watch.c:84:12
+    #22 0x7f8fc04adf7d in g_main_dispatch /home/lmy/glib-2.68.0/_build/../glib/gmain.c:3337:28
+    #23 0x7f8fc04adf7d in g_main_context_dispatch /home/lmy/glib-2.68.0/_build/../glib/gmain.c:4055:7
+    #24 0x5570e5a014e9 in glib_pollfds_poll /mnt/Hypervisor/qemu/build/master/fuzz/../util/main-loop.c:287:9
+    #25 0x5570e59ffe23 in os_host_main_loop_wait /mnt/Hypervisor/qemu/build/master/fuzz/../util/main-loop.c:310:5
+    #26 0x5570e59ff9ec in main_loop_wait /mnt/Hypervisor/qemu/build/master/fuzz/../util/main-loop.c:589:11
+    #27 0x5570e376f217 in qemu_main_loop /mnt/Hypervisor/qemu/build/master/fuzz/../system/runstate.c:835:9
+    #28 0x5570e5679ecc in qemu_default_main /mnt/Hypervisor/qemu/build/master/fuzz/../system/main.c:37:14
+    #29 0x5570e5679f17 in main /mnt/Hypervisor/qemu/build/master/fuzz/../system/main.c:48:12
+    #30 0x7f8fbe74f082 in __libc_start_main /build/glibc-LcI20x/glibc-2.31/csu/../csu/libc-start.c:308:16
+    #31 0x5570e18f189d in _start (/mnt/Hypervisor/qemu/build/master/fuzz/qemu-system-x86_64+0x2c8b89d)
+
+0x618000000b28 is located 680 bytes inside of 800-byte region [0x618000000880,0x618000000ba0)
+freed by thread T0 here:
+    #0 0x5570e196dde2 in __interceptor_free /home/brian/src/llvm_releases/llvm-project/llvm/utils/release/final/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:111:3
+    #1 0x5570e37befc1 in cryptodev_vhost_cleanup /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost.c:45:5
+    #2 0x5570e37ce272 in cryptodev_vhost_user_stop /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost-user.c:86:9
+    #3 0x5570e37cd728 in cryptodev_vhost_user_event /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost-user.c:171:9
+    #4 0x5570e5655ed1 in chr_be_event /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:62:5
+    #5 0x5570e564b465 in qemu_chr_be_event /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:82:5
+    #6 0x5570e5646076 in tcp_chr_disconnect_locked /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-socket.c:482:9
+    #7 0x5570e5632534 in tcp_chr_write /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-socket.c:131:17
+    #8 0x5570e564c1f5 in qemu_chr_write_buffer /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:122:15
+    #9 0x5570e564b8a2 in qemu_chr_write /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:186:11
+    #10 0x5570e5615f82 in qemu_chr_fe_write_all /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-fe.c:52:12
+    #11 0x5570e49ec22c in vhost_user_write /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost-user.c:410:11
+    #12 0x5570e4a0e512 in vhost_user_write_sync /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost-user.c:1141:11
+    #13 0x5570e49f84f9 in vhost_user_set_vring_addr /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost-user.c:1384:12
+    #14 0x5570e3543fcb in vhost_virtqueue_set_addr /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:979:9
+    #15 0x5570e3540a0b in vhost_virtqueue_start /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:1321:9
+    #16 0x5570e3562051 in vhost_dev_start /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:2041:13
+    #17 0x5570e37c10c1 in cryptodev_vhost_start_one /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost.c:96:9
+    #18 0x5570e37c067f in cryptodev_vhost_start /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost.c:213:13
+    #19 0x5570e34f06ce in virtio_crypto_vhost_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-crypto.c:1189:13
+    #20 0x5570e34ce991 in virtio_crypto_set_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-crypto.c:1205:5
+    #21 0x5570e49725e5 in virtio_set_status /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio.c:2242:9
+    #22 0x5570e3496356 in virtio_pci_common_write /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/virtio-pci.c:1612:9
+    #23 0x5570e4bbdc93 in memory_region_write_accessor /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:497:5
+    #24 0x5570e4bbd385 in access_with_adjusted_size /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:573:18
+    #25 0x5570e4bbb2f9 in memory_region_dispatch_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/memory.c:1553:16
+    #26 0x5570e4c64dfe in flatview_write_continue_step /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2786:18
+    #27 0x5570e4c64694 in flatview_write_continue /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2816:19
+    #28 0x5570e4c3b3eb in flatview_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2847:12
+    #29 0x5570e4c3aec8 in address_space_write /mnt/Hypervisor/qemu/build/master/fuzz/../system/physmem.c:2967:18
+
+previously allocated by thread T0 here:
+    #0 0x5570e196e04d in malloc /home/brian/src/llvm_releases/llvm-project/llvm/utils/release/final/llvm-project/compiler-rt/lib/asan/asan_malloc_linux.cpp:129:3
+    #1 0x7f8fc04b3dc8 in g_malloc /home/lmy/glib-2.68.0/_build/../glib/gmem.c:106:13
+    #2 0x5570e37cdca6 in cryptodev_vhost_user_start /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost-user.c:108:30
+    #3 0x5570e37cd599 in cryptodev_vhost_user_event /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost-user.c:164:13
+    #4 0x5570e5655ed1 in chr_be_event /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:62:5
+    #5 0x5570e564b465 in qemu_chr_be_event /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char.c:82:5
+    #6 0x5570e5618d42 in qemu_chr_fe_set_handlers_full /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-fe.c:283:13
+    #7 0x5570e5618674 in qemu_chr_fe_set_handlers /mnt/Hypervisor/qemu/build/master/fuzz/../chardev/char-fe.c:297:5
+    #8 0x5570e37cb960 in cryptodev_vhost_user_init /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev-vhost-user.c:220:5
+    #9 0x5570e37a4e98 in cryptodev_backend_complete /mnt/Hypervisor/qemu/build/master/fuzz/../backends/cryptodev.c:420:9
+    #10 0x5570e4eb0c40 in user_creatable_complete /mnt/Hypervisor/qemu/build/master/fuzz/../qom/object_interfaces.c:28:9
+    #11 0x5570e4eb16a8 in user_creatable_add_type /mnt/Hypervisor/qemu/build/master/fuzz/../qom/object_interfaces.c:125:10
+    #12 0x5570e4eb1c74 in user_creatable_add_qapi /mnt/Hypervisor/qemu/build/master/fuzz/../qom/object_interfaces.c:157:11
+    #13 0x5570e378882b in object_option_foreach_add /mnt/Hypervisor/qemu/build/master/fuzz/../system/vl.c:1809:13
+    #14 0x5570e378553c in qemu_create_late_backends /mnt/Hypervisor/qemu/build/master/fuzz/../system/vl.c:2029:5
+    #15 0x5570e3779efe in qemu_init /mnt/Hypervisor/qemu/build/master/fuzz/../system/vl.c:3726:5
+    #16 0x5570e5679f11 in main /mnt/Hypervisor/qemu/build/master/fuzz/../system/main.c:47:5
+    #17 0x7f8fbe74f082 in __libc_start_main /build/glibc-LcI20x/glibc-2.31/csu/../csu/libc-start.c:308:16
+
+SUMMARY: AddressSanitizer: heap-use-after-free /mnt/Hypervisor/qemu/build/master/fuzz/../hw/virtio/vhost.c:1359:33 in vhost_virtqueue_start
+Shadow bytes around the buggy address:
+  0x0c307fff8110: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0c307fff8120: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0c307fff8130: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0c307fff8140: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x0c307fff8150: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+=>0x0c307fff8160: fd fd fd fd fd[fd]fd fd fd fd fd fd fd fd fd fd
+  0x0c307fff8170: fd fd fd fd fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c307fff8180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x0c307fff8190: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c307fff81a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x0c307fff81b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==2277232==ABORTING
+```

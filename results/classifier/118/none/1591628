@@ -1,0 +1,210 @@
+user-level: 0.731
+register: 0.720
+KVM: 0.716
+VMM: 0.685
+x86: 0.679
+permissions: 0.663
+i386: 0.660
+ppc: 0.657
+hypervisor: 0.650
+virtual: 0.632
+mistranslation: 0.627
+performance: 0.624
+peripherals: 0.620
+semantic: 0.618
+TCG: 0.615
+device: 0.614
+vnc: 0.606
+PID: 0.603
+network: 0.586
+risc-v: 0.576
+debug: 0.564
+boot: 0.563
+arm: 0.561
+graphic: 0.527
+architecture: 0.523
+socket: 0.517
+files: 0.494
+assembly: 0.493
+kernel: 0.478
+
+2.6.0 hangs linux vm using vfio for pci passthrough of graphics card
+
+Not a duplicate of my old bug 1488363
+
+qemu version 2.5.1 works fine
+qemu version 2.6.0 fails
+
+seabios 1.9.2-1
+
+using kernel 4.5.5 with grsecurity
+
+I built using the arch packaging tools, but commented out all the patch code, so it should be vanilla.
+
+The problem is just that I start a Linux vm using either my radeon R7 260x or radeon HD 6770, and with qemu 2.6.0, it looks normal until after the grub menu, and then the screen looks broken (with mostly black, and some pixely junk spread horizontally in a few places on the screen... first we thought maybe the monitor died). I'm not sure if it's before or only at the moment where the screen resolution changes (I could check that or record it on request). Also, the VM is not pingable and does not respond to "system_powerdown" on qemu monitor.
+
+However, the same setup works fine with windows 8. And it works fine without graphics cards passed through. A usb controller passed through works fine too.
+
+
+And then I ran a bisect...
+
+        2d82f8a3cdb276bc3cb92d6f01bf8f66bf328d62 is the first bad commit
+        commit 2d82f8a3cdb276bc3cb92d6f01bf8f66bf328d62
+        Author: Alex Williamson <email address hidden>
+        Date:   Thu Mar 10 09:39:08 2016 -0700
+
+            vfio/pci: Convert all MemoryRegion to dynamic alloc and consistent functions
+            
+            Match common vfio code with setup, exit, and finalize functions for
+            BAR, quirk, and VGA management.  VGA is also changed to dynamic
+            allocation to match the other MemoryRegions.
+            
+            Signed-off-by: Alex Williamson <email address hidden>
+
+        :040000 040000 0acfd49b6ecae780b6f52a34080ecec6b3ec3672 e0cfdadede08f553463c0b23931eda81107f41b8 M      hw
+        
+then confirm it by reverting that commit
+        git checkout v2.6.0
+        git revert 2d82f8a3cdb276bc3cb92d6f01bf8f66bf328d62
+        git mergetool -t kdiff3
+            "select all from C", save
+            not sure if this is the right way to do this...but it compiles and works (bug fixed)
+        git commit -m "revert 2d82f8a3cdb276bc3cb92d6f01bf8f66bf328d62 resolve conflicts"
+
+And that 2.6.0 build with that one patch reverted works fine.
+
+And here's the qemu command (missing \ at the end of the lines)
+
+
+qemu-system-x86_64
+    -enable-kvm
+    -M q35
+    -m 3584
+    -cpu host
+    -boot c
+    -smp 8,sockets=1,cores=8,threads=1
+    -vga none
+    -device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1
+    -device vfio-pci,host=05:00.0,bus=root.1,multifunction=on,x-vga=on,addr=0.0,romfile=/mnt/archive/software/vgarom/Sapphire.HD6770.1024/Sapphire.HD6770.1024.120105.rom
+    -device vfio-pci,host=00:13.0,bus=pcie.0
+    -device vfio-pci,host=00:13.2,bus=pcie.0
+    -usb
+    -device ahci,bus=pcie.0,id=ahci
+    -drive file=/dev/ssd/manjaro-a,id=disk1,format=raw,if=virtio,index=0,media=disk,discard=on
+    -drive file=/mnt/archive/software/manjaro/manjaro-net-0.8.12-openrc-x86_64.iso,id=isocd1,index=2,media=cdrom
+    -drive file=,id=isocd2,index=3,media=cdrom
+    -drive media=cdrom,id=cdrom,index=5,media=cdrom
+    -netdev type=tap,id=net0,ifname=tap-7a
+    -device virtio-net-pci,netdev=net0,mac=00:01:02:03:04:05
+    -monitor stdio
+    -boot menu=on
+    -vnc :12
+
+
+I'm not able to reproduce.  Testing with an HD8570 and the following commandline:
+
+/usr/local/bin/qemu-system-x86_64 -enable-kvm -M q35 -m 4G -cpu host -smp 8 -vga none -device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1 -device vfio-pci,host=2:00.0,bus=root.1,x-vga=on,addr=0.0 -usb -device ahci,bus=pcie.0,id=ahci -drive file=/mnt/ISOs/Fedora-Live-Cinnamon-x86_64-23-10.iso,id=iso,index=0,media=cdrom -net none -nographic -monitor stdio -boot menu=on -serial none -parallel none -device usb-host,hostbus=3,hostaddr=7
+
+(where the passthrough usb device is composite mouse/kbd for a kvm)  Same results with Fedora virt-preview provided qemu-kvm binary (qemu-system-x86-2.6.0-3.fc23.x86_64)
+
+Please try to reduce to the minimum commandline to reproduce, take a picture of the symptoms you're describing, and if possible get a dmesg log from the guest.
+
+(changed your command with a different iso, and without the usb-host, and with a pci passthrough of a usb controller, and with a vgarom for my gpu otherwise I find it hangs if I repeatedly reboot a VM)
+
+If I try with your command with an iso it works. If I replace the iso with the VM's disk, it fails (see photo).
+
+I'm not sure what is special about the VM. I tried a grsecurity kernel 4.1.6, and vanilla kernel 3.18.35, which both hang. And I tried single user mode. I figured maybe it's something in grub. So I cleared out my grub.cfg other than memtest86+ (grub.cfg attached)... and it still fails, but this time it's a black screen except for the manjaro logo in the bottom right (attached).
+
+
+
+
+
+
+
+Attached is a 4.7 MB xz image of a 20 MB disk image that triggers the problem. It contains a grub2 (2.02~beta2) bootloader, /boot with memtest86+, and no rootfs.
+
+If I load that as is, it hangs.
+
+If I comment out the "load_video" line, it works. (memtest doesn't run properly, but auto-reboots, but that's not the issue)
+
+
+
+Ran as:
+
+# /usr/local/bin/qemu-system-x86_64 -enable-kvm -M q35 -m 4G -cpu host -smp 8 \
+  -vga none -device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1 \
+  -device vfio-pci,host=02:00.0,bus=root.1,x-vga=on,addr=0.0,romfile=/root/HD8570.rom \
+  -device ahci,bus=pcie.0,id=ahci \
+  -drive file=/root/qemutest2.img,id=iso,index=0,media=disk,format=raw \
+  -net none -nographic -monitor stdio -serial none -parallel none
+
+Works fine, memtest86+ works fine too.  Are you on an AMD or Intel host?  Can you try with a recent, stock (non-grsecurity) kernel?  Can you reproduce without the assigned USB devices?
+
+It's an AMD FX(tm)-8150 with a GA-990FXA-UD5 board bios version F11. I also tested without the usb controllers, such as with your suggested commands. And again below.
+
+root@peter:~ # uname -a
+Linux peter 4.6.2-1-MANJARO #1 SMP PREEMPT Wed Jun 8 11:00:08 UTC 2016 x86_64 GNU/Linux
+
+root@peter:~ # cat /proc/cmdline 
+BOOT_IMAGE=/boot/vmlinuz-4.6-x86_64 root=UUID=dc395127-6336-448f-a950-137c100420c9 rw pcie_acs_override=downstream apparmor=1 security=apparmor vfio-pci.pci-ids=00:13.0,00:13.2,00:14.2,00:16.0,00:16.2,01:00.1,04:00.0,04:00.1,05:00.0,05:00.1
+
+the vfio-pci.pci-ids=... is for a mkinitcpio hook I wrote that binds vfio-pci early so X has no chance to touch the GPUs and risk hanging the system; it runs before the radeon driver is loaded; it does 3 steps: unbind on each listed, then vfio-pci bind which annoyingly takes non-unique device:vendor rather than pci address, then unbind anything not listed to solve the non-unique problem (relevant since the host also has the same GPU device:vendor id, and usb controllers)
+
+and you can ignore the apparmor stuff since this stock kernel has no apparmor support
+
+Testing with my full command or your command, with minimal changes (pci id, path to romfile, my disk is lvm rather than file)
+...
+    instead of a black screen/manjaro logo, I get a screen more like the first photo with colored pixel mess.
+    And a new error (that plus the non-black screen are possibly because I waited longer rather than changing the test):
+    
+    root@peter:~/kvm # qemu-system-x86_64 -enable-kvm -M q35 -m 4G -cpu host -smp 8 \
+    >             -vga none -device ioh3420,bus=pcie.0,addr=1c.0,port=1,chassis=1,id=root.1 \
+    >             -device vfio-pci,host=05:00.0,bus=root.1,x-vga=on,addr=0.0,romfile=/mnt/archive/software/vgarom/Sapphire.HD6770.1024/Sapphire.HD6770.1024.120105.rom \
+    >             -device ahci,bus=pcie.0,id=ahci \
+    >             -drive file=/dev/data/qemutest2,id=iso,index=0,media=disk,format=raw \
+    >             -net none -nographic -monitor stdio -serial none -parallel none
+    QEMU 2.6.0 monitor - type 'help' for more information
+    (qemu) KVM internal error. Suberror: 1
+    emulation failure
+    EAX=b0000000 EBX=00000000 ECX=000f80f2 EDX=7f729950
+    ESI=005a3c00 EDI=7feb82e0 EBP=0007fe1c ESP=0007fe14
+    EIP=0000cd12 EFL=00000017 [----APC] CPL=0 II=0 A20=1 SMM=0 HLT=0
+    ES =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+    CS =0008 00000000 ffffffff 00c09b00 DPL=0 CS32 [-RA]
+    SS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+    DS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+    FS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+    GS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+    LDT=0000 00000000 0000ffff 00008200 DPL=0 LDT
+    TR =0000 00000000 0000ffff 00008b00 DPL=0 TSS32-busy
+    GDT=     00008280 00000027
+    IDT=     00000000 00000000
+    CR0=00000011 CR2=00000000 CR3=00000000 CR4=00000000
+    DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+    DR6=00000000ffff0ff0 DR7=0000000000000400
+    EFER=0000000000000000
+    Code=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 <00> 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+and here's without the acs thing
+    vfio: No available IOMMU models
+    vfio: failed to setup container for group 20
+    
+    ummm I though this worked in the past and this acs thing was only needed for my onboard sound to pass through correctly. Not sure what to do.
+
+    If you want me to try another setting for pcie_acs_override=downstream, feel free to suggest.
+
+
+
+FYI I tried my grsec kernel (which also has some =m changed to =y so maybe I only forgot a modprobe command before) without acs_override=downstream which works with the revert build, and hangs without.
+
+Please test the patch in the link below and send your email address (privately if preferred) so I can provide proper attributes for Reported-by.  Thanks.
+
+https://paste.fedoraproject.org/381971/46638926/
+
+It works. :) Thanks a bunch.
+
+I tested linux it originally crashed with, plus the memtest86+ (still auto rebooted though), and no sign of a problem.
+
+Fix has been included in QEMU v2.7.0:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=4d3fc4fdc6857e33346e
+

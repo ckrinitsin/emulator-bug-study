@@ -1,0 +1,107 @@
+permissions: 0.801
+performance: 0.782
+semantic: 0.770
+graphic: 0.769
+user-level: 0.769
+network: 0.747
+register: 0.744
+assembly: 0.742
+architecture: 0.736
+PID: 0.732
+peripherals: 0.727
+virtual: 0.726
+device: 0.716
+arm: 0.694
+debug: 0.681
+kernel: 0.676
+ppc: 0.674
+files: 0.651
+socket: 0.642
+boot: 0.638
+mistranslation: 0.637
+risc-v: 0.608
+hypervisor: 0.604
+vnc: 0.577
+VMM: 0.559
+TCG: 0.522
+KVM: 0.491
+x86: 0.320
+i386: 0.297
+
+qemu 2.5 network model rtl8139 collisions Ubuntu 16.04.2 LTS
+
+When I use NIC model rtl8139, I have a lot collisions and very low transfer.
+I tested that with brctl and Open vSwitch, because I thought that was a vSwitch issue. 
+When I change NIC model to virtio all works as expect.
+
+Host: Ubuntu 16.04.2 LTS
+Guest: Ubuntu 14.04.5 LTS - affected
+Guest: Ubuntu 16.04.2 LTS - not affected
+
+QEMU emulator version 2.5.0 (Debian 1:2.5+dfsg-5ubuntu10.10)
+
+Thanks Thomas for reassigning, and hi Bartłomeij,
+Btw - I'd recommend very much to user virtio over rtl driver anyway [1], but that is not the point here.
+
+Thanks for retesting with brctl and moving OVS out of the equation already.
+The difference certainly is within the guest drivers for that network card between the 14.04 and 16.04 guest.
+
+I checked the changes we had in between the respective kernels and there were not that much for the drivers themselves at least. Mostly bug fixes and while it could be anything else in the kernels this is certainly worth a quick test. There is one in particular which could be interesting that enabled TSO offloading by default.
+You can check in your guests with
+ $ ethtool -k <device>
+what the offloads currently are.
+Please check if more differ than just TSO (usually the list grows the newer things get).
+Then on the 16.04 guest modify the config one-by-one to match the one you have seen with the 14.04 guest.
+If you happen to find a single offload feature that switches good/bad behavior get back here.
+
+Furthermore we can exclude other packages here by using the HWE kernels [2]. Could you confirm that the 14.04 guest with the HWE-x kernel booted shows the same bad behavior?
+That would exclude anything of 16.04 other than the kernel to cause the difference.
+
+If so it would be great to further shrink the range we are looking at by trying HWE-
+To do so in your case take the 14.04 the guest and install the packages
+linux-image-virtual-lts-utopic, linux-image-virtual-lts-vivid, linux-image-virtual-lts-wily, linux-image-virtual-lts-xenial. Then modify the boot loader (or interactively select at the prompt) to boot one after the other and check your results as well as the maybe related offload settings of above.
+
+Also to better reproduce this could you outline what kind/direction of workload you are testing
+- Is it Guest-to-Guest or Traffic from the outside?
+- What is the network traffic you are using, can it be in archive net tools or only a custom workload in your setup?
+
+Summary:
+- please verify that the same happens in 14.04 + HWE+x kernel (go on with that setup if it shows the issue)
+- please check different HWE level which is the first to show the issue (go on with the oldest of the HWE kernels that show the issue)
+- please compare and test different offload settings as outlined above
+- please describe your workload more in Details so that we can try to reproduce
+
+[1]: http://www.linux-kvm.org/page/Tuning_KVM
+[2]: https://wiki.ubuntu.com/Kernel/LTSEnablementStack
+
+A quick check on a Trusty Guest modified from the uvt default of virtio to use rtl8139 and then moving into the kernel that is likely the reason shows me this for a trivial 1 connection duplex iperf streaming load to the Host:
+
+Release Nettype Kernel   - Result
+1. 14.04 virtio 3.13.0-116  - ~11 +   8 GBits/s
+2. 14.04 rtl8139 3.13.0-116 - 124 + 824 Mbits/s
+3. 14.04 rtl8139 4.4.0-72   - 758 + 703 MBits/s
+4. 14.04 rtl8139 4.4.0-72 - 115 + 795 MBits/s
+
+Notes:
+On #2: I already see 13k receive drops here
+on #3: I can confirm TSO, GSO, SG and IP Checksum offloads on as expected, they help to speed up my load despite now seeing 26k receive drops
+On #4: slow again back to ~14k drops
+
+Note: disabling offloads via:
+$ sudo ethtool -K eth0 tx-tcp-segmentation off
+$ sudo ethtool -K eth0 tx-checksum-ipv4 off
+$ sudo ethtool -K eth0 tx-scatter-gather off
+
+There is quite a chance that the generally much better behavior of enabling those offloads for your specific case it is a drawback. In that case please check with the disabling of the offloads and help to clarify the details I asked for.
+
+Yet overall IMHO - as I stated in my first comment - I'd strongly vote to use the virtio driver and be much faster than any rtl8139 based network would be.
+
+The affected Ubuntu 14.04.5 LTS has kernel HWE 4.4.0-72-generic 
+
+Usually I'm using virtio but that was first time when I used vSwitch and I would rather start with rtl8139.
+
+Because that is my production env I need to prepare new VMs. It's take me few days.
+
+
+[Expired for qemu (Ubuntu) because there has been no activity for 60 days.]
+

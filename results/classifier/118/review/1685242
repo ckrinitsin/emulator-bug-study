@@ -1,0 +1,214 @@
+semantic: 0.810
+graphic: 0.789
+user-level: 0.734
+debug: 0.688
+PID: 0.612
+virtual: 0.595
+permissions: 0.595
+register: 0.582
+kernel: 0.581
+architecture: 0.581
+network: 0.569
+x86: 0.565
+assembly: 0.561
+VMM: 0.561
+hypervisor: 0.559
+arm: 0.554
+files: 0.544
+device: 0.536
+boot: 0.523
+performance: 0.512
+ppc: 0.493
+risc-v: 0.463
+TCG: 0.463
+mistranslation: 0.454
+peripherals: 0.452
+socket: 0.413
+KVM: 0.406
+vnc: 0.377
+i386: 0.182
+--------------------
+x86: 0.996
+virtual: 0.913
+hypervisor: 0.798
+TCG: 0.236
+debug: 0.134
+boot: 0.084
+device: 0.049
+kernel: 0.039
+files: 0.019
+semantic: 0.018
+PID: 0.017
+register: 0.011
+network: 0.010
+VMM: 0.010
+KVM: 0.007
+performance: 0.007
+socket: 0.006
+graphic: 0.005
+user-level: 0.005
+peripherals: 0.004
+assembly: 0.004
+architecture: 0.004
+risc-v: 0.003
+ppc: 0.002
+permissions: 0.001
+vnc: 0.001
+mistranslation: 0.000
+arm: 0.000
+i386: 0.000
+
+ovmf hangs at efi with virtio-net memory hotplug
+
+with qemu 2.9 it hangs at the efi stage when memory-hotplug is enabled and it has a virtio-net devices
+
+the ovmf images where compiled from https://github.com/tianocore/edk2 (current master)
+
+reproducer:
+
+qemu-system-x86_64 -drive 'if=pflash,unit=0,format=raw,readonly,file=./OVMF_CODE.fd' -drive 'if=pflash,unit=1,format=raw,file=./my_OVMF_VARS.fd' -smp 1 -vga std -netdev 'type=tap,id=mynet' -device 'virtio-net-pci,netdev=mynet' -display sdl -nodefaults -m 'size=1G,slots=256,maxmem=1024G'
+
+interestingly, it works when you do the following:
+
+- omit the virtio-net-pci device
+- use seabios
+- use less maxmem, e.g. 512G
+
+qemu was compiled from source (v2.9.0) with following options:
+
+./configure --target-list=x86_64-softmmu --disable-xen --enable-gnutls --enable-sdl --enable-linux-aio --enable-rbd --enable-libiscsi --disable-smartcard --audio-drv-list="alsa" --enable
+-spice --enable-usb-redir --enable-glusterfs --enable-libusb --disable-gtk --enable-xfsctl --enable-numa --disable-strip --enable-jemalloc --enable-virtfs --disable-libnfs --disable-fdt --disable-guest-agent --disable-guest-agent-msi
+
+i forgot:
+
+it also works with
+
+-machine pc-i440fx-2.6
+
+Tested here with versions of pc-i440fx-XX and it didn't work here on qemu-server 5.0-46, qemu 2.12.1-1
+
+Didn't work. 
+
+OVMF places the 64-bit PCI MMIO aperture after the memory hotplug area. If you specify `-m maxmem=1024G`, then accessing 64-bit MMIO BARs of PCI(e) devices, allocated from the aperture, will require at least 41 address bits. If you use KVM, and nested paging (EPT on Intel, NPT on AMD) is enabled, and your /proc/cpuinfo on the host reports a smaller phys address width than 41, then 64-bit PCI MMIO accesses in the guest will silently fail. You can read more details in <https://bugzilla.redhat.com/show_bug.cgi?id=1353591#c8>.
+
+SeaBIOS uses an independent algorithm for aperture placement and BAR allocation.
+
+If you remove virtio-net-pci, then your command line ends up without any PCI(e) device that has a 64-bit MMIO BAR. So the issue is not triggered.
+
+If you use a maxmem of 512G, then 40 bits might suffice. It's possible that your physical CPU has precisely that many address bits, and so the behavior could change.
+
+If you attach the OVMF debug log (capture `-debugcon file:debug.log -global isa-debugcon.iobase=0x402`), I could say more.
+
+Thus far this ticket looks like "NOTABUG" -- use a smaller memory hotplug area, or disable nested paging (which will come with a performance penalty).
+
+i see, 
+
+but is there a good reason why it did work with an older qemu version/machine type (<= 2.6)
+also my cpuinfo says physical bits 39 but i cannot use more maxmem than 222G
+
+i attached the cpuinfo, cmdline, and debug logs for a nonworking invocation and
+one for each working, with 222G, with machine type 2.6 and without a virtio-net respectively
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+The reason why it behaves differently with machine types <= 2.4 is that
+- up to and including qemu-2.4, the calculation of the DIMM hotplug area was incorrect,
+- in 2.5, the calculation was fixed,
+- but for the migration compatibility of machine types <= 2.4, the old calculation was preserved for those machine types (the DIMM hotplug area is guest-visible)
+
+See the following (adjacent) commits:
+- 3385e8e2640e ("pc: memhotplug: fix incorrectly set reserved-memory-end", 2015-09-10)
+- 2f8b50083b32 ("pc: memhotplug: keep reserved-memory-end broken on 2.4 and earlier machines", 2015-09-10)
+
+These commits were first released in v2.5.0.
+
+I'll look at your logs now.
+
+* From "debug-nonworking.log":
+
+> GetFirstNonAddress: Pci64Base=0x8800000000 Pci64Size=0x800000000
+> [...]
+> PublishPeiMemory: mPhysMemAddressWidth=40 PeiMemoryCap=69644 KB
+> [...]
+> Type =  Mem64; Base = 0x8800000000;	Length = 0x100000;	Alignment = 0xFFFFF
+>  Base = 0x8800000000;	Length = 0x4000;	Alignment = 0x3FFF;	Owner = PCI [00|12|00:20]; Type = PMem64
+
+- The 64-bit MMIO aperture starts at (512+32)GB (see "Pci64Base").
+- 40 physical address bits are required (see "mPhysMemAddressWidth").
+  Your PCPU has 39 (thanks for confirming that).
+- The 64-bit MMIO BAR of the virtio-net-pci device is allocated at
+  (512+32)GB. Will not be accessible.
+
+
+* From "debug-working-222G.log":
+
+> GetFirstNonAddress: Pci64Base=0x7800000000 Pci64Size=0x800000000
+> [...]
+> PublishPeiMemory: mPhysMemAddressWidth=39 PeiMemoryCap=67592 KB
+> [...]
+> Type =  Mem64; Base = 0x7800000000;	Length = 0x100000;	Alignment = 0xFFFFF
+>  Base = 0x7800000000;	Length = 0x4000;	Alignment = 0x3FFF;	Owner = PCI [00|12|00:20]; Type = PMem64
+
+- Aperture at 480GB.
+- 39 phys bits suffice.
+- BAR allocated at 480GB. Will be accessible.
+
+
+* From "debug-working-novirtio-net.log":
+
+- Identical to "debug-nonworking.log", except there is no PCI device
+  with a 64-bit BAR, hence no attempt is made to access the inaccessible
+  aperture.
+
+
+* Regarding why 222GB seems to be the cutoff. The base of the 64-bit
+  aperture must be suitably aligned. I explained this in the
+  earlier-referenced
+  <https://bugzilla.redhat.com/show_bug.cgi?id=1353591#c8>, in
+  particular, bullet (6). If you decrease the aperture size, the
+  required alignment will shrink as well, and the DIMM hotplug cutoff
+  might increase. Please refer to
+
+    -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=4096
+
+  in <https://bugzilla.redhat.com/show_bug.cgi?id=1353591#c10>.
+
+Right now everything appears to work by design. Closing this ticket.
+
+
+Last night I remembered another tidbit:
+
+In OVMF, you can entirely disable the 64-bit MMIO aperture.
+
+  -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=0
+
+If you use the above switch, the firmware log should contain the following message:
+
+> GetFirstNonAddress: disabling 64-bit PCI host aperture
+
+This will force the BAR allocations into 32-bit address space. Obviously, that makes it a lot easier to run out of the (much smaller) 32-bit MMIO aperture, but if you don't have PCI(E) devices with large MMIO BARs, then it should work (e.g. it should totally work in your present use case).
+
+And then you should be able to increase the DIMM hotplug area significantly, without running out of the GPA range covered by 39 physical address bits:
+
+    //
+    // There's nothing more to do; the amount of memory above 4GB fully
+    // determines the highest address plus one. The memory hotplug area (see
+    // below) plays no role for the firmware in this case.
+    //
+
+"This case" beeing (Pci64Size == 0).
+
+Hope this helps.
+

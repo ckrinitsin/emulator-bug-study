@@ -1,0 +1,103 @@
+virtual: 0.935
+permissions: 0.933
+semantic: 0.932
+debug: 0.931
+architecture: 0.926
+performance: 0.922
+user-level: 0.921
+graphic: 0.920
+assembly: 0.920
+risc-v: 0.919
+register: 0.909
+device: 0.908
+kernel: 0.904
+network: 0.901
+vnc: 0.900
+PID: 0.900
+files: 0.899
+arm: 0.898
+peripherals: 0.897
+mistranslation: 0.896
+boot: 0.890
+socket: 0.889
+x86: 0.886
+ppc: 0.884
+TCG: 0.876
+KVM: 0.873
+VMM: 0.863
+hypervisor: 0.837
+i386: 0.834
+
+colo: Can not  recover colo after svm failover twice
+
+Hi Expert,
+x-blockdev-change met some error, during testing colo
+
+Host os:
+CentOS Linux release 7.6.1810 (Core)
+
+Reproduce steps:
+1. create colo vm following https://github.com/qemu/qemu/blob/master/docs/COLO-FT.txt
+2. kill secondary vm and remove the nbd child from the quorum to wait for recover
+  type those commands on primary vm console:
+  { 'execute': 'x-blockdev-change', 'arguments': {'parent': 'colo-disk0', 'child': 'children.1'}}
+  { 'execute': 'human-monitor-command','arguments': {'command-line': 'drive_del replication0'}}
+  { 'execute': 'x-colo-lost-heartbeat'}
+3. recover colo
+4. kill secondary vm again after recover colo and type same commands as step 2:
+  { 'execute': 'x-blockdev-change', 'arguments': {'parent': 'colo-disk0', 'child': 'children.1'}}
+  { 'execute': 'human-monitor-command','arguments': {'command-line': 'drive_del replication0'}}
+  { 'execute': 'x-colo-lost-heartbeat'}
+  but the first command got error
+  { 'execute': 'x-blockdev-change', 'arguments': {'parent': 'colo-disk0', 'child': 'children.1'}}
+{"error": {"class": "GenericError", "desc": "Node 'colo-disk0' does not have child 'children.1'"}}
+
+according to https://www.qemu.org/docs/master/qemu-qmp-ref.html
+Command: x-blockdev-change
+Dynamically reconfigure the block driver state graph. It can be used to add, remove, insert or replace a graph node. Currently only the Quorum driver implements this feature to add or remove its child. This is useful to fix a broken quorum child.
+
+It seems x-blockdev-change not worked as expected.
+
+Thanks.
+
+
+
+In step 3 I used following commands:
+on primary vm console:
+{"execute": "drive-mirror", "arguments":{ "device": "colo-disk0", "job-id": "resync", "target": "nbd://169.254.66.10:9999/parent0", "mode": "existing","format":"raw","sync":"full"} }
+
+// till the job ready
+{ "execute": "query-block-jobs" }
+
+{"execute": "stop"}
+{"execute": "block-job-cancel", "arguments":{ "device": "resync"} }
+
+{'execute': 'human-monitor-command', 'arguments': {'command-line': 'drive_add -n buddy driver=replication,mode=primary,file.driver=nbd,file.host=169.254.66.10,file.port=9999,file.export=parent0,node-name=replication0'}}
+{'execute': 'x-blockdev-change', 'arguments':{'parent': 'colo-disk0', 'node': 'replication0' } }
+{'execute': 'migrate-set-capabilities', 'arguments': {'capabilities': [ {'capability': 'x-colo', 'state': true } ] } }
+{'execute': 'migrate', 'arguments': {'uri': 'tcp:169.254.66.10:9998' } }
+{ "execute": "migrate-set-parameters" , "arguments":{ "x-checkpoint-delay": 10000 } }
+
+
+primary vm command:
+./qemu-system-x86_64 -L /usr/share/qemu-kvm/ -enable-kvm -cpu qemu64,+kvmclock -m 2048 -smp 2 -qmp stdio -vnc :0 -device piix3-usb-uhci -device usb-tablet -name primary -netdev tap,id=hn0,vhost=off,br=br_bond1,helper=/usr/libexec/qemu-bridge-helper -device rtl8139,id=e0,netdev=hn0,romfile="" -chardev socket,id=mirror0,host=169.254.66.11,port=9003,server,nowait -chardev socket,id=compare1,host=169.254.66.11,port=9004,server,wait -chardev socket,id=compare0,host=169.254.66.11,port=9001,server,nowait -chardev socket,id=compare0-0,host=169.254.66.11,port=9001 -chardev socket,id=compare_out,host=169.254.66.11,port=9005,server,nowait -chardev socket,id=compare_out0,host=169.254.66.11,port=9005 -object filter-mirror,id=m0,netdev=hn0,queue=tx,outdev=mirror0 -object filter-redirector,netdev=hn0,id=redire0,queue=rx,indev=compare_out -object filter-redirector,netdev=hn0,id=redire1,queue=rx,outdev=compare0 -object iothread,id=iothread1 -object colo-compare,id=comp0,primary_in=compare0-0,secondary_in=compare1,outdev=compare_out0,iothread=iothread1 -drive if=ide,id=colo-disk0,driver=quorum,read-pattern=fifo,vote-threshold=1,children.0.file.filename=/root/Centos7.4.qcow2,children.0.driver=qcow2 -S
+
+secondary vm:
+./qemu-system-x86_64 -L /usr/share/qemu-kvm/ -enable-kvm -cpu qemu64,+kvmclock -m 2048 -smp 2 -qmp stdio -vnc :1 -device piix3-usb-uhci -device usb-tablet -name secondary -netdev tap,id=hn0,vhost=off,br=br_bond1,helper=/usr/libexec/qemu-bridge-helper -device rtl8139,id=e0,netdev=hn0,romfile="" -chardev socket,id=red0,host=169.254.66.11,port=9003,reconnect=1 -chardev socket,id=red1,host=169.254.66.11,port=9004,reconnect=1 -object filter-redirector,id=f1,netdev=hn0,queue=tx,indev=red0 -object filter-redirector,id=f2,netdev=hn0,queue=rx,outdev=red1 -object filter-rewriter,id=rew0,netdev=hn0,queue=all -drive if=none,id=parent0,file.filename=/root/Centos7.4.qcow2,driver=qcow2 -drive if=none,id=childs0,driver=replication,mode=secondary,file.driver=qcow2,top-id=childs0,file.file.filename=/root/active.qcow2,file.backing.driver=qcow2,file.backing.file.filename=/root/hidden.qcow2,file.backing.backing=parent0 -drive if=none,id=colo-disk0,driver=quorum,read-pattern=fifo,vote-threshold=1,children.0=childs0 -incoming tcp:0:9998
+
+
+Please try this patch:
+https://lists.nongnu.org/archive/html/qemu-devel/2020-06/msg00016.html
+
+Thanks
+Zhang Chen
+
+I think Lukas's fix:
+  block/quorum.c: stable children names
+
+was merged a few days ago as 5eb9a3c7b0571562c0289747690e25e6855bc96f
+
+Can someone confirm that helped?
+
+QEMU v5.2 has been released now and should contain the fix
+

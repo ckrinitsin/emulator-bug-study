@@ -1,0 +1,197 @@
+permissions: 0.870
+device: 0.849
+graphic: 0.834
+architecture: 0.831
+performance: 0.829
+arm: 0.818
+files: 0.816
+assembly: 0.814
+debug: 0.808
+register: 0.804
+network: 0.798
+hypervisor: 0.795
+semantic: 0.795
+TCG: 0.794
+socket: 0.791
+user-level: 0.788
+mistranslation: 0.781
+kernel: 0.780
+virtual: 0.780
+peripherals: 0.773
+risc-v: 0.766
+PID: 0.759
+ppc: 0.741
+boot: 0.733
+VMM: 0.730
+KVM: 0.710
+x86: 0.699
+i386: 0.690
+vnc: 0.682
+
+KVM guest crashes when doing a block commit command
+
+I scripted a simple backup procedure that works like this:
+
+1. Create snapshot
+
+        virsh snapshot-create-as ${VM} "backup-${VM}" \
+            --diskspec vda,file=${SNAP}/backup-snapshot-${VM}.qcow2 \
+            --disk-only \
+            --atomic \
+            --quiesce \
+            --no-metadata
+
+2. Copy disk image to different location
+
+    cp -f --sparse=always /var/lib/libvirt/images/${VM}.img ${DST}/
+
+3. Merge snapshot back to base image
+
+    virsh blockcommit ${VM} vda --wait --active --verbose
+    virsh blockjob ${VM} ${SNAP}/backup-snapshot-${VM}.qcow2 --pivot
+
+4. Copy XML liver file
+
+    cp -f /etc/libvirt/qemu/${VM}.xml ${DST}/
+
+5. Remove old snapshot file
+
+        rm -f ${SNAP}/backup-snapshot-${VM}.qcow2
+
+When it comes to the blockcommit operation, the guest receives a SIGABRT.
+
+(gdb) bt
+#0  0x00007f4b6e6ccb8e in raise () from /lib64/libc.so.6
+#1  0x00007f4b6e6ce391 in abort () from /lib64/libc.so.6
+#2  0x0000555a316a8c39 in qemu_coroutine_enter (co=0x555a34651a50, opaque=0x0)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/qemu-coroutine.c:111
+#3  0x0000555a316a8eda in qemu_co_queue_run_restart (co=co@entry=0x555a33d271b0)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/qemu-coroutine-lock.c:59
+#4  0x0000555a316a8b53 in qemu_coroutine_enter (co=0x555a33d271b0, opaque=<optimized out>)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/qemu-coroutine.c:118
+#5  0x0000555a316e3adf in bdrv_co_aio_rw_vector (bs=bs@entry=0x555a336a6be0,
+    sector_num=sector_num@entry=113551488, qiov=qiov@entry=0x555a3367d2c8,
+    nb_sectors=nb_sectors@entry=15360, flags=flags@entry=(unknown: 0),
+    cb=cb@entry=0x555a316e1fe0 <mirror_read_complete>, opaque=0x555a3367d2c0, is_write=is_write@entry=false)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/block/io.c:2142
+#6  0x0000555a316e4b1e in bdrv_aio_readv (bs=bs@entry=0x555a336a6be0,
+    sector_num=sector_num@entry=113551488, qiov=qiov@entry=0x555a3367d2c8,
+    nb_sectors=nb_sectors@entry=15360, cb=cb@entry=0x555a316e1fe0 <mirror_read_complete>,
+    opaque=opaque@entry=0x555a3367d2c0)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/block/io.c:1744
+#7  0x0000555a316e2ccf in mirror_iteration (s=0x555a34a0c250)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/block/mirror.c:302
+#8  mirror_run (opaque=0x555a34a0c250)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/block/mirror.c:512
+#9  0x0000555a316a9a5a in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>)
+    at /var/tmp/portage/app-emulation/qemu-2.4.0/work/qemu-2.4.0/coroutine-ucontext.c:80
+#10 0x00007f4b6e6df4a0 in ?? () from /lib64/libc.so.6
+#11 0x00007ffe67b71840 in ?? ()
+#12 0x0000000000000000 in ?? ()
+(gdb)
+
+There is one very interesting aspect:
+
+After the guest died, I can restart it and if I do the exact same blockcommit and blockjob as shown above, everything succeeds without errors. That's strange.
+
+This is from my libvirt log. So you can see how the guest was started and the C-routine error message:
+
+2015-08-24 18:38:13.077+0000: starting up libvirt version: 1.2.18, qemu version: 2.4.0
+LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin QEMU_AUDIO_DRV=none /usr/bin/qemu-system-x86_64 -name mx.roessner-net.de-TESTING -S -machine pc-i440fx-2.1,accel=kvm,usb=off -cpu qemu64,+kvm_pv_eoi -m 4096 -realtime mlock=off -smp 4,sockets=4,cores=1,threads=1 -uuid d86b82d5-153f-4dd9-aa66-d98c2e65db8c -no-user-config -nodefaults -device sga -chardev socket,id=charmonitor,path=/var/lib/libvirt/qemu/mx.roessner-net.de-TESTING.monitor,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc,driftfix=slew -global kvm-pit.lost_tick_policy=discard -no-shutdown -boot order=cd,menu=on,strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x8 -drive file=/var/lib/libvirt/images/mx.roessner-net.de-TESTING.img,if=none,id=drive-virtio-disk0,format=raw,cache=writeback -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0 -drive if=none,id=drive-ide0-1-0,readonly=on,format=raw -device ide-cd,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0 -netdev tap,fd=34,id=hostnet0,vhost=on,vhostfd=35 -device virtio-net-pci,netdev=hostnet0,id=net0,mac=54:52:00:27:ac:8d,bus=pci.0,addr=0x3 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -chardev socket,id=charchannel0,path=/var/lib/libvirt/qemu/channel/target/mx.roessner-net.de-TESTING.org.qemu.guest_agent.0,server,nowait -device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=org.qemu.guest_agent.0 -vnc 127.0.0.1:7 -device cirrus-vga,id=video0,bus=pci.0,addr=0x2 -device i6300esb,id=watchdog0,bus=pci.0,addr=0x7 -watchdog-action reset -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5 -object rng-random,id=objrng0,filename=/dev/random -device virtio-rng-pci,rng=objrng0,id=rng0,bus=pci.0,addr=0x6 -msg timestamp=on
+char device redirected to /dev/pts/8 (label charserial0)
+Formatting '/var/backups/snapshots/backup-snapshot-mx.roessner-net.de-TESTING.qcow2', fmt=qcow2 size=107374182400 backing_file='/var/lib/libvirt/images/mx.roessner-net.de-TESTING.img' backing_fmt='raw' encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
+Formatting '/var/backups/snapshots/backup-snapshot-mx.roessner-net.de-TESTING.qcow2', fmt=qcow2 size=107374182400 backing_file='/var/lib/libvirt/images/mx.roessner-net.de-TESTING.img' backing_fmt='raw' encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
+Co-routine re-entered recursively
+2015-08-24 19:43:17.700+0000: shutting down
+
+Here is my envirmornment information:
+
+emerge --info qemu
+Portage 2.2.20.1 (python 2.7.9-final-0, hardened/linux/amd64/no-multilib, gcc-4.8.4, glibc-2.20-r2, 4.1.6-gentoo x86_64)
+=================================================================
+                         System Settings
+=================================================================
+System uname: Linux-4.1.6-gentoo-x86_64-Intel-R-_Xeon-R-_CPU_L5520_@_2.27GHz-with-gentoo-2.2
+KiB Mem:    49454932 total,   7729532 free
+KiB Swap:    2097148 total,   2097148 free
+Timestamp of repository gentoo: Tue, 25 Aug 2015 21:15:01 +0000
+sh bash 4.3_p39
+ld GNU ld (Gentoo 2.24 p1.4) 2.24
+ccache version 3.1.9 [enabled]
+app-shells/bash:          4.3_p39::gentoo
+dev-lang/perl:            5.20.2::gentoo
+dev-lang/python:          2.7.9-r1::gentoo, 3.4.1::gentoo
+dev-util/ccache:          3.1.9-r4::gentoo
+dev-util/cmake:           3.2.2::gentoo
+dev-util/pkgconfig:       0.28-r2::gentoo
+sys-apps/baselayout:      2.2::gentoo
+sys-apps/openrc:          0.17::gentoo
+sys-apps/sandbox:         2.6-r1::gentoo
+sys-devel/autoconf:       2.69::gentoo
+sys-devel/automake:       1.14.1::gentoo, 1.15::gentoo
+sys-devel/binutils:       2.24-r3::gentoo
+sys-devel/gcc:            4.8.4::gentoo
+sys-devel/gcc-config:     1.7.3::gentoo
+sys-devel/libtool:        2.4.6::gentoo
+sys-devel/make:           4.1-r1::gentoo
+sys-kernel/linux-headers: 3.18::gentoo (virtual/os-headers)
+sys-libs/glibc:           2.20-r2::gentoo
+Repositories:
+
+gentoo
+    location: /usr/portage
+    sync-type: rsync
+    sync-uri: rsync://rsync.europe.gentoo.org/gentoo-portage
+    priority: -1000
+
+x-portage
+    location: /usr/local/portage
+    masters: gentoo
+    priority: 0
+
+ACCEPT_KEYWORDS="amd64"
+ACCEPT_LICENSE="* -@EULA"
+CBUILD="x86_64-pc-linux-gnu"
+CFLAGS="-O2 -pipe"
+CHOST="x86_64-pc-linux-gnu"
+CONFIG_PROTECT="/etc /usr/share/easy-rsa /usr/share/gnupg/qualified.txt"
+CONFIG_PROTECT_MASK="/etc/ca-certificates.conf /etc/env.d /etc/fonts/fonts.conf /etc/gconf /etc/gentoo-release /etc/php/apache2-php5.6/ext-active/ /etc/php/cgi-php5.6/ext-active/ /etc/php/cli-php5.6/ext-active/ /etc/revdep-rebuild /etc/sandbox.d /etc/terminfo"
+CXXFLAGS="-O2 -pipe"
+DISTDIR="/usr/portage/distfiles"
+EMERGE_DEFAULT_OPTS="--keep-going --with-bdeps=y --binpkg-respect-use=y --binpkg-changed-deps=y --usepkg=y --rebuilt-binaries=y --rebuilt-binaries-timestamp=20140405050000"
+FCFLAGS="-O2 -pipe"
+FEATURES="assume-digests binpkg-logs ccache compressdebug config-protect-if-modified distlocks ebuild-locks fixlafiles merge-sync news parallel-fetch preserve-libs protect-owned sandbox sfperms strict unknown-features-warn unmerge-logs unmerge-orphans userfetch userpriv usersandbox usersync xattr"
+FFLAGS="-O2 -pipe"
+GENTOO_MIRRORS="http://de-mirror.org/gentoo/ rsync://de-mirror.org/gentoo/"
+LANG="en_US.utf8"
+LC_ALL="en_US.UTF-8"
+LDFLAGS="-Wl,-O1 -Wl,--as-needed"
+MAKEOPTS="-j17"
+PKGDIR="/export/packages"
+PORTAGE_CONFIGROOT="/"
+PORTAGE_RSYNC_OPTS="--recursive --links --safe-links --perms --times --omit-dir-times --compress --force --whole-file --delete --stats --human-readable --timeout=180 --exclude=/distfiles --exclude=/local --exclude=/packages"
+PORTAGE_TMPDIR="/var/tmp"
+USE="acl adns aio amd64 bacula-clientonly bacula-console bash-completion berkdb bindist btrfs bzip2 caps cli cracklib crypt curl cxx device-mapper dri gdbm hardened iconv ipv6 justify logrotate loop-aes lzo mmap mmx mmxext modules ncurses nls nptl nscd ntp openmp openssl pam pax_kernel pcre pie readline seccomp session sse sse2 ssl ssp systemd tcpd threads unicode urandom vim-syntax xattr xtpax zlib" ABI_X86="64" ALSA_CARDS="ali5451 als4000 atiixp atiixp-modem bt87x ca0106 cmipci emu10k1x ens1370 ens1371 es1938 es1968 fm801 hda-intel intel8x0 intel8x0m maestro3 trident usb-audio via82xx via82xx-modem ymfpci" APACHE2_MODULES="authn_core authz_core socache_shmcb unixd actions alias auth_basic authn_alias authn_anon authn_dbm authn_default authn_file authz_dbm authz_default authz_groupfile authz_host authz_owner authz_user autoindex cache cgi cgid dav dav_fs dav_lock deflate dir disk_cache env expires ext_filter file_cache filter headers include info log_config logio mem_cache mime mime_magic negotiation rewrite setenvif speling status unique_id userdir usertrack vhost_alias" CALLIGRA_FEATURES="kexi words flow plan sheets stage tables krita karbon braindump author" CAMERAS="ptp2" COLLECTD_PLUGINS="df interface irq load memory rrdtool swap syslog aggregation cgroups contextswitch cpu cpufreq curl curl_json curl_xml disk email entropy ethstat exec filecount fscache hddtemp ipmi iptables logfile multimeter netlink network nfs nginx ntpd numa openvpn ping postgresql processes protocols python sensors snmp uptime users uuid" CPU_FLAGS_X86="mmx sse sse2" ELIBC="glibc" GPSD_PROTOCOLS="ashtech aivdm earthmate evermore fv18 garmin garmintxt gpsclock itrax mtk3301 nmea ntrip navcom oceanserver oldstyle oncore rtcm104v2 rtcm104v3 sirf superstar2 timing tsip tripmate tnt ublox ubx" INPUT_DEVICES="keyboard mouse evdev" KERNEL="linux" LCD_DEVICES="bayrad cfontz cfontz633 glk hd44780 lb216 lcdm001 mtxorb ncurses text" LIBREOFFICE_EXTENSIONS="presenter-console presenter-minimizer" LINGUAS="de en" NGINX_MODULES_HTTP="access auth_basic autoindex browser charset dav empty_gif fastcgi geo gzip headers_more limit_conn limit_req map memcached proxy referer rewrite scgi spdy split_clients ssi upstream_ip_hash userid uwsgi" OFFICE_IMPLEMENTATION="libreoffice" PHP_TARGETS="php5-6" PYTHON_SINGLE_TARGET="python2_7" PYTHON_TARGETS="python2_7 python3_4" QEMU_SOFTMMU_TARGETS="x86_64 i386" QEMU_USER_TARGETS="x86_64 i386" RUBY_TARGETS="ruby19 ruby20" USERLAND="GNU" VIDEO_CARDS="fbdev glint intel mach64 mga nouveau nv r128 radeon savage sis tdfx trident vesa via vmware dummy v4l" XTABLES_ADDONS="quota2 psd pknock lscan length2 ipv4options ipset ipp2p iface geoip fuzzy condition tee tarpit sysrq steal rawnat logmark ipmark dhcpmac delude chaos account"
+Unset:  CC, CPPFLAGS, CTARGET, CXX, INSTALL_MASK, PORTAGE_BUNZIP2_COMMAND, PORTAGE_COMPRESS, PORTAGE_COMPRESS_FLAGS, PORTAGE_RSYNC_EXTRA_OPTS, USE_PYTHON
+
+=================================================================
+                        Package Settings
+=================================================================
+
+app-emulation/qemu-2.4.0::gentoo was built with the following:
+USE="aio caps curl debug fdt filecaps iscsi jpeg lzo ncurses nfs nls pin-upstream-blobs png python sasl seccomp snappy spice ssh systemtap threads tls usb usbredir uuid vhost-net virtfs vnc xattr xfs -accessibility -alsa -bluetooth -glusterfs -gtk -gtk2 -infiniband -numa -opengl -pulseaudio -rbd -sdl -sdl2 (-selinux) -smartcard -static -static-softmmu -static-user -tci -test -vde -vte -xen" PYTHON_TARGETS="python2_7" QEMU_SOFTMMU_TARGETS="i386 x86_64 -aarch64 (-alpha) (-arm) -cris -lm32 (-m68k) -microblaze -microblazeel (-mips) -mips64 -mips64el -mipsel -moxie -or32 (-ppc) (-ppc64) -ppcemb -s390x -sh4 -sh4eb (-sparc) -sparc64 -unicore32 -xtensa -xtensaeb" QEMU_USER_TARGETS="i386 x86_64 -aarch64 (-alpha) (-arm) -armeb -cris (-m68k) -microblaze -microblazeel (-mips) -mips64 -mips64el -mipsel -mipsn32 -mipsn32el -or32 (-ppc) (-ppc64) -ppc64abi32 -s390x -sh4 -sh4eb (-sparc) -sparc32plus -sparc64 -unicore32"
+
+>>> Attempting to run pkg_info() for 'app-emulation/qemu-2.4.0'
+Using:
+  app-emulation/spice-protocol-0.12.3
+  sys-firmware/ipxe-1.0.0_p20130925
+  sys-firmware/seabios-1.7.5
+    USE=binary
+  sys-firmware/vgabios-0.7a
+
+The server hardware is a HP ProLiant SE316M1-R2 (also known as DL160 G6) with 48GB RAM and a RAID1+0 with 15k SAS disks.
+
+Problem is solved in current master branch
+
+Closing according to the previous comment
+

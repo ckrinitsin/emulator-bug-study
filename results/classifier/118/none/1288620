@@ -1,0 +1,196 @@
+register: 0.674
+semantic: 0.642
+user-level: 0.632
+virtual: 0.594
+hypervisor: 0.579
+permissions: 0.577
+peripherals: 0.563
+debug: 0.546
+risc-v: 0.537
+mistranslation: 0.536
+graphic: 0.530
+PID: 0.530
+network: 0.527
+vnc: 0.520
+TCG: 0.520
+VMM: 0.499
+x86: 0.479
+arm: 0.477
+assembly: 0.466
+device: 0.446
+KVM: 0.435
+files: 0.432
+performance: 0.430
+architecture: 0.404
+ppc: 0.392
+socket: 0.353
+boot: 0.332
+kernel: 0.324
+i386: 0.214
+
+memory leak with config file
+
+I have a Windows 7 SP1 Professional 64-bit installation on a QCOW2 image with compat=1.1, which I launch via
+
+qemu-system-x86_64 -drive file=windows_base_HDD.img,index=0,media=disk -enable-kvm -m 512M -vga std -net nic,vlan=0 -net user,vlan=0
+
+As soon as I start using the network in any application — for example, visiting www.google.com in Internet Explorer — QEMU starts gobbling memory until the (host) kernel kills it because of an OOM condition.  If I run the QEMU with the same options, but with model=e1000 option set for the NIC (i.e. -net -nic,vlan=0,model=e1000), I can use the network from the guest OS without any noticeable effect on QEMU's memory consumption.
+
+I do not have this problem when running QEMU with the exact same options (as above, without model=e1000) but with a Debian wheezy installation (on a QCOW image of the same format).  My host system in Ubuntu 13.10 x86_64, kernel image 3.11.0-17-generic, but with the QEMU packages from trusty (the codename for the next release):
+Output of `dpkg -l \*qemu\* | grep '^ii'`:
+ii  ipxe-qemu                             1.0.0+git-20130710.936134e-0ubuntu1        all          Virtual package to support use of kvm-ipxe with qemu
+ii  qemu-keymaps                          1.7.0+dfsg-3ubuntu2                        all          QEMU keyboard maps
+ii  qemu-system-common                    1.7.0+dfsg-3ubuntu2                        amd64        QEMU full system emulation binaries (common files)
+ii  qemu-system-x86                       1.7.0+dfsg-3ubuntu2                        amd64        QEMU full system emulation binaries (x86)
+ii  qemu-utils                            1.7.0+dfsg-3ubuntu2                        amd64        QEMU utilities
+
+(If necessary, I can try to reproduce this with QEMU built from the upstream source or the latest source from version control.)
+
+Please try to reproduce this with a debug built (configure --enable-debug) from latest QEMU. If it shows the same memory leak, you can try to find the cause of this leak with valgrind:
+
+valgrind --leak-check=full qemu-system-x86_64 -drive file=windows_base_HDD.img,index=0,media=disk -enable-kvm -m 512M -vga std -net nic,vlan=0 -net user,vlan=0 2>&1 | tee valgrind.log
+
+As soon as you terminate the running qemu process, valgrind will write a protocol of all allocated memory. Leaks can usually be found quite easily in this protocol: after a long run, the leak will dominate any other memory allocation. If your executable still contains the full debug information, you will also see the exact line of source code which allocates repeatedly memory.
+ 
+Please note that valgrind slows down your process by a factor of 10 to 20, so it takes some time to run Windows.
+
+If valgrind does not work (which sometimes happens), you can attach a debugger (gdb) to the running qemu process and try to detect the buggy memory allocation by setting breakpoints on the memory allocator functions (malloc or g_malloc, g_malloc0, g_new, g_new0).
+
+
+I can not reproduce this even with the Ubuntu package after rebooting after a kernel update.  I will try again with the previous kernel image to confirm this is the relevant variable.  Is it possible that the behaviour I described in the initial report is/was caused by code in the KVM module?
+
+Even after rebooting with the kernel I was using when I had the problem behaviour in QEMU, I can not reproduce the issue.  It certainly was not a one-off, because QEMU was gobbling memory consistently on my system, in consecutive sessions.
+
+I have been able to consistently reproduce the bug again, and have run QEMU with Valgrind until OOM.  It is unrelated to networking; it is caused by loading a config file.
+
+I ran QEMU from Git commit 7f6613cedc59fa849105668ae971dc31004bca1c under valgrind via...
+
+valgrind qemu-system-x86_64 -readconfig windows8_throwaway_VM.conf -m 1G -vga std 2>&1 | tee valgrind.log
+
+...where the contents of windows8_throwaway_VM.conf is...
+
+[drive]
+  file = "windows8_throwaway_HDD.img"
+  index = "0"
+  media = "disk"
+  if = "virtio"
+
+[net]
+  type = "nic"
+  vlan = "0"
+  model = "virtio"
+
+[net]
+  type = "user"
+  vlan = "0"
+
+[rtc]
+  base = "localtime"
+
+[machine]
+  accel = "kvm"
+
+(I will attach the file in a separate comment, because launchpad appears to only allow at most one attachment per comment.)
+
+It does not seem to matter whether VirtIO is used, as I have had this problem when not using any VirtIO devices, but the Windows guest I had on-hand was already using it.
+
+If I invoke QEMU with the equivalent settings all via the command line, it does not gobble memory (again, regardless of VirtIO).
+
+qemu-system-x86_64 -drive file=windows8_throwaway_HDD.img,index=0,media=disk,if=virtio -enable-kvm -m 1G -vga std -net nic,vlan=0,model=virtio -net user,vlan=0 -rtc localtime
+
+Attaching config file mentioned in previous comment.
+
+On Sat, Mar 29, 2014 at 03:02:23AM -0000, Aidan Gauland wrote:
+> I have been able to consistently reproduce the bug again, and have run
+> QEMU with Valgrind until OOM.  It is unrelated to networking; it is
+> caused by loading a config file.
+> 
+> I ran QEMU from Git commit 7f6613cedc59fa849105668ae971dc31004bca1c
+> under valgrind via...
+> 
+> valgrind qemu-system-x86_64 -readconfig windows8_throwaway_VM.conf -m 1G
+> -vga std 2>&1 | tee valgrind.log
+> 
+> ...where the contents of windows8_throwaway_VM.conf is...
+> 
+> [drive]
+>   file = "windows8_throwaway_HDD.img"
+>   index = "0"
+>   media = "disk"
+>   if = "virtio"
+> 
+> [net]
+>   type = "nic"
+>   vlan = "0"
+>   model = "virtio"
+> 
+> [net]
+>   type = "user"
+>   vlan = "0"
+> 
+> [rtc]
+>   base = "localtime"
+> 
+> [machine]
+>   accel = "kvm"
+> 
+> (I will attach the file in a separate comment, because launchpad appears
+> to only allow at most one attachment per comment.)
+> 
+> It does not seem to matter whether VirtIO is used, as I have had this
+> problem when not using any VirtIO devices, but the Windows guest I had
+> on-hand was already using it.
+> 
+> If I invoke QEMU with the equivalent settings all via the command line,
+> it does not gobble memory (again, regardless of VirtIO).
+> 
+> qemu-system-x86_64 -drive
+> file=windows8_throwaway_HDD.img,index=0,media=disk,if=virtio -enable-kvm
+> -m 1G -vga std -net nic,vlan=0,model=virtio -net user,vlan=0 -rtc
+> localtime
+
+So this is a problem that only happens under Valgrind?  Perhaps this is
+a valgrind bug.
+
+Stefan
+
+
+On Wed, 23 Apr 2014 13:10:39 -0000, Stefan Hajnoczi wrote:
+> So this is a problem that only happens under Valgrind?  Perhaps this 
+> is
+> a valgrind bug.
+
+No, it happens outside of Valgrind as well.  It only happens when QEMU 
+is told to read a config file (with -readconfig).
+
+
+
+On Wed, Apr 23, 2014 at 08:18:21PM -0000, Aidan Gauland wrote:
+> On Wed, 23 Apr 2014 13:10:39 -0000, Stefan Hajnoczi wrote:
+> > So this is a problem that only happens under Valgrind?  Perhaps this 
+> > is
+> > a valgrind bug.
+> 
+> No, it happens outside of Valgrind as well.  It only happens when QEMU 
+> is told to read a config file (with -readconfig).
+
+Weird, I tried yesterday and couldn't reproduce it against
+qemu.git/master (2d03b49c3f225994c4b0b46146437d8c887d6774) with your
+config file.
+
+I wonder if your guest is repeatedly doing something that causes QEMU to
+leak memory.  My guest was Red Hat Enterprise Linux 6.4.
+
+Does it happen if you provide a non-bootable disk image so the guest is
+stuck at the BIOS screen?  Use dd if=/dev/zero of=test.img bs=1M
+count=1024 to create an empty 1 GB raw file.
+
+Stefan
+
+
+It does seem to be related to the guest, because with a dummy (non-bootable, garbage data) disk image, the rapid memory leak does not occur.
+
+Can you still reproduce this issue with the latest version of QEMU (currently version 2.9)?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

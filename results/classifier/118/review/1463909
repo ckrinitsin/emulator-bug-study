@@ -1,0 +1,134 @@
+user-level: 0.836
+hypervisor: 0.787
+graphic: 0.783
+risc-v: 0.757
+KVM: 0.751
+arm: 0.747
+VMM: 0.746
+register: 0.744
+virtual: 0.742
+mistranslation: 0.740
+semantic: 0.736
+x86: 0.734
+ppc: 0.727
+vnc: 0.710
+permissions: 0.709
+device: 0.700
+peripherals: 0.691
+assembly: 0.688
+TCG: 0.686
+debug: 0.683
+PID: 0.668
+network: 0.659
+performance: 0.658
+files: 0.647
+kernel: 0.625
+architecture: 0.618
+i386: 0.589
+boot: 0.547
+socket: 0.485
+--------------------
+network: 0.981
+virtual: 0.939
+hypervisor: 0.682
+kernel: 0.311
+TCG: 0.252
+risc-v: 0.116
+register: 0.053
+debug: 0.040
+device: 0.039
+PID: 0.030
+files: 0.027
+x86: 0.023
+socket: 0.019
+boot: 0.017
+VMM: 0.011
+ppc: 0.007
+KVM: 0.007
+semantic: 0.006
+user-level: 0.005
+permissions: 0.003
+assembly: 0.003
+architecture: 0.002
+performance: 0.002
+vnc: 0.002
+peripherals: 0.001
+graphic: 0.001
+arm: 0.001
+i386: 0.001
+mistranslation: 0.000
+
+virtio: networking not working when guest's eth0 is not in promiscuous mode
+
+We are unable to get http responses from qemu guest machine until interface inside qemu guest machine is in promiscuous mode.
+
+Our configuration is following:
+
+<pre>
+     ------------------------
+     |       Host server    |
+     ------------------------
+     |     /eth1.10(IP1)    |
+LAN2-|-eth1-eth1.11(IP2)    |
+     |     \eth1.12(IP3)    |
+     |                      |
+LAN1-|-eth0(IP4) <IP[1-4]>  |
+     |              /       |
+     |      iptables[nat]   |
+     |    /  ________________
+     |    |  | Guest system |
+     |  tap0-|-eth0(guestIP)|
+     ------------------------
+</pre>
+
+Host server is connected to LAN1 with eth0 and to LAN2 with eth1. eth0 has IP4 assigned. eth1 is connected to the switch in trunk mode that has vlans 10, 11 and 12 allows. Thus in Host systems we have eth1.10, eth1.11 and eth1.12 interfaces with IP1, IP2 and IP3 respectfully.
+
+Inside Host systems we start Guest system using following command:
+
+> qemu-system-x86_64 -m 3G -nographic -monitor stdio -serial none -kernel /vmlinuz -initrd /webiface.gz -hda /data/data.img -net nic,model=virtio,macaddr=fe:32:31:30:29:00 -net tap,ifname=tap0,script=no,downscript=no
+
+tap interface was created with commands:
+> ip tuntap add dev tap0 mode tap user user                                                                                              
+> ip addr add 172.31.31.253/30 brd + dev tap0
+> ip link set dev tap0 up
+
+
+Routing for packets comming from LAN1 or LAN2 to guest system is identical and is done by iptables DNAT target:
+
+> iptables -t nat -A PREROUTING -d <IP1> -p tcp --dport 8580 -j DNAT --to-destination <guest IP>:80
+...
+> iptables -t nat -A PREROUTING -d <IP4> -p tcp --dport 8580 -j DNAT --to-destination <guest IP>:80
+
+Now the problem is that requests for @http://<IP4>:8580/index.html@ stall, until we put eth0 on Guest system in promiscuous mode. Note this concerns only packets coming through eth0 on Host system. Requests for @http://<IP[1-3]>:8580/index.html@ work as the should!
+
+It is really strange how promiscuous mode of the interface on guest system affects the way it receives packets. So we did further debuging with tcpdump. 
+
+For interesting (broken) case when packets arrive through eth0 of Host system, using tcpdump, we found that syn requests are coming out at tap0 interface:
+
+> 12:40:11.049007 c2:30:61:72:8d:14 > fe:32:31:30:29:00, ethertype IPv4 (0x0800), length 74: <IP>.45661 > <guestIP>.80: Flags [S], seq 1998302974, win 29200, options [mss 1352,sackOK,TS val 3509464 ecr 0,nop,wscale 7], length 0
+
+but no packet arrives on guest's eth0 interface! We confirmed that with tcpdump running with promiscuous mode disabled. So packets gone out from tap0 but never archived eth0 of the Guest system! Of course, once we run tcpdump without -p, guest interface will run in promiscuous mode and all packets/traffic will be visible on Guest also and everything works as expected.
+
+ifconfig shows no drops on tap0 interface. I've check MAC addresses of tap0(c2:30:61:72:8d:14) and guest's eth0 (fe:32:31:30:29:00). I don't see problem here.
+
+We've tried with eth1 interface not configured (no vlans) and still have this problem.
+
+This is Ubuntu 12.04.4 LTS server system with 3.2.0-67-generic kernel and QEMU emulator version 1.0 (qemu-kvm-1.0), Copyright (c) 2003-2008 Fabrice Bellard. 
+
+Googling we found that similar problem was reported with much older system (but very few details unfortunately):
+http://www.serverphorums.com/read.php?12,28222
+
+We failed to find any confirmation that this problem was fixed in newer version. Is this a known bug? Any suggestions how to debug?
+
+I'm seeing this as Thomas was so kind to mark it for Ubuntu after all the time.
+To finally answer your closing question, no this is neither a known bug nor reported anywhere else to my knowledge so far. Due to that I can't point to any "here it was fixed" change of later.
+
+I have to beg your pardon after so much time and ask you if this still happens to whatever setup you have today. And if possible at least use Ubuntu Bionic for the much newer stack of virtualization software.
+
+For debugging I think you did what you'd expect.
+You could start switching device types from virtio to one of the emulated types just to check if it is related.
+Further pretty often in "manual" setups there are minor flaws (had some myself) that are already covered by quirks in libvirt. So the next step would to push your setup into a libvirt based guest and if it is working then comparing how it had started your guest.
+
+
+[Expired for qemu (Ubuntu) because there has been no activity for 60 days.]
+

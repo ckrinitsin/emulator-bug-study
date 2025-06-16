@@ -1,0 +1,188 @@
+user-level: 0.880
+peripherals: 0.848
+risc-v: 0.835
+mistranslation: 0.813
+semantic: 0.805
+register: 0.793
+debug: 0.780
+assembly: 0.780
+device: 0.775
+permissions: 0.773
+virtual: 0.762
+KVM: 0.761
+PID: 0.759
+ppc: 0.759
+hypervisor: 0.759
+vnc: 0.758
+graphic: 0.756
+performance: 0.754
+arm: 0.753
+VMM: 0.742
+TCG: 0.736
+architecture: 0.730
+x86: 0.725
+kernel: 0.721
+socket: 0.703
+files: 0.678
+network: 0.670
+boot: 0.645
+i386: 0.616
+--------------------
+user-level: 0.069
+files: 0.033
+TCG: 0.023
+virtual: 0.017
+hypervisor: 0.015
+PID: 0.009
+kernel: 0.007
+semantic: 0.007
+register: 0.005
+debug: 0.005
+network: 0.004
+VMM: 0.003
+ppc: 0.002
+device: 0.002
+vnc: 0.001
+socket: 0.001
+x86: 0.001
+risc-v: 0.001
+performance: 0.001
+architecture: 0.001
+graphic: 0.001
+boot: 0.001
+assembly: 0.001
+mistranslation: 0.001
+KVM: 0.001
+permissions: 0.001
+peripherals: 0.001
+arm: 0.000
+i386: 0.000
+
+configure: fix POSIX compatibility issue
+
+When running configure script from 2.5.0-rc4 on OpenBSD-current (amd64), I get the following error:
+
+  ./configure[4756]: ${nettle:+($nettle_version)}": bad substitution
+  *** Error 1 in . (/usr/ports/infrastructure/mk/bsd.port.mk:2747 '/usr/ports/pobj/qemu-2.5.0rc4/.configure_done')
+  *** Error 1 in /usr/ports/openbsd-wip/emulators/qemu (/usr/ports/infrastructure/mk/bsd.port.mk:2491 'configure')
+
+Indeed, construct "${nettle:+($nettle_version)}" does not conform to POSIX Shell Command Language. The attached patch fixes the issue.
+
+
+
+Sorry, wrong patch.
+
+On Sun, Dec 13, 2015 at 06:39:22PM -0000, Dmitrij D. Czarkoff wrote:
+> Sorry, wrong patch.
+> 
+> ** Patch added: "0001-configure-fix-POSIX-compatibility-issue.patch"
+>    https://bugs.launchpad.net/qemu/+bug/1525682/+attachment/4534158/+files/0001-configure-fix-POSIX-compatibility-issue.patch
+> 
+> ** Patch removed: "0001-configure-fix-POSIX-compatibility-issue.patch"
+>    https://bugs.launchpad.net/qemu/+bug/1525682/+attachment/4534156/+files/0001-configure-fix-POSIX-compatibility-issue.patch
+
+Please send patches to <email address hidden>.  Guidelines on submitting
+patches are here:
+http://qemu-project.org/Contribute/SubmitAPatch
+
+Thanks!
+
+
+In particular, the Signed-off-by: line is critically important -- we cannot apply a patch without one.
+
+git blame says this + syntax was originally introduced in commit becaeb726 in July (though at that point the variable name was slightly different: ${gnutls_nettle+($nettle_version)} ). That means we were using this construct in v2.4.0, so this is not a regression for 2.5.0.
+
+I'm also a bit confused by your patch and your original bug report. The error message you quote is complaining about a line with ":+" syntax, but upstream configure is not using ":+" syntax here. Indeed your patch is changing it from + to :+.
+
+   -echo "nettle            $nettle ${nettle+($nettle_version)}"
+   +echo "nettle            $nettle ${nettle:+($nettle_version)}"
+
+It's not clear to me why this would help, because
+http://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_06_02
+(section "Parameter Expansion") which documents the syntax describes both ":+" and "+", so whatever the shell is complaining about it presumably isn't the + vs :+ distinction.
+
+Which shell is this?
+
+
+OK, so I misidentified the issue and screwed up my bug report.
+
+The shell is pdksh on OpenBSD, and the real issue is with parentheses:
+
+  $ a=1
+  $ b=2
+  $ echo "${a+($b)}"
+  ksh: ${a+($b)}": bad substitution
+  $ echo "${a+\($b\)}"
+  (2)
+
+Unfortunately in bash and dash backslash-escaping the brackets results in the backslashes being printed verbatim:
+$ (a=1 b=2 ; echo "${a+\($b\)}")
+\(2\)
+
+Can you try this syntax with extra quote characters? (It works in bash/dash):
+(a=1 b=2 ; echo "${a+"($b)"}")
+(2)
+
+
+It works.
+
+Thanks. I'll send out a patch.
+
+
+Actually it turns out we really shouldn't be using the ${} syntax anyway, because if nettle is not present we end up printing
+"nettle: no ()"
+because $nettle is set to "no", not null or unset. So we should just write this out like:
+if test "$nettle" = "yes"; then
+    echo "nettle            $nettle ($nettle_version)"
+else
+    echo "nettle            $nettle"
+fi
+
+
+FWIW this way it is also consistent with other check results reporting, eg. spice.
+
+The patch to fix this is at: http://patchwork.ozlabs.org/patch/556537/
+
+Unfortunately it has just missed the cutoff to get into 2.5.0 (since it has been present since 2.4.0 and there is a workaround of running "/path/to/bash configure"). We'll put it into the next 2.5.x stable release, though.
+
+
+[adding autoconf, which likes to document shell bugs]
+
+On 12/14/2015 04:34 AM, Dmitrij D. Czarkoff wrote:
+> OK, so I misidentified the issue and screwed up my bug report.
+> 
+> The shell is pdksh on OpenBSD, and the real issue is with parentheses:
+> 
+>   $ a=1
+>   $ b=2
+>   $ echo "${a+($b)}"
+>   ksh: ${a+($b)}": bad substitution
+
+That's a bug in pdksh; see the POSIX interpretation:
+
+http://austingroupbugs.net/view.php?id=221#c399
+
+    For parameter expansions other than the four varieties that provide
+    for substring processing, within the string of characters from an
+    enclosed "${" to the matching '}', the double-quotes within which
+    the expansion occurs shall preserve the literal value of all
+    characters, with the exception of the characters double-quote,
+    backquote, <dollar-sign>, and <backslash>.
+
+The fact that you are using "" outside the ${} means that all characters
+between + and } should be used literally (the same as if you had done
+'echo "($b)"').  According to POSIX, it should not be a syntax error, so
+you should report this to the pdksh shell developers.
+
+-- 
+Eric Blake   eblake redhat com    +1-919-301-3266
+Libvirt virtualization library http://libvirt.org
+
+
+
+Note that mksh is virtually a superset of OpenBSD ksh and accepts this construct, for a quick fix.
+
+The patch has been included here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=18f49881cf8359e89396aac
+... which should be part of QEMU 2.6.0, so let's mark this bug report as fixed.
+

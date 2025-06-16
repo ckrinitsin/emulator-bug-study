@@ -1,0 +1,73 @@
+graphic: 0.621
+virtual: 0.592
+register: 0.591
+performance: 0.591
+user-level: 0.574
+architecture: 0.558
+device: 0.548
+TCG: 0.513
+risc-v: 0.512
+arm: 0.506
+VMM: 0.502
+mistranslation: 0.481
+semantic: 0.455
+hypervisor: 0.438
+KVM: 0.427
+x86: 0.415
+PID: 0.402
+files: 0.396
+permissions: 0.393
+boot: 0.393
+debug: 0.390
+ppc: 0.371
+kernel: 0.370
+peripherals: 0.354
+assembly: 0.352
+network: 0.346
+socket: 0.269
+i386: 0.260
+vnc: 0.252
+
+aarch64-virt: heap-use-after-free in gic_dist_writeb
+
+Reproducer:
+cat << EOF | ./qemu-system-aarch64 \
+-machine virt,accel=qtest -qtest stdio
+writel 0x8000f00 0x5affaf
+write 0x8000eff 0x1 0x0
+EOF
+
+Stacktrace:
+../hw/intc/arm_gic.c:1419:17: runtime error: index 3068 out of bounds for type 'gic_irq_state [1020]'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior ../hw/intc/arm_gic.c:1419:17 in
+=================================================================
+==641550==ERROR: AddressSanitizer: heap-use-after-free on address 0x629000023a85 at pc 0x55b5dfb0fbf8 bp 0x7fff95cb5870 sp 0x7fff95cb5868
+WRITE of size 1 at 0x629000023a85 thread T0
+    #0 0x55b5dfb0fbf7 in gic_dist_writeb /home/alxndr/Development/qemu/build/../hw/intc/arm_gic.c:1419:17
+    #1 0x55b5dfb061e2 in gic_dist_write /home/alxndr/Development/qemu/build/../hw/intc/arm_gic.c
+    #2 0x55b5e0809ef4 in memory_region_write_with_attrs_accessor /home/alxndr/Development/qemu/build/../softmmu/memory.c:511:12
+    #3 0x55b5e0808bfb in access_with_adjusted_size /home/alxndr/Development/qemu/build/../softmmu/memory.c:552:18
+    #4 0x55b5e0808467 in memory_region_dispatch_write /home/alxndr/Development/qemu/build/../softmmu/memory.c
+    #5 0x55b5e0b98ffb in flatview_write_continue /home/alxndr/Development/qemu/build/../softmmu/physmem.c:2759:23
+    #6 0x55b5e0b8e71b in flatview_write /home/alxndr/Development/qemu/build/../softmmu/physmem.c:2799:14
+    #7 0x55b5e0b8e71b in address_space_write /home/alxndr/Development/qemu/build/../softmmu/physmem.c:2891:18
+    #8 0x55b5e07fad35 in qtest_process_command /home/alxndr/Development/qemu/build/../softmmu/qtest.c:654:9
+    #9 0x55b5e07f3b97 in qtest_process_inbuf /home/alxndr/Development/qemu/build/../softmmu/qtest.c:797:9
+    #10 0x55b5e1044286 in fd_chr_read /home/alxndr/Development/qemu/build/../chardev/char-fd.c:68:9
+    #11 0x7fa997b30aae in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x51aae)
+    #12 0x55b5e169f363 in glib_pollfds_poll /home/alxndr/Development/qemu/build/../util/main-loop.c:232:9
+    #13 0x55b5e169f363 in os_host_main_loop_wait /home/alxndr/Development/qemu/build/../util/main-loop.c:255:5
+    #14 0x55b5e169f363 in main_loop_wait /home/alxndr/Development/qemu/build/../util/main-loop.c:531:11
+    #15 0x55b5e075a599 in qemu_main_loop /home/alxndr/Development/qemu/build/../softmmu/runstate.c:721:9
+    #16 0x55b5de9e71fd in main /home/alxndr/Development/qemu/build/../softmmu/main.c:50:5
+    #17 0x7fa9975d5cc9 in __libc_start_main csu/../csu/libc-start.c:308:16
+    #18 0x55b5de93abc9 in _start (/home/alxndr/Development/qemu/build/qemu-system-aarch64+0x3350bc9)
+
+Fix for this 13+ years old issue:
+https://lists.gnu.org/archive/html/qemu-devel/2021-01/msg07969.html
+
+The actual overrun here is not the one the backtrace describes. The first "writel 0x8000f00 0x5affaf" writes a value to GICD_SGIR which overruns the sgi_pending array in the GICState structure. In particular, it overwrites the s->num_irq field, which is what is guarding the array access to gic_irq_state[] that the "write 0x8000eff 0x1 0x0" exercises. With the first overrun fixed, the check for "if (irq >= s->num_irq)" functions correctly.
+
+
+Commited as edfe2eb4360cde4ed5d95bda7777edcb3510f76a.
+

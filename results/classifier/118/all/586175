@@ -1,0 +1,477 @@
+user-level: 0.955
+virtual: 0.952
+debug: 0.952
+boot: 0.951
+permissions: 0.951
+peripherals: 0.951
+device: 0.951
+architecture: 0.950
+performance: 0.949
+graphic: 0.949
+TCG: 0.949
+files: 0.948
+risc-v: 0.948
+hypervisor: 0.947
+register: 0.946
+x86: 0.946
+assembly: 0.946
+vnc: 0.945
+socket: 0.944
+semantic: 0.944
+VMM: 0.943
+mistranslation: 0.943
+arm: 0.942
+PID: 0.942
+kernel: 0.940
+KVM: 0.939
+network: 0.936
+ppc: 0.934
+i386: 0.932
+
+Windows XP/2003 doesn't boot
+
+Hello everyone,
+
+my qemu doesn't boot any Windows XP/2003 installations if I try to boot the image.
+If I boot the install cd first, it's boot manager counts down and triggers the boot on it's own. That's kinda stupid.
+
+I'm using libvirt, but even by a simple
+> qemu-kvm -drive file=image.img,media=disk,if=ide,boot=on
+it won't boot. Qemu hangs at the message "Booting from Hard Disk..."
+
+I'm using qemu-kvm-0.12.4 with SeaBIOS 0.5.1 on Gentoo (No-Multilib and AMD64). It's a server, that means I'm using VNC as the primary graphic output but i don't think it should be an issue.
+
+There's a fedora rawhide bug about this as well:
+
+https://bugzilla.redhat.com/show_bug.cgi?id=579348
+
+Which points to a qemu-devel posting talking about disk geometry confusion:
+
+http://article.gmane.org/gmane.comp.emulators.qemu/66135
+
+Can someone try to reproduce this without ,boot=on?
+
+It's possible that extboot is screwing up the disk geometry.
+
+I don't have any problem using TCG.
+
+Tested with Windows XP Home Update in 0.12.4 and Windows 2003 Enterprise Server in 0.12.3.
+
+It's a very strange bug.
+
+Starting qemu without boot=on results in the same dilemma.
+
+But: I've used a .vdi image (because qcow2 is terribly slow).
+Just now I tried a raw image. Now I can boot neither directly from the image nor with the install cd. Both ways boot finally NTLDR, but now the loader has a problem with the drive. (I don't know how this message is called in the english version, but the german version says: "An error occurred while reading the drive. Restart with Ctrl+Alt+Del.")
+
+Now I'll try to install Windows Server 2008 R2...
+
+Can someone post the exact qemu command line that gets generated so we can test without libvirt?
+
+Do you mean, I should try to install and boot Win2k3 without libvirt?
+
+If I install Windows through libvirt and boot it with a simple command line like
+> qemu-kvm -hda /someimage.img -enable-kvm
+it doesn't boot.
+
+It's in fact this bug, just like Cole meant:
+https://bugzilla.redhat.com/show_bug.cgi?id=579348
+
+Also interesting, if I use a raw image instead of a vdi image, the workaround (booting the install cd and let it hand over to the installed windows) doesn't work anymore.
+
+Now I'll set up another machine with gentoo and try all combinations of image file types, Windozes (< NT 6.0) and qemu options and I'll report the results.
+
+It sounds like this is an existing image that you can't boot from.  I can create a new 2k3 VM with upstream qemu and boot it again after install with no issues.  So I'm wondering if you can also do this.  If so, then something happened to your existing image (maybe some sort of corruption of the boot sector ?).
+
+I can reproduce with qemu-kvm 0.12.4 like the original reporter. I cannot reproduce with qemu-kvm upstream, qemu stable, or qemu upstream. So boot=on could be the culprit. Libvirt generated command line:
+
+LC_ALL=C PATH=/sbin:/usr/sbin:/bin:/usr/bin QEMU_AUDIO_DRV=none /usr/bin/qemu-system-x86_64 -S -M pc-0.12 -no-kvm -m 512 -smp 1,sockets=1,cores=1,threads=1 -name winxp_test -uuid 634dff56-8c5a-fdbb-b5fc-091bcf78e586 -nodefaults -chardev socket,id=monitor,path=/var/lib/libvirt/qemu/winxp_test.monitor,server,nowait -mon chardev=monitor,mode=readline -rtc base=localtime -boot c -drive file=/var/lib/libvirt/images/winxp_test.img,if=none,id=drive-ide0-0-0,boot=on,format=raw -device ide-drive,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0 -drive file=/mnt/data/media/win_xp_sp3_32.iso,if=none,media=cdrom,id=drive-ide0-1-0,readonly=on,format=raw -device ide-drive,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0 -device rtl8139,vlan=0,id=net0,mac=52:54:00:ac:e8:ca,bus=pci.0,addr=0x4 -net tap,fd=20,vlan=0,name=hostnet0 -chardev pty,id=serial0 -device isa-serial,chardev=serial0 -usb -device usb-tablet,id=input0 -vnc 127.0.0.1:1 -k en-us -vga std -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3
+
+Markus has a patch internally against an older qemu-kvm release that apparently fixes the issue, however the upstream code is different so it doesn't cleanly apply. Maybe this will give someone a hint for a proper upstream solution:
+
+ hw/pc.c |    4 ++++
+ 1 files changed, 4 insertions(+), 0 deletions(-)
+
+diff --git a/hw/pc.c b/hw/pc.c
+index d142282..c60a79a 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -271,12 +271,16 @@ static void cmos_init(ram_addr_t ram_size, ram_addr_t above_4g_mem_size,
+      */
+     for (i = 0; i < 4; i++) {
+         char id[32];
++        int cylinders, heads, secs;
+ 
+         if (hd_table[i])
+             continue;
+         snprintf(id, sizeof(id), "drive-ide0-%d-%d",
+                  i / MAX_IDE_DEVS, i % MAX_IDE_DEVS);
+         hd_table[i] = drive_get_by_id(id);
++        if (hd_table[i]) {
++            bdrv_guess_geometry(hd_table[i]->bdrv, &cylinders, &heads, &secs);
++        }
+     }
+ 
+     /* various important CMOS locations needed by PC/Bochs bios */
+
+
+
+Long time no post, i tried to install Win2k3 through RIS/PXE this time. I still get the same error at boot time: "A disk read error occurred. Press Ctrl + Alt + Del to restart".
+
+Neither the Win2k3 install source nor the VirtIO drivers are defective. Something's just wrong with QEMU.
+
+Currently qemu.git is able to compile itself properly, so I'll check it out. Without libvirt (because it can't parse "qemu-kvm-devel" as version string :/ https://bugzilla.redhat.com/show_bug.cgi?id=609741 )
+
+Ran into this problem today with fresh Windows 2003 R2 install on a IDE boot drive. Because the CD-ROM boot bypasses this problem the install completes just fine, until I tell it to boot from the hard disk (via libvirt).
+
+Latest available packages from Debian testing;
+
+qemu 0.12.4+dfsg-3
+qemu-kvm 0.12.4+dfsg-1
+qemu-system 0.12.4+dfsg-3
+qemu-user 0.12.4+dfsg-3
+qemu-utils 0.12.4+dfsg-3
+seabios 0.5.1-3
+
+The only thing I've been able to find so far is an odd character in the SeaBIOS string when booting from the hard disk, which isn't there when booting from the CD-ROM image.
+
+I agree to #10. Today I installed qemu-kvm-0.12.4-r3 and I still can't boot Windows XP/2003 without booting the install cd at first.
+
+But now: After I tried to boot the Windows installation I get the same odd char in the screen as described by #10. Plus, I can install Windows without problems, but it doesn't boot AFTER the setup, whether I use IDE or VirtIO as hard disk bus.
+
+Ergo: Booting from install cd, the setup copies the files on the hard disk, reboot, booting from hard disk, the setup installs Windows, reboot, and then: it hangs. Seems to be an BIOS issue.
+
+P.S.: Of course I can't boot Windows XP/2003 from a VirtIO drive at all, because the install cd only checks the IDE bus for an existing Windows installation...
+
+I'm not sure all experience the same as me, but it may be worth having a look at the workaround I found, described here : http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=579166#17
+
+Hth.
+
+I have to correct myself.
+
+Booting from Windows XP/2003 after the first reboot of the Windows setup is still impossible (without booting from the install CD at first).
+
+I tried both the command line used by libvirt and the following one:
+
+> qemu-kvm -hda thisfile -cdrom thatfile -boot c
+
+Also, I tested these command lines on qemu-kvm-0.12.4, qemu-kvm-0.12.4-r3 and qemu.git with SeaBIOS 0.5.1, 0.6.0 and seabios.git respectively. Windows always hangs at boot time. (But Windows Server 2008 R2 boots up. I assume Windows 7 and Vista will do fine as well.)
+
+I have this problem as well.  I'm installing using a slightly different situation -- I'm restoring a WinXP/Win2k3 backup that was made with fsarchiver -- but essentially I run across the same issue namely that boot fails when mbr tries to boot the first partition.  In my case I use install-mbr from the mbr package but have also tried to install the windows mbr from the boot cd without success.  Here are the steps I've taken and the partial fix I've discovered.
+
+First, let me say that these steps worked perfectly in 9.10.  In fact, I can move the raw image from 9.10 to 10.04 and boot it without problem.  That was initially how I got these restores to work; I installed on a Karmic laptop and moved the raw image to Lucid.
+
+Install Notes:
+
+Install Procedure (for karmic or lucid):
+
+1. boot system to image to rescuecd and backup xp or win2k3 using fsarchiver:
+ fsarchiver savefs /some/remote/location/win.fsa /dev/sda1
+2. on kvm host create restore disk:
+ lvcreate -L10GB -n win vg
+3. boot virt with rescuecd
+ kvm -m 1024 -cdrom rescuecd.iso -hda /dev/vg/win -boot d
+3. partition disk (entire disk, one partition, active):
+ fdisk /dev/sda
+ commands: o n p 1 [] [] t 7 a 1 w
+4. restore archive:
+ fsarchiver restfs win.fsa id=0,dest=/dev/mapper/vg-winp1
+5. install mbr:
+ install-mbr /dev/sda
+6. halt virt and reboot to image:
+ kvm -m 1024 -hda /dev/vg/win
+
+At this point, the image will boot in 9.10. But following the same steps in lucid it will hang after the mbr boots the first partition.
+
+I tried everything I could think of and all the different steps found on the web including repairing the mbr changing disk types and boot options to no avail.  What was odd for me is that the resulting image created on karmic would boot on lucid which indicated to me that once the install was completed successfully whatever kvm was doing didn't matter -- it was just the creation of the mbr or file system in the kvm boot that was at fault.
+
+My next step at this point was to install hexedit and compare the two resulting images.  Specifically, the mbr at the beginning of the disk and the ntfs partition starting at sector 63.  On the net there is some talk about changing 0x7E1A to 'FF' -- which is supposed to indicate disk geometry of the ntfs partition.  There were three values that were different at this point in the ntfs file region -- 0x8E18, 0x7E1A, and 0x7E1C.  The first two did not seem to have any effect.  But changing 0x7E1C to the value of '3F' would result in the image booting properly.  Evidently this is the part of the NTFS file system that records the starting sector of the partition.  This change successfully booted all my test cases restores with a single partition.
+
+OK, so at this point I backtracked and did just steps 1-4 on both Karmic and Lucid but instead of booting to a rescuecd in the virt I used kpartx to mount the raw file system:
+
+1. make backup
+ fsarchiver savefs win.fsa /dev/sda1
+2. create disk
+ lvcreate -L10GB -n win vg
+3. partition
+  fdisk /dev/vg/win
+4. mount to loop, restore, detach
+ kpartx -av /dev/vg/win
+ fsarchiver restfs win.fsa id=0,dest=/dev/mapper/vg-winp1
+ kpartx -dv /dev/loop0
+5. install mbr
+ install-mbr /dev/vg/win
+
+At this point, unfortunately, these steps will not boot on either karmic or lucid -- the boot section of the ntfs partition does not seem to write correctly (0x8E18, 0x7E1A, and 0x7E1C are all '00').  However, if you change 0x7E1C to '3F', these resulting images will boot fine:
+
+6. after hexedit, boot, success
+ kvm -m 1024 -hda /dev/vg/win
+
+Hope this helps track down this issue.  My feeling here is that this is not an issue with the mbr but rather the creation of the ntfs file system.  And it does seem that the disk geometry presented by the version of kvm in lucid is different enough from karmic to cause the ntfs file system incorrectly write sector 0x7E1C thus causing the resulting image to hang at boot.
+
+
+I am struggling with the same problem with a WIndows 2003 install under virt-manager/virsh The byte at 7e1c was already set to 3F. hexediting the byte at offset 7e1a to FF allowed the system to boot OK.
+
+
+
+I'm getting the same error with restoring an Acronis based image to KVM on Scientific Linux 5.4. The image is known good, and I just tested to physical hardware and it boots fine. I hope this can be fixed...
+
+How are people hex editing the disk?
+
+I run into the same problem, but the workaround regarding editing the number of heads in the ntfs partition boot sector did it for me. Little Howto:
+
+Asume: A raw complete harddisc image within a bootable NTFS partition with XP or 2k3 on it
+
+Incident: when using these image with kvm based qemu, the system wan't boot anymore
+
+solution:
+
+1) set up the whole discimage as a loop device
+- losetup /dev/loop0 /path/to/my/diskimage.raw
+
+2) let kpartx create drive mappings for all partitions within the loop device
+- kpartx -a /dev/loop0
+
+3) you need to know on which partition your NTFS partition resides
+- fdisk -l /dev/loop0
+
+4) use the right partition mapping with hex-edit (eg. partition 1)
+- hexedit /dev/mapper/loop0p1
+
+5) look on hex position 0x1a, for the count of heads NTFS asumes
+- in hexedit type enter and then 1A
+
+6) change the value to 0xFF 
+- in hexedit type FF
+
+7) save and exit hexedit
+- press Ctrl+X to end 
+
+8) remove the partition mappings
+- kpartx -d /dev/loop0
+
+9) remove loop device
+- losetup -d /dev/loop0
+
+Hope that helps
+
+Cheers Andreas
+
+Great solution Andreas, it worked for a Win2k image which I could only boot previously using an iso from http://www.resoo.org/docs/ntldr/files/
+
+However, I have a w7 image that I have never managed to boot, apart from its installation cd image using virt-install
+
+20Gb w7 image:
+
+# losetup /dev/loop0 /vm/w7.img; kpartx -a /dev/loop0
+# fdisk -l /dev/loop0
+
+Disk /dev/loop0: 21.5 GB, 21474836480 bytes
+255 heads, 63 sectors/track, 2610 cylinders
+Units = cylinders of 16065 * 512 = 8225280 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disk identifier: 0xaf12c11f
+
+      Device Boot      Start         End      Blocks   Id  System
+/dev/loop0p1   *           1          13      102400    7  HPFS/NTFS
+Partition 1 does not end on cylinder boundary.
+/dev/loop0p2              13        2611    20867072    7  HPFS/NTFS
+Partition 2 does not end on cylinder boundary.
+
+# hexedit /dev/mapper/loop0p1
+00000000   EB 52 90 4E  54 46 53 20  20 20 20 00  02 08 00 00  00 00 00 00  00 F8 00 00  3F 00 10 00  00 08 00 00  .R.NTFS    .............?.......
+00000020   00 00 00 00  80 00 80 00  FF 1F 03 00  00 00 00 00  55 21 00 00  00 00 00 00  02 00 00 00  00 00 00 00  ................U!..............
+
+
+# hexedit /dev/mapper/loop0p2
+00000000   EB 52 90 4E  54 46 53 20  20 20 20 00  02 08 00 00  00 00 00 00  00 F8 00 00  3F 00 10 00  00 28 03 00  .R.NTFS    .............?....(..
+00000020   00 00 00 00  80 00 80 00  FF CF 7C 02  00 00 00 00  00 00 0C 00  00 00 00 00  02 00 00 00  00 00 00 00  ..........|.....................
+
+
+# kpartx -d /dev/loop0; losetup -d /dev/loop0
+
+I changed location 0x1a to 0xFF on one or other or both partitions and it still will not boot in virt-manager.
+
+Cheers,
+Andy.
+
+Hi Andy
+
+When i look at your w7 partition table output, then there seems to be a problem with start/end cylinders. 
+
+Your first partitions last cylinder is 13, but also the start cylinder of your second partition is 13. two partitions should not share the same cylinder/sector! Something seems to be messed up. 
+
+I would create a loop device and then use a deep scan with "testdisk" on that loop device. May be it's possible to correct the wrong entrys in the partition table.
+
+Cheers Andreas
+
+I had the same problem.
+
+I.ve tried with VirtualBox and KVM: Win Xp SP3 hang on the same point (mup.sys when "safe mode")...
+Both has the same problem I believe the libvirt maybe the cause.  
+
+So I use "Raw Access" with VirtualBox that solved my problem....
+
+00:00:01.385 [/Devices/piix3ide/0/LUN#0/AttachedDriver/Config/] (level 6)
+00:00:01.385   Format <string>  = "VMDK" (cb=5)
+00:00:01.385   Path   <string>  = "/home/jtloni/.VirtualBox/HardDisks/xp3.vmdk" (cb=45)
+
+hope will help..
+
+Andreas,
+
+The program that created the disk image seems confused, but it worked for creating a VM for FC11.
+Windows install seems to run fine, until wanting to boot from the drive it created.
+I don't know what creates the drive image and geometry, but it is broken.
+
+I think this is what I used to create the VM, but I have messed around with so many configurations and methods, I'm not sure what is what anymore.
+
+virt-install --connect qemu:///system -n w7 -r 2048 --vcpus=2 \
+--disk path=/vm/w7.img,size=20,sparse=false,format=qcow2 \
+-c /vm/w7cd.iso --vnc --noautoconsole \
+--os-type windows --os-variant win7 --accelerate --network=bridge:br0 --hvm
+
+How many thousands of people have struggled with this and also got nowhere?
+It just looks like the virt-install developers have not tasted their own dogfood!
+
+LVM is supposed to be easy - just select vm image and boot, but the more
+I read about VMs, kvm, qemu, virtualbox, virsh etc, the more confused I get on how they
+relate to each other.
+
+testdisk reports this:
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Disk /dev/loop0 - 21 GB / 20 GiB - CHS 41943040 1 1         (wtf ??)
+
+     Partition                  Start        End    Size in sectors
+ 1 * HPFS - NTFS                 2048     206847     204800 [System Reserved]
+ 2 P HPFS - NTFS               206848   41940991   41734144
+
+
+Select 1:
+Disk /dev/loop0 - 21 GB / 20 GiB - CHS 41943040 1 1
+     Partition                  Start        End    Size in sectors
+ 1 * HPFS - NTFS                 2048     206847     204800 [System Reserved]
+
+Boot sector
+Warning: Incorrect number of heads/cylinder 16 (NTFS) != 1 (HD)
+Warning: Incorrect number of sectors per track 63 (NTFS) != 1 (HD)
+Status: OK
+
+Backup boot sector
+Warning: Incorrect number of heads/cylinder 16 (NTFS) != 1 (HD)
+Warning: Incorrect number of sectors per track 63 (NTFS) != 1 (HD)
+Status: OK
+
+Sectors are identical.
+
+A valid NTFS Boot sector must be present in order to access
+any data; even if the partition is not bootable.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+
+Rebuild BS:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Disk /dev/loop0 - 21 GB / 20 GiB - CHS 41943040 1 1
+     Partition                  Start        End    Size in sectors
+ 1 * HPFS - NTFS                 2048     206847     204800 [System Reserved]
+
+filesystem size           204800 204800
+sectors_per_cluster       8 8
+mft_lcn                   8533 8533
+mftmirr_lcn               2 2
+clusters_per_mft_record   -10 -10
+clusters_per_index_record 1 1
+Extrapolated boot sector and current boot sector are different.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Q
+
+Select 2:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Disk /dev/loop0 - 21 GB / 20 GiB - CHS 41943040 1 1
+     Partition                  Start        End    Size in sectors
+ 2 P HPFS - NTFS               206848   41940991   41734144
+
+Boot sector
+Warning: Incorrect number of heads/cylinder 16 (NTFS) != 1 (HD)
+Warning: Incorrect number of sectors per track 63 (NTFS) != 1 (HD)
+Status: OK
+
+Backup boot sector
+Warning: Incorrect number of heads/cylinder 16 (NTFS) != 1 (HD)
+Warning: Incorrect number of sectors per track 63 (NTFS) != 1 (HD)
+Status: OK
+
+Sectors are identical.
+
+A valid NTFS Boot sector must be present in order to access
+any data; even if the partition is not bootable.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Rebuild BS:
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Disk /dev/loop0 - 21 GB / 20 GiB - CHS 41943040 1 1
+     Partition                  Start        End    Size in sectors
+ 2 P HPFS - NTFS               206848   41940991   41734144
+
+filesystem size           41734144 41734144
+sectors_per_cluster       8 8
+mft_lcn                   786432 786432
+mftmirr_lcn               2 2
+clusters_per_mft_record   -10 -10
+clusters_per_index_record 1 1
+Extrapolated boot sector and current boot sector are different.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It looks a mess.
+
+
+
+
+This appears to be fixed in 0.13-tobe by this patch:
+http://lists.gnu.org/archive/html/qemu-devel/2010-07/msg00152.html
+(hence it's "fix released" in debian which now has 0.13 in experimental).
+
+(and it is also filed agains debian qemu-kvm package, not just qemu -- http://bugs.debian.org/588739 )
+
+This is fixed by a backport of the mentioned patchset to stable-0.12 branch, in qemu git tree, see http://git.savannah.gnu.org/gitweb/?p=qemu.git;a=commit;h=6394bd0e05441c363ebb73597c74c951378810e6
+
+This bug is annoying. I don't know who patched what but:
+
+1. I finally was able (with version 0.12.5) to set up a WinXP installation which is able to boot on its own.
+
+2. But this works only with IDE, if I try to use VirtIO I still can't boot the installation.
+
+3. I just updated from 0.12.5 to 0.12.5-r1 and again I can't boot the WinXP installation on IDE.
+
+What the hell are you doing?
+
+I don't know what's wrong but qemu-kvm works with Windows Vista and above much better than with Windows XP atm. Windows Server 2008 boots on it's own even with the non-signed viostor drivers. 
+
+P.S.: I just read the link posted by Michael.
+
+I have also to mention that this boot problem not only appears by using the -drive parameter, even the good old -hda got this bug.
+
+I've also tried to correct some funny offsets in the NTFS header, but all offsets were already set to the right values. And it doesn't boot at all.
+
+Does anyone else has similar problem?  With 0.12.4 I were able to repeat it.  With 0.12.5 all winxp and win2003 installations, existing and new, just work with either -drive or -hda or with virtio...
+
+This bug was fixed in the package qemu-kvm - 0.12.5+noroms-0ubuntu6
+
+---------------
+qemu-kvm (0.12.5+noroms-0ubuntu6) maverick; urgency=low
+
+  * debian/fix-CMOS-info-for-drives-defined-with--device.patch: make sure
+    the CMOS knows about the correct geometry so Windows XP installs
+    properly. (LP: #586175)
+ -- Marc Deslauriers <email address hidden>   Wed, 15 Sep 2010 19:48:15 -0400
+
+In qemu-kvm-0.12.5-r1 Windows XP/2003 is booting fine on IDE, but it hangs directly after the first reboot of the Windows setup if you try to install it on a viostor drive. Windows Vista and higher never had any problems in any version of qemu-kvm with any drive (IDE and viostor)...
+
+I'm using the binaries of viostor-1.11.1, which I got from this site: http://www.linux-kvm.com/content/latest-windows-virtio-drivers
+
+virtio disk is entrely different story, unrelated to this issue.
+

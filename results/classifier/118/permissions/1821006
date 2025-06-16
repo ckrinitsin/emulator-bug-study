@@ -1,0 +1,143 @@
+permissions: 0.851
+device: 0.847
+register: 0.845
+architecture: 0.832
+performance: 0.824
+virtual: 0.813
+assembly: 0.803
+kernel: 0.795
+files: 0.790
+debug: 0.789
+boot: 0.789
+arm: 0.775
+PID: 0.774
+network: 0.771
+semantic: 0.763
+risc-v: 0.758
+VMM: 0.748
+socket: 0.744
+peripherals: 0.720
+user-level: 0.697
+graphic: 0.678
+ppc: 0.669
+mistranslation: 0.648
+vnc: 0.638
+hypervisor: 0.607
+KVM: 0.604
+TCG: 0.600
+x86: 0.588
+i386: 0.478
+
+qemu: Unsupported syscall: 382
+
+I used
+
+qemu-user-static/stable,stable,now 1:2.8+dfsg-6+deb9u5 amd64 [installed]
+
+When I try to build an image of a docker for an arm, an error occurs.
+
+This affects the operation of applications.
+
+
+Dockerfile
+
+ARG ARCH
+FROM ${ARCH}/debian:buster-slim
+
+RUN \
+    printf "Install dependencies...\n" && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl
+
+RUN curl https://google.com
+
+EOF
+
+The command that I run
+
+docker build --build-arg ARCH=arm32v7 --file ./Dockerfile -t test .
+
+
+root@unit6:/lib/binfmt.d# cat qemu-arm-static.conf 
+:qemu-arm:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:F
+
+Here is a related discussion.
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=923479
+
+I don't suppose you have a testcase that doesn't require docker?
+
+Syscall 382 is renameat2 for arm. Note that messages from QEMU about unsupported syscalls are often harmless, because typically they only appear for relatively new syscalls which QEMU hasn't implemented yet. The guest code will have a fallback path so it works on older kernels which don't implement the syscall, so a message is printed but the application still runs. So if the guest program is failing then it is quite likely to be for an entirely unrelated reason to the missing syscalls.
+
+
+...that said, we should implement renameat2 provided that the host kernel does. What host kernel version are you using, and what host kernel minimum requirement was the glibc for your guest compiled to require? renameat2 was added in kernel 3.15, so if your host kernel is older than this but your guest glibc assumes it has at least 3.15 then there's no way QEMU can bridge this gap.
+
+
+Yes, you are right the application works correctly. At least the result is expected.
+
+Vesion kernel
+le9i0nx@unit6:~$ uname -a
+Linux unit6 4.9.0-8-rt-amd64 #1 SMP PREEMPT RT Debian 4.9.144-3.1 (2019-02-19) x86_64 GNU/Linux
+Host debian 9
+quest debian 10
+
+quest glib version
+root@ddf2245902b3:/app# apt list | grep libc
+
+WARNING: apt does not have a stable CLI interface. Use with caution in scripts.
+
+libc-bin/now 2.28-7 armhf [installed,local]
+libc6/now 2.28-7 armhf [installed,local]
+
+Examining the build source. I found an option
+MIN_KERNEL_SUPPORTED := 3.2
+
+I also tried to repeat through chroot. a message also appears.
+https://wiki.debian.org/Arm64Qemu I use armhf.
+
+qemu-debootstrap --arch=armhf --keyring /usr/share/keyrings/debian-archive-keyring.gpg --variant=buildd --exclude=debfoster buster  debian-armhf http://ftp.debian.org/debian
+chroot debian-armhf/
+apt-get install -y --no-install-recommends ca-certificates curl
+...
+debconf: falling back to frontend: Readline
+Updating certificates in /etc/ssl/certs...
+qemu: Unsupported syscall: 382
+128 added, 0 removed; done.
+Setting up libgssapi-krb5-2:armhf (1.17-2) ...
+Setting up libcurl4:armhf (7.64.0-1) ...
+Setting up curl (7.64.0-1) ...
+Processing triggers for libc-bin (2.28-8) ...
+Processing triggers for ca-certificates (20190110) ...
+...
+
+
+
+
+
+Upgrading the kernel did not change the situation.
+
+le9i0nx@unit6:~$ uname -a
+Linux unit6 4.19.0-0.bpo.2-rt-amd64 #1 SMP PREEMPT RT Debian 4.19.16-1~bpo9+1 (2019-02-07) x86_64 GNU/Linux
+
+...
+Updating certificates in /etc/ssl/certs...
+qemu: Unsupported syscall: 382
+0 added, 0 removed; done.
+Running hooks in /etc/ca-certificates/update.d...
+...
+
+Thanks for that repro case with qemu-debootstrap and chroot. I can confirm that I can repro this with QEMU version 2.11.1. However with current head of git QEMU this is fixed -- the "unsupported syscall" message is not printed. We added support for the renameat2 syscall in commit 95d0307cc10ca3df87 which is in QEMU version 2.12 and later -- could you try with a newer QEMU version?
+
+
+Unfortunately I was only able to check in 3.1.
+There is no problem with the call.
+
+root@unit6:/mnt/build/chroot# dpkg -l | grep qemu-user-static
+ii  qemu-user-static                                                 1:3.1+dfsg-5                                amd64        QEMU user mode emulation binaries (static version)
+
+
+Hello.
+
+As far as I can tell, this is still an issue with the latest available ubuntu, 18.04.2, which has: version 2.11.1(Debian 1:2.11+dfsg-1ubuntu7.15)
+
+Anyone know where I could get a newer version that would be compatible with Ubuntu?
+

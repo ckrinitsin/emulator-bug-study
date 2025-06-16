@@ -1,0 +1,356 @@
+risc-v: 0.715
+performance: 0.714
+TCG: 0.712
+KVM: 0.711
+register: 0.703
+peripherals: 0.701
+user-level: 0.695
+mistranslation: 0.694
+hypervisor: 0.677
+device: 0.675
+x86: 0.666
+virtual: 0.660
+vnc: 0.660
+ppc: 0.657
+architecture: 0.654
+debug: 0.653
+permissions: 0.648
+arm: 0.643
+i386: 0.637
+VMM: 0.636
+graphic: 0.629
+boot: 0.628
+files: 0.627
+semantic: 0.627
+PID: 0.616
+kernel: 0.609
+assembly: 0.605
+socket: 0.602
+network: 0.597
+
+SIGSEGV in memory_region_access_valid on Sabre Lite board
+
+I'm trying to emulate a Sabre Lite board and booting U-Boot, but I'm encountering a SIGSEGV almost immediately after starting QEMU.
+
+QEMU version: 6f1d2d1c5ad20d464705b17318cb7ca495f8078a
+U-Boot version: mx6qsabrelite_defconfig 2016.05 (with http://git.denx.de/?p=u-boot.git;a=commitdiff;h=1f516faa45611aedc8c2e3f303b3866f615d481e reverted, since it hangs the CPU)
+
+$ gdb --args ./arm-softmmu/qemu-system-arm -machine sabrelite -kernel ~/u-boot-2016.05/u-boot
+GNU gdb (Ubuntu 7.7.1-0ubuntu5~14.04.2) 7.7.1
+
+...
+
+(gdb) r
+Starting program: /home/kota/qemu/build/arm-softmmu/qemu-system-arm -machine sabrelite -kernel /home/kota/u-boot-2016.05/u-boot
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7fffe9074700 (LWP 18025)]
+[New Thread 0x7fffe58c0700 (LWP 18027)]
+
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fffe58c0700 (LWP 18027)]
+0x00005555557aaaa8 in memory_region_access_valid (mr=mr@entry=0x7fffe594e0e0, addr=addr@entry=0, size=size@entry=4, is_write=is_write@entry=true) at /home/kota/qemu/memory.c:1143
+1143	    if (!mr->ops->valid.unaligned && (addr & (size - 1))) {
+(gdb) bt
+#0  0x00005555557aaaa8 in memory_region_access_valid (mr=mr@entry=0x7fffe594e0e0, addr=addr@entry=0, size=size@entry=4, is_write=is_write@entry=true) at /home/kota/qemu/memory.c:1143
+#1  0x00005555557aacbd in memory_region_dispatch_write (mr=0x7fffe594e0e0, addr=0, data=3925868734, size=4, attrs=...) at /home/kota/qemu/memory.c:1249
+#2  0x00007fffe645a4e4 in code_gen_buffer ()
+#3  0x0000555555778d4d in cpu_tb_exec (itb=<optimized out>, itb=<optimized out>, cpu=0x7fffe58c92e0) at /home/kota/qemu/cpu-exec.c:166
+#4  cpu_loop_exec_tb (sc=0x7fffe58bfab0, tb_exit=<synthetic pointer>, last_tb=0x7fffe58bfaa0, tb=<optimized out>, cpu=0x7fffe58c92e0) at /home/kota/qemu/cpu-exec.c:530
+#5  cpu_arm_exec (cpu=cpu@entry=0x7fffe58c1080) at /home/kota/qemu/cpu-exec.c:626
+#6  0x0000555555798a20 in tcg_cpu_exec (cpu=0x7fffe58c1080) at /home/kota/qemu/cpus.c:1541
+#7  tcg_exec_all () at /home/kota/qemu/cpus.c:1574
+#8  qemu_tcg_cpu_thread_fn (arg=<optimized out>) at /home/kota/qemu/cpus.c:1171
+#9  0x00007ffff27f1184 in start_thread (arg=0x7fffe58c0700) at pthread_create.c:312
+#10 0x00007ffff251e37d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+
+I've narrowed the crash to a stmia instruction in U-Boot's relocate_code:
+
+Breakpoint 3, relocate_code () at arch/arm/lib/relocate.S:81
+81		subs	r4, r0, r1		/* r4 <- relocation offset */
+(gdb) disas
+Dump of assembler code for function relocate_code:
+   0x17802620 <+0>:	ldr	r1, [pc, #76]	; 0x17802674 <relocate_done+4>
+=> 0x17802624 <+4>:	subs	r4, r0, r1
+   0x17802628 <+8>:	beq	0x17802670 <relocate_done>
+   0x1780262c <+12>:	ldr	r2, [pc, #68]	; 0x17802678 <relocate_done+8>
+   0x17802630 <+16>:	ldm	r1!, {r10, r11}
+   0x17802634 <+20>:	stmia	r0!, {r10, r11}
+   0x17802638 <+24>:	cmp	r1, r2
+   0x1780263c <+28>:	bcc	0x17802630 <relocate_code+16>
+   0x17802640 <+32>:	ldr	r2, [pc, #52]	; 0x1780267c <relocate_done+12>
+   0x17802644 <+36>:	ldr	r3, [pc, #52]	; 0x17802680 <relocate_done+16>
+   0x17802648 <+0>:	ldm	r2!, {r0, r1}
+   0x1780264c <+4>:	and	r1, r1, #255	; 0xff
+   0x17802650 <+8>:	cmp	r1, #23
+   0x17802654 <+12>:	bne	0x17802668 <fixnext>
+   0x17802658 <+16>:	add	r0, r0, r4
+   0x1780265c <+20>:	ldr	r1, [r0]
+   0x17802660 <+24>:	add	r1, r1, r4
+   0x17802664 <+28>:	str	r1, [r0]
+   0x17802668 <+0>:	cmp	r2, r3
+   0x1780266c <+4>:	bcc	0x17802648 <fixloop>
+   0x17802670 <+0>:	bx	lr
+End of assembler dump.
+(gdb) si
+82		beq	relocate_done		/* skip relocation */
+(gdb) 
+83		ldr	r2, =__image_copy_end	/* r2 <- SRC &__image_copy_end */
+(gdb) 
+86		ldmia	r1!, {r10-r11}		/* copy from source address [r1]    */
+(gdb) 
+87		stmia	r0!, {r10-r11}		/* copy to   target address [r0]    */
+(gdb) bt
+#0  relocate_code () at arch/arm/lib/relocate.S:87
+#1  0x178025cc in _main () at arch/arm/lib/crt0.S:121
+Backtrace stopped: previous frame identical to this frame (corrupt stack?)
+(gdb) si
+Remote connection closed
+
+Registers at location of crash:
+(gdb) info reg
+r0             0x0	0
+r1             0x17800008	394264584
+r2             0x178655e8	394679784
+r3             0x0	0
+r4             0xe8800000	-394264576
+r5             0x17800338	394265400
+r6             0x0	0
+r7             0x0	0
+r8             0x0	0
+r9             0x4f53beb8	1330888376
+r10            0xea0000be	-369098562
+r11            0xe59ff014	-442503148
+r12            0x4f53bfb0	1330888624
+sp             0x4f53be90	0x4f53be90
+lr             0x178025cc	394274252
+pc             0x17802634	0x17802634 <relocate_code+20>
+cpsr           0x800001d3	-2147483181
+
+We shouldn't really be segfaulting in QEMU no matter what the guest does. Can you put the guest binary somewhere where we can get it, please?
+
+
+Attached, though I've since recompiled it (with no further changes) so addresses might no longer match the ones in my original report. It still crashes, though
+
+This issue as same as when I build yocto sabrelite build. You can find detailed information as below:
+berte [ ~/playground/fsl-arm-yocto-bsp/hmi_test/tmp/deploy/images/imx6dlsabresd ]$ gdb --args  ~/playground/qemu/debug/arm-softmmu/qemu-system-arm -smp 4 -M sabrelite -m 1024M -kernel u-boot.imx-sd
+GNU gdb (Gentoo 7.10.1 vanilla) 7.10.1
+Copyright (C) 2015 Free Software Foundation, Inc.
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.  Type "show copying"
+and "show warranty" for details.
+This GDB was configured as "x86_64-pc-linux-gnu".
+Type "show configuration" for configuration details.
+For bug reporting instructions, please see:
+<https://bugs.gentoo.org/>.
+Find the GDB manual and other documentation resources online at:
+<http://www.gnu.org/software/gdb/documentation/>.
+For help, type "help".
+Type "apropos word" to search for commands related to "word"...
+Reading symbols from /home/berte/playground/qemu/debug/arm-softmmu/qemu-system-arm...done.
+(gdb) r
+Starting program: /home/berte/playground/qemu/debug/arm-softmmu/qemu-system-arm -smp 4 -M sabrelite -m 1024M -kernel u-boot.imx-sd
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib64/libthread_db.so.1".
+[New Thread 0x7fffeb37b700 (LWP 8652)]
+[New Thread 0x7fffd63ca700 (LWP 8653)]
+Program received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fffd63ca700 (LWP 8653)]
+0x00005555557ac1fa in memory_region_access_valid (mr=0x7ffff7f2b0e0, addr=0, size=1, is_write=true) at /home/berte/playground/qemu/memory.c:1143
+1143	    if (!mr->ops->valid.unaligned && (addr & (size - 1))) {
+(gdb) bt
+#0  0x00005555557ac1fa in memory_region_access_valid (mr=0x7ffff7f2b0e0, addr=0, size=1, is_write=true) at /home/berte/playground/qemu/memory.c:1143
+#1  0x00005555557ac663 in memory_region_dispatch_write (mr=0x7ffff7f2b0e0, addr=0, data=0, size=1, attrs=...) at /home/berte/playground/qemu/memory.c:1249
+#2  0x00005555557b24f4 in io_writeb (env=0x7ffff7ea62f8, iotlbentry=0x7ffff7eb9688, val=0 '\000', addr=0, retaddr=140736862856889)
+    at /home/berte/playground/qemu/softmmu_template.h:369
+#3  0x00005555557b2837 in helper_ret_stb_mmu (env=0x7ffff7ea62f8, addr=0, val=0 '\000', oi=4, retaddr=140736862856889)
+    at /home/berte/playground/qemu/softmmu_template.h:409
+#4  0x00007fffdab7a6bb in code_gen_buffer ()
+#5  0x000055555576a056 in cpu_tb_exec (cpu=0x7ffff7e9e080, itb=0x7fffd63cb240) at /home/berte/playground/qemu/cpu-exec.c:166
+#6  0x000055555576ab3a in cpu_loop_exec_tb (cpu=0x7ffff7e9e080, tb=0x7fffd63cb240, last_tb=0x7fffd63c9a68, tb_exit=0x7fffd63c9a64, sc=0x7fffd63c9a80)
+    at /home/berte/playground/qemu/cpu-exec.c:530
+#7  0x000055555576ae26 in cpu_arm_exec (cpu=0x7ffff7e9e080) at /home/berte/playground/qemu/cpu-exec.c:626
+#8  0x000055555579483a in tcg_cpu_exec (cpu=0x7ffff7e9e080) at /home/berte/playground/qemu/cpus.c:1541
+#9  0x0000555555794925 in tcg_exec_all () at /home/berte/playground/qemu/cpus.c:1574
+#10 0x0000555555793d05 in qemu_tcg_cpu_thread_fn (arg=0x7ffff7e9e080) at /home/berte/playground/qemu/cpus.c:1171
+#11 0x00007ffff56ec434 in start_thread () from /lib64/libpthread.so.0
+#12 0x00007ffff0fbb28d in clone () from /lib64/libc.so.6
+(gdb) disas
+Dump of assembler code for function memory_region_access_valid:
+   0x00005555557ac1da <+0>:	push   %rbp
+   0x00005555557ac1db <+1>:	mov    %rsp,%rbp
+   0x00005555557ac1de <+4>:	sub    $0x30,%rsp
+   0x00005555557ac1e2 <+8>:	mov    %rdi,-0x18(%rbp)
+   0x00005555557ac1e6 <+12>:	mov    %rsi,-0x20(%rbp)
+   0x00005555557ac1ea <+16>:	mov    %edx,-0x24(%rbp)
+   0x00005555557ac1ed <+19>:	mov    %ecx,%eax
+   0x00005555557ac1ef <+21>:	mov    %al,-0x28(%rbp)
+   0x00005555557ac1f2 <+24>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac1f6 <+28>:	mov    0x48(%rax),%rax
+=> 0x00005555557ac1fa <+32>:	movzbl 0x30(%rax),%eax
+   0x00005555557ac1fe <+36>:	xor    $0x1,%eax
+   0x00005555557ac201 <+39>:	test   %al,%al
+   0x00005555557ac203 <+41>:	je     0x5555557ac220 <memory_region_access_valid+70>
+   0x00005555557ac205 <+43>:	mov    -0x24(%rbp),%eax
+   0x00005555557ac208 <+46>:	sub    $0x1,%eax
+   0x00005555557ac20b <+49>:	mov    %eax,%eax
+   0x00005555557ac20d <+51>:	and    -0x20(%rbp),%rax
+   0x00005555557ac211 <+55>:	test   %rax,%rax
+   0x00005555557ac214 <+58>:	je     0x5555557ac220 <memory_region_access_valid+70>
+   0x00005555557ac216 <+60>:	mov    $0x0,%eax
+   0x00005555557ac21b <+65>:	jmpq   0x5555557ac2f1 <memory_region_access_valid+279>
+   0x00005555557ac220 <+70>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac224 <+74>:	mov    0x48(%rax),%rax
+   0x00005555557ac228 <+78>:	mov    0x38(%rax),%rax
+   0x00005555557ac22c <+82>:	test   %rax,%rax
+   0x00005555557ac22f <+85>:	jne    0x5555557ac23b <memory_region_access_valid+97>
+   0x00005555557ac231 <+87>:	mov    $0x1,%eax
+   0x00005555557ac236 <+92>:	jmpq   0x5555557ac2f1 <memory_region_access_valid+279>
+   0x00005555557ac23b <+97>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac23f <+101>:	mov    0x48(%rax),%rax
+   0x00005555557ac243 <+105>:	mov    0x28(%rax),%eax
+   0x00005555557ac246 <+108>:	mov    %eax,-0x10(%rbp)
+   0x00005555557ac249 <+111>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac24d <+115>:	mov    0x48(%rax),%rax
+   0x00005555557ac251 <+119>:	mov    0x28(%rax),%eax
+   0x00005555557ac254 <+122>:	test   %eax,%eax
+   0x00005555557ac256 <+124>:	jne    0x5555557ac25f <memory_region_access_valid+133>
+   0x00005555557ac258 <+126>:	movl   $0x1,-0x10(%rbp)
+   0x00005555557ac25f <+133>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac263 <+137>:	mov    0x48(%rax),%rax
+   0x00005555557ac267 <+141>:	mov    0x2c(%rax),%eax
+---Type <return> to continue, or q <return> to quit--- 
+   0x00005555557ac26a <+144>:	mov    %eax,-0xc(%rbp)
+   0x00005555557ac26d <+147>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac271 <+151>:	mov    0x48(%rax),%rax
+   0x00005555557ac275 <+155>:	mov    0x2c(%rax),%eax
+   0x00005555557ac278 <+158>:	test   %eax,%eax
+   0x00005555557ac27a <+160>:	jne    0x5555557ac283 <memory_region_access_valid+169>
+   0x00005555557ac27c <+162>:	movl   $0x4,-0xc(%rbp)
+   0x00005555557ac283 <+169>:	mov    -0xc(%rbp),%edx
+   0x00005555557ac286 <+172>:	mov    -0x24(%rbp),%eax
+   0x00005555557ac289 <+175>:	cmp    %eax,%edx
+   0x00005555557ac28b <+177>:	cmova  %eax,%edx
+   0x00005555557ac28e <+180>:	mov    -0x10(%rbp),%eax
+   0x00005555557ac291 <+183>:	cmp    %eax,%edx
+   0x00005555557ac293 <+185>:	cmovae %edx,%eax
+   0x00005555557ac296 <+188>:	mov    %eax,-0x4(%rbp)
+   0x00005555557ac299 <+191>:	movl   $0x0,-0x8(%rbp)
+   0x00005555557ac2a0 <+198>:	jmp    0x5555557ac2e4 <memory_region_access_valid+266>
+   0x00005555557ac2a2 <+200>:	mov    -0x18(%rbp),%rax
+   0x00005555557ac2a6 <+204>:	mov    0x48(%rax),%rax
+   0x00005555557ac2aa <+208>:	mov    0x38(%rax),%rax
+   0x00005555557ac2ae <+212>:	movzbl -0x28(%rbp),%ecx
+   0x00005555557ac2b2 <+216>:	mov    -0x4(%rbp),%edx
+   0x00005555557ac2b5 <+219>:	mov    -0x8(%rbp),%esi
+   0x00005555557ac2b8 <+222>:	movslq %esi,%rdi
+   0x00005555557ac2bb <+225>:	mov    -0x20(%rbp),%rsi
+   0x00005555557ac2bf <+229>:	lea    (%rdi,%rsi,1),%r8
+   0x00005555557ac2c3 <+233>:	mov    -0x18(%rbp),%rsi
+   0x00005555557ac2c7 <+237>:	mov    0x50(%rsi),%rdi
+   0x00005555557ac2cb <+241>:	mov    %r8,%rsi
+   0x00005555557ac2ce <+244>:	callq  *%rax
+   0x00005555557ac2d0 <+246>:	xor    $0x1,%eax
+   0x00005555557ac2d3 <+249>:	test   %al,%al
+   0x00005555557ac2d5 <+251>:	je     0x5555557ac2de <memory_region_access_valid+260>
+   0x00005555557ac2d7 <+253>:	mov    $0x0,%eax
+   0x00005555557ac2dc <+258>:	jmp    0x5555557ac2f1 <memory_region_access_valid+279>
+   0x00005555557ac2de <+260>:	mov    -0x4(%rbp),%eax
+   0x00005555557ac2e1 <+263>:	add    %eax,-0x8(%rbp)
+   0x00005555557ac2e4 <+266>:	mov    -0x8(%rbp),%eax
+   0x00005555557ac2e7 <+269>:	cmp    -0x24(%rbp),%eax
+   0x00005555557ac2ea <+272>:	jb     0x5555557ac2a2 <memory_region_access_valid+200>
+   0x00005555557ac2ec <+274>:	mov    $0x1,%eax
+   0x00005555557ac2f1 <+279>:	leaveq 
+   0x00005555557ac2f2 <+280>:	retq   
+---Type <return> to continue, or q <return> to quit---
+End of assembler dump.
+(gdb) 
+(gdb) info reg
+rax            0x0	0
+rbx            0x4	4
+rcx            0x1	1
+rdx            0x1	1
+rsi            0x0	0
+rdi            0x7ffff7f2b0e0	140737353265376
+rbp            0x7fffd63c93c0	0x7fffd63c93c0
+rsp            0x7fffd63c9390	0x7fffd63c9390
+r8             0x6	6
+r9             0x7	7
+r10            0x0	0
+r11            0x217	535
+r12            0x0	0
+r13            0x7fffffffd70f	140737488344847
+r14            0x7ffff7ea62f8	140737352721144
+r15            0x7fffffffd7d0	140737488345040
+rip            0x5555557ac1fa	0x5555557ac1fa <memory_region_access_valid+32>
+eflags         0x10206	[ PF IF RF ]
+cs             0x33	51
+ss             0x2b	43
+ds             0x0	0
+es             0x0	0
+fs             0x0	0
+gs             0x0	0
+(gdb) 
+
+
+
+
+The immediate cause of this crash is that the guest is trying to write to the imx6.rom region, which (as the name suggests) is read-only, so your guest is probably misconfigured if it's doing that. However we shouldn't crash.
+
+The bug here is that the various imx boards call memory_region_init_rom_device() for the ROMs passing a NULL pointer for the 'ops' argument, which is always a bug. The right API for this is to call memory_region_init_ram() and then memory_region_set_readonly(). We should also assert in memory_region_rom_device() if the ops argument is NULL...
+
+
+I have some patches which I'll post shortly which fix QEMU crashing on attempts to write to the ROM. However this doesn't cause your test binary to work. What happens is that we start executing "instructions" from the start of this binary blob, but it looks like this is actually data:
+
+0x10010000:  402000d1      ldrdmi       r0, [r0], -r1
+0x10010004:  17800000      strne        r0, [r0, r0]
+0x10010008:  00000000      andeq        r0, r0, r0
+0x1001000c:  177ff42c      ldrbne       pc, [pc, -ip, lsr #8]!
+0x10010010:  177ff420      ldrbne       pc, [pc, -r0, lsr #8]!
+0x10010014:  177ff400      ldrbne       pc, [pc, -r0, lsl #8]!
+0x10010018:  00000000      andeq        r0, r0, r0
+0x1001001c:  00000000      andeq        r0, r0, r0
+0x10010020:  177ff000      ldrbne       pc, [pc, -r0]!
+0x10010024:  00065000      andeq        r5, r6, r0
+0x10010028:  00000000      andeq        r0, r0, r0
+0x1001002c:  40f002d2      ldrsbtmi     r0, [r0], #34
+0x10010030:  04ec02cc      strbteq      r0, [ip], #716
+0x10010034:  74070e02      strvc        r0, [r7], #-3586
+0x10010038:  00000c00      andeq        r0, r0, r0, lsl #24
+0x1001003c:  54070e02      strpl        r0, [r7], #-3586
+0x10010040:  00000000      andeq        r0, r0, r0
+0x10010044:  ac040e02      stcge        14, cr0, [r4], {2}
+
+
+Eventually we get to that 'stcge', which isn't a valid instruction for a Cortex-A9, and causes an UNDEF exception. We take the exception to the usual UNDEF vector, where there is no code:
+0x00000004:  00000000      andeq        r0, r0, r0
+0x00000008:  00000000      andeq        r0, r0, r0
+0x0000000c:  00000000      andeq        r0, r0, r0
+0x00000010:  00000000      andeq        r0, r0, r0
+
+and continue to execute NOPs through the whole of this empty ROM until we get to the end of it:
+0x00017ff8:  00000000      andeq        r0, r0, r0
+0x00017ffc:  00000000      andeq        r0, r0, r0
+
+at which point we hit the usual "trying to execute code outside RAM or ROM" error:
+
+qemu: fatal: Trying to execute code outside RAM or ROM at 0x00018000
+
+R00=00000000 R01=ffffffff R02=10000100 R03=00000000
+R04=00000000 R05=00000000 R06=00000000 R07=ffffe3fc
+R08=00000000 R09=00000000 R10=00000000 R11=00000000
+R12=000002cc R13=00000000 R14=10010048 R15=00018000
+PSR=400001db -Z-- A S und32
+
+
+So the underlying problem here is that the thing you're passing to -kernel is neither (1) a Linux kernel nor (2) an ELF format binary, which is what -kernel is expecting.
+
+thanks
+-- PMM
+
+
+Patches fixing the SEGV are now in git master and will be in the 2.7 release.
+
+

@@ -1,0 +1,100 @@
+user-level: 0.960
+peripherals: 0.947
+semantic: 0.946
+debug: 0.938
+permissions: 0.936
+graphic: 0.928
+performance: 0.927
+risc-v: 0.926
+hypervisor: 0.924
+register: 0.918
+virtual: 0.916
+mistranslation: 0.916
+vnc: 0.902
+assembly: 0.900
+architecture: 0.890
+socket: 0.890
+files: 0.884
+VMM: 0.883
+TCG: 0.881
+device: 0.879
+arm: 0.876
+ppc: 0.874
+boot: 0.870
+PID: 0.865
+KVM: 0.853
+network: 0.840
+i386: 0.820
+kernel: 0.787
+x86: 0.774
+
+xhci Control Transfer requiring a Status TRB before starting transfer
+
+This may not necessarily be a bug, but more of a change.
+
+A little background may need to be in order.
+
+With all USB Control transfers, there is a SETUP transfer, zero or more DATA transfers, and if successful, a STATUS transfer.  This STATUS transfer is used to indicate to the recipient that the previous transfers were successful.  For example, in a CONTROL IN transfer, the host sends a SETUP packet to the device, receives zero or more DATA packets, and then on successful transfer, the HOST sends the STATUS packet indicating to the device that all was received.
+
+If no DATA packets are received, the HOST is not to send a STATUS packet.  This could be due to a STALL or other error.
+
+With this in mind, the STATUS transfer, in this case an xHCI STATUS TRB, may not even be on the transfer ring yet.  The HOST software may be waiting for a successful transfer before it submits the STATUS transfer.
+
+However, if you look at the test at line 1701 (https://git.qemu.org/?p=qemu.git;a=blob;f=hw/usb/hcd-xhci.c#l1701), the current code will not start the CONTROL transfer at all if it doesn't see that STATUS TRB on the ring.
+
+In my opinion, this is in error.  It is not required that a STATUS TRB be on the ring to start the CONTROL transfer.  This STATUS TRB can be placed on the ring after a successful SETUP and zero or more DATA transfers followed by a ring to the door bell.  Then after a successful transfer to this point, placing this STATUS TRB on the ring and another ring to the door bell.
+
+In my opinion, the check at line 1701 should be removed.
+
+Thank you,
+Ben
+
+Removing this check will indeed require a bit of a re-write.  The way the code is now, the transfer expects a SETUP packet to be first.  If you remove the check I ask about above, will the next transfer show that it is the STATUS packet?  If so, then the check at line 1696 will indeed catch and not allow the STATUS packet to be accepted.
+
+A little more work might need to be done to remove this check.
+
+It is just a request.
+
+Thank you,
+Ben
+
+Just a little more information.
+
+In section 4.11.2.2, page 159 of version 1.0 of the xHCI specification, it states:
+
+<start quote>
+• The xHC shall NOT check for the following Control transfer error conditions.
+  • If a Data Stage TD follows a Setup Stage TD, where wLength = ‘0’.
+  • If a Status Stage TD does not follow a Setup Stage TD, where wLength = ‘0’.
+  • If a Data Stage TD does not follow a Setup Stage TD, where wLength > ‘0’21.
+  • If the total size of the Data Stage TD is not equal to wLength.
+  • If the Data Stage TRB Direction (DIR) flag does not correspond to the definition in Table 7.
+  • If the Status Stage TRB Direction (DIR) flag does not correspond to the definition in Table 7.
+• The xHC is NOT required to check for the following Control transfer error conditions. 
+  If system software is properly designed these error conditions will never occur. However 
+  if the xHC does check for these conditions it shall generate a Transfer Event for the TRB
+  that the error was detected on with the Completion Code set to TRB Error.
+  • If a Status Stage TD does not follow a Data Stage TD.
+  • If the Setup Stage TRB defines a Length not = 8.
+  • If the Status Stage TRB defines a Length > 0.
+<end quote>
+
+I take the first bullet in the second set as it is not required that the STATUS TRB be on the ring at this point in time.  However, if the controller (xHC) does check, it must place an event TRB on the Event ring indicating an error at the SETUP TRB.
+
+Thank you for your time,
+Ben
+
+Well, no.  Status TB not being present is an error.  The host adapter is not required to check for that error condition though.  If the host adapter checks for that error condition it should queue an transfer error.  So, yes, we could improve qemu a bit here, by throwing an error instead of silently waiting forever.  Note that current behavior doesn't violate the spec, the host adapter is not required to send an error event.
+
+I believe it is required to send an error event.  It checked for the STATUS TRB and found that it was missing, therefore it must send an Error Event.
+
+This is (not so clearly) stated in the specification and I have quoted this in a previous comment.
+
+I took it as:
+If the controller checks for the error and then does not processes the transfer due to the check, the controller is required to place an Error Event on the Event ring.
+
+Therefore, QEMU either needs to follow through with the check and place an Error on the Event Ring *or* not do the 'check and return'.
+
+Anyway, this is just my opinion.  Thank you for your time.
+Ben
+

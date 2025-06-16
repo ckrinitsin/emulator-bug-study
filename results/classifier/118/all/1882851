@@ -1,0 +1,522 @@
+device: 0.947
+architecture: 0.946
+register: 0.944
+peripherals: 0.939
+virtual: 0.938
+assembly: 0.938
+kernel: 0.934
+performance: 0.934
+boot: 0.928
+graphic: 0.928
+KVM: 0.927
+debug: 0.927
+PID: 0.926
+user-level: 0.925
+semantic: 0.925
+files: 0.922
+risc-v: 0.921
+TCG: 0.920
+arm: 0.920
+ppc: 0.916
+hypervisor: 0.907
+vnc: 0.906
+permissions: 0.906
+VMM: 0.905
+socket: 0.904
+mistranslation: 0.891
+network: 0.890
+x86: 0.836
+i386: 0.813
+
+QEMU video freezes with "Guest disabled display" (virtio driver)
+
+I am using Arch Linux as my Guest and Host OS, after starting qemu with the following command:
+
+  $ qemu-system-x86_64 -enable-kvm -hda arch-zoom.qcow2 -m 4G -vga virtio
+
+and waiting for a screen blank, I get this message:
+
+  Guest disabled display
+
+And nothing happens after that, I can move the mouse or hit any key, and the message is still there.
+
+I can still reboot the VM but that's not optimal.
+
+I can reproduce this with the latest QEMU release (5.0.0) or git master, 
+I also tried this with older releases (4.0.0, 3.0.0) and the issue is still there.
+
+I can't reproduce this with other video drivers (std, qxl).
+
+With std/qxl the screen will blank a bit and then continue as normal.
+
+OK, I found a workaround: sendkey ctrl-alt-f1 from the QEMU console (ctrl alt 2) then I can switch back to X and continue from where I left off.
+
+Strange, that workaround doesn't work anymore.
+
+My bad, the workaround works, it's just a bit tricky.
+
+`xset dpms force off' on the guest is a good way to reproduce it.
+
+Hmm, happens with xorg only.
+Wayland behaves as expected (any mouse/kbd event wakes up the screen).
+Which pretty much implies this is a guest bug.
+
+> Hmm, happens with xorg only.
+
+Nope, I can reproduce it with sway as well (which is another Wayland compositor).
+
+To reproduce it with sway, just do: swaymsg "output * dpms off" and then should you see "Guest disabled display", at that point I'm unable to get back image.
+
+I tried the sendkey ctrl-alt-f2 and then switch back to TTY1 but the "Guest disabled display" remains.
+
+Can you please tell me which compositor you used?
+
+Thanks.
+
+I can't wake up the screen after hitting keys or moving the mouse after turning off the screen with sway.
+
+Gerd: I tried the LTS kernel on Arch Linux (5.4.46-1-lts) and I can't reproduce the bug with this kernel.
+
+It works as expected: `xset dpms force off' triggers the "Guest disabled display" and it disappears after moving the mouse.
+
+Could it be a regression in virtio_gpu?
+
+I guess I'll try the latest linux git and if it's an issue in master, I'll bisect it.
+
+I can reproduce it with current linux git master[1].
+
+1. git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+
+OK, I was able to bisect, here is the result:
+
+[diego@arch-zoom linux]$ git bisect bad
+3954ff10e06e4fbc548fc02ff1fcaaac3228fed5 is the first bad commit
+commit 3954ff10e06e4fbc548fc02ff1fcaaac3228fed5
+Author: Gerd Hoffmann <email address hidden>
+Date:   Thu Dec 12 13:53:44 2019 +0100
+
+    drm/virtio: skip set_scanout if framebuffer didn't change
+
+    v2: also check src rect (Chia-I Wu).
+
+    Signed-off-by: Gerd Hoffmann <email address hidden>
+    Reviewed-by: Chia-I Wu <email address hidden>
+    Link: http://patchwork<email address hidden>
+
+ drivers/gpu/drm/virtio/virtgpu_plane.c | 35 ++++++++++++++++++++--------------
+ 1 file changed, 21 insertions(+), 14 deletions(-)
+[diego@arch-zoom linux]$
+
+
+
+
+I just sanity checked, and can confirm the bad commit causes it, and going back one commit makes it work.
+
+When going through a disable/enable cycle without changing the framebuffer
+the optimization added by commit 3954ff10e06e causes the screen stay
+blank.  Add a bool to force an update to fix that.
+
+Cc: <email address hidden>
+Fixes: 3954ff10e06e ("drm/virtio: skip set_scanout if framebuffer didn't change")
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h     | 1 +
+ drivers/gpu/drm/virtio/virtgpu_display.c | 1 +
+ drivers/gpu/drm/virtio/virtgpu_plane.c   | 4 +++-
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 7879ff58236f..6d5410d5dd84 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -138,6 +138,7 @@ struct virtio_gpu_output {
+ 	int cur_x;
+ 	int cur_y;
+ 	bool enabled;
++	bool need_update;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index 2b7e6ae65546..44e9c7b874f5 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -99,6 +99,7 @@ static void virtio_gpu_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+ 
+ 	output->enabled = true;
++	output->need_update = true;
+ }
+ 
+ static void virtio_gpu_crtc_atomic_disable(struct drm_crtc *crtc,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 52d24179bcec..5948031a9ce8 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -163,7 +163,8 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 	    plane->state->src_w != old_state->src_w ||
+ 	    plane->state->src_h != old_state->src_h ||
+ 	    plane->state->src_x != old_state->src_x ||
+-	    plane->state->src_y != old_state->src_y) {
++	    plane->state->src_y != old_state->src_y ||
++	    output->need_update) {
+ 		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
+ 			  bo->hw_res_handle,
+ 			  plane->state->crtc_w, plane->state->crtc_h,
+@@ -178,6 +179,7 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 					   plane->state->src_h >> 16,
+ 					   plane->state->src_x >> 16,
+ 					   plane->state->src_y >> 16);
++		output->need_update = false;
+ 	}
+ 
+ 	virtio_gpu_cmd_resource_flush(vgdev, bo->hw_res_handle,
+-- 
+2.18.4
+
+
+
+Gerd, thanks. I can confirm your patch fixes the problem with X, but Wayland (sway) is still affected.
+
+I tested X and wayland, and while the "Guest disabled display" no longer hangs on X, it still does hangs under wayland.
+
+Should I bisect again?
+
+Sway log after the crash.
+
+It looks like sway requires swayidle to wake up from sleep[1].
+
+This works:
+
+swayidle timeout 2 'swaymsg "output * dpms off"' resume 'swaymsg "output * dpms on"'
+
+1. https://github.com/swaywm/sway/issues/2914
+
+Yeah, I can reproduce the same exact behavior outside of QEMU with sway and it's consistent to what I observed in QEMU.
+
+> Hmm, happens with xorg only.
+
+I think you were right all along about this, sorry.
+
+Thanks for fixing this bug, feel free to close this bug as fixed.
+
+Will the patch make it for 5.8?
+
+When going through a disable/enable cycle without changing the
+framebuffer the optimization added by commit 3954ff10e06e ("drm/virtio:
+skip set_scanout if framebuffer didn't change") causes the screen stay
+blank.  Add a bool to force an update to fix that.
+
+Cc: <email address hidden>
+Fixes: 3954ff10e06e ("drm/virtio: skip set_scanout if framebuffer didn't change")
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h     | 1 +
+ drivers/gpu/drm/virtio/virtgpu_display.c | 1 +
+ drivers/gpu/drm/virtio/virtgpu_plane.c   | 4 +++-
+ 3 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 9ff9f4ac0522..7b0c319f23c9 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -138,6 +138,7 @@ struct virtio_gpu_output {
+ 	int cur_x;
+ 	int cur_y;
+ 	bool enabled;
++	bool need_update;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index cc7fd957a307..378be5956b30 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -100,6 +100,7 @@ static void virtio_gpu_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+ 
+ 	output->enabled = true;
++	output->need_update = true;
+ }
+ 
+ static void virtio_gpu_crtc_atomic_disable(struct drm_crtc *crtc,
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 52d24179bcec..5948031a9ce8 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -163,7 +163,8 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 	    plane->state->src_w != old_state->src_w ||
+ 	    plane->state->src_h != old_state->src_h ||
+ 	    plane->state->src_x != old_state->src_x ||
+-	    plane->state->src_y != old_state->src_y) {
++	    plane->state->src_y != old_state->src_y ||
++	    output->need_update) {
+ 		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
+ 			  bo->hw_res_handle,
+ 			  plane->state->crtc_w, plane->state->crtc_h,
+@@ -178,6 +179,7 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 					   plane->state->src_h >> 16,
+ 					   plane->state->src_x >> 16,
+ 					   plane->state->src_y >> 16);
++		output->need_update = false;
+ 	}
+ 
+ 	virtio_gpu_cmd_resource_flush(vgdev, bo->hw_res_handle,
+-- 
+2.18.4
+
+
+
+  Hi,
+
+> > --- a/drivers/gpu/drm/virtio/virtgpu_display.c
+> > +++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+> > @@ -100,6 +100,7 @@ static void virtio_gpu_crtc_atomic_enable(struct drm_crtc *crtc,
+> >  	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+> >  
+> >  	output->enabled = true;
+> > +	output->need_update = true;
+
+> > --- a/drivers/gpu/drm/virtio/virtgpu_plane.c
+> > +++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+> > @@ -163,7 +163,8 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+> >  	    plane->state->src_w != old_state->src_w ||
+> >  	    plane->state->src_h != old_state->src_h ||
+> >  	    plane->state->src_x != old_state->src_x ||
+> > -	    plane->state->src_y != old_state->src_y) {
+> > +	    plane->state->src_y != old_state->src_y ||
+> > +	    output->need_update) {
+> 
+> Uh instead of hand-rolling what's essentially a drm_crtc_needs_modeset
+> check, why not use that one? atomic helpers try to keep the usual suspects
+> for state transitions already handy, to avoid every driver rolling their
+> own. Or do I miss something here?
+
+Well, the virtio-gpu virtual hardware can't do plane updates and crtc
+updates independant from each other.  So the crtc callbacks handle
+disable only (we don't need a fb for that) and leave the enable to the
+plane update.
+
+I suspect calling drm_atomic_crtc_needs_modeset() in plane update isn't
+going to fly ...
+
+take care,
+  Gerd
+
+
+
+On Mon, Aug 17, 2020 at 11:03:42AM +0200, Gerd Hoffmann wrote:
+>   Hi,
+> 
+> > > --- a/drivers/gpu/drm/virtio/virtgpu_display.c
+> > > +++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+> > > @@ -100,6 +100,7 @@ static void virtio_gpu_crtc_atomic_enable(struct drm_crtc *crtc,
+> > >  	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
+> > >  
+> > >  	output->enabled = true;
+> > > +	output->need_update = true;
+> 
+> > > --- a/drivers/gpu/drm/virtio/virtgpu_plane.c
+> > > +++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+> > > @@ -163,7 +163,8 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+> > >  	    plane->state->src_w != old_state->src_w ||
+> > >  	    plane->state->src_h != old_state->src_h ||
+> > >  	    plane->state->src_x != old_state->src_x ||
+> > > -	    plane->state->src_y != old_state->src_y) {
+> > > +	    plane->state->src_y != old_state->src_y ||
+> > > +	    output->need_update) {
+> > 
+> > Uh instead of hand-rolling what's essentially a drm_crtc_needs_modeset
+> > check, why not use that one? atomic helpers try to keep the usual suspects
+> > for state transitions already handy, to avoid every driver rolling their
+> > own. Or do I miss something here?
+> 
+> Well, the virtio-gpu virtual hardware can't do plane updates and crtc
+> updates independant from each other.  So the crtc callbacks handle
+> disable only (we don't need a fb for that) and leave the enable to the
+> plane update.
+> 
+> I suspect calling drm_atomic_crtc_needs_modeset() in plane update isn't
+> going to fly ...
+
+Digged a bit more, seems crtc_state->*_changed is cleared after modeset
+so the following plane update wouldn't see it.  Which I think means
+there is no way around tracking that in need_update.
+
+output->enabled is probably not needed though, seems I can replace that
+by either output->crtc.state->enable or ->active.  Not fully sure which
+one, probably ->active.
+
+take care,
+  Gerd
+
+
+
+When going through a disable/enable cycle without changing the
+framebuffer the optimization added by commit 3954ff10e06e ("drm/virtio:
+skip set_scanout if framebuffer didn't change") causes the screen stay
+blank.  Add a bool to force an update to fix that.
+
+v2: use drm_atomic_crtc_needs_modeset() (Daniel).
+
+Cc: <email address hidden>
+Fixes: 3954ff10e06e ("drm/virtio: skip set_scanout if framebuffer didn't change")
+Signed-off-by: Gerd Hoffmann <email address hidden>
+---
+ drivers/gpu/drm/virtio/virtgpu_drv.h     |  1 +
+ drivers/gpu/drm/virtio/virtgpu_display.c | 11 +++++++++++
+ drivers/gpu/drm/virtio/virtgpu_plane.c   |  4 +++-
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 9ff9f4ac0522..4ab1b0ba2925 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -138,6 +138,7 @@ struct virtio_gpu_output {
+ 	int cur_x;
+ 	int cur_y;
+ 	bool enabled;
++	bool needs_modeset;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index 2c2742b8d657..6c26b41f4e0d 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -123,6 +123,17 @@ static int virtio_gpu_crtc_atomic_check(struct drm_crtc *crtc,
+ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 					 struct drm_crtc_state *old_state)
+ {
++	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
++
++	/*
++	 * virtio-gpu can't do modeset and plane update operations
++	 * independant from each other.  So the actual modeset happens
++	 * in the plane update callback, and here we just check
++	 * whenever we must force the modeset.
++	 */
++	if (drm_atomic_crtc_needs_modeset(crtc->state)) {
++		output->needs_modeset = true;
++	}
+ }
+ 
+ static const struct drm_crtc_helper_funcs virtio_gpu_crtc_helper_funcs = {
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 52d24179bcec..65757409d9ed 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -163,7 +163,9 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 	    plane->state->src_w != old_state->src_w ||
+ 	    plane->state->src_h != old_state->src_h ||
+ 	    plane->state->src_x != old_state->src_x ||
+-	    plane->state->src_y != old_state->src_y) {
++	    plane->state->src_y != old_state->src_y ||
++	    output->needs_modeset) {
++		output->needs_modeset = false;
+ 		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
+ 			  bo->hw_res_handle,
+ 			  plane->state->crtc_w, plane->state->crtc_h,
+-- 
+2.18.4
+
+
+
+From: Gerd Hoffmann <email address hidden>
+
+When going through a disable/enable cycle without changing the
+framebuffer the optimization added by commit 3954ff10e06e ("drm/virtio:
+skip set_scanout if framebuffer didn't change") causes the screen stay
+blank.  Add a bool to force an update to fix that.
+
+v2: use drm_atomic_crtc_needs_modeset() (Daniel).
+
+Cc: <email address hidden>
+Fixes: 3954ff10e06e ("drm/virtio: skip set_scanout if framebuffer didn't change")
+Signed-off-by: Gerd Hoffmann <email address hidden>
+Tested-by: Jiri Slaby <email address hidden>
+Tested-by: Diego Viola <email address hidden>
+---
+ drivers/gpu/drm/virtio/virtgpu_display.c | 11 +++++++++++
+ drivers/gpu/drm/virtio/virtgpu_drv.h     |  1 +
+ drivers/gpu/drm/virtio/virtgpu_plane.c   |  4 +++-
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index af55b334be2f..35b5c80f5d85 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -123,6 +123,17 @@ static int virtio_gpu_crtc_atomic_check(struct drm_crtc *crtc,
+ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 					 struct drm_crtc_state *old_state)
+ {
++	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
++
++	/*
++	 * virtio-gpu can't do modeset and plane update operations
++	 * independant from each other.  So the actual modeset happens
++	 * in the plane update callback, and here we just check
++	 * whenever we must force the modeset.
++	 */
++	if (drm_atomic_crtc_needs_modeset(crtc->state)) {
++		output->needs_modeset = true;
++	}
+ }
+ 
+ static const struct drm_crtc_helper_funcs virtio_gpu_crtc_helper_funcs = {
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 9ff9f4ac0522..4ab1b0ba2925 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -138,6 +138,7 @@ struct virtio_gpu_output {
+ 	int cur_x;
+ 	int cur_y;
+ 	bool enabled;
++	bool needs_modeset;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 52d24179bcec..65757409d9ed 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -163,7 +163,9 @@ static void virtio_gpu_primary_plane_update(struct drm_plane *plane,
+ 	    plane->state->src_w != old_state->src_w ||
+ 	    plane->state->src_h != old_state->src_h ||
+ 	    plane->state->src_x != old_state->src_x ||
+-	    plane->state->src_y != old_state->src_y) {
++	    plane->state->src_y != old_state->src_y ||
++	    output->needs_modeset) {
++		output->needs_modeset = false;
+ 		DRM_DEBUG("handle 0x%x, crtc %dx%d+%d+%d, src %dx%d+%d+%d\n",
+ 			  bo->hw_res_handle,
+ 			  plane->state->crtc_w, plane->state->crtc_h,
+-- 
+2.28.0
+
+
+
+On Mon, Aug 24, 2020 at 09:24:40AM +0200, Jiri Slaby wrote:
+> On 18. 08. 20, 9:25, Gerd Hoffmann wrote:
+> > When going through a disable/enable cycle without changing the
+> > framebuffer the optimization added by commit 3954ff10e06e ("drm/virtio:
+> > skip set_scanout if framebuffer didn't change") causes the screen stay
+> > blank.  Add a bool to force an update to fix that.
+> > 
+> > v2: use drm_atomic_crtc_needs_modeset() (Daniel).
+> > 
+> > Cc: <email address hidden>
+> > Fixes: 3954ff10e06e ("drm/virtio: skip set_scanout if framebuffer didn't change")
+> > Signed-off-by: Gerd Hoffmann <email address hidden>
+> 
+> Tested-by: Jiri Slaby <email address hidden>
+
+Ping.  Need an ack or an review to merge this.
+
+thanks,
+  Gerd
+
+
+
+This bug is now fixed with Linux 5.9-rc5, thank you.
+

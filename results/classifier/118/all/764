@@ -1,0 +1,75 @@
+graphic: 0.958
+debug: 0.954
+semantic: 0.944
+virtual: 0.939
+assembly: 0.934
+vnc: 0.933
+register: 0.932
+arm: 0.930
+architecture: 0.930
+TCG: 0.928
+ppc: 0.926
+x86: 0.922
+permissions: 0.920
+PID: 0.920
+boot: 0.919
+performance: 0.918
+device: 0.917
+hypervisor: 0.913
+risc-v: 0.911
+socket: 0.908
+peripherals: 0.906
+KVM: 0.903
+user-level: 0.891
+kernel: 0.883
+VMM: 0.881
+files: 0.873
+network: 0.869
+mistranslation: 0.867
+i386: 0.864
+
+qemu-system-x86 crash (reason: use after free in socket_reconnect_timeout when reconnecting vhost-user dev)
+Description of problem:
+(gdb) bt<br/>
+#0  0x00007f205976b78b in raise () from /usr/lib64/libc.so.6<br/>
+#1  0x00007f205976cab1 in abort () from /usr/lib64/libc.so.6<br/>
+#2  0x00007f205976404a in ?? () from /usr/lib64/libc.so.6<br/>
+#3  0x00007f20597640c2 in __assert_fail () from /usr/lib64/libc.so.6<br/>
+#4  0x00007f20594ea556 in **qemu_mutex_lock_impl**(mutex=<optimized out>, file=<optimized out>, line=<optimized out>)<br/>
+#5  0x00007f205957a4ef in **socket_reconnect_timeout** (opaque=<optimized out>)<br/>
+#6  0x00007f205993b68d in ?? () from /usr/lib64/libglib-2.0.so.0<br/>
+#7  0x00007f205993aba4 in g_main_context_dispatch () from /usr/lib64/libglib-2.0.so.0<br/>
+#8  0x00007f20594e5d49 in glib_pollfds_poll () at /usr/src/debug/qemu-4.1.0-666.x86_64/util/main-loop.c:218<br/>
+#9  0x00007f20594e5dc2 in os_host_main_loop_wait (timeout=<optimized out>)<br/>
+#10 0x00007f20594e5f5d in main_loop_wait (nonblocking=nonblocking@entry=0)<br/>
+... ...<br/>
+#14 0x0000560919e13180 in main (argc=80, argv=0x7ffebc1d0598, envp=0x7ffebc1d0820)<br/>
+
+at the moment, chr had be free by hot unplug vhost-user dev<br/>
+
+I think the bug cause reason as following:<br/>
+1. when vhost-user dev is connecting state, io-task-worker thread will try call tcp_chr_connect_client_async <br/>
+ again and again to reconnect.<br/>
+2. if reconnect fail, io-task-worker thread will switch to main-thread to handle error, and main-thread will <br/> 
+call qemu_chr_socket_restart_timer again to reconnect again. <br/>
+
+3. But, if a hot unplug operation insert to main-thread before io-task-worker switch to main-thread,<br/>
+   the qemu_chr_socket_restart_timer->socket_reconnect_timeout process will use the released chardev and <br/>
+   trigger qemu crash
+
+in short, the primary cause of this bug is io-task-worker reconnect process and <br/>
+main-thread hot unplug vhost-user-dev process in a race.<br/>
+Steps to reproduce:
+1. in qio_task_thread_worker func, add sleep in the following position: <br/>
+      &emsp;task->thread->completion = g_idle_source_new(); <br/>
+      &emsp;g_source_set_callback(task->thread->completion,<br/>
+                          qio_task_thread_result, task, NULL);<br/>
+      &emsp;**sleep(8);**<br/>
+      &emsp;g_source_attach(task->thread->completion,<br/>
+                    task->thread->context);<br/>
+      &emsp;g_source_unref(task->thread->completion);  <br/>
+2. kill spdk proces or dpdk process, qemu will reconnect to the disconnected vhost-user dev of spdk or dpdk <br/>
+3. hot unplug the disconnected vhost-user dev when reconnect logic goto upper sleep position <br/>
+4. qemu_chr_socket_restart_timer will use the chr after free, and trigger qemu crash
+Additional information:
+

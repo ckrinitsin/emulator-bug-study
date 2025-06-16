@@ -1,0 +1,186 @@
+hypervisor: 0.838
+permissions: 0.829
+device: 0.822
+files: 0.819
+peripherals: 0.818
+architecture: 0.794
+debug: 0.792
+user-level: 0.789
+virtual: 0.783
+performance: 0.781
+TCG: 0.781
+ppc: 0.780
+kernel: 0.777
+register: 0.776
+vnc: 0.776
+assembly: 0.774
+mistranslation: 0.772
+x86: 0.770
+KVM: 0.769
+VMM: 0.762
+PID: 0.758
+arm: 0.757
+semantic: 0.744
+risc-v: 0.735
+graphic: 0.725
+socket: 0.723
+boot: 0.702
+network: 0.664
+i386: 0.653
+
+VHDX is corrupted on expansion
+Description of problem:
+Fresh VHDX corrupts with data loss upon copying data into it.
+Steps to reproduce:
+1. Create new dynamic vhdx file of about 93Gib (unexpanded, starting size is small ~205Mib, freshly created and NTFS formatted in windows.) 
+2. Connect drive using qemu-nbd to /dev/nbd0
+3. Ensure partition using gdisk
+4. format partition with ntfs/ExFAT volume
+5. mount volume
+6. copy/rsync data of about 85Gib of data into the mounted volume
+7. unmount volume
+8. disconnect /dev/nbd0
+9. reconnect /dev/nbd0
+10. attempt mount, sometimes mount may fail if corrupted
+11. If mount succeeds, verify data/all-files using some method like sha256sum. Some data is likely to fail
+
+Given the amount of data I am rsync-ing into the volume, there is very high chance of corruption. 
+
+The corruption is not apparent until **disconnection and reconnection** of virtual-disk. Simply unmounting and remounting without disconnecting is unlikely to cause one to suspect corruption. 
+
+If the expanded corrupted volume is again disconnected, reconnected, reformatted and data is again re-copied onto it, then the volume is less likely to experience a corruption, perhaps because new block allocation is not required.
+
+Errors vary and include:
+- sometimes mount fails
+- sometimes ls -l output is garbled
+- sometimes one cannot cd into a directory
+- several consecutive errors in shasum256 start midway through the file-list processing. Error is shown as if rsync failed and files do not exist.
+  ```
+  sha256sum: ./201207/IMG_2406.JPG: No such file or directory
+  ./201207/IMG_2406.JPG: FAILED open or read
+  ```
+- Doing chdsk on windows may just create FOUND.000/FILE0000.CHK files.
+Additional information:
+See comment https://gitlab.com/qemu-project/qemu/-/issues/136#note_731044761 from where this all began. Some summary included here.
+
+```
+[root@sirius a16]# uname -a
+Linux sirius 5.15.0-60.fc35.x86_64 #1 SMP Tue Nov 2 15:38:03 IST 2021 x86_64 x86_64 x86_64 GNU/Linux
+
+[root@sirius ~]# qemu-system-x86_64 --version
+QEMU emulator version 6.1.0 (qemu-6.1.0-10.fc35)
+Copyright (c) 2003-2021 Fabrice Bellard and the QEMU Project developers
+
+[root@sirius ~]# cat /etc/mtab | grep -E "a16|a17" | grep ntfs3
+/dev/sda16 /mnt/a16 ExFAT rw,relatime,fmask=0022,dmask=0022,iocharset=utf8,errors=remount-ro 0 0
+/dev/sda17 /mnt/a17 ntfs3 rw,relatime,uid=0,gid=0,iocharset=utf8 0 0
+
+[root@sirius ~]# uname -a # self-built rpmbuild kernel from fedora rawhide kernel-src rpm 
+Linux sirius 5.15.0-60.fc35.x86_64 #1 SMP Tue Nov 2 15:38:03 IST 2021 x86_64 x86_64 x86_64 GNU/Linux
+```
+
+Test/Activity being done: About 85Gib of data is copied onto a size 93Gib VHDX on host-FS ntfs3 with guest-FS ntfs3. 
+```
+Prefer windows method: Inside windows-10, using powershell command New-VHD, one may a 93Gib VHDX
+  New-VHD -Path I:\gkpics01.vhdx -SizeBytes 99723771904 -Dynamic
+  Then attach disk and format volume inside to ntfs.
+or Alternatively, Linux method (less preferred)
+  qemu-img create -f qcow2 /mnt/a16/gkpics01.qcow2 99723771904
+  qemu-img create -f vhdx -o subformat=dynamic /mnt/a16/gkpics01.vhdx 99723771904
+:
+sync ; sleep 1 ; qemu-nbd -c /dev/nbd0 /mnt/a16/gkpics01.vhdx
+:
+create appropriate partitions on /dev/nbd0 if not already partitioned
+gdisk /dev/nbd0 
+:
+format volume with filesystem ntfs, or ext4 etc if not already formatted
+mkfs -t ntfs -Q -L fs_gkpics01 /dev/nbd0p2 
+:
+mount partition
+sync ; sleep 1 ; mount -t ntfs3 /dev/nbd0p2 /mnt/t1
+:
+do copy/rsync etc
+( fl="photos001" ; src="/mnt/c13" ; dst="/mnt/t1" ; cd "$src" ;rsync -avH "$fl" "$dst" ; sudo -u gana DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus DISPLAY=:0.0 -- notify-send "$src/$fl" "rsync $src/$fl" )
+:
+sync ; sleep 1 ; umount /mnt/t1
+:
+sync ; sleep 1 ; blockdev --flushbufs /dev/nbd0 ; sleep 2 ; qemu-nbd -d /dev/nbd0 ; sleep 1 ; sync
+:
+sync ; sleep 1 ; qemu-nbd -c /dev/nbd0 /mnt/a16/gkpics01.vhdx
+:
+sync ; sleep 1 ; mount -t ntfs3 /dev/nbd0p2 /mnt/t1
+:
+do ls-l/verify/sha256sum-c etc
+( fl="photos001" ; rtpt="/mnt/t1" ; cd "${rtpt}/${fl}" ; sdate=`date` ; echo "$sdate" ; sha256sum -c "$rtpt/$fl/find.CHECKSUM" --quiet ; echo "$sdate" ; date ; sudo -u gana DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus DISPLAY=:0.0 -- notify-send "$src/$fl" "checksum $src/$fl" )
+```
+
+In the below list detailing under what circumstance corruption occurs
+
+- Format:  kernel-version/ disk-attaching-sw/ hostFS/ VDISK/ guestFS with any parameters in parenthesis.
+- Corruption does happen with kernel-5.15.0-60/qemu-6.1.0-10/ntfs3/VHDX/ntfs3
+- Corruption does happen with kernel-5.15.0-60/qemu-6.1.0-10/ntfs3/VHDX/ext4
+- Corruption does happen with kernel-5.15.0-60/guestfish-1.46.0(backend=direct)/ntfs3/VHDX/ntfs3
+- Corruption does happen with kernel-5.15.0-60/guestfish-1.46.0(backend=libvirt-7.6.0-3)/ntfs3/VHDX/ntfs3
+- Corruption does happen on host-FS **ExFAT too** with kernel-5.15.0-60/qemu-6.1.0-10/ExFAT/VHDX/ntfs3
+- Corruption does happen with kernel-5.15.0-60/qemu-6.0.0-10/ExFAT/VHDX/ntfs3
+- Corruption does happen with kernel-5.14.18-300/qemu-6.0.0-12/ExFAT/VHDX/ntfs3g-fuseblk
+- Corruption does happen with kernel-5.14.18-300/qemu-6.0.0-12/ExFAT/VHDX(created by qemu-img)/ntfs3g-fuseblk
+  ``` Failed to mount '/dev/nbd0p2': Input/output error NTFS is either inconsistent, or there is a hardware fault,```
+- Corruption does **not** happen with kernel-5.14.18-300/qemu-6.0.0-12/ExFAT/qcow2/ext4
+- Corruption does **not** happen with kernel-5.14.18-300/qemu-6.0.0-12/ExFAT/qcow2/ntfs3g-fuseblk
+- Corruption does happen with kernel-5.15.0-60/qemu-6.1.0-10/ExFAT/VHDX(cache=none,aio=threads)/ntfs3
+- Corruption does happen with kernel-5.15.0-60/qemu-6.1.0-10/ExFAT/VHDX(cache=none,aio=io_uring)/ntfs3
+- VHDX fixed disk grows in size. Filed as different bug: https://gitlab.com/qemu-project/qemu/-/issues/806 
+  - Corruption **does happen** with kernel-5.15.0-60/qemu-6.1.0-10/ExFAT/VHDX(fixed)/ntfs3
+    A fixed vhdx disk should not grow in size. It is as if the blocks are added to a vhdx-journal instead of overwriting preallocated blocks.
+- Corruption does happen with kernel-5.15.0-60/qemu-6.1.0-10/ext4/VHDX/ntfs3
+- Corruption does happen with kernel-5.15.2-200/**qemu-6.2.0-rc1**/ExFAT/VHDX/ntfs3
+- Corruption does **not** happen with kernel-5.15.2-200/qemu-6.2.0-rc1/ExFAT/**VMDK**(v4,monolithicSparse)/ntfs3
+- Corruption does not happen with kernel-5.15.2-200/qemu-6.2.0-rc1/ExFAT/VMDK(compat6,monolithicSparse)/ntfs3
+- Corruption does **not** happen with kernel-5.15.2-200/qemu-6.2.0-rc1/ExFAT/**VDI**/ntfs3
+- Corruption does **not** happen with kernel-5.15.2-200/qemu-6.2.0-rc1/ExFAT/**VPC**(dynamic)/ntfs3
+- Corruption does happen with kernel-5.15.2-200/**qemu-5.2.0-8**/ExFAT/VHDX/ntfs3
+- Corruption does happen with kernel-5.15.2-200/**qemu-4.2.1-1**/ExFAT/VHDX/ntfs3
+- Corruption does happen with vhdx-file is on 2Tb NTFS 1Tb partition of **external USB HDD** 2Tb,  with kernel-5.15.2-200/qemu-6.2.0-rc1/ntfs3/VHDX/ntfs3
+- Corruption does happen when using src is on ntfs3 partition on external USB drive, which is **generated synthetic data (sgdata)** sgdata/kernel-5.15.2-200/qemu-6.2.0-rc1/ExFat/VHDX/ntfs3
+- Corruption does happen when starting with qemu-img created vhdx image with sgdata/kernel-5.15.2-200/qemu-6.2.0-rc1/ExFat/VHDX(created by qemu-img)/ext4 superblock mount fail
+- Corruption does happen older fc34-kernel on Fedora-35, sgdata/kernel-5.13.19-200/qemu-6.2.0-rc2/ExFAT/VHDX/ntfs3g-fuseblk , different, fewer files 3 small files affected
+- Corruption does happen with older fc32-kernel on Fedora-35, sgdata/kernel-5.11.22-100/qemu-6.2.0-rc2/ExFAT/VHDX/ntfs3g-fuseblk , fewer files, different, but same as above  3 small files affected, 
+- Corruption does happen with older fc32-kernel on Fedora-35, sgdata/kernel-5.11.22-100/qemu-6.2.0-rc2/ExFAT/VHDX/ext4  
+- Corruption does happen with self-built 5.10 LTS kernel on Fedora-35, sgdata/kernel-5.10.90-200/qemu-6.2.0-1/ExFAT/VHDX/ext4 (sgdata accessed using ntfs-fuseblk)  
+- As the host kernel invoking qemu-nbd, these kernels showed less errors than if they were run inside a VM as a guest. If run as a guest VM, These kernels, 5.15.4 and above, may also have kernel bugs https://bugzilla.kernel.org/show_bug.cgi?id=215460 or https://bugzilla.kernel.org/show_bug.cgi?id=215563 resulting in additional compounded errors in the failure test results, even in raw-img and qcow2(fixed).
+  - Corruption does happen with sgdata/kernel-5.15.4-201/qemu-6.2.0-rc1/ExFAT/VHDX(created by qemu-img)/ext4
+  - Corruption does happen with sgdata/kernel-5.15.4-201/**qemu-6.2.0-rc2**/ExFAT/VHDX(created by qemu-img)/ext4
+  - Corruption does not happen with synthetic-data sgdata/kernel-5.15.4-201/qemu-6.2.0-rc2/ExFAT/VMDK(created by qemu-img)/ext4
+  - Corruption does happen with sgdata/kernel-5.15.5-200/qemu-6.2.0-rc2/ExFAT/VHDX(created by qemu-img)/ext4
+  - Corruption does not happen with sgdata/kernel-5.15.4-201/nbdkit-1.28.2-nbdplugin-qemu-6.2.0-0.rc2/ExFAT/vmdk/ntfs3
+  - Corruption does not happen with sgdata/kernel-5.15.4-201/nbdkit-1.28.2-nbdplugin/ExFAT/vmdk-nbd-vddkplugin/ntfs3
+  - Corruption does happen with sgdata/kernel-5.15.4-201/nbdkit-1.28.2-nbdplugin-qemu-6.2.0-0.rc2/ExFAT/VHDX/ntfs3
+  - Corruption does happen with sgdata/kernel-5.15.6-200 to kernel-5.15.13-200 /qemu-6.2.0-0.rc2/ExFAT/VHDX/ntfs3
+- On Windows-10, these tests may possibly be different bug. Also causes system-wide DiskIO stuck in addition to corruption https://github.com/cloudbase/wnbd/issues/63
+  - Corruption does happen with sgdata/**WIN10**-21H2-19044-1415/**WNBD**-0.2.2-4-g10c1fbe/qemu-6.2.0-rc4/ExFAT/VHDX/NTFS
+  - Corruption **does happen** with sgdata/**WIN10**-21H2-19044-1415/**WNBD**-0.2.2-4-g10c1fbe/qemu-6.2.0-rc4/ExFAT/**qcow2**/NTFS 
+- Possibly different bug, on Windows-10, corruption of virtual-disk from inside VM, no nbd . Maybe https://bugzilla.kernel.org/show_bug.cgi?id=215460 or https://bugzilla.kernel.org/show_bug.cgi?id=215563
+  - Win10-21H2-19044-1415/WHPX/ExFAT/qemu-6.2.0-rc4/alpine-linux-3.15/kernel-5.15.4/VHDX/ntfs3
+  - Win10-21H2-19044-1415/WHPX/ExFAT/qemu-6.2.0-rc4/alpine-linux-3.15/kernel-5.15.4/**qcow2**/ext4
+- Corruption does **not** happen with Fedora-35/kernel-5.17.0-0.rc3.89(SB)/qemu-6.2.0-2/Fedora-Rawhide-202208/kernel-5.17.0-0.rc3.89/ExFAT/**qcow2(dyn)**/ntfs3 data-src: VHDX(dyn)/ntfs3/sgdata
+- Corruption does **not** happen with Fedora-35/kernel-5.17.0-0.rc3.89(SB)/qemu-6.2.0-2/Fedora-Rawhide-202208/kernel-5.17.0-0.rc3.89/ExFAT/qcow2(dyn)/ntfs3 data-src: VHDX(dyn)/**ntfs-fuseblk**/sgdata
+- Corruption **does** happen with Fedora-35/kernel-5.17.0-0.rc3.89(SB)/qemu-6.2.0-2/Fedora-Rawhide-202208/kernel-5.17.0-0.rc3.89/ExFAT/**VHDX**/ntfs3 data-src: VHDX(dyn)/ntfs3/sgdata
+- Corruption **does** happen with Fedora-35/kernel-5.17.0-0.rc3.89(SB)/qemu-6.2.0-2/Fedora-Rawhide-202208/kernel-5.17.0-0.rc3.89/ExFAT/VHDX/ext4 data-src: VHDX(dyn)/**ntfs-fuseblk**/sgdata
+- Corruption **does** happen with Fedora-35/kernel-5.17.0-0.rc3.89(SB)/qemu-6.2.0-2/**Rocky-8.5-Workstation-20211114.iso**/**kernel-4.18.0-348.el8.0.2.x86_64**/ExFAT/VHDX/ext4 data-src: VHDX(dyn)/**ntfs-fuseblk**/sgdata
+
+ExFAT filesystem was considered because it does not have concept of sparse files eliminating that factor from troubleshooting. Furthermore, it may be incorrect to suspect NTFS3, ExFAT or NTFS3g-fuseblk only because they are new/recently mainstreamed filesystems, as there aren't any intense/complex filesystem operations. The filesystem is experiencing only though-put and files are simply copied into it without further operations. Furthermore, ext4 also experiences corruption if on VHDX.
+
+It just seems to me the VHDX support implementation has bugs, corrupts and hence is not reliable.
+
+The qemu test-suite needs test-cases added for testing for vhdx-stress and vhdx-throughput .
+
+More troubleshooting test results are summarized in https://gitlab.com/qemu-project/qemu/-/issues/727#note_745711084
+
+Chief suspect files
+- ~~kernel: nbd: [drivers/block/nbd.c](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/block/nbd.c)~~ can be made to happen via VM
+- ~~kernel: ntfs3~~ no ntfs3 partition required
+- ~~kernel 5.x series~~ bug exists in 4.18.0.348
+- ~~qemu: block~~ doesn't happen to other virtual-disk formats (raw,qcow2) 
+- qemu/VM : seems to happen only when using qemu-nbd or inside qemu-VM
+- qemu: [block/vhdx.c](https://gitlab.com/qemu-project/qemu/-/blob/master/block/vhdx.c) , [block/vhdx_log.c](https://gitlab.com/qemu-project/qemu/-/blob/master/block/vhdx-log.c) , [block/vhdx-endian.c](https://gitlab.com/qemu-project/qemu/-/blob/master/block/vhdx-endian.c) , [block/vhdx.h](https://gitlab.com/qemu-project/qemu/-/blob/master/block/vhdx.h),

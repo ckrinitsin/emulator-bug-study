@@ -1,0 +1,152 @@
+virtual: 0.675
+performance: 0.636
+graphic: 0.620
+register: 0.620
+TCG: 0.586
+debug: 0.556
+user-level: 0.538
+KVM: 0.526
+peripherals: 0.523
+hypervisor: 0.501
+permissions: 0.499
+boot: 0.494
+ppc: 0.494
+network: 0.494
+architecture: 0.489
+device: 0.481
+PID: 0.474
+semantic: 0.473
+files: 0.460
+x86: 0.458
+socket: 0.443
+risc-v: 0.440
+vnc: 0.440
+arm: 0.439
+kernel: 0.436
+assembly: 0.435
+VMM: 0.435
+mistranslation: 0.404
+i386: 0.361
+
+qemu-system-ppc64 segfaults in helper_ldl_mmu
+
+Download a Fedora 19 ISO from:
+http://mirrors.kernel.org/fedora-secondary/releases/19/Fedora/ppc64/iso/
+
+Compile qemu from git (I'm using 401c227b0a1134245ec61c6c5a9997cfc963c8e4
+from today).
+
+Run qemu-system-ppc64 like this:
+
+ppc64-softmmu/qemu-system-ppc64 -M pseries -m 4096 -hda /dev/fedora/f20ppc64 -cdrom /tmp/Fedora-19-ppc64-DVD.iso -netdev user,id=usernet,net=169.254.0.0/16 -device virtio-net-pci,netdev=usernet
+
+Guest gets to yaboot.  If you hit return, qemu segfaults:
+
+Program received signal SIGABRT, Aborted.
+0x00007ffff041fa19 in __GI_raise (sig=sig@entry=6)
+    at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+56	  return INLINE_SYSCALL (tgkill, 3, pid, selftid, sig);
+(gdb) t a a bt
+
+Thread 4 (Thread 0x7fff6eef7700 (LWP 7553)):
+#0  sem_timedwait ()
+    at ../nptl/sysdeps/unix/sysv/linux/x86_64/sem_timedwait.S:101
+#1  0x00005555559a5897 in qemu_sem_timedwait (sem=sem@entry=0x55555631e788, 
+    ms=ms@entry=10000) at util/qemu-thread-posix.c:238
+#2  0x000055555577e54c in worker_thread (opaque=0x55555631e6f0)
+    at thread-pool.c:97
+#3  0x00007ffff625ec53 in start_thread (arg=0x7fff6eef7700)
+    at pthread_create.c:308
+#4  0x00007ffff04df13d in clone ()
+    at ../sysdeps/unix/sysv/linux/x86_64/clone.S:113
+
+Thread 3 (Thread 0x7fff6e605700 (LWP 7547)):
+#0  0x00007ffff041fa19 in __GI_raise (sig=sig@entry=6)
+    at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007ffff0421128 in __GI_abort () at abort.c:90
+#2  0x000055555583ea33 in helper_ldl_mmu (env=0x7ffff7fd7140, addr=1572864, 
+    mmu_idx=1) at /home/rjones/d/qemu/include/exec/softmmu_template.h:153
+#3  0x00007fffab0819d8 in code_gen_buffer ()
+#4  0x00005555557aa7ae in cpu_tb_exec (tb_ptr=<optimized out>, 
+    cpu=0x7ffff7fd7010) at /home/rjones/d/qemu/cpu-exec.c:56
+#5  cpu_ppc_exec (env=env@entry=0x7ffff7fd7140)
+    at /home/rjones/d/qemu/cpu-exec.c:631
+#6  0x00005555557abc35 in tcg_cpu_exec (env=0x7ffff7fd7140)
+    at /home/rjones/d/qemu/cpus.c:1193
+#7  tcg_exec_all () at /home/rjones/d/qemu/cpus.c:1226
+#8  qemu_tcg_cpu_thread_fn (arg=<optimized out>)
+    at /home/rjones/d/qemu/cpus.c:885
+#9  0x00007ffff625ec53 in start_thread (arg=0x7fff6e605700)
+    at pthread_create.c:308
+#10 0x00007ffff04df13d in clone ()
+    at ../sysdeps/unix/sysv/linux/x86_64/clone.S:113
+
+Thread 1 (Thread 0x7ffff7fa9a40 (LWP 7542)):
+#0  0x00007ffff04d4c2f in __GI_ppoll (fds=0x555556483210, nfds=4, 
+    timeout=<optimized out>, timeout@entry=0x7fffffffd940, 
+    sigmask=sigmask@entry=0x0) at ../sysdeps/unix/sysv/linux/ppoll.c:56
+#1  0x0000555555762db9 in ppoll (__ss=0x0, __timeout=0x7fffffffd940, 
+    __nfds=<optimized out>, __fds=<optimized out>)
+    at /usr/include/bits/poll2.h:77
+#2  qemu_poll_ns (fds=<optimized out>, nfds=<optimized out>, 
+    timeout=timeout@entry=951497) at qemu-timer.c:276
+#3  0x000055555572b58c in os_host_main_loop_wait (timeout=951497)
+    at main-loop.c:228
+#4  main_loop_wait (nonblocking=<optimized out>) at main-loop.c:484
+#5  0x00005555555ef9d8 in main_loop () at vl.c:2090
+#6  main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>)
+    at vl.c:4435
+
+NB: This does NOT happen if you specify -cpu POWER7 on the command line.
+
+git bisect points the finger at:
+
+401c227b0a1134245ec61c6c5a9997cfc963c8e4 is the first bad commit
+commit 401c227b0a1134245ec61c6c5a9997cfc963c8e4
+Author: Richard Henderson <email address hidden>
+Date:   Thu Jul 25 07:16:52 2013 -1000
+
+    tcg-i386: Use new return-argument ld/st helpers
+    
+    Discontinue the jump-around-jump-to-jump scheme, trading it for a single
+    immediate move instruction.  The two extra jumps always consume 7 bytes,
+    whereas the immediate move is either 5 or 7 bytes depending on where the
+    code_gen_buffer gets located.
+    
+    Signed-off-by: Richard Henderson <email address hidden>
+
+:040000 040000 dfd9a66c85713cd1886a3342de1e9ac95d7ea43f df8673dea69bc89cc2cc979aa24415e3fea4ed53 M	include
+:040000 040000 1f7cd5291f2c69b4126c63bd567c6b106eb332c9 87e7ece766168dda860b513dc97fe5af28ec2c4b M	tcg
+
+
+I just bisected the same thing down to this commit. It only breaks on one of my x86 machines though. Namely one with
+
+  gcc (SUSE Linux) 4.7.2 20130108 [gcc-4_7-branch revision 195012]
+
+The abort comes from stack protect code:
+
+(gdb) bt
+#0  0x00007f4cdf7ff3d5 in raise () from /lib64/libc.so.6
+#1  0x00007f4cdf800858 in abort () from /lib64/libc.so.6
+#2  0x00007f4ce18f15b9 in helper_ldl_mmu (env=0x7f4cce74f140, addr=2143803008,
+    mmu_idx=1) at /tmp/qemu_src/include/exec/softmmu_template.h:153
+#3  0x00007f4cd71eb335 in ?? ()
+#4  0x0000000000000000 in ?? ()
+(gdb) up
+#1  0x00007f4cdf800858 in abort () from /lib64/libc.so.6
+(gdb)
+#2  0x00007f4ce18f15b9 in helper_ldl_mmu (env=0x7f4cce74f140, addr=2143803008,
+    mmu_idx=1) at /tmp/qemu_src/include/exec/softmmu_template.h:153
+warning: Source file is more recent than executable.
+153	                                                        GETPC_EXT());
+(gdb) p /x addr
+$1 = 0x7fc7d680
+(gdb) x /i $pc
+=> 0x7f4ce18f15b9 <helper_ldl_mmu+121>:
+    callq  0x7f4ce16d3550 <__stack_chk_fail@plt>
+
+Fix posted: http://patchwork.ozlabs.org/patch/270872/
+
+
+Commit 584950fd4e4d6ca580800e46f1b41cf1b0b4236c
+

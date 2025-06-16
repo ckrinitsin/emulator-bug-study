@@ -1,0 +1,144 @@
+user-level: 0.866
+architecture: 0.842
+register: 0.838
+risc-v: 0.820
+device: 0.813
+virtual: 0.802
+mistranslation: 0.800
+graphic: 0.799
+assembly: 0.797
+semantic: 0.795
+peripherals: 0.784
+performance: 0.783
+PID: 0.783
+files: 0.780
+ppc: 0.779
+network: 0.776
+arm: 0.774
+permissions: 0.769
+boot: 0.763
+KVM: 0.762
+debug: 0.758
+VMM: 0.746
+vnc: 0.740
+socket: 0.731
+TCG: 0.731
+x86: 0.727
+kernel: 0.702
+hypervisor: 0.675
+i386: 0.619
+--------------------
+arm: 0.878
+kernel: 0.660
+hypervisor: 0.403
+virtual: 0.132
+debug: 0.101
+files: 0.054
+architecture: 0.045
+boot: 0.042
+PID: 0.026
+TCG: 0.014
+ppc: 0.013
+user-level: 0.010
+register: 0.010
+device: 0.007
+semantic: 0.006
+socket: 0.005
+network: 0.005
+performance: 0.004
+assembly: 0.002
+peripherals: 0.002
+permissions: 0.002
+VMM: 0.002
+vnc: 0.002
+graphic: 0.001
+x86: 0.001
+mistranslation: 0.001
+risc-v: 0.000
+KVM: 0.000
+i386: 0.000
+
+systemd complains Failed to enqueue loopback interface start request: Operation not supported
+
+This symptom seems similar to
+https://bugs.launchpad.net/qemu/+bug/1823790
+
+Host Linux: Debian 11 Bullseye (testing) on x84-64 architecture
+qemu version: latest git of git commit hash eb2c66b10efd2b914b56b20ae90655914310c925
+compiled with "./configure --static --disable-system" 
+
+Down stream bug report at https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=964289
+Bug report (closed) to systemd: https://github.com/systemd/systemd/issues/16359
+
+systemd in armhf and armel (both little endian 32-bit) containers fail to start with
+Failed to enqueue loopback interface start request: Operation not supported
+
+How to reproduce on Debian (and probably Ubuntu):
+mmdebstrap --components="main contrib non-free" --architectures=armhf --variant=important bullseye /var/lib/machines/armhf-bullseye
+systemd-nspawn -D /var/lib/machines/armhf-bullseye -b
+
+When "armhf" architecture is replaced with "mips" (32-bit big endian) or "ppc64"
+(64-bit big endian), the container starts up fine.
+
+The same symptom is also observed with "powerpc" (32-bit big endian) architecture.
+
+It would help to know which operation is not supported.
+
+Could you get the coredump?
+Is it possible to run the operation with "QEMU_STRACE" set in the environment?
+Normally loop ioctls are supported.
+
+But it seems the following ones are not implemented in QEMU: LOOP_SET_CAPACITY, LOOP_SET_DIRECT_IO, LOOP_SET_BLOCK_SIZE.
+
+It seems systemd is trying to use RTM_SETLINK.
+
+Could you try this patch:
+
+diff --git a/linux-user/fd-trans.c b/linux-user/fd-trans.c
+index c0687c52e62b..b09b5b7c13e0 100644
+--- a/linux-user/fd-trans.c
++++ b/linux-user/fd-trans.c
+@@ -1200,6 +1200,7 @@ static abi_long target_to_host_data_route(struct nlmsghdr *nlh)
+         break;
+     case RTM_NEWLINK:
+     case RTM_DELLINK:
++    case RTM_SETLINK:
+         if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(*ifi))) {
+             ifi = NLMSG_DATA(nlh);
+             ifi->ifi_type = tswap16(ifi->ifi_type);
+
+
+> It seems systemd is trying to use RTM_SETLINK.
+> Could you try this patch:
+
+Yes, you are right!
+With the patch, I am able to boot containers of
+Debian Bullseye of armhf and armel architectures!!
+
+https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1887606
+
+Fixed here:
+
+65b261a63a48 linux-user: add netlink RTM_SETLINK command
+https://git.qemu.org/?p=qemu.git;a=commit;h=65b261a63a48fbb3b11193361d4ea0c38a3c3dfd
+
+qemu (1:5.0-5ubuntu3) groovy; urgency=medium
+
+has the merge with this fix:
+
+    - linux-user-add-netlink-RTM_SETLINK-command.patch (Closes: #964289)
+
+
+@Ryutaroh - could you test [1] if it gets you around this bug (1886811) and if bug 1890881 is present in focal as well?
+
+[1]: https://launchpad.net/~ci-train-ppa-service/+archive/ubuntu/4197
+
+To fully work this also needs the fix for bug 1890881 as identified there.
+
+SRU need the bug 1890881 fix to be really helpful, but the dependency chain of that is not SRUable.
+See: https://bugs.launchpad.net/ubuntu/+source/qemu/+bug/1890881/comments/17
+
+Users (of this valid but rare use case) can either use Groovy which will fix this or wait until Openstack Victoria will make it available for Focal via the Ubuntu Cloud Archive [1].
+
+[1]: https://wiki.ubuntu.com/OpenStack/CloudArchive
+

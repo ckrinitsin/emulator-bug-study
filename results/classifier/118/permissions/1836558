@@ -1,0 +1,475 @@
+permissions: 0.924
+debug: 0.910
+x86: 0.904
+register: 0.901
+user-level: 0.899
+performance: 0.898
+architecture: 0.895
+ppc: 0.892
+PID: 0.886
+TCG: 0.885
+graphic: 0.882
+hypervisor: 0.881
+device: 0.875
+risc-v: 0.870
+semantic: 0.860
+virtual: 0.856
+socket: 0.851
+arm: 0.843
+KVM: 0.840
+assembly: 0.840
+vnc: 0.824
+files: 0.822
+boot: 0.811
+VMM: 0.791
+mistranslation: 0.783
+peripherals: 0.778
+network: 0.771
+kernel: 0.725
+i386: 0.570
+
+Qemu-ppc Memory leak creating threads
+
+When creating c++ threads (with c++ std::thread), the resulting binary has memory leaks when running with qemu-ppc.
+
+Eg the following c++ program, when compiled with gcc, consumes more and more memory while running at qemu-ppc. (does not have memory leaks when compiling for Intel, when running same binary on real powerpc CPU hardware also no memory leaks).
+
+(Note I used function getCurrentRSS to show available memory, see https://stackoverflow.com/questions/669438/how-to-get-memory-usage-at-runtime-using-c; calls commented out here)
+
+Compiler: powerpc-linux-gnu-g++ (Debian 8.3.0-2) 8.3.0 (but same problem with older g++ compilers even 4.9)
+Os: Debian 10.0 ( Buster) (but same problem seen on Debian 9/stetch)
+qemu: qemu-ppc version 3.1.50
+
+
+
+---
+
+#include <iostream>
+#include <thread>
+#include <chrono>
+
+
+using namespace std::chrono_literals;
+
+// Create/run and join a 100 threads.
+void Fun100()
+{
+//    auto b4 = getCurrentRSS();
+//    std::cout << getCurrentRSS() << std::endl;
+    for(int n = 0; n < 100; n++)
+    {
+        std::thread t([]
+        {
+            std::this_thread::sleep_for( 10ms );
+        });
+//        std::cout << n << ' ' << getCurrentRSS() << std::endl;
+        t.join();
+    }
+    std::this_thread::sleep_for( 500ms ); // to give OS some time to wipe memory...
+//    auto after = getCurrentRSS();
+    std::cout << b4 << ' ' << after << std::endl;
+}
+
+
+int main(int, char **)
+{
+    Fun100();
+    Fun100();  // memory used keeps increasing
+}
+
+Forgive my ignorance of the C++ threading semantics but when do these threads end? Inspection shows we do clear-up CPU and thread structures on exit. That said we do have a comment in linux-user that says:
+
+    /* TODO: Free new CPU state if thread creation failed.  */
+
+So I wonder if thread creation is actually failing and and that is where we start leaking?
+
+The thread creating is not failing. The thread is just running the function with line: 'std::this_thread::sleep_for( 10ms );' 
+in the thread, thus waiting for 10ms. Once finished, the thread function ends, which should also end and cleanup the thread.
+(when putting some std::cout console output before the sleep it does show up).
+The main thread waits for that in in the join function.
+
+By running:
+
+  valgrind --leak-check=yes ./qemu-ppc tests/testthread
+
+I can replicate a leak compared to qemu-arm with the same test....
+
+==25789==    at 0x483577F: malloc (vg_replace_malloc.c:299)                                                                                                         [13/7729]
+==25789==    by 0x4D7F8D0: g_malloc (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.5800.3)
+==25789==    by 0x1FC65D: create_new_table (translate_init.inc.c:9252)
+==25789==    by 0x1FC65D: register_ind_in_table (translate_init.inc.c:9291)
+==25789==    by 0x1FC971: register_ind_insn (translate_init.inc.c:9325)
+==25789==    by 0x1FC971: register_insn (translate_init.inc.c:9390)
+==25789==    by 0x1FC971: create_ppc_opcodes (translate_init.inc.c:9450)
+==25789==    by 0x1FC971: ppc_cpu_realize (translate_init.inc.c:9819)
+==25789==    by 0x277263: device_set_realized (qdev.c:834)
+==25789==    by 0x27BBC6: property_set_bool (object.c:2076)
+==25789==    by 0x28019E: object_property_set_qobject (qom-qobject.c:26)
+==25789==    by 0x27DAF4: object_property_set_bool (object.c:1334)
+==25789==    by 0x27AE4B: cpu_create (cpu.c:62)
+==25789==    by 0x1C89B8: cpu_copy (main.c:188)
+==25789==    by 0x1CA44F: do_fork (syscall.c:5604)
+==25789==    by 0x1D665A: do_syscall1.isra.43 (syscall.c:9160)
+==25789==
+==25789== 6,656 bytes in 26 blocks are possibly lost in loss record 216 of 238
+==25789==    at 0x483577F: malloc (vg_replace_malloc.c:299)
+==25789==    by 0x4D7F8D0: g_malloc (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.5800.3)
+==25789==    by 0x1FC65D: create_new_table (translate_init.inc.c:9252)
+==25789==    by 0x1FC65D: register_ind_in_table (translate_init.inc.c:9291)
+==25789==    by 0x1FC9BA: register_dblind_insn (translate_init.inc.c:9337)
+==25789==    by 0x1FC9BA: register_insn (translate_init.inc.c:9384)
+==25789==    by 0x1FC9BA: create_ppc_opcodes (translate_init.inc.c:9450)
+==25789==    by 0x1FC9BA: ppc_cpu_realize (translate_init.inc.c:9819)
+==25789==    by 0x277263: device_set_realized (qdev.c:834)
+==25789==    by 0x27BBC6: property_set_bool (object.c:2076)
+==25789==    by 0x28019E: object_property_set_qobject (qom-qobject.c:26)
+==25789==    by 0x27DAF4: object_property_set_bool (object.c:1334)
+==25789==    by 0x27AE4B: cpu_create (cpu.c:62)
+==25789==    by 0x17304D: main (main.c:681)
+==25789==
+==25789== 10,752 (1,024 direct, 9,728 indirect) bytes in 4 blocks are definitely lost in loss record 223 of 238
+==25789==    at 0x483577F: malloc (vg_replace_malloc.c:299)
+==25789==    by 0x4D7F8D0: g_malloc (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.5800.3)
+==25789==    by 0x1FC65D: create_new_table (translate_init.inc.c:9252)
+==25789==    by 0x1FC65D: register_ind_in_table (translate_init.inc.c:9291)
+==25789==    by 0x1FC998: register_dblind_insn (translate_init.inc.c:9332)
+==25789==    by 0x1FC998: register_insn (translate_init.inc.c:9384)
+==25789==    by 0x1FC998: create_ppc_opcodes (translate_init.inc.c:9450)
+==25789==    by 0x1FC998: ppc_cpu_realize (translate_init.inc.c:9819)
+==25789==    by 0x277263: device_set_realized (qdev.c:834)
+==25789==    by 0x27BBC6: property_set_bool (object.c:2076)
+==25789==    by 0x28019E: object_property_set_qobject (qom-qobject.c:26)
+==25789==    by 0x27DAF4: object_property_set_bool (object.c:1334)
+==25789==    by 0x27AE4B: cpu_create (cpu.c:62)
+==25789==    by 0x1C89B8: cpu_copy (main.c:188)
+==25789==    by 0x1CA44F: do_fork (syscall.c:5604)
+==25789==    by 0x1D665A: do_syscall1.isra.43 (syscall.c:9160)
+
+So something funky happens to the PPC translator for each new thread....
+
+Could you try an experiment and put a final 30 second sleep before the program exits. I suspect the RCU cleanup of the per-thread data never gets a chance to cleanup.
+
+Nope we think we have identified the leak. On CPU realize (ppc_cpu_realize) the translator sets up its tables (create_ppc_opcodes). This will happen for each thread created. This would be fine but linux_user cpu_copy function then does:
+
+    memcpy(new_env, env, sizeof(CPUArchState));
+
+which will blindly overwrite the tables in CPUArchState (CPUPPCState) causing the leak. The suggestion is the data should be moved to PowerPCCPU (as it is internal to the translator) and avoid being smashed by the memcpy. However longer term we should replace the memcpy with an arch aware smart copy.
+
+The opcode decode tables aren't really part of the CPUPPCState but an
+internal implementation detail for the translator. This can cause
+problems with memcpy in cpu_copy as any table created during
+ppc_cpu_realize get written over causing a memory leak. To avoid this
+move the tables into PowerPCCPU which is better suited to hold
+internal implementation details.
+
+Attempts to fix: https://bugs.launchpad.net/qemu/+bug/1836558
+Cc: <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ target/ppc/cpu.h                |  8 ++++----
+ target/ppc/translate.c          |  3 ++-
+ target/ppc/translate_init.inc.c | 16 +++++++---------
+ 3 files changed, 13 insertions(+), 14 deletions(-)
+
+diff --git a/target/ppc/cpu.h b/target/ppc/cpu.h
+index c9beba2a5c0..10e34b69b75 100644
+--- a/target/ppc/cpu.h
++++ b/target/ppc/cpu.h
+@@ -1104,10 +1104,6 @@ struct CPUPPCState {
+     bool resume_as_sreset;
+ #endif
+ 
+-    /* Those resources are used only during code translation */
+-    /* opcode handlers */
+-    opc_handler_t *opcodes[PPC_CPU_OPCODES_LEN];
+-
+     /* Those resources are used only in QEMU core */
+     target_ulong hflags;      /* hflags is a MSR & HFLAGS_MASK         */
+     target_ulong hflags_nmsr; /* specific hflags, not coming from MSR */
+@@ -1191,6 +1187,10 @@ struct PowerPCCPU {
+     int32_t node_id; /* NUMA node this CPU belongs to */
+     PPCHash64Options *hash64_opts;
+ 
++    /* Those resources are used only during code translation */
++    /* opcode handlers */
++    opc_handler_t *opcodes[PPC_CPU_OPCODES_LEN];
++
+     /* Fields related to migration compatibility hacks */
+     bool pre_2_8_migration;
+     target_ulong mig_msr_mask;
+diff --git a/target/ppc/translate.c b/target/ppc/translate.c
+index 4a5de280365..c0faab8a824 100644
+--- a/target/ppc/translate.c
++++ b/target/ppc/translate.c
+@@ -7857,6 +7857,7 @@ static bool ppc_tr_breakpoint_check(DisasContextBase *dcbase, CPUState *cs,
+ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
+ {
+     DisasContext *ctx = container_of(dcbase, DisasContext, base);
++    PowerPCCPU *cpu = POWERPC_CPU(cs);
+     CPUPPCState *env = cs->env_ptr;
+     opc_handler_t **table, *handler;
+ 
+@@ -7874,7 +7875,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
+               opc3(ctx->opcode), opc4(ctx->opcode),
+               ctx->le_mode ? "little" : "big");
+     ctx->base.pc_next += 4;
+-    table = env->opcodes;
++    table = cpu->opcodes;
+     handler = table[opc1(ctx->opcode)];
+     if (is_indirect_opcode(handler)) {
+         table = ind_table(handler);
+diff --git a/target/ppc/translate_init.inc.c b/target/ppc/translate_init.inc.c
+index 86fc8f2e316..9cd2033bb92 100644
+--- a/target/ppc/translate_init.inc.c
++++ b/target/ppc/translate_init.inc.c
+@@ -9440,14 +9440,13 @@ static void fix_opcode_tables(opc_handler_t **ppc_opcodes)
+ static void create_ppc_opcodes(PowerPCCPU *cpu, Error **errp)
+ {
+     PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
+-    CPUPPCState *env = &cpu->env;
+     opcode_t *opc;
+ 
+-    fill_new_table(env->opcodes, PPC_CPU_OPCODES_LEN);
++    fill_new_table(cpu->opcodes, PPC_CPU_OPCODES_LEN);
+     for (opc = opcodes; opc < &opcodes[ARRAY_SIZE(opcodes)]; opc++) {
+         if (((opc->handler.type & pcc->insns_flags) != 0) ||
+             ((opc->handler.type2 & pcc->insns_flags2) != 0)) {
+-            if (register_insn(env->opcodes, opc) < 0) {
++            if (register_insn(cpu->opcodes, opc) < 0) {
+                 error_setg(errp, "ERROR initializing PowerPC instruction "
+                            "0x%02x 0x%02x 0x%02x", opc->opc1, opc->opc2,
+                            opc->opc3);
+@@ -9455,7 +9454,7 @@ static void create_ppc_opcodes(PowerPCCPU *cpu, Error **errp)
+             }
+         }
+     }
+-    fix_opcode_tables(env->opcodes);
++    fix_opcode_tables(cpu->opcodes);
+     fflush(stdout);
+     fflush(stderr);
+ }
+@@ -10023,7 +10022,6 @@ static void ppc_cpu_unrealize(DeviceState *dev, Error **errp)
+ {
+     PowerPCCPU *cpu = POWERPC_CPU(dev);
+     PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
+-    CPUPPCState *env = &cpu->env;
+     Error *local_err = NULL;
+     opc_handler_t **table, **table_2;
+     int i, j, k;
+@@ -10035,11 +10033,11 @@ static void ppc_cpu_unrealize(DeviceState *dev, Error **errp)
+     }
+ 
+     for (i = 0; i < PPC_CPU_OPCODES_LEN; i++) {
+-        if (env->opcodes[i] == &invalid_handler) {
++        if (cpu->opcodes[i] == &invalid_handler) {
+             continue;
+         }
+-        if (is_indirect_opcode(env->opcodes[i])) {
+-            table = ind_table(env->opcodes[i]);
++        if (is_indirect_opcode(cpu->opcodes[i])) {
++            table = ind_table(cpu->opcodes[i]);
+             for (j = 0; j < PPC_CPU_INDIRECT_OPCODES_LEN; j++) {
+                 if (table[j] == &invalid_handler) {
+                     continue;
+@@ -10057,7 +10055,7 @@ static void ppc_cpu_unrealize(DeviceState *dev, Error **errp)
+                                              ~PPC_INDIRECT));
+                 }
+             }
+-            g_free((opc_handler_t *)((uintptr_t)env->opcodes[i] &
++            g_free((opc_handler_t *)((uintptr_t)cpu->opcodes[i] &
+                 ~PPC_INDIRECT));
+         }
+     }
+-- 
+2.20.1
+
+
+
+When a CPU object is created it is parented during it's realize stage.
+If we don't unparent before the "final" unref we will never finzalize
+the object leading to a memory leak. For most setups you probably
+won't notice but with anything that creates and destroys a lot of
+threads this will add up. This goes especially for architectures which
+allocate a lot of memory in their CPU structures.
+
+Fixes: https://bugs.launchpad.net/qemu/+bug/1836558
+Cc: <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ linux-user/syscall.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 39a37496fed..4c9313fd9d0 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7183,6 +7183,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+                           NULL, NULL, 0);
+             }
+             thread_cpu = NULL;
++            object_unparent(OBJECT(cpu));
+             object_unref(OBJECT(cpu));
+             g_free(ts);
+             rcu_unregister_thread();
+-- 
+2.20.1
+
+
+
+Ccing the QOM maintainers to make sure we have the
+QOM lifecycle operations right here...
+
+On Tue, 16 Jul 2019 at 15:02, Alex Bennée <email address hidden> wrote:
+>
+> When a CPU object is created it is parented during it's realize stage.
+> If we don't unparent before the "final" unref we will never finzalize
+> the object leading to a memory leak. For most setups you probably
+> won't notice but with anything that creates and destroys a lot of
+> threads this will add up. This goes especially for architectures which
+> allocate a lot of memory in their CPU structures.
+>
+> Fixes: https://bugs.launchpad.net/qemu/+bug/1836558
+> Cc: <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+>  linux-user/syscall.c | 1 +
+>  1 file changed, 1 insertion(+)
+>
+> diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+> index 39a37496fed..4c9313fd9d0 100644
+> --- a/linux-user/syscall.c
+> +++ b/linux-user/syscall.c
+> @@ -7183,6 +7183,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+>                            NULL, NULL, 0);
+>              }
+>              thread_cpu = NULL;
+> +            object_unparent(OBJECT(cpu));
+>              object_unref(OBJECT(cpu));
+>              g_free(ts);
+>              rcu_unregister_thread();
+
+I think (as I mentioned on IRC) that we also need to unrealize
+the CPU object, because target/ppc at least does some freeing
+of memory in its unrealize method. I think we do that by
+setting the QOM "realize" property back to "false" -- but that
+might barf if we try it on a CPU that isn't hotpluggable...
+
+thanks
+-- PMM
+
+
+
+Peter Maydell <email address hidden> writes:
+
+> Ccing the QOM maintainers to make sure we have the
+> QOM lifecycle operations right here...
+>
+> On Tue, 16 Jul 2019 at 15:02, Alex Bennée <email address hidden> wrote:
+>>
+>> When a CPU object is created it is parented during it's realize stage.
+>> If we don't unparent before the "final" unref we will never finzalize
+>> the object leading to a memory leak. For most setups you probably
+>> won't notice but with anything that creates and destroys a lot of
+>> threads this will add up. This goes especially for architectures which
+>> allocate a lot of memory in their CPU structures.
+>>
+>> Fixes: https://bugs.launchpad.net/qemu/+bug/1836558
+>> Cc: <email address hidden>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> ---
+>>  linux-user/syscall.c | 1 +
+>>  1 file changed, 1 insertion(+)
+>>
+>> diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+>> index 39a37496fed..4c9313fd9d0 100644
+>> --- a/linux-user/syscall.c
+>> +++ b/linux-user/syscall.c
+>> @@ -7183,6 +7183,7 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
+>>                            NULL, NULL, 0);
+>>              }
+>>              thread_cpu = NULL;
+>> +            object_unparent(OBJECT(cpu));
+>>              object_unref(OBJECT(cpu));
+>>              g_free(ts);
+>>              rcu_unregister_thread();
+>
+> I think (as I mentioned on IRC) that we also need to unrealize
+> the CPU object, because target/ppc at least does some freeing
+> of memory in its unrealize method. I think we do that by
+> setting the QOM "realize" property back to "false" -- but that
+> might barf if we try it on a CPU that isn't hotpluggable...
+
+I have tried:
+
+             thread_cpu = NULL;
++            object_unparent(OBJECT(cpu));
++            object_property_set_bool(OBJECT(cpu), false, "realized", NULL);
+             object_unref(OBJECT(cpu));
+
+but it didn't manifestly change anything (i.e. both with and without
+setting realized the thread allocated stuff is freed). Valgrind still
+complains about:
+
+==22483== 6,656 bytes in 26 blocks are possibly lost in loss record 1,639 of 1,654
+==22483==    at 0x483577F: malloc (vg_replace_malloc.c:299)
+==22483==    by 0x4D7F8D0: g_malloc (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.5800.3)
+==22483==    by 0x27D692: create_new_table (translate_init.inc.c:9252)
+==22483==    by 0x27D7CD: register_ind_in_table (translate_init.inc.c:9291)
+==22483==    by 0x27D975: register_dblind_insn (translate_init.inc.c:9337)
+==22483==    by 0x27DBBB: register_insn (translate_init.inc.c:9384)
+==22483==    by 0x27DE4E: create_ppc_opcodes (translate_init.inc.c:9449)
+==22483==    by 0x27E79C: ppc_cpu_realize (translate_init.inc.c:9818)
+==22483==    by 0x2C6FE8: device_set_realized (qdev.c:834)
+==22483==    by 0x2D1E3D: property_set_bool (object.c:2076)
+==22483==    by 0x2D00B3: object_property_set (object.c:1268)
+==22483==    by 0x2D3185: object_property_set_qobject (qom-qobject.c:26)
+
+But I don't know if that is just because the final exit_group of the
+main CPU just exits without attempting to clean-up. However it is better
+than it was.
+
+--
+Alex Bennée
+
+
+
+David Gibson <email address hidden> writes:
+
+> On Tue, Jul 16, 2019 at 01:13:52PM +0100, Alex Bennée wrote:
+>> The opcode decode tables aren't really part of the CPUPPCState but an
+>> internal implementation detail for the translator. This can cause
+>> problems with memcpy in cpu_copy as any table created during
+>> ppc_cpu_realize get written over causing a memory leak. To avoid this
+>> move the tables into PowerPCCPU which is better suited to hold
+>> internal implementation details.
+>>
+>> Attempts to fix: https://bugs.launchpad.net/qemu/+bug/1836558
+>> Cc: <email address hidden>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>
+> I've applied this now to ppc-for-4.2.  If there's an argument for
+> including it in 4.1 during hard freeze, you'll need to spell it out
+> for me.
+
+Well without:
+
+  Subject: [RFC PATCH for 4.1] linux-user: unparent CPU object before unref
+  Date: Tue, 16 Jul 2019 15:01:33 +0100
+  Message-Id: <email address hidden>
+
+it doesn't matter as we never attempt to free the memory once a thread
+is destroyed. This causes all linux-user guests that create and destroy
+threads quickly to slowly leak memory. However due to the dynamic opcode
+table ppc/ppc64-linux-user guests leak a lot faster than most, in the
+order of ~50k each time a thread is created and destroyed.
+
+However I'm happy to defer to you as the maintainer :-)
+
+--
+Alex Bennée
+
+
+A fix for this bug has been merged here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=28876bf27d2792e6b16cf
+It has been released with QEMU v4.2. Can this bug ticket now be closed?
+

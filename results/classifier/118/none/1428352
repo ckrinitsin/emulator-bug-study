@@ -1,0 +1,80 @@
+semantic: 0.788
+permissions: 0.764
+hypervisor: 0.682
+peripherals: 0.675
+graphic: 0.673
+mistranslation: 0.665
+performance: 0.653
+assembly: 0.653
+debug: 0.652
+user-level: 0.639
+arm: 0.635
+device: 0.631
+ppc: 0.619
+architecture: 0.615
+vnc: 0.613
+register: 0.607
+PID: 0.596
+KVM: 0.595
+VMM: 0.583
+TCG: 0.559
+risc-v: 0.552
+network: 0.538
+x86: 0.532
+boot: 0.531
+virtual: 0.530
+kernel: 0.514
+files: 0.506
+i386: 0.493
+socket: 0.491
+
+SYSRET instruction incorrectly implemented
+
+The Intel architecture manual states that when returning to user mode, the SYSRET instruction will re-load the stack selector (%ss) from the IA32_STAR model specific register using the following logic:
+
+SS.Selector <-- (IA32_STAR[63:48]+8) OR 3; (* RPL forced to 3 *)
+
+Another description of the instruction behavior which shows the same logic in a slightly different form can also be found here:
+
+http://tptp.cc/mirrors/siyobik.info/instruction/SYSRET.html
+
+[...]
+        SS(SEL) = IA32_STAR[63:48] + 8;
+        SS(PL) = 0x3;
+[...]
+
+In other words, the value of the %ss register is supposed to be loaded from  bits 63:48 of the IA32_STAR model-specific register, incremented by 8, and then ORed with 3. ORing in the 3 sets the privilege level to 3 (user). This is done since SYSRET returns to user mode after a system call.
+
+However, helper_sysret() in target-i386/seg_helper.c does not do the "OR 3" step. The code looks like this:
+
+        cpu_x86_load_seg_cache(env, R_SS, selector + 8,
+                               0, 0xffffffff,
+                               DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                               DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
+                               DESC_W_MASK | DESC_A_MASK);
+
+It should look like this:
+
+        cpu_x86_load_seg_cache(env, R_SS, (selector + 8) | 3,
+                               0, 0xffffffff,
+                               DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                               DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
+                               DESC_W_MASK | DESC_A_MASK);
+
+The code does correctly set the privilege level bits for the code selector register (%cs) but not for the stack selector (%ss).
+
+The effect of this is that when SYSRET returns control to the user-mode caller, %ss will be have the privilege level bits cleared. In my case, it went from 0x2b to 0x28. This caused a crash later: when the user-mode code was preempted by an interrupt, and the interrupt handler would do an IRET, a general protection fault would occur because the %ss value being loaded from the exception frame was not valid for user mode. (At least, I think that's what happened.)
+
+This behavior seems inconsistent with real hardware, and also appears to be wrong with respect to the Intel documentation, so I'm pretty confident in calling this a bug. :)
+
+Note that this issue seems to have been around for a long time. I discovered it while using QEMU 2.2.0, but I happened to have the sources for QEMU 0.10.5, and the problem is there too (in os_helper.c). I am using FreeBSD/amd64 9.1-RELEASE as my host system, without KVM.
+
+The fix is fairly simple. I'm attaching a patch which worked for me. Using this fix, the code that I'm testing now behaves the same on the QEMU virtual machine as on real hardware.
+
+- Bill (<email address hidden>)
+
+
+
+If I've got that right, this has been fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=ac57622985220de0
+

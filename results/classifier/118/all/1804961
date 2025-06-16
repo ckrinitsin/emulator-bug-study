@@ -1,0 +1,194 @@
+user-level: 0.979
+peripherals: 0.977
+semantic: 0.976
+risc-v: 0.975
+architecture: 0.975
+graphic: 0.975
+permissions: 0.973
+register: 0.973
+assembly: 0.973
+debug: 0.971
+PID: 0.971
+device: 0.970
+performance: 0.968
+network: 0.967
+socket: 0.966
+vnc: 0.966
+arm: 0.965
+files: 0.964
+hypervisor: 0.964
+boot: 0.956
+KVM: 0.953
+kernel: 0.952
+virtual: 0.945
+VMM: 0.941
+mistranslation: 0.940
+ppc: 0.925
+TCG: 0.916
+x86: 0.911
+i386: 0.873
+
+qemu-system-aarch64: Windows 10 ARM64 BSoD on boot while using virt-3.0
+
+When I emulate a virt-3.0 machine, Windows 10 BSoD on boot, with the error code being ACPI_BIOS_ERROR(0x000000A5), virt-2.12 boots fine.
+
+Windows Build: 10.0.17134.1
+QEMU version: 3.0.0
+Commandline: qemu-system-aarch64 -M virt -accel tcg,thread=multi -cpu cortex-a57 -smp 2 -m 2048 -bios QEMU_EFI.fd -device ramfb -device nec-usb-xhci -device usb-kbd -device usb-tablet -hda disk.vhd -vnc :0
+
+By the way, the patch to add DBG2 table discussed here https://lists.gnu.org/archive/html/qemu-devel/2015-09/msg02550.html works (although minor change is required to adapt to the qemu 3.0.0 code), the table is accepted by Windows (Windows require both DBG2 and SPCR to be valid for serial kernel debugging to work), so it may help further diagnosing this issue.
+
+On Sat, 24 Nov 2018 20:36:54 -0000
+GH Cao <email address hidden> wrote:
+
+> ** Description changed:
+> 
+>   When I emulate a virt-3.0 machine, Windows 10 BSoD on boot, with the
+>   error code being ACPI_BIOS_ERROR(0x000000A5), virt-2.12 boots fine.
+>   
+>   Windows Build: 10.0.17134.1
+>   QEMU version: 3.0.0
+>   Commandline: qemu-system-aarch64 -M virt -accel tcg,thread=multi -cpu cortex-a57 -smp 2 -m 2048 -bios QEMU_EFI.fd -device ramfb -device nec-usb-xhci -device usb-kbd -device usb-tablet -hda disk.vhd -vnc :0
+>   
+>   By the way, the patch to add DBG2 table discussed here
+> - https://lists.gnu.org/archive/html/qemu-devel/2015-09/msg02550.html
+> + https://lists.gnu.org/archive/html/qemu-devel/2015-09/msg01719.html
+>   works (although minor change is required to adapt to the qemu 3.0.0
+>   code), the table is accepted by Windows (Windows require both DBG2 and
+>   SPCR to be valid for serial kernel debugging to work), so it may help
+>   further diagnosing this issue.
+> 
+
+if you are able to attach a debugger early before guest BSODs,
+you can try to use AMIL Debugger
+https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/the-amli-debugger
+to find out what windows doesn't like in ACPI tables.
+
+
+@imammedo:
+I am new to kernel debugging, but I managed to get some traces, hope that will help you. 
+
+https://pastebin.com/shWUC1Pk
+https://pastebin.com/n0gnSaVx
+
+And the namespace objects tree of virt-2.12 is this.
+https://pastebin.com/GybigJ9r
+
+On Wed, 28 Nov 2018 19:25:07 -0000
+GH Cao <email address hidden> wrote:
+
+> @imammedo:
+> I am new to kernel debugging, but I managed to get some traces, hope that will help you. 
+> 
+> https://pastebin.com/shWUC1Pk
+> https://pastebin.com/n0gnSaVx
+> 
+
+try it with following amli options set: errbrkon traceon spewon
+hopefully errbrkon will stop at the error and the rest of options should provide context
+
+
+Could it be related to:
+
+commit 17ec075a651a3f9613429c2d97018fce459ed943
+Author: Eric Auger <email address hidden>
+Date:   Fri Jun 22 13:28:37 2018 +0100
+
+    hw/arm/virt: Use 256MB ECAM region by default
+
+    With this patch, virt-3.0 machine uses a new 256MB ECAM region
+    by default instead of the legacy 16MB one, if highmem is set
+    (LPAE supported by the guest) and (!firmware_loaded || aarch64).
+
+    Indeed aarch32 mode FW may not support this high ECAM region.
+
+As far as I can tell the only real differences between virt-2.12 and later at the size of the ECAM region and the max number of CPUs it supports:
+
+static void virt_machine_2_12_options(MachineClass *mc)
+{
+    VirtMachineClass *vmc = VIRT_MACHINE_CLASS(OBJECT_CLASS(mc));
+
+    virt_machine_3_0_options(mc);
+    SET_MACHINE_COMPAT(mc, VIRT_COMPAT_2_12);
+    vmc->no_highmem_ecam = true;
+    mc->max_cpus = 255;
+}
+
+
+Yeah it seems to be. Windows boots fine after I disable hi ECAM region.
+
+
+ 
+---Original---
+From: "Alex Bennée"<email address hidden>
+Date: 2018/12/5 19:41:40
+To: "driver1998"<email address hidden>;
+Subject: [Bug 1804961] Re: qemu-system-aarch64: Windows 10 ARM64 BSoD on boot while using virt-3.0
+
+
+Could it be related to:
+
+commit 17ec075a651a3f9613429c2d97018fce459ed943
+Author: Eric Auger <email address hidden>
+Date:   Fri Jun 22 13:28:37 2018 +0100
+
+    hw/arm/virt: Use 256MB ECAM region by default
+
+    With this patch, virt-3.0 machine uses a new 256MB ECAM region
+    by default instead of the legacy 16MB one, if highmem is set
+    (LPAE supported by the guest) and (!firmware_loaded || aarch64).
+
+    Indeed aarch32 mode FW may not support this high ECAM region.
+
+As far as I can tell the only real differences between virt-2.12 and
+later at the size of the ECAM region and the max number of CPUs it
+supports:
+
+static void virt_machine_2_12_options(MachineClass *mc)
+{
+    VirtMachineClass *vmc = VIRT_MACHINE_CLASS(OBJECT_CLASS(mc));
+
+    virt_machine_3_0_options(mc);
+    SET_MACHINE_COMPAT(mc, VIRT_COMPAT_2_12);
+    vmc->no_highmem_ecam = true;
+    mc->max_cpus = 255;
+}
+
+
+** Tags added: aarch64 acpi
+
+-- 
+You received this bug notification because you are subscribed to the bug
+report.
+https://bugs.launchpad.net/bugs/1804961
+
+Title:
+  qemu-system-aarch64: Windows 10 ARM64 BSoD on boot while using
+  virt-3.0
+
+Status in QEMU:
+  New
+
+Bug description:
+  When I emulate a virt-3.0 machine, Windows 10 BSoD on boot, with the
+  error code being ACPI_BIOS_ERROR(0x000000A5), virt-2.12 boots fine.
+
+  Windows Build: 10.0.17134.1
+  QEMU version: 3.0.0
+  Commandline: qemu-system-aarch64 -M virt -accel tcg,thread=multi -cpu cortex-a57 -smp 2 -m 2048 -bios QEMU_EFI.fd -device ramfb -device nec-usb-xhci -device usb-kbd -device usb-tablet -hda disk.vhd -vnc :0
+
+  By the way, the patch to add DBG2 table discussed here
+  https://lists.gnu.org/archive/html/qemu-devel/2015-09/msg01719.html
+  works (although minor change is required to adapt to the qemu 3.0.0
+  code), the table is accepted by Windows (Windows require both DBG2 and
+  SPCR to be valid for serial kernel debugging to work), so it may help
+  further diagnosing this issue.
+
+To manage notifications about this bug go to:
+https://bugs.launchpad.net/qemu/+bug/1804961/+subscriptions
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

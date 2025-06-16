@@ -1,0 +1,93 @@
+architecture: 0.936
+arm: 0.880
+graphic: 0.879
+performance: 0.862
+peripherals: 0.826
+mistranslation: 0.807
+semantic: 0.799
+register: 0.700
+device: 0.671
+VMM: 0.647
+network: 0.636
+permissions: 0.604
+ppc: 0.571
+debug: 0.528
+kernel: 0.527
+vnc: 0.510
+assembly: 0.502
+user-level: 0.479
+PID: 0.470
+socket: 0.403
+hypervisor: 0.385
+risc-v: 0.369
+x86: 0.369
+boot: 0.353
+virtual: 0.335
+i386: 0.289
+TCG: 0.277
+KVM: 0.234
+files: 0.226
+--------------------
+arm: 0.986
+user-level: 0.813
+debug: 0.740
+register: 0.305
+files: 0.049
+virtual: 0.040
+hypervisor: 0.039
+kernel: 0.025
+architecture: 0.022
+semantic: 0.021
+device: 0.018
+assembly: 0.017
+boot: 0.015
+TCG: 0.011
+risc-v: 0.007
+permissions: 0.007
+performance: 0.007
+PID: 0.007
+VMM: 0.003
+peripherals: 0.003
+socket: 0.002
+vnc: 0.001
+network: 0.001
+graphic: 0.001
+KVM: 0.001
+mistranslation: 0.001
+i386: 0.000
+x86: 0.000
+ppc: 0.000
+
+ARM SCTLR allows writes to "write ignore" bits
+Description of problem:
+The firmware I have executed in qemu sets up pagetables and then enables the MMU.
+A few instructions later, a prefetch abort was occurring. After debugging it turned out the problem was because get_phys_addr_v5 was being used to walk the pagetable instead of get_phys_addr_v6.
+qemu has this code:
+```c
+regime_sctlr(env, mmu_idx) & SCTLR_XP
+// where SCTLR_XP is commented as
+#define SCTLR_XP      (1U << 23) /* up to v6; v7 onward RAO */
+```
+Somewhat interestingly, A5 has a lot of bits marked as `/WI`: https://developer.arm.com/documentation/ddi0433/c/system-control/register-descriptions/system-control-register
+
+A9 has less, but still a few which qemu is not handling: https://developer.arm.com/documentation/ddi0388/e/the-system-control-coprocessors/summary-of-system-control-coprocessor-registers/system-control-register
+I've made this hacky patch to fix it for myself:
+```diff
+diff --git a/qemu/target/arm/helper.c b/qemu/target/arm/helper.c
+index 60c9db9e..d8fd5a7d 100644
+--- a/qemu/target/arm/helper.c
++++ b/qemu/target/arm/helper.c
+@@ -4306,6 +4306,11 @@ static void sctlr_write(CPUARMState *env, const ARMCPRegInfo *ri,
+ {
+     ARMCPU *cpu = env_archcpu(env);
+
++    // for cortex-a5 specifically
++    value |= (0b11 << 22) | (1 << 18) | (1 << 16) | (0b1111 << 3);
++    value &= ~((1 << 31) | (0b11 << 26) | (1 << 24) | (0b111 << 19) |
++        (1 << 17) | (0b11 << 14) | (0b111 << 7));
++
+     if (raw_read(env, ri) == value) {
+         /* Skip the TLB flush if nothing actually changed; Linux likes
+          * to do a lot of pointless SCTLR writes.
+```
+I think the real fix would allow expressing the ones/zeros mask as part of `ARMCPU` per-arch.

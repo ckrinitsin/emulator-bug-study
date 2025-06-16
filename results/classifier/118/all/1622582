@@ -1,0 +1,125 @@
+permissions: 0.968
+debug: 0.956
+assembly: 0.955
+semantic: 0.950
+register: 0.948
+graphic: 0.947
+boot: 0.946
+performance: 0.945
+architecture: 0.942
+arm: 0.930
+user-level: 0.929
+socket: 0.925
+PID: 0.923
+virtual: 0.921
+device: 0.918
+kernel: 0.918
+vnc: 0.891
+network: 0.890
+files: 0.883
+peripherals: 0.879
+KVM: 0.867
+TCG: 0.865
+x86: 0.843
+VMM: 0.842
+hypervisor: 0.842
+ppc: 0.841
+risc-v: 0.840
+mistranslation: 0.772
+i386: 0.401
+
+Can't install Windows 7 with q35 (SATA)
+
+I'm trying to install Windows 7 on a q35 machine on a "SATA disk". If I use q35 the installation is extremely slow. With extremely slow I mean, that the first few minutes (10-15 minutes) on the second installation step (copying files to disk) nothing happens. Than there is some progress, maybe until 9% and than there is "silence" for another 10 minutes or so. Therefore I used iotop (with --only option) in order to see, if there are any disk operations. But as I mentioned, only a few times qemu writes something to disk (with about < 1M/s). But most of the time there is nothing from qemu. Therefore the installation lasts over an hour. But even worse, after installation I can't boot Windows. Windows-Start-Manager tells me, that windows couldn't be loaded because the kernel is missing or corrupt (Status 0xc0000221, File: \Windows\system32\ntoskrnl.exe). If I use IDE on q35 or pc-i440fx-2.6 everything works fine. There is a continuous installation progress and iotop shows continuous disk writes with max 30M/s (but also 5M/s and other values...). 
+
+I've tried qemu 2.6.0, 2.6.1 and 2.7.0 (all versions from git). 
+
+My host machine: 
+Ubuntu 14.04.5 LTS
+3.13.0-95-generic #142-Ubuntu SMP Fri Aug 12 17:00:09 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux
+Intel(R) Core(TM) i5-3470 CPU
+16 GB RAM
+
+
+I used the following commands:
+
+"Standard" command
+qemu-system-x86_64 -m 2048 -machine q35,accel=kvm -cpu host,kvm=off -smp 1,sockets=1,cores=1,threads=1 -enable-kvm -hda win7_qemu_standard_q35.qcow2 -cdrom win7proX64.iso -boot order=d
+
+I think by using -hda sata will be used?!? 
+
+With explicit ahci:
+qemu-system-x86_64 -m 2048 -machine q35,accel=kvm -cpu host,kvm=off -smp 1,sockets=1,cores=1,threads=1 -enable-kvm -drive file=win7_qemu_standard_q35.qcow2,media=disk,if=none,id=sata-disk -device ich9-ahci,id=ahci -device ide-drive,drive=sata-disk,bus=ahci.0 -drive file=win7proX64.iso,media=cdrom,if=none,id=sata-cdrom -device ide-cd,drive=sata-cdrom,bus=ahci.1 -boot order=d
+
+I don't know if this is totally correct, because it's a little bit weird that I have to use ide-drive on a ich9 bus.
+
+Without kvm there is a continious disk write with 100 K/s - 5 M/s (works only with qemu 2.7.0, otherwise I get a 0x000000D1 bluescreen on the setup start screen):
+qemu-system-x86_64 -m 2048 -machine q35 -cpu IvyBridge -hda win7_qemu_standard_q35.qcow2 -cdrom win7proX64.iso -boot order=d
+
+But with all three commands the installed Windows is not working, because always the same error occurs: windows couldn't be loaded because kernel is missing or corrupt
+
+Interestingly both commands ("standard" command and with explicit ahci) works very well with a Windows 10 installation.
+
+In my opinion it's a "SATA problem", because if I use e.g. piix4-ide instead of ich9-ahci it works:
+qemu-system-x86_64 -m 2048 -machine q35,accel=kvm -cpu host,kvm=off -smp 1,sockets=1,cores=1,threads=1 -enable-kvm -drive file=win7_qemu_standard_q35.qcow2,media=disk,if=none,id=ide-disk -device piix4-ide,id=ide -device ide-drive,drive=ide-disk,bus=ide.0 -drive file=win7proX64.iso,media=cdrom,if=none,id=ide-cdrom -device ide-cd,drive=ide-cdrom,bus=ide.1 -boot order=d
+
+With this command there is a continuous disk write and the installation is bootable.
+
+Dennis, what's the exact version, edition, region (etc) of your Windows 7 install media?
+
+It's been a while since I've tried to install Windows 7 personally, but around the ~2.4 timeframe I didn't have any problems. I'd like to try with your exact media if at all possible; can you give me a checksum? If it's official MSDN media I can correlate that and attempt to reproduce.
+
+Thanks,
+--js
+
+PS:
+
+(1) Yes, using -hda et al under the Q35 machine type will give you SATA disks on the AHCI device.
+
+(2) All ATA-related devices are a type of "ide-drive" in QEMU, there is no explicit "SATA" drive because QEMU does not bother or care to emulate the transport specifics. At that level, ATA and SATA drives are almost exactly the same, apart from an expanded command verb repertoire in the SATA spec.
+
+Hi John,
+thx for your quick reply and the explanation for -hda and ide-drive.
+
+I'm using Windows 7 Professional x64 German edition. The md5 sum is: 705b6aaa5cf406428c2ab5e4d76c0cc4
+
+If you need anything else, please let me know.
+
+I can reproduce with the English version:
+7b7af5fe3a01e9fd76de4dacb45a796b  en_windows_7_professional_x64_dvd_x15-65805.iso
+
+I can't reproduce with SP1, however:
+ed15956fe33c13642a6d2cb2c7aa9749  en_windows_7_professional_with_sp1_x64_dvd_u_676939.iso
+
+We might be bumping up against a driver fix, but I still don't know the root cause just yet. I'll have to investigate. It looks like Windows 7 submits a flurry of NCQ writes, then hangs for a while, then submits an ATA SET FEATURES request, then another flurry of NCQ writes, then hangs for a while again; rinse repeat.
+
+It doesn't LOOK as if QEMU is dropping any requests, but I will have to investigate to see if there's anything improper happening...
+
+In the meantime, for you and anyone else who comes across this problem, I recommend using Windows 7 Professional x64 SP1 if at all possible!
+
+I also face this problem, any idea to resolve.
+I am using qemeu 4.2 + whpx support but failed to install
+
+./qemu-system-x86_64 -m 4096 \
+-vga vmware \
+-machine q35 \
+-accel whpx \
+-usb -device usb-kbd \
+-device usb-mouse -device usb-audio -boot c \
+-netdev tap,id=mynet0,ifname=tap0,script=no,downscript=no \
+-device e1000,netdev=mynet0,mac=52:55:00:d1:55:01 \
+ -smp 4  \
+-cdrom /e/Software/OS/WIN7/en_windows_7_ultimate_with_sp1_x64_dvd_u_677332.iso
+
+
+But when using -accel tcg, it's insalled fine.
+
+
+
+This is an automated cleanup. This bug report has been moved
+to QEMU's new bug tracker on gitlab.com and thus gets marked
+as 'expired' now. Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/55
+
+

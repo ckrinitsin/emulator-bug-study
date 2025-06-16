@@ -1,0 +1,57 @@
+performance: 0.892
+architecture: 0.860
+graphic: 0.807
+files: 0.790
+device: 0.766
+semantic: 0.746
+peripherals: 0.742
+socket: 0.738
+permissions: 0.734
+kernel: 0.730
+PID: 0.729
+assembly: 0.715
+network: 0.714
+register: 0.693
+debug: 0.680
+hypervisor: 0.672
+TCG: 0.662
+ppc: 0.656
+arm: 0.647
+mistranslation: 0.647
+virtual: 0.639
+vnc: 0.602
+x86: 0.599
+risc-v: 0.593
+user-level: 0.578
+boot: 0.552
+KVM: 0.541
+VMM: 0.521
+i386: 0.517
+
+Chardev behavior breaks polling based devices
+
+Currently in latest QEMU (9cd69f1a270235b652766f00b94114f48a2d603f at this time) the behavior of chardev sources is that when processed (before IO polling occurs), the chardev source will check the amount of space for reading.
+
+If it reports more than 0 bytes available to accept the read and a callback is not set, the code will set a child source connected to the QIOChannel submitted to the original source. If there's no buffer space reported, it will check for an active source, if registered it will detach this source. 
+
+Next time the loop fires, if the buffer now reports space (most likely the guest has run, emptying some bytes from the buffer), it will setup the callback again.
+
+However, if we have a stupid simple device (or driver) that doesn't have buffers big enough to fit an available write when one is sent (say a single byte buffer, polled serial port), then the poll will be set, the poll will occur and return quickly, then the callback will (depending on the backend chardev used) most likely read the 1 byte it has space for from the source, push it over to the frontend hardware side, and the IO loop will run again.
+
+Most likely the guest will not clear this byte before the next io loop cycle, meaning that the next prepare call on the source will see a full buffer in the guest and remove the poll for the data source, to allow the guest time to run to clear the buffer. Except, without a poll or a timeout set, the io loop might now block forever, since there's no report from the guest after clearing that buffer. This only returns in a sane amount of time because often some other device/timer is scheduled which sets a timeout on the poll to a reasonable time.
+
+I don't have a simple submittable bit of code to replicate at the moment but connecting a serial port to a pty then writing a large amount of data, while a guest that doesn't enable the fifo spins on an rx ready register, you can observe that RX on the guest takes anywhere from 1s to forever per byte.
+
+This logic all occurs in chardev/char-io.c
+
+Fixing this can be as simple as removing the logic to detach the child event source and changing the attach logic to only occur if there's buffer space and the poll isn't already setup. That fix could cause flow control issues potentially if the io runs on the same thread as the emulated guest (I am not sure about the details of this) and the guest is in a tight loop doing the poll. I don't see that as happening but the logic might be there for a reason.
+
+Another option is to set a timeout when the source gets removed, forcing the poll to exit with a fixed delay, this delay could potentially be derived from something like the baud rate set, forcing a minimum time before forward progress.
+
+If removing the logic isn't an option, another solution is to make the emulated hardware code itself kick the IO loop and trigger it to reschedule the poll. Similar to how the non-blocking write logic works, the read logic could recognize when the buffer has been emptied and reschedule the hw on the guest. In theory this sounds nice, but for it to work would require adding logic to all the emulated chardev frontends and in reality would likely be going through the effort to remove the callback only to within a few nanoseconds potentially want to add it back. 
+
+I'm planning to submit a patch with just outright removing the logic, but am filing this bug as a place to reference since tracking down this problem is non-obvious.
+
+commit f2c0fb93a44972a96f93510311c93ff4c2c6fab5
+
+

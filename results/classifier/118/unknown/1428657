@@ -1,0 +1,191 @@
+ppc: 0.885
+permissions: 0.869
+performance: 0.855
+graphic: 0.851
+user-level: 0.849
+peripherals: 0.849
+arm: 0.845
+architecture: 0.843
+debug: 0.842
+risc-v: 0.836
+TCG: 0.828
+device: 0.819
+vnc: 0.817
+i386: 0.809
+x86: 0.809
+semantic: 0.803
+register: 0.801
+virtual: 0.799
+kernel: 0.798
+PID: 0.783
+assembly: 0.782
+VMM: 0.768
+files: 0.762
+hypervisor: 0.758
+socket: 0.747
+mistranslation: 0.739
+KVM: 0.725
+boot: 0.694
+network: 0.694
+
+qemu-system-arm does not ignore the lowest bit of pc when returning from interrrupt
+
+This was observed in qemu v2.1.3, running a sample app from 
+
+FreeRTOS(FreeRTOSV7.5.2/FreeRTOS/Demo/CORTEX_LM3Sxxxx_Eclipse/RTOSDemo)
+
+In the sample code compiled with arm-none-eabi-gcc , version 4.8.2 (4.8.2-14ubuntu1+6) .
+
+qemu seems to be executing the wrong instrunction after returning from the SVCHandler. The svc handler changes the PSP register and the new stack contains an add return address, which should be allowed(http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.faqs/ka12545.html). The lowest bit of the address should be ignored, but it seems that qemu executes garbage after returning from the interrupt.
+
+qemu is run like this:
+
+qemu-system-arm -semihosting -machine lm3s6965evb -kernel RTOSDemo.axf -gdb tcp::1234 -S
+
+
+this is the arm-gdb trace
+Program received signal SIGINT, Interrupt.
+IntDefaultHandler () at startup.c:231
+231	{
+(gdb) bt
+#0  IntDefaultHandler () at startup.c:231
+#1  0xfffffffc in ?? ()
+
+(gdb) info registers 
+r0             0x0	0
+r1             0x14b4b4b4	347387060
+r2             0xa5a5a5a5	-1515870811
+r3             0xa5a5a53d	-1515870915
+r4             0xa5a5a5a5	-1515870811
+r5             0xa5a5a5a5	-1515870811
+r6             0xa5a5a5a5	-1515870811
+r7             0x40d00542	1087374658
+r8             0xa5a5a5a5	-1515870811
+r9             0xa5a5a5a5	-1515870811
+r10            0xa5a5a5a5	-1515870811
+r11            0xa5a5a5a5	-1515870811
+r12            0xa5a5a5a5	-1515870811
+sp             0x20008380	0x20008380
+lr             0xfffffffd	-3
+pc             0xc648	0xc648 <IntDefaultHandler>
+cpsr           0x20000173	536871283
+
+this exception occur after running SVC handler code
+
+(gdb) disassemble vPortSVCHandler 
+Dump of assembler code for function vPortSVCHandler:
+   0x0000c24c <+0>:	ldr	r3, [pc, #24]	; (0xc268 <vPortSVCHandler+28>)
+   0x0000c24e <+2>:	ldr	r1, [r3, #0]
+   0x0000c250 <+4>:	ldr	r0, [r1, #0]
+   0x0000c252 <+6>:	ldmia.w	r0!, {r4, r5, r6, r7, r8, r9, r10, r11}
+   0x0000c256 <+10>:	msr	PSP, r0
+   0x0000c25a <+14>:	mov.w	r0, #0
+   0x0000c25e <+18>:	msr	BASEPRI, r0
+   0x0000c262 <+22>:	orr.w	lr, lr, #13
+   0x0000c266 <+26>:	bx	lr
+   0x0000c268 <+28>:	andcs	r2, r0, r12, ror #5
+End of assembler dump.
+
+This stores this stack in PSP register:
+(gdb) x /32 0x200052c8
+0x200052c8:	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5
+0x200052d8:	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5
+0x200052e8:	0x00000000	0x14b4b4b4	0xa5a5a5a5	0xa5a5a53d
+0x200052f8:	0xa5a5a5a5	0x00000000	0x00003b49	0x21000000
+0x20005308:	0xa5a5a5a5	0xa5a5a5a5	0x200081b8	0x00000058
+0x20005318:	0x00000000	0x00000000	0x00000000	0x00000000
+0x20005328:	0x00000000	0x20005330	0xffffffff	0x20005330
+0x20005338:	0x20005330	0x00000000	0x20005344	0xffffffff
+
+It seems that qemu actually executes 0x00003b49 after the interrupt, but it should execute 0x00003b48
+
+
+
+On 5 March 2015 at 23:15, Anders Esbensen <email address hidden> wrote:
+> Public bug reported:
+>
+> This was observed in qemu v2.1.3, running a sample app from
+>
+> FreeRTOS(FreeRTOSV7.5.2/FreeRTOS/Demo/CORTEX_LM3Sxxxx_Eclipse/RTOSDemo)
+>
+> In the sample code compiled with arm-none-eabi-gcc , version 4.8.2
+> (4.8.2-14ubuntu1+6) .
+>
+> qemu seems to be executing the wrong instrunction after returning from
+> the SVCHandler. The svc handler changes the PSP register and the new
+> stack contains an add return address, which should be
+> allowed(http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.faqs/ka12545.html).
+> The lowest bit of the address should be ignored, but it seems that qemu
+> executes garbage after returning from the interrupt.
+
+So if I understand you correctly, the guest is executing
+a return-from-exception (via a bx lr instruction where the
+return address is one of the 0xffffffXX special cases), and
+the PC value in the exception frame we're restoring has
+its least significant bit set?
+
+If so, then this is a guest bug. In an exception frame the
+PC must be halfword aligned (ie must have the ls bit clear),
+because the "is this Thumb or not?" information is stored in
+the PSR field in the exception frame. If the LSB of the PC
+is set then the behaviour is UNPREDICTABLE (see the PopStack
+pseudocode in the ARMv7M ARM ARM). Real hardware seems to
+ignore the LSbit, but QEMU's behaviour is architecturally
+permitted and you should really fix your guest code.
+
+(The ARM knowledgebase article you give a link to correctly
+notes that the LSbit in vector table entries and normal
+branch targets is significant, but says nothing about the
+PC in exception frames.)
+
+thanks
+-- PMM
+
+
+Yes the situation I'm describing is the bx 0xfffffffx case.
+
+I see that the article I'm referring to, actually only describes the behaviour of branches and in ISR vector.
+
+Searching a bit more I see this:
+
+Cortex™-M3 Technical Reference Manual	Revision: r1p1
+Home > Programmer’s Model > Registers > General-purpose registers
+2.3.1. General-purpose registers
+
+-Program counter
+Register r15 is the Program Counter (PC).
+Bit [0] is always 0, so instructions are always aligned to word or halfword boundaries.
+
+Which is like you are describing.
+
+So I agree, I should correct my guest code, which I did :-), but shouldn't qemu reflect the behaviour of the implemented hardware?
+So it is "unpredictable" in the same way?
+
+I'will note the FreeRTOS people they have a bad implementation of their SVC handler for Cortex M3
+
+Thanks for the help.
+
+/Anders
+
+
+Proposed patch: http://patchwork.ozlabs.org/patch/449400/ which could use testing.
+
+
+
+I've tested the patch against the FreeRTOS example. An the patch seems 
+to make the example run.
+The FreeRTOS sample now crash for other reasons. But I consider the 
+issue resolved.
+
+/Anders
+
+On 03/12/2015 02:45 PM, Peter Maydell wrote:
+> Proposed patch: http://patchwork.ozlabs.org/patch/449400/ which could
+> use testing.
+>
+
+
+
+The patch described in an earlier comment was applied to master and the fix was in QEMU 2.4.
+
+

@@ -1,0 +1,589 @@
+register: 0.917
+permissions: 0.906
+files: 0.899
+assembly: 0.896
+peripherals: 0.877
+device: 0.874
+architecture: 0.867
+graphic: 0.864
+virtual: 0.862
+boot: 0.860
+kernel: 0.850
+PID: 0.845
+TCG: 0.841
+debug: 0.834
+arm: 0.833
+KVM: 0.829
+network: 0.818
+socket: 0.810
+vnc: 0.810
+semantic: 0.805
+hypervisor: 0.785
+performance: 0.778
+risc-v: 0.772
+ppc: 0.769
+user-level: 0.763
+x86: 0.666
+VMM: 0.661
+mistranslation: 0.440
+i386: 0.294
+--------------------
+x86: 0.986
+hypervisor: 0.800
+kernel: 0.329
+TCG: 0.184
+virtual: 0.066
+user-level: 0.059
+debug: 0.034
+files: 0.032
+register: 0.021
+PID: 0.020
+ppc: 0.015
+semantic: 0.015
+risc-v: 0.009
+i386: 0.007
+VMM: 0.004
+boot: 0.003
+socket: 0.003
+permissions: 0.003
+network: 0.002
+architecture: 0.002
+performance: 0.002
+KVM: 0.002
+graphic: 0.002
+assembly: 0.001
+device: 0.001
+vnc: 0.001
+peripherals: 0.001
+mistranslation: 0.000
+arm: 0.000
+
+qemu 2.10 locks images with no feature flag
+
+1) % lsb_release -rd
+Description:	Ubuntu Artful Aardvark (development branch)
+Release:	17.10
+
+2) % apt-cache policy qemu-system-x86
+qemu-system-x86:
+  Installed: 1:2.10~rc3+dfsg-0ubuntu1
+  Candidate: 1:2.10+dfsg-0ubuntu1
+  Version table:
+     1:2.10+dfsg-0ubuntu1 500
+        500 http://archive.ubuntu.com//ubuntu devel/main amd64 Packages
+ *** 1:2.10~rc3+dfsg-0ubuntu1 100
+        100 /var/lib/dpkg/status
+
+3) qemu locks image files with no way to discover this feature nor how to disable it
+
+4) qemu provides a way to query if it supports image locking, and what the default value is, and how to disable the locking via cli
+
+qemu 2.10 now will lock image files and warn if an image is currently locked.  This prevent qemu from running (and possibly corrupting said image).
+
+However, qemu does not provide any way to determine if a qemu binary actually has this capability.  Normally behavior changing features are exposed via some change to the qemu help menu or QMP/QAPI output of capabilities.
+
+I believe this slipped through since libvirt already does image locking, but direct cli users will be caught by this change.
+
+In particular, we have a use-case where we simulate multipath disks by creating to disks which point to the same file which now breaks without adding the 'file.locking=off' to the -drive parameters;  which is also completely undocumented and unexposed. 
+
+Some parts of the cli like -device allow querying of settable options (qemu-system-x86 -device scsi_hd,?)  but nothing equivalent exists for -drive parameters.
+
+ProblemType: Bug
+DistroRelease: Ubuntu 17.10
+Package: qemu-system-x86 1:2.10~rc3+dfsg-0ubuntu1
+ProcVersionSignature: Ubuntu 4.12.0-11.12-generic 4.12.5
+Uname: Linux 4.12.0-11-generic x86_64
+NonfreeKernelModules: zfs zunicode zavl zcommon znvpair
+ApportVersion: 2.20.6-0ubuntu7
+Architecture: amd64
+Date: Fri Sep  8 12:56:53 2017
+JournalErrors:
+ Hint: You are currently not seeing messages from other users and the system.
+       Users in groups 'adm', 'systemd-journal' can see all messages.
+       Pass -q to turn off this notice.
+ -- Logs begin at Mon 2017-01-30 11:56:02 CST, end at Fri 2017-09-08 12:56:46 CDT. --
+ -- No entries --
+KvmCmdLine: COMMAND         STAT  EUID  RUID   PID  PPID %CPU COMMAND
+MachineType: HP ProLiant DL360 Gen9
+ProcEnviron:
+ TERM=xterm
+ PATH=(custom, no user)
+ XDG_RUNTIME_DIR=<set>
+ LANG=en_US.UTF-8
+ SHELL=/bin/bash
+ProcKernelCmdLine: BOOT_IMAGE=/vmlinuz-4.12.0-11-generic root=UUID=45354276-e0c0-4bf6-9083-f130b89411cc ro --- console=ttyS1,115200
+SourcePackage: qemu
+UpgradeStatus: No upgrade log present (probably fresh install)
+dmi.bios.date: 03/05/2015
+dmi.bios.vendor: HP
+dmi.bios.version: P89
+dmi.chassis.type: 23
+dmi.chassis.vendor: HP
+dmi.modalias: dmi:bvnHP:bvrP89:bd03/05/2015:svnHP:pnProLiantDL360Gen9:pvr:cvnHP:ct23:cvr:
+dmi.product.family: ProLiant
+dmi.product.name: ProLiant DL360 Gen9
+dmi.sys.vendor: HP
+
+
+
+Thanks Ryan for filing this bug, as I said in IRC all the file locking is rather new and I think this is for upstream qemu to address.
+Might just be a missed use case for them as well.
+
+I'll be adding an upstream qemu task to get their attention.
+@Rayn - It would be nice if - from the multipath tests - you could copy in here a commandline that worked before but fails now.
+
+Added a qemu task, this seems to be a use case affected by the file locking.
+In particular a (formerly working) case for multipath tests that use the same image files multiple times intentionally.
+
+So far the workaround is to set file.locking=off for all these, which might be just the right thing to do.
+But then as outlined by the reporter there currently is no way to query if file locking is supported, nor if it is the current default - so at least adding that might be required to be added in qemu.
+
+The correct way to query whether file locking is supported is 'query-qmp-schema', which will expose the 'locking' option for the 'file' branch of the 'blockdev-add' command then.
+
+As a first comment, in your setup, completely disabling file locking is probably a too big hammer. It is preferable to just allow multiple writers on the same image by setting share-rw=on for the block device (e.g. '-device virtio-blk-pci,drive=foo,share-rw=on'). This will allow all guest devices to share the same image, but will still protect the image against other users like an incorrect qemu-img invocation while the VM is running.
+
+However, note that opening the same image file twice is not the best approach to the problem anyway. This happens to work with raw images (except for the locking), but it would cause corruption for any other image format.
+
+The better solution (though it may require more changes to your management application) is to open the image once and assign a node-name to it, and then let two guest devices point to the same node. Like above, this requires that share-rw=on be set for guest devices, but it will also work with non-raw image formats because the image file is now opened only once and the sharing is done internally in qemu.
+
+An example command line fragment might look like this:
+
+  -blockdev node-name=disk,driver=file,filename=hd.img
+  -device virtio-blk,drive=disk,share-rw=on
+  -device virtio-blk,drive=disk,share-rw=on
+
+Technically, you can also keep using -drive instead of -blockdev, but it will result in a mixed state of modern node-name based block device management and the traditional drive based configuration, which might be confusing at times.
+
+Kevin,
+
+Thanks for the information.  A couple of points for feedback:
+
+1) there doesn't appear to be a way to run qmp query-schema without spawning a qemu instance in -qmp mode and having a second client issue the query-schema;  certainly a qemu-system-$arch -qmp-schema would be quite useful when examining feature availability.   While I know the QMP/QAPI introspection is where most of the work has gone to describing how to interact with qemu it's quite cumbersome at best:
+
+searching for blockdev-add, find arg-type: 48, read arg-type-48, find list of 'variants', know that locking feature is part of 'file', find type: 207, see member 'locking' in list[A], which is of type 296, find type: 296, which is an enum of 'on', 'off', 'auto'
+
+A. Interesting enough, qapi says the default is None, however qemu certainly locks files by default which would seem to imply a mismatch between qapi defaults and qemu behavior.
+
+That's pretty heavy;  Maybe that warning message qemu prints could provide some hints as to what a user could do (or refer to a manpage on locking?).
+
+2) share-rw appears to be a blockdev parameter (I see it available via most block devices via qemu-system-$arch -device {scsi-hd,ide-hd,virtio-blk}? However there is no equivalent -blockdev for dumping the default options that a -blockdev parameter takes.  The qmp-schema also does not include any information about 'share-rw' w.r.t what values are available that I could find after dumping the schema.
+
+Thanks smoser:
+
+#!/bin/sh
+qemu-system-x86_64 -S -nodefaults -nographic \
+   -serial none -monitor none -qmp stdio <<EOF |
+{ "execute": "qmp_capabilities" }
+{ "execute": "query-qmp-schema" }
+{ "execute": "quit" }
+EOF
+   python3 -c '
+import json, sys
+data = json.loads(sys.stdin.read().splitlines()[2])
+print(json.dumps(data, indent=1, sort_keys=True,
+                 separators=(",", ": ")))'
+
+
+
+
+
+
+
+In our multipath case, the initial open succeeds (it's not locked by anything else) and the second lock attempt fails, however, IIUC the fcntl structure[1] includes the locking pid, which should be our invocation of QEMU; 
+
+Can we not check if the locking pid matches the current pid and not fail?  This appears to be the original goal of protecting locked images from being manipulated by external processes.
+
+
+
+Having a single QEMU process open the same qcow2 file twice is just as dangerous as having two separate QEMU processes open the same qcow2 file concurrently. In both cases you have qcow2 state cached in a BlockDriverState and nothing is able to invalidate the cache in the other BlockDriverState.  So short-circuiting locking if the current pid matches would be wrong.
+
+Kevin,
+Thanks for the suggestion of share-rw=on.  I figured I'd try to change our 'xkvm' wrapper around qemu to use that.
+
+Unfortunately, it looks like , at least in our version of qemu (QEMU emulator
+version 2.10.0(Debian 1:2.10+dfsg-0ubuntu1)), that this does not work
+with the -drive path.
+
+$ qemu-img create -f qcow2 disk1.img 1G
+$ qemu-system-x86_64 \
+   -device virtio-net-pci,netdev=net00 \
+   -netdev type=user,id=net00 \
+   -drive id=drive01,file=disk1.img,format=qcow2,share-rw=on \
+   -device drive=drive01,serial=sn-drive01,driver=virtio-blk,index=1 \
+   -device drive=drive01,serial=sn-drive01,driver=virtio-blk,index=2
+qemu-system-x86_64: -drive id=drive01,file=disk1.img,format=qcow2,share-rw=on: Block format 'qcow2' does not support the option 'share-rw'
+
+I had thought you were suggesting the above, right?
+
+
+The share-rw=on option belongs to -device, not to -drive/-blockdev.
+
+Your example does work (using -blockdev), but I can't get it to work with
+-drive.
+
+$ qemu-system-x86_64 \
+   -drive id=d01,file=disk1.img,format=qcow2 \
+   -device drive=d01,serial=s01,driver=virtio-blk,index=1,share-rw=on \
+   -device drive=d01,serial=s01,driver=virtio-blk,index=2,share-rw=on
+warning: TCG doesn't support requested feature: CPUID.01H:ECX.vmx [bit 5]
+qemu-system-x86_64: -device drive=d01,serial=s01,driver=virtio-blk,index=1,share-rw=on: Drive 'd01' is already in use because it has been automatically connected to another device (did you need 'if=none' in the drive options?)
+
+
+## ok, fix that error, add 'if=none' to the -drive.
+
+$ qemu-system-x86_64  \
+  -drive id=d01,file=disk1.img,format=qcow2,if=none \
+  -device virtio-blk,drive=d01,serial=s01,index=1,share-rw=on \
+  -device virtio-blk,drive=d01,serial=s01,index=2,share-rw=on
+qemu-system-x86_64: -device drive=d01,serial=s01,driver=virtio-blk,index=1,share-rw=on: Property '.index' not found
+
+## ok, index belongs on the -drive (which I should have known from
+## the past, but which seems not the right place).  Try that anyway.
+
+$ qemu-system-x86_64  \
+  -drive id=d01,file=disk1.img,format=qcow2,if=none,index=1  \
+  -device virtio-blk,drive=d01,serial=s01,share-rw=on \
+  -device virtio-blk,drive=d01,serial=s01,share-rw=on
+qemu-system-x86_64: -device drive=d01,serial=s01,driver=virtio-blk,share-rw=on: Drive 'd01' is already in use by another device
+
+## Huh?  Isn't that what I said to explicitly allow with share-rw=on?
+
+Note that I've also tried with 'format=raw'.  Is there something I'm
+missing to try to use -drive and -device ?
+
+Lastly (if you're still reading), how do  you specify the format of
+the file to -blockdev ?  adding 'format=qcow2' makes qemu complain that
+"'format' is unexpected".
+
+Thanks for your time.
+
+
+I see the answer to my question above.  'format' is now driver=qcow2.
+
+
+The important difference between your -drive command line and my -blockdev example is that I used the node-name to reference the image. You can specify a node-name with -drive, too (having both id and node-name is one of the main things that I meant what I said mixing both styles can be confusing).
+
+I also don't think that index=1 does anything useful when used with if=none, so you can leave that out.
+
+Putting everything together, we get this:
+
+$ qemu-system-x86_64 \
+  -drive node-name=d01,file=disk1.img,format=qcow2,if=none \
+  -device virtio-blk,drive=d01,serial=s01,share-rw=on \
+  -device virtio-blk,drive=d01,serial=s01,share-rw=on
+
+Kevin,
+thanks again.  You've provided enough support for me at this point.  I had looked at trying to coalesce multiple -drive values into a single one, and that can definitely be made to work with the newer qemu, but i'm not sure I can make it work with older.  
+
+the goal there would be to do something like:
+$ qemu-system-x86_64   \
+   -drive id=d01,file.filename=disk1.img,format=qcow2,if=none -\
+   -device virtio-blk,drive=d01,serial=s01 \
+   -device virtio-blk,drive=d01,serial=s02
+
+on newer qemu, that works if i change 'id=' to 'node-name', but on older qemu I can't convince it to let me have 1 drive associated to multiple -device.
+
+What we ended up doing is at 
+  https://code.launchpad.net/~smoser/curtin/trunk.lp1716028-hack-file-locking-in-qemu/+merge/330456
+
+
+
+Note that 'share-rw' was introduced earlier (commit dabd18f6, qemu 2.9) than 'locking' (commit 16b48d5d, qemu 2.10), so if qemu 2.9 is relevant for you, your hacky check doesn't work.
+
+We had a discussion today on how to workaround if you drive qmeu via libvirt.
+While discussions often and up at the correctness of such setups they exists, I think it is worth to document until libvirt supports that officially.
+
+TL:DR:
+- no native libvirt feature yet
+- discussions if <shareable/> should set it
+- workaround available via cmdline
+
+Details on the workaround:
+- To use the workaround you have to check your log usually in /var/log/libvirt/qemu/<guestname>.log
+- Get the id of the device that matters to you
+- then use [1] to tweak qemu cmdline
+- example is from [2] to [3]
+
+[1]: http://blog.vmsplice.net/2011/04/how-to-pass-qemu-command-line-options.html
+[2]: https://gist.github.com/anonymous/a2ce3cbf7878995537212f0dafd06d99
+[3]: https://gist.github.com/anonymous/07a357af9e34172b60c83d410fe63fdd
+
+Note: Depending on the case you might also get lucky with "shareable" and/or "readonly" disk attributes.
+
+
+Umm, the latter is the official way to go, but only in latter libvirt versions.
+https://libvirt.org/git/?p=libvirt.git;a=commit;h=28907b0043fbf71085a798372ab9c816ba043b93
+
+I'm adding a libvirt bug task for the bionic merge to pick that up "explicitly"
+
+Also on the qemu side this is "works as intended" and workarounds are documented in this bug.
+So we should set that bug status as well - looking back given it was mostly a discussion I guess "opinion" is the best close status in this case.
+
+I've taked this qemu-file-locking just so we can group/easily find other bugs that have this tag.
+link to search for all bugs with that tag is: https://goo.gl/W2aT2T
+
+or the longer form:
+https://bugs.launchpad.net/bugs/+bugs?field.status%3Alist=NEW&field.status%3Alist=OPINION&field.status%3Alist=INVALID&field.status%3Alist=WONTFIX&field.status%3Alist=EXPIRED&field.status%3Alist=CONFIRMED&field.status%3Alist=TRIAGED&field.status%3Alist=INPROGRESS&field.status%3Alist=FIXCOMMITTED&field.status%3Alist=FIXRELEASED&field.status%3Alist=INCOMPLETE_WITH_RESPONSE&field.status%3Alist=INCOMPLETE_WITHOUT_RESPONSE&assignee_option=any&field.tag=qemu-file-locking
+
+
+
+Libvirt will make this "easier" to be avoided by
+commit 28907b0043fbf71085a798372ab9c816ba043b93
+Author: Peter Krempa <email address hidden>
+Date:   Wed Nov 15 15:21:14 2017 +0100
+
+    qemu: command: Mark <shared/> disks as such in qemu
+    
+    Qemu has now an internal mechanism for locking images to fix specific
+    cases of disk corruption. This requires libvirt to mark the image as
+    shared so that qemu lifts certain restrictions.
+    
+    Resolves: https://bugzilla.redhat.com/show_bug.cgi?id=1378242
+
+commit 860a3c4bea1d24773d8a495f213d5de3ac48a462
+Author: Peter Krempa <email address hidden>
+Date:   Wed Nov 15 15:02:58 2017 +0100
+
+    qemu: caps: Add capability for 'share-rw' disk option
+    
+    'share-rw' for the disk device configures qemu to allow concurrent
+    access to the backing storage.
+    
+    The capability is checked in various supported disk frontend buses since
+    it does not make sense to partially backport it.
+
+Once this is complete in bionic by taking the new upstream I'll take a look at how backportable that is (changes look ok, but might need some testing in the SRU spirit of things).
+
+This bug was fixed in the package libvirt - 4.0.0-1ubuntu1
+
+---------------
+libvirt (4.0.0-1ubuntu1) bionic; urgency=medium
+
+  * Merged with Debian unstable (4.0)
+    This closes several bugs:
+    - Error generating apparmor profile when hostname contains spaces
+      (LP: #799997)
+    - qemu 2.10 locks files, libvirt shared now sets share-rw=on (LP: #1716028)
+    - libvirt usb passthrough throws apparmor denials related to
+      /run/udev/data/+usb (LP: #1727311)
+    - AppArmor denies access to /sys/block/*/queue/max_segments (LP: #1729626)
+    - iohelper improvements to let bypass-cache work without opening up the
+      apparmor isolation (LP: #1719579)
+    - nodeinfo on s390x to contain more CPU info (LP: #1733688)
+    - Upgrade libvirt >= 4.0 (LP: #1745934)
+  * Remaining changes:
+    - Disable libssh2 support (universe dependency)
+    - Disable firewalld support (universe dependency)
+    - Disable selinux
+    - Set qemu-group to kvm (for compat with older ubuntu)
+    - Additional apport package-hook
+    - Modifications to adapt for our delayed switch away from libvirt-bin (can
+      be dropped >18.04).
+      + d/p/ubuntu/libvirtd-service-add-bin-alias.patch: systemd: define alias
+        to old service name so that old references work
+      + d/p/ubuntu/libvirtd-init-add-bin-alias.patch: sysv init: define alias
+        to old service name so that old references work
+      + d/control: transitional package with the old name and maintainer
+        scripts to handle the transition
+    - Backwards compatible handling of group rename (can be dropped >18.04).
+    - config details and autostart of default bridged network. Creating that is
+      now the default in general, yet our solution provides the following on
+      top as of today:
+      + autostart the default network by default
+      + do not autostart if subnet is already taken (e.g. in guests).
+    - d/p/ubuntu/Allow-libvirt-group-to-access-the-socket.patch: This is
+      the group based access to libvirt functions as it was used in Ubuntu
+      for quite long.
+      + d/p/ubuntu/daemon-augeas-fix-expected.patch fix some related tests
+        due to the group access change.
+    - ubuntu/parallel-shutdown.patch: set parallel shutdown by default.
+    - d/p/ubuntu/enable-kvm-spice.patch: compat with older Ubuntu qemu/kvm
+      which provided a separate kvm-spice.
+    - d/p/ubuntu/ubuntu-libxl-qemu-path.patch: this change was split. The
+      section that adapts the path of the emulator to the Debian/Ubuntu
+      packaging is kept.
+    - d/p/ubuntu/ubuntu-libxl-Fix-up-VRAM-to-minimum-requirements.patch: auto
+      set VRAM to minimum requirements
+    - d/p/ubuntu/xen-default-uri.patch: set default URI on xen hosts
+    - Add libxl log directory
+    - libvirt-uri.sh: Automatically switch default libvirt URI for users on
+      Xen dom0 via user profile (was missing on changelogs before)
+    - d/p/ubuntu/apibuild-skip-libvirt-common.h: drop libvirt-common.h from
+      included_files to avoid build failures due to duplicate definitions.
+    - Update README.Debian with Ubuntu changes
+    - Convert libvirt0, libnss_libvirt and libvirt-dev to multi-arch.
+    - Enable some additional features on ppc64el and s390x (for arch parity)
+      + systemtap, zfs, numa and numad on s390x.
+      + systemtap on ppc64el.
+    - fix conffile upgrade handling to avoid obsolete files
+      and inactive duplicates (LP 1694159)
+    - d/t/control, d/t/smoke-qemu-session: fixup smoke-qemu-session by making
+      vmlinuz available and accessible (Debian bug 848314)
+    - d/test/smoke-lxc workaround for debbug 848317/867379
+    - d/t/control, d/t/smoke-lxc: fix up lxc smoke test (Debian bug 848317)
+    - Add dnsmasq configuration to work with system wide dnsmasq (drop >18.04,
+      no more UCA onto Xenial then which has global dnsmasq by default).
+    - d/p/ubuntu/ubuntu_machine_type.patch: accept ubuntu types as pci440fx
+    - conffile handling of files dropped in 3.5 (can be dropped >18.04)
+      + /etc/init.d/virtlockd was sysv init only
+      + /etc/apparmor.d/local/usr.sbin.libvirtd and
+        /etc/apparmor.d/local/usr.lib.libvirt.virt-aa-helper are now generated
+        by dh_apparmor as needed
+    - Reworked apparmor Delta, especially the more complex delta is dropped
+      now, also our former delta is now split into logical pieces, has
+      improved comments and is part of a continuous upstreaming effort.
+      Listing related remaining changes:
+      + d/p/0001-apparmor-Allow-pygrub-to-run-on-Debian-Ubuntu.patch: apparmor:
+        Allow pygrub to run on Debian/Ubuntu
+      + d/p/0003-apparmor-libvirt-qemu-Allow-read-access-to-overcommi.patch:
+        apparmor, libvirt-qemu: Allow read access to overcommit_memory
+      + d/p/0007-apparmor-libvirt-qemu-Allow-owner-read-access-to-PRO.patch:
+        apparmor, libvirt-qemu: Allow owner read access to @{PROC}/*/auxv
+      + d/p/0017-apparmor-virt-aa-helper-Allow-access-to-tmp-director.patch:
+        apparmor, virt-aa-helper: Allow access to tmp directories
+      + d/p/ubuntu-aa/0020-virt-aa-helper-ubuntu-storage-paths.patch:
+        apparmor, virt-aa-helper: Allow various storage pools and image
+        locations
+      + d/p/0021-apparmor-virt-aa-helper-Add-openvswitch-support.patch:
+        apparmor, virt-aa-helper: Add openvswitch support
+      + d/p/0025-apparmor-fix-newer-virt-manager-1.4.0.patch: Add Apparmor
+        permissions so virt-manager 1.4.0 viewing works (LP 1668681).
+      + d/p/0029-appmor-libvirt-qemu-Add-9p-support.patch: appmor,
+        libvirt-qemu: Add 9p support
+      + d/p/0030-virt-aa-helper-Complete-9p-support.patch: virt-aa-helper:
+        add l to 9p file options.
+      + d/p/0031-virt-aa-helper-Ask-for-no-deny-rule-for-readonly-dis.patch:
+        virt-aa-helper: Ask for no deny rule for readonly disk (renamed and
+        reworded, was virt-aa-helper-no-explicity-deny-for-basefiles.patch)
+      + d/p/0032-apparmor-libvirt-qemu-Allow-reading-charm-specific-c.patch:
+        apparmor, libvirt-qemu: Allow reading charm-specific ceph config
+      + d/p/0033-UBUNTU-only-apparmor-for-kvm.powerpc-LP-1680384.patch: allow
+        commands executed by ubuntu only kvm wrapper on ppc64el (LP 1686621).
+      + d/p/0034-apparmor-virt-aa-helper-access-for-snapped-nova.patch:
+        apparmor, virt-aa-helper: access for snapped nova
+  * Dropped Changes (Upstream):
+    - d/p/0005-apparmor-libvirt-qemu-Allow-use-of-sgabios.patch: apparmor,
+      libvirt-qemu: Allow use of sgabios
+    - d/p/0006-apparmor-libvirt-qemu-Silence-lttng-related-deny-mes.patch:
+      apparmor, libvirt-qemu: Silence lttng related deny messages
+    - d/p/0008-apparmor-libvirt-qemu-Allow-read-access-to-sysfs-sys.patch:
+      apparmor, libvirt-qemu: Allow read access to sysfs system info
+    - d/p/0009-apparmor-libvirt-qemu-Allow-read-access-to-max_mem_r.patch:
+      apparmor, libvirt-qemu: Allow read access to max_mem_regions
+    - d/p/0010-apparmor-libvirt-qemu-Allow-qemu-block-extra-librari.patch:
+      apparmor, libvirt-qemu: Allow qemu-block-extra libraries
+    - d/p/0012-apparmor-libvirtd-Allow-access-to-netlink-sockets.patch:
+      apparmor, libvirtd: Allow access to netlink sockets
+    - d/p/0013-apparmor-Add-rules-for-mediation-support.patch:
+      apparmor: Add rules for mediation support
+    - d/p/0015-apparmor-virt-aa-helper-Allow-access-to-ecryptfs-fil.patch:
+      apparmor, virt-aa-helper: Allow access to ecryptfs files
+    - d/p/0016-apparmor-libvirtd-Allow-ixr-to-var-lib-libvirt-virtd.patch:
+      apparmor, libvirtd: Allow ixr to /var/lib/libvirt/virtd*
+    - d/p/0018-apparmor-virt-aa-helper-Add-ipv6-network-policy.patch:
+      apparmor, virt-aa-helper: Add ipv6 network policy
+    - d/p/0019-apparmor-virt-aa-helper-Allow-access-to-sys-bus-usb-.patch:
+      apparmor, virt-aa-helper: Allow access to /sys/bus/usb/devices
+    - d/p/0023-apparmor-qemu-won-t-call-qemu-nbd.patch: apparmor: qemu
+      won't call qemu-nbd
+    - d/p/0027-apparmor-allow-reading-cmdline-of-shutdown-signal.patch:
+      apparmor: allow to parse cmdline of the pid that send the shutdown
+      signal (LP 1680384).
+    - d/p/0028-apparmor-add-default-pki-path-of-lbvirt-spice.patch:
+      apparmor: add default pki path of lbvirt-spice (LP 1690140)
+    - d/p/ubuntu-aa/0035-virt-aa-helper-locking-disk-files-for-qemu-2.10.patch:
+      for compatibility with the behavior of qemu 2.10 this adds locking
+      permission to rules generated for disk files (LP 1709818)
+    - d/p/ubuntu-aa/0036-virt-aa-helper-locking-loader-nvram-for-qemu-2.10.patch:
+      for compatibility with the behavior of qemu 2.10 this adds locking
+      permission to rules generated for loader/nvram (LP 1710960)
+    - d/p/ubuntu-aa/0037-virt-aa-helper...: grant locking permission on append
+      files (LP 1726804)
+    - d/p/ubuntu-aa/0038-virt-aa-helper-fix-paths-for-usb-hostdevs.patch:
+      fix path generation for USB host devices (LP 1552241)
+    - d/p/ubuntu-aa/0039-virt-aa-helper-fix-libusb-access-to-udev-usb-data.patch:
+      generate valid rules on usb passthrough (LP 1686324)
+    - d/p/avoid-double-locking.patch: fix a deadlock that could occur when
+      libvirtd interactions raced with dbus causing a deadlock (LP 1714254).
+    - d/p/u/gnulib-getopt-posix-Fix-build-failure-when-using-ac_cv_head.patch:
+      fix FTBFS with glibc 2.26 (LP 1718668)
+    - Extended handling of apparmor profiles - clear lost profiles via cron
+      (now cleared by virt-aa-helper on domain stop)
+    - nat only on some ports <port start='1024' end='65535'/> (upstream
+      default now if nothing is specified, actually dropped last cycle)
+  * Dropped Changes (In Debian or no more important):
+    - d/p/0002-apparmor-libvirt-qemu-Allow-macvtap-access.patch: apparmor,
+      libvirt-qemu: Allow macvtap access
+    - d/p/0004-apparmor-Explicit-deny-for-setpcap.patch: apparmor: Explicit
+      deny for setpcap (LP 522845).
+    - d/p/0014-apparmor-virt-aa-helper-Improve-comment-about-backin.patch:
+      apparmor, virt-aa-helper: Improve comment about backing store
+    - d/p/0022-apparmor-drop-references-to-qemu-kvm.patch: apparmor: drop
+      references to qemu-kvm
+    - d/p/0024-apparmor-virt-aa-helper-Allow-access-to-name-service.patch:
+      apparmor, virt-aa-helper: Allow access to name services
+    - d/p/0026-apparmor-add-generic-base-vfio-device.patch: apparmor: add
+      /dev/vfio for vf (hot) attach (LP 1680384) (added by virt-aa-helper per
+      guest if needed).
+    - d/p/0011-apparmor-libvirt-qemu-Allow-access-to-hugepage-mount.patch:
+      apparmor, libvirt-qemu: Allow access to hugepage mounts
+    - Disable sheepdog (was for universe dependency, but is now only a suggest)
+    - d/p/ubuntu/storage-disable-gluster-test: gluster not enabled, skip test
+  * Dropped Changes (In Debian/Upstream now based on interim 3.10 work) some of
+    these were never released, but important to mention for the bug references:
+    - libnss-libvirt once enabled causes apt to call getdents
+      avoid this being an issue by dropping a apt conf that allows
+      this in seccomp (LP: #1732030).
+    - d/libvirt-daemon-system.postrm: clean up more libvirt directories on
+      purge
+    - d/p/ubuntu-aa/0041-apparmor-allow-unix-stream-for-p2p-migrations.patch:
+      apparmor: allow unix stream for p2p migrations
+    - d/p/ubuntu-aa/0043-security-apparmor-implement-domainSetPathLabel.patch:
+      this replaces the hugepage rules and fixes many more formerly missing
+    - d/p/ubuntu-aa/0044-security-full-path-option-for-DomainSetPathLabel.patch:
+      allowing to have path wildcards on labels set by domain callbacks
+    - d/p/ubuntu-aa/0045-security-apparmor-add-Set-Restore-ChardevLabel.patch:
+      apparmor implementation of security callback
+    - d/p/ubuntu-aa/0046-apparmor-virt-aa-helper-drop-static-channel-rule.patch:
+      this is now covered by chardev label callbacks
+  * Added Changes:
+    - Revert Debian change "Drop libvirt-bin upgrade handling"
+      This is needed in Ubuntu one last time (drop >18.04)
+    - Revert Debian change "Drop maintscript helpers for versions predating
+      jessie and wheezy-backports". This is needed in Ubuntu one last
+      time (drop >18.04)
+    - Refreshed d/p/* to match new version (only fuzz, no semantic change)
+    - d/libvirt-daemon-system.postrm: change order of libvirt-qemu removal
+      to avoid error messages on purge
+    - remove no more used libvirt-dnsmasq user (drop >18.04)
+    - d/p/ubuntu-aa/0040-apparmor-add-mediation-rules-for-unconfined.patch:
+      apparmor: add mediation rules for unconfined guests
+    - d/p/ubuntu-aa/0042-security-introduce-virSecurityManager-Set-Restore-Ch
+      .patch: backport upstream cahnge to expose already used chardev calls.
+    - d/libvirt-daemon-system.postrm: Remove the default.xml network link
+      set up by postinst.
+    - d/libvirt-daemon-system.maintscript: remove the now dropped conffile
+      /etc/cron.daily/libvirt-daemon-system
+    - d/libvirt-daemon-system.postinst: fixups for autostart default network
+      - use modern shell syntax
+      - try more default networks before giving up to enable by default
+    - d/p/ubuntu-aa/0020-virt-aa-helper-ubuntu-storage-paths.patch:
+      add multipass image path and mark as ubuntu only change.
+    - d/rules: install virtlockd correctly with defaults file (LP: #1729516)
+    - extended d/p/0025-apparmor-fix-newer-virt-manager-1.4.0.patch to cover
+      the slightly changed behavior of libvirt 4.0 (LP: #1741617)
+    - d/control: make libvirt-daemon-driver-storage-rbd a recommend instead of
+      just a suggest to have 3rd party relying on rbd out of the box working.
+      This is deprecated and users of rbd backend should start depending on
+      this package for it will be dropped to a suggest in future releases.
+
+ -- Christian Ehrhardt <email address hidden>  Thu, 14 Dec 2017 14:15:55 +0100
+
+The avoidance for libvirt driven cases to map </shared> onto share-rw is complete in Bionic now, so I started to look into a potential SRU.
+
+But looking back it seems in the meantime everybody learned how to use it.
+I have not seen any more dups coming in recently.
+The same is true for openstack and likely everyone else.
+
+Therefore I'll set Won't Fix for Artful, we would have to wait for an upcoming security fix to be out of the queue anyway. If until that is done someone steps up and explains why this really still is needed in Artful I'll backport them, but otherwise I think we are good with Won't fix.
+

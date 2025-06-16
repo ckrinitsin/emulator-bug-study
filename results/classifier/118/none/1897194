@@ -1,0 +1,77 @@
+architecture: 0.789
+user-level: 0.535
+performance: 0.480
+graphic: 0.460
+device: 0.450
+semantic: 0.440
+ppc: 0.418
+network: 0.413
+debug: 0.369
+permissions: 0.368
+arm: 0.343
+kernel: 0.310
+PID: 0.301
+socket: 0.297
+boot: 0.245
+vnc: 0.237
+peripherals: 0.224
+mistranslation: 0.207
+x86: 0.197
+register: 0.194
+virtual: 0.191
+files: 0.179
+VMM: 0.155
+hypervisor: 0.149
+risc-v: 0.148
+i386: 0.145
+TCG: 0.132
+KVM: 0.132
+assembly: 0.084
+
+Test failure in test-crypto-secret.c
+
+When running qemu test suite I'm seeing a test failure:
+
+ERROR:../qemu/tests/test-crypto-secret.c:144:test_secret_keyring_good: assertion failed: (key >= 0)
+
+Host is Arch Linux running in the standard Arch build environment (essentially an nspawn container).
+
+I first noticed this at release of 5.1.0 but it's still there on current trunk. For 5.1.0 I was able to sidestep the issue by building with `--disable-keyring' but this no longer works (I think due to 9866a33cbb7046891dec3dcc9ca2015828673afe)
+
+Any clues on what might be the cause? Not sure how to debug.
+
+Ping. Nobody else seeing this?
+
+I can only assume you don't have keyutils-dev (or equivalent) installed on your system.
+
+This is a key difference (pardon the pun!) between Arch and the bigger distros. Arch tends to avoid splitting development libs and headers into separate packages, which might explain why others are not seeing the test failure.
+
+strace shows the problem:
+
+add_key("user", "qemu_test_secret", "Test Payload", 12, KEY_SPEC_PROCESS_KEYRING) = -1 EPERM (Operation not permitted)
+
+It appears systemd-nspawn containers don't have CAP_SYS_ADMIN which is apparently needed for the keyring stuff to work. Fair enough.
+
+But the underlying problem here is configure switch `--disable-keyring' does not work. It previously worked in the 5.1.0 release but now it's broken.
+
+
+
+> systemd-nspawn containers don't have CAP_SYS_ADMIN
+
+Above statement is utter bollocks. Please ignore..
+
+
+I finally got to the bottom of all this and now have the test suite passing.
+
+- don't use `--disable-keyring', it's busted
+
+- systemd-nspawn containers need to be configured with additional capabilities/syscalls (see below)
+
+I noticed another test failing (postcopy-ram in tests/qtest/migration-test.c). It needs access to munlockall which is covered by CAP_IPC_LOCK capability.
+
+Here is my .nspawn config needed to get the test suite passing inside a systemd-nspawn container:
+
+[Exec]
+Capability=CAP_IPC_LOCK
+SystemCallFilter=add_key keyctl
+

@@ -1,0 +1,133 @@
+mistranslation: 0.896
+user-level: 0.890
+graphic: 0.878
+semantic: 0.856
+virtual: 0.850
+permissions: 0.849
+debug: 0.849
+risc-v: 0.847
+performance: 0.842
+register: 0.835
+vnc: 0.832
+assembly: 0.831
+hypervisor: 0.827
+KVM: 0.823
+architecture: 0.823
+socket: 0.820
+PID: 0.820
+arm: 0.815
+network: 0.807
+peripherals: 0.799
+TCG: 0.797
+x86: 0.791
+kernel: 0.785
+ppc: 0.782
+VMM: 0.771
+device: 0.761
+i386: 0.760
+boot: 0.758
+files: 0.712
+
+qemu-img convert segfaults with specific URL
+
+Using what is currently the latest git: (commit 00d8ba9e0d62ea1c7459c25aeabf9c8bb7659462, Date:   Sun Feb 21 19:52:58 2021 +0000)
+
+$ ./build/qemu-img convert -f qcow2 -O raw https://download.cirros-cloud.net/0.4.0/cirros-0.4.0-x86_64-disk.img out.img
+Segmentation fault (core dumped)
+
+
+Backtrace for convenience:
+qemu: qemu_mutex_lock_impl: Invalid argument
+
+Thread 1 "qemu-img" received signal SIGABRT, Aborted.
+0x00007ffff77c59d5 in raise () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007ffff77c59d5 in raise () from /lib64/libc.so.6
+#1  0x00007ffff77ae8a4 in abort () from /lib64/libc.so.6
+#2  0x00005555556705b2 in error_exit (err=<optimized out>, msg=msg@entry=0x5555556b69a0 <__func__.31> "qemu_mutex_lock_impl") at ../util/qemu-thread-posix.c:37
+#3  0x0000555555670945 in qemu_mutex_lock_impl (mutex=0x555555ae3758, file=0x5555556827a2 "../block/curl.c", line=406) at ../util/qemu-thread-posix.c:81
+#4  0x000055555559a05b in curl_multi_do (arg=0x555555aad2a0) at ../block/curl.c:406
+#5  0x000055555566193a in aio_dispatch_handler (ctx=ctx@entry=0x555555737790, node=0x555555b14150) at ../util/aio-posix.c:329
+#6  0x0000555555662072 in aio_dispatch_handlers (ctx=0x555555737790) at ../util/aio-posix.c:372
+#7  aio_dispatch (ctx=0x555555737790) at ../util/aio-posix.c:382
+#8  0x000055555564442e in aio_ctx_dispatch (source=<optimized out>, callback=<optimized out>, user_data=<optimized out>) at ../util/async.c:306
+#9  0x00007ffff7cfda9f in g_main_context_dispatch () from /lib64/libglib-2.0.so.0
+#10 0x000055555566f2c8 in glib_pollfds_poll () at ../util/main-loop.c:232
+#11 os_host_main_loop_wait (timeout=4397000000) at ../util/main-loop.c:255
+#12 main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:531
+#13 0x0000555555581edd in convert_do_copy (s=0x7fffffffd3a0) at ../qemu-img.c:2139
+#14 img_convert (argc=<optimized out>, argv=<optimized out>) at ../qemu-img.c:2738
+#15 0x00005555555783b1 in main (argc=7, argv=<optimized out>) at ../qemu-img.c:5536
+
+I can reproduce this, and I can reproduce it back to 5.0 (haven’t tried any release before that).  I couldn’t find a definite reason for why it breaks (curl_clean_state() is called because curl reports CURLMSG_DONE, freeing a socket, but then curl_multi_do() is called again for that socket, resulting in a use-after-free – but I don’t know why curl_multi_do() is invoked after CURLMSG_DONE).
+
+Because I remembered a similar situation where the curl driver suddenly failed (and then failed for every qemu release until that point), and where it turned out a change in libcurl broke our driver, I tried bisecting libcurl, but it turned out that when I build it myself and use it via LD_PRELOAD, I don’t get a crash.  I’ve tried building it with different options and in different versions, but consistently I see that using the system libcurl results in a crash, and using one I built myself does not.  (Tested on Fedora and Arch.)
+
+That isn’t to say the bug isn’t in our curl driver, but to find out where it is exactly, it seems necessary to find out what the difference between the system libcurl and the one I built is...  So far, I have no idea. :/
+
+Guys, when I run with valgrind, I always get this when segfault occurs:
+
+==74885== Invalid read of size 8
+==74885==    at 0x1DC87D: curl_multi_do (curl.c:410)
+==74885==    by 0x23B949: aio_dispatch_handler (aio-posix.c:329)
+==74885==    by 0x23C0A1: aio_dispatch_handlers (aio-posix.c:372)
+==74885==    by 0x23C0A1: aio_dispatch (aio-posix.c:382)
+==74885==    by 0x22DEE1: aio_ctx_dispatch (async.c:306)
+==74885==    by 0x4A854DA: g_main_context_dispatch (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.6600.1)
+==74885==    by 0x236097: glib_pollfds_poll (main-loop.c:232)
+==74885==    by 0x236097: os_host_main_loop_wait (main-loop.c:255)
+==74885==    by 0x236097: main_loop_wait (main-loop.c:531)
+==74885==    by 0x13E30C: convert_do_copy (qemu-img.c:2139)
+==74885==    by 0x13E30C: img_convert (qemu-img.c:2738)
+==74885==    by 0x134660: main (qemu-img.c:5536)
+==74885==  Address 0xf9779b8 is 8 bytes inside a block of size 32 free'd
+==74885==    at 0x483DA3F: free (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)
+==74885==    by 0x1DC5BC: curl_clean_state (curl.c:529)
+==74885==    by 0x1DC5BC: curl_clean_state (curl.c:515)
+==74885==    by 0x1DC7E4: curl_multi_check_completion (curl.c:385)
+==74885==    by 0x1DC8D4: curl_multi_do (curl.c:414)
+==74885==    by 0x23B949: aio_dispatch_handler (aio-posix.c:329)
+==74885==    by 0x23C0A1: aio_dispatch_handlers (aio-posix.c:372)
+==74885==    by 0x23C0A1: aio_dispatch (aio-posix.c:382)
+==74885==    by 0x22DEE1: aio_ctx_dispatch (async.c:306)
+==74885==    by 0x4A854DA: g_main_context_dispatch (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.6600.1)
+==74885==    by 0x236097: glib_pollfds_poll (main-loop.c:232)
+==74885==    by 0x236097: os_host_main_loop_wait (main-loop.c:255)
+==74885==    by 0x236097: main_loop_wait (main-loop.c:531)
+==74885==    by 0x13E30C: convert_do_copy (qemu-img.c:2139)
+==74885==    by 0x13E30C: img_convert (qemu-img.c:2738)
+==74885==    by 0x134660: main (qemu-img.c:5536)
+==74885==  Block was alloc'd at
+==74885==    at 0x483ED99: calloc (in /usr/lib/x86_64-linux-gnu/valgrind/vgpreload_memcheck-amd64-linux.so)
+==74885==    by 0x4A8B5A0: g_malloc0 (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.6600.1)
+==74885==    by 0x1DBDC9: curl_sock_cb (curl.c:156)
+==74885==    by 0x55402C1: ??? (in /usr/lib/x86_64-linux-gnu/libcurl-gnutls.so.4.6.0)
+==74885==    by 0x5543D33: ??? (in /usr/lib/x86_64-linux-gnu/libcurl-gnutls.so.4.6.0)
+==74885==    by 0x5543E77: curl_multi_socket_action (in /usr/lib/x86_64-linux-gnu/libcurl-gnutls.so.4.6.0)
+==74885==    by 0x1DC8C7: curl_multi_do_locked (curl.c:403)
+==74885==    by 0x1DC8C7: curl_multi_do (curl.c:413)
+==74885==    by 0x23B949: aio_dispatch_handler (aio-posix.c:329)
+==74885==    by 0x23C0A1: aio_dispatch_handlers (aio-posix.c:372)
+==74885==    by 0x23C0A1: aio_dispatch (aio-posix.c:382)
+==74885==    by 0x22DEE1: aio_ctx_dispatch (async.c:306)
+==74885==    by 0x4A854DA: g_main_context_dispatch (in /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.6600.1)
+==74885==    by 0x236097: glib_pollfds_poll (main-loop.c:232)
+==74885==    by 0x236097: os_host_main_loop_wait (main-loop.c:255)
+==74885==    by 0x236097: main_loop_wait (main-loop.c:531)
+
+It seems that sockets are being free'd in a non-expecting situation.
+
+Yes, as I wrote in comment 1, curl reports CURLMSG_DONE, the socket is freed, but then curl_multi_do() is called again for that socket (despite the CURLMSG_DONE).
+
+I suspect that qemu has interpreted the curl interface differently than curl itself (i.e., qemu has probably understood something wrong), which led to some change in curl breaking qemu’s curl module.   (Because I can’t find an old qemu version that doesn’t break, and so can’t find a change in qemu that broke it.)
+
+So if indeed a change to the curl library is what causes this segfault, or at least made the underlying issue visible, I’d like to know which change that is, so we can try to infer what qemu does wrong.  But I can’t find that change, because if I compile libcurl myself, I don’t get a segfault (nor valgrind errors in curl).
+
+Perhaps there’s something special about the server serving the image (although it just looks like AWS to me), i.e. it was always broken and we’ve just never seen it with other servers.  If so, debugging will be more difficult because we’d really need to take a detailed look into all our curl driver does.
+
+I think I’ve come to kind of understood what might be wrong: qemu frees CURLSocket objects when “their” transfer is done, but libcurl’s documentation actually doesn’t note any long-lasting relationship between a socket and some transfer (i.e., a CURL object), so we probably shouldn’t free CURLSocket objects just because some transfer is done.  Instead, we should only do so once libcurl explicitly tells us to remove the socket.
+
+I’ve sent a two-patch series to that effect: https://lists.nongnu.org/archive/html/qemu-block/2021-03/msg00515.html – it seems to help.
+
+https://gitlab.com/qemu-project/qemu/-/commit/0f418a207696b37f05d
+

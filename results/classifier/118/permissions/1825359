@@ -1,0 +1,217 @@
+permissions: 0.886
+arm: 0.817
+semantic: 0.811
+performance: 0.810
+graphic: 0.809
+assembly: 0.786
+ppc: 0.782
+peripherals: 0.767
+vnc: 0.759
+register: 0.756
+hypervisor: 0.753
+device: 0.753
+TCG: 0.751
+risc-v: 0.750
+VMM: 0.746
+virtual: 0.736
+architecture: 0.727
+files: 0.721
+mistranslation: 0.719
+debug: 0.712
+user-level: 0.712
+PID: 0.705
+network: 0.683
+KVM: 0.681
+socket: 0.669
+x86: 0.658
+kernel: 0.640
+i386: 0.608
+boot: 0.601
+
+cpu_ld*_code() triggers MMU_DATA_LOAD i.s.o. MMU_INST_FETCH
+
+commit 377b155bde451d5ac545fbdcdfbf6ca17a4228f5
+Merge: c876180938 328eb60dc1
+Author: Peter Maydell <peter.x@x.x>        ; masked for anti-spamming purposes
+Date:   Mon Mar 11 18:26:37 2019 +0000
+https://github.com/qemu/qemu/commit/377b155bde451d5ac545fbdcdfbf6ca17a4228f5
+--------------------------------------------------
+
+cpu_ld*_code() is used for loading code data as the name suggests. Although, it begins
+accessing memory with MMU_INST_FETCH access type, somewhere down the road, when the
+"io_readx(..., access_type=MMU_INST_FETCH, ...)" is called, it is ignoring this "access_type"
+while calling the "tlb_fill()" with a _hardcoded_ MMU_DATA_LOAD:
+
+cputlb.c
+--------
+static uint64_t io_readx(..., MMUAccessType access_type, ...)
+{
+
+    if (recheck) {
+        CPUTLBEntry *entry;
+        target_ulong tlb_addr;
+    
+        tlb_fill(cpu, addr, size, MMU_DATA_LOAD, mmu_idx, retaddr);
+        ...
+}
+--------
+
+This is an issue, because there can exist _small_ regions of memory (smaller than the
+TARGET_PAGE_SIZE) that are only executable and not readable.
+
+TL;DR
+
+What happens is at first, a "tlb_fill(..., access_type=MMU_INST_FETCH, ...)" is
+triggered by "tb_lookup_cpu_state()". To be precise, this is the call stack which is good behavior:
+---
+#0  tlb_fill (cs=..., vaddr=684, size=0, access_type=MMU_INST_FETCH, mmu_idx=0, retaddr=0) at target/arc/mmu.c:602
+#1  get_page_addr_code (env=..., addr=684) at accel/tcg/cputlb.c:1045
+#2  tb_htable_lookup (cpu=..., pc=684, cs_base=0, flags=0, cf_mask=4278190080) at accel/tcg/cpu-exec.c:337
+#3  tb_lookup__cpu_state (cpu=..., pc=..., cs_base=..., flags=..., cf_mask=4278190080) at include/exec/tb-lookup.h:43
+#4  tb_find (cpu=..., last_tb=... <code_gen_buffer+17811>, tb_exit=0, cf_mask=0) at accel/tcg/cpu-exec.c:404
+#5  cpu_exec (cpu=...) at accel/tcg/cpu-exec.c:729
+#6  tcg_cpu_exec (cpu=...) at cpus.c:1430
+#7  qemu_tcg_rr_cpu_thread_fn (arg=...) at cpus.c:1531
+#8  qemu_thread_start (args=...) at util/qemu-thread-posix.c:502
+---
+
+After this call, TLB is filled with an entry that its size field is small, say 32 bytes.
+This causes a TLB_RECHECK for consequent memory accesses, which is logical. However,
+in our decoder, we use cpu_lduw_code() to read the instructions and decode them. As mentioned,
+in the beginning, the access_type=MMU_INST_FETCH is lost in "io_readx()" while calling "tlb_fill()",
+and now THIS CAUSES A GUEST EXCEPTION BECAUSE THAT REGION IS NOT ALLOWED TO BE READ. Here,
+comes that trace call of the _bad_ behavior:
+---
+#0  tlb_fill (..., access_type=MMU_DATA_LOAD, ...) at target/arc/mmu.c:605
+#1  io_readx (..., access_type=MMU_INST_FETCH, size=2) at accel/tcg/cputlb.c:881
+#2  io_readw (..., access_type=MMU_INST_FETCH) at accel/tcg/softmmu_template.h:106
+#3  helper_le_ldw_cmmu (..., oi=16, retaddr=0) at accel/tcg/softmmu_template.h:146
+#4  cpu_lduw_code_ra (env=..., ptr=684, retaddr=0) at include/exec/cpu_ldst_template.h:102
+#5  cpu_lduw_code (env=..., ptr=684) at include/exec/cpu_ldst_template.h:114
+#6  read_and_decode_context (ctx=..., opcode_p=...) at target/arc/arc-decoder.c:1479
+#7  arc_decode (ctx=...) at target/arc/arc-decoder.c:1736              
+#8  decode_opc (env=..., ctx=...) at target/arc/translate.c:313
+#9  arc_tr_translate_insn (dcbase=..., cpu=...) at target/arc/translate.c:335
+#10 translator_loop (.. <code_gen_buffer+18131>) at accel/tcg/translator.c:107
+#11 gen_intermediate_code (cpu=..., tb=... <code_gen_buffer+18131>) at target/arc/translate.c:413
+#12 tb_gen_code (cpu=..., pc=684, cs_base=0, flags=0, cflags=-16711679) at accel/tcg/translate-all.c:1723
+#13 tb_find (cpu=..., last_tb=... <code_gen_buffer+17811>, tb_exit=0, cf_mask=0) at accel/tcg/cpu-exec.c:407
+#14 cpu_exec (cpu=...) at accel/tcg/cpu-exec.c:729                     
+#15 tcg_cpu_exec (cpu=...) at cpus.c:1430
+
+---
+
+Do you confirm if this is an issue? Maybe there are other ways to read an instruction with
+MMU_INST_FETCH access that I don't know about.
+
+Last but not least, although this is not a security issue for QEMU per se, but it is hindering a
+security feature for the guest.
+
+Yeah, this looks like a bug -- we should pass the access_type through rather than using MMU_DATA_LOAD.
+
+
+Should I make a patch then?
+
+
+
+
+
+
+The patch looks OK code-wise, but could you submit it to the mailing list, please?
+https://wiki.qemu.org/Contribute/SubmitAPatch has the details, but the most important part is that it needs a Signed-off-by: line from you that says you have the legal right and are willing to contribute it to QEMU under our license. Otherwise we can't use the patch.
+
+
+I have to say, after applying this patch, my test still fails while fetching the instructions from this _small_ region. Although there is no MMU_DATA_LOAD anymore, a few iterations later (while guest code has just jumped to the beginning of the executable region), QEmu segfaults (call stack is attached):
+
+memory.c
+--------
+static MemTxResult
+memory_region_read_with_attrs_accessor(MemoryRegion *mr,
+                                       ...)
+{
+    uint64_t tmp = 0;
+    MemTxResult r;
+
+    r = mr->ops->read_with_attrs(mr->opaque, addr, &tmp, size, attrs);
+    ...
+}
+--------
+
+Here, "read_with_attrs" is null. The call stack looks like:
+---
+#0  memory_region_read_with_attrs_accessor at memory.c:465
+#1  access_with_adjusted_size at memory.c:568
+#2  memory_region_dispatch_read1 at memory.c:1425
+#3  memory_region_dispatch_read at memory.c:1446
+#4  io_readx at accel/tcg/cputlb.c:909
+#5  io_readw at accel/tcg/softmmu_template.h:106
+#6  helper_le_ldw_cmmu at accel/tcg/softmmu_template.h:146
+#7  cpu_lduw_code_ra at include/exec/cpu_ldst_template.h:102
+#8  cpu_lduw_code at include/exec/cpu_ldst_template.h:114
+#9  read_and_decode_context at target/arc/arc-decoder.c:1479
+#10 arc_decode at target/arc/arc-decoder.c:1736
+#11 decode_opc at target/arc/translate.c:313
+#12 arc_tr_translate_insn at target/arc/translate.c:335
+#13 translator_loop at accel/tcg/translator.c:107
+#14 gen_intermediate_code at target/arc/translate.c:413
+#15 tb_gen_code at accel/tcg/translate-all.c:1723
+#16 tb_find at accel/tcg/cpu-exec.c:407
+#17 cpu_exec at accel/tcg/cpu-exec.c:729
+#18 tcg_cpu_exec at cpus.c:1430
+---
+more detailed call stack is attached.
+
+call stack for SEGFAULT that happens during the execution of small region. This will go away IF THE ENTRY ADDED TO TLB FOR THIS REGION IS OF SIZE TARGET_PAGE_SIZE. However, that would not be correct behavior.
+
+That should not happen unless you have some device that is incorrectly not providing a suitable read function in its MemoryRegionOps. If you look at 'mr' in the debugger you should be able to figure out which device is the problem.
+
+
+The problem seems to be this piece of code:
+
+cputlb.c
+--------
+static uint64_t io_readx(...)
+{
+
+    if (recheck) {
+        ...
+
+        tlb_fill(cpu, addr, size, MMU_DATA_LOAD, mmu_idx, retaddr);
+
+        entry = tlb_entry(env, mmu_idx, addr);
+        tlb_addr = entry->addr_read;
+        ...
+}
+--------
+
+"entry->addr_read" is indeed looking for a "reading address". in this case, it must look for an
+"executing address", i.e. "entry->addr_code".
+
+I see softmmu_template.h does something like this:
+----
+...
+#ifdef SOFTMMU_CODE_ACCESS
+#define READ_ACCESS_TYPE MMU_INST_FETCH
+#define ADDR_READ addr_code
+#else
+#define READ_ACCESS_TYPE MMU_DATA_LOAD
+#define ADDR_READ addr_read
+#endif
+...
+
+WORD_TYPE helper_le_ld_name(...)
+{
+    ...
+    target_ulong tlb_addr = entry->ADDR_READ;
+    ...
+}
+----
+
+This patch has fixed for me both issues. Although I am not very proud of the changes in the second hunk. Please let me know if there is a better way.
+
+
+Your patch is now in git master as commit ef5dae6805cce7b59d129 -- thanks!
+
+
+Thank YOU for all the supports along the way :)
+

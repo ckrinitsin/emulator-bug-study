@@ -1,0 +1,120 @@
+architecture: 0.828
+kernel: 0.757
+virtual: 0.754
+performance: 0.739
+graphic: 0.725
+PID: 0.718
+device: 0.712
+boot: 0.690
+network: 0.672
+debug: 0.671
+permissions: 0.670
+semantic: 0.641
+ppc: 0.632
+x86: 0.620
+hypervisor: 0.618
+socket: 0.617
+files: 0.614
+arm: 0.590
+KVM: 0.576
+user-level: 0.563
+assembly: 0.562
+register: 0.552
+risc-v: 0.508
+TCG: 0.499
+vnc: 0.441
+peripherals: 0.413
+i386: 0.377
+VMM: 0.346
+mistranslation: 0.303
+--------------------
+x86: 0.968
+debug: 0.965
+kernel: 0.932
+KVM: 0.928
+TCG: 0.914
+virtual: 0.913
+hypervisor: 0.884
+user-level: 0.240
+performance: 0.202
+files: 0.125
+architecture: 0.089
+VMM: 0.059
+register: 0.048
+boot: 0.043
+PID: 0.035
+risc-v: 0.025
+semantic: 0.023
+device: 0.020
+ppc: 0.017
+assembly: 0.009
+socket: 0.007
+network: 0.004
+graphic: 0.004
+permissions: 0.003
+peripherals: 0.003
+i386: 0.002
+vnc: 0.001
+mistranslation: 0.001
+arm: 0.000
+
+TCG & LA57 (5-level page tables) causes intermittent triple fault when setting %CR3
+Description of problem:
+Enabling LA57 (5-level page tables) + TCG causes an intermittent triple fault when the kernel loads %cr3 in preparation for jumping to protected mode.  It is quite rare, only happening on perhaps 1 in 20 runs.
+
+The observed behaviour for most users is that we see SeaBIOS messages, and no kernel messages, and qemu exits.  (Triple fault in TCG code causes qemu to reset the virtual CPU, and we are using `-no-reboot` so that causes qemu to exit).
+
+There's a simple reproducer below.  I enabled qemu -d options to capture the full instruction traces which can be found here:
+
+http://oirase.annexia.org/tmp/fullexec-failed (error case)
+http://oirase.annexia.org/tmp/fullexec-good (successful run)
+
+I also added an `abort()` into qemu after the triple fault message in order to capture a stack trace, which can be found here: https://bugzilla.redhat.com/show_bug.cgi?id=2082806#c8
+Steps to reproduce:
+1. Save the following script into a file, adjusting the two variables at the top as appropriate:
+
+```
+#!/bin/bash -
+
+# Point this to any kernel in /boot:
+kernel=/boot/vmlinuz-4.18.0-387.el8.x86_64
+
+# Point this to qemu:
+qemu=/usr/libexec/qemu-kvm
+#qemu=/home/rjones/d/qemu/build/qemu-system-x86_64
+
+log=/tmp/log
+
+cpu=max
+#cpu=max,la57=off
+
+while $qemu \
+    -global virtio-blk-pci.scsi=off \
+    -no-user-config \
+    -nodefaults \
+    -display none \
+    -machine accel=tcg,graphics=off \
+    -cpu "$cpu" \
+    -m 2048 \
+    -no-reboot \
+    -rtc driftfix=slew \
+    -no-hpet \
+    -global kvm-pit.lost_tick_policy=discard \
+    -kernel $kernel \
+    -object rng-random,filename=/dev/urandom,id=rng0 \
+    -device virtio-rng-pci,rng=rng0 \
+    -device virtio-serial-pci \
+    -serial stdio \
+    -append "panic=1 console=ttyS0" >& $log &&
+    grep -sq "Linux version" $log; do
+    echo -n .
+done
+```
+
+2. Run the script.  It will run qemu many times, checking that it reaches the kernel.
+3. Eventually the script may exit. 
+4. Check `/tmp/log` and see if you only see SeaBIOS messages.
+5. Modify the script to add `-cpu max,la57=off` and the error will stop happening.
+Additional information:
+Downstream bug report: https://bugzilla.redhat.com/show_bug.cgi?id=2082806
+LA57 was enabled here: https://gitlab.com/qemu-project/qemu/-/issues/661

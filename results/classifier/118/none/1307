@@ -1,0 +1,102 @@
+mistranslation: 0.297
+risc-v: 0.296
+user-level: 0.283
+ppc: 0.248
+hypervisor: 0.240
+TCG: 0.237
+KVM: 0.226
+peripherals: 0.209
+x86: 0.206
+i386: 0.204
+virtual: 0.194
+VMM: 0.194
+vnc: 0.193
+graphic: 0.168
+debug: 0.164
+PID: 0.163
+device: 0.161
+semantic: 0.160
+register: 0.160
+performance: 0.159
+kernel: 0.158
+assembly: 0.157
+architecture: 0.156
+permissions: 0.153
+arm: 0.152
+files: 0.151
+network: 0.150
+socket: 0.148
+boot: 0.147
+
+query-named-block-nodes, without flat=true, is massively slow as number of block nodes increases
+Description of problem:
+The query-named-block-nodes command is insanely slow with deep backing chains when the flat=true arg is NOT given.
+
+```
+qemu-img create demo0.qcow2 1g
+j=0
+for i in `seq 1 199`
+do 
+    qemu-img create -f qcow2 -o backing_file=demo$j.qcow2 -o backing_fmt=qcow2 demo$i.qcow2
+    j=$i
+done
+```
+
+Now configure libvirt with
+
+```
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='/var/lib/libvirt/images/demo199.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x07' slot='0x00' function='0x0'/>
+    </disk>
+```
+
+This results in `-blockdev` args
+
+```
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo0.qcow2","node-name":"libvirt-201-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-201-format","read-only":true,"discard":"unmap","driver":"qcow2","file":"libvirt-201-storage","backing":null}' \
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo1.qcow2","node-name":"libvirt-200-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-200-format","read-only":true,"discard":"unmap","driver":"qcow2","file":"libvirt-200-storage","backing":"libvirt-201-format"}' \
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo2.qcow2","node-name":"libvirt-199-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-199-format","read-only":true,"discard":"unmap","driver":"qcow2","file":"libvirt-199-storage","backing":"libvirt-200-format"}' \
+...snip...
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo197.qcow2","node-name":"libvirt-4-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-4-format","read-only":true,"discard":"unmap","driver":"qcow2","file":"libvirt-4-storage","backing":"libvirt-5-format"}' \
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo198.qcow2","node-name":"libvirt-3-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-3-format","read-only":true,"discard":"unmap","driver":"qcow2","file":"libvirt-3-storage","backing":"libvirt-4-format"}' \
+-blockdev '{"driver":"file","filename":"/var/lib/libvirt/images/demo199.qcow2","node-name":"libvirt-1-storage","auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-1-format","read-only":false,"discard":"unmap","driver":"qcow2","file":"libvirt-1-storage","backing":"libvirt-3-format"}' \
+-device '{"driver":"virtio-blk-pci","bus":"pci.7","addr":"0x0","drive":"libvirt-1-format","id":"virtio-disk1"}' \
+```
+
+Now stop libvirt
+
+```
+systemctl stop libvirtd
+```
+
+And speak directly to QMP
+
+```
+$ time socat UNIX:/var/lib/libvirt/qemu/domain-158-fedora38/monitor.sock - > /dev/null 
+{ "execute": "qmp_capabilities", "arguments": { "enable": ["oob"] } }
+{ "execute": "query-named-block-nodes"}
+{ "execute": "quit" }
+
+real	2m19.276s
+user	0m0.006s
+sys	0m0.014s
+```
+
+If we save the 'query-named-block-nodes' output instead of sending it to /dev/null, we get a 86 MB file for the QMP response. This will break all known client apps since they limit QMP reply size.
+
+It appears to have a combinatorial expansion of block nodes in the output.
+
+Blocking the main event loop for 2 minutes is obviously not good either.
+
+If we use '"flat": true' parameter to query-named-block-nodes, the command completes in just 15 seconds, and produces a large, but more manageable 2.7 MB
+
+Since the non-flat  query-named-block-nodes output is so incredibly non-scalable, I think we should deprecate non-flat mode, and eventually make  flat the mandatory option.

@@ -1,0 +1,167 @@
+user-level: 0.869
+files: 0.854
+ppc: 0.850
+mistranslation: 0.850
+register: 0.844
+risc-v: 0.842
+graphic: 0.839
+permissions: 0.839
+boot: 0.838
+KVM: 0.838
+device: 0.837
+VMM: 0.834
+TCG: 0.834
+performance: 0.832
+semantic: 0.828
+virtual: 0.826
+arm: 0.825
+debug: 0.824
+network: 0.824
+assembly: 0.823
+PID: 0.822
+socket: 0.817
+vnc: 0.809
+architecture: 0.805
+kernel: 0.802
+hypervisor: 0.797
+peripherals: 0.775
+x86: 0.764
+i386: 0.744
+
+Concurrent VMs crash w/ GPU passthrough and multiple disks
+
+When running multiple VMs with GPU passthrugh, both VMs will crash unless all virtual disks are on the same physical volume as root, likely on all X58 chipset motherboards.  I've tested with 3.
+
+Expected Behavior:  No Crash
+Result:  Both VMs GPU drivers fail and the guest OS are unrecoverable, usually within seconds, though the degree of "fickleness" of it depends on the multidisk setup.  
+Reproducibility:  100% 
+  
+
+Steps to reproduce:
+
+*  Install OS (In my case Debian Jessie/Proxmox), and update to latest
+*  Setup VMs
+*  Setup up GPU passthrough with 1 GPU per VM, and one for host, as per https://pve.proxmox.com/wiki/Pci_passthrough
+*  Setup up USB passthrough
+*  Launch both VM
+*  Observe "everything is working"
+*  Stop VMs
+*  Add a second disk to one of the VMs, which exists on a separate physical disk from Host OS /
+*  Observe both VMs crash when the virtual disk which exists on separate physical media is used (i.e. copy files to the disk)
+*  Stop VMs
+*  Remove new disk, and move Guest OS virtual root disk to separate physical media.
+*  Observe both VMs crash around the time GPU driver is loaded on one
+
+As I mentioned earlier, there is some degree of difference in how difficult it is to trigger a crash, depending on the multidisk setup.  For instance, when / is ZFS, and the virtual disks exist on a separate ZFS raid-z volume, both VMs must be doing some relatively intensive HW 3d acceleration in order to trigger the crash.
+
+Passing two GPU to one VM works fine all the time, and running either VM on its in general will not trigger a crash.
+
+There are many variables I have yet to test, such as using sata instead of virtio for the virtual disks, however unfortunately I do not have anything from std err or logs to indicate what the problem could be.
+
+kernel verion:  Linux test-ve 4.4.15-1-pve  (other versions >= 4.2.1 and <= 4.7.? tested)
+qemu version:  2.6.0 pve-qemu-kvm_2.6-1
+motherboards tested:  rampage iii, ga-ex58-ud5, asus Psomething
+CPUs tested:  i7 920, X5670
+
+
+KVM invocation 1:
+
+/usr/bin/kvm \
+-id 101 \
+-chardev socket,id=qmp,path=/var/run/qemu-server/101.qmp,server,nowait \
+-mon chardev=qmp,mode=control \
+-pidfile /var/run/qemu-server/101.pid \
+-daemonize \
+-smbios type=1,uuid=450e337e-244c-429b-9aa8-afb7aee037e8 \
+-drive if=pflash,format=raw,readonly,file=/usr/share/kvm/OVMF-pure-efi.fd \
+-drive if=pflash,format=raw,file=/root/101-OVMF_VARS-pure-efi.fd \
+-name Madzia-PC \
+-smp 12,sockets=1,cores=12,maxcpus=12 \
+-nodefaults \
+-boot menu=on,strict=on,reboot-timeout=1000 \
+-vga none \
+-nographic \
+-no-hpet \
+-cpu host,hv_vendor_id=Nvidia43FIX,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_runtime,hv_relaxed,+kvm_pv_unhalt,+kvm_pv_eoi,kvm=off \
+-m 8192 \
+-object memory-backend-ram,id=ram-node0,size=8192M \
+-numa node,nodeid=0,cpus=0-11,memdev=ram-node0 \
+-k en-us -readconfig /usr/share/qemu-server/pve-q35.cfg \
+-device usb-tablet,id=tablet,bus=ehci.0,port=1 \
+-device vfio-pci,host=04:00.0,id=hostpci0,bus=ich9-pcie-port-1,addr=0x0 \
+-device vfio-pci,host=04:00.1,id=hostpci1,bus=ich9-pcie-port-2,addr=0x0 \
+-device usb-host,hostbus=1,hostport=6.1,id=usb0 \
+-device usb-host,hostbus=1,hostport=6.2.1,id=usb1 \
+-device usb-host,hostbus=1,hostport=6.2.2,id=usb2 \
+-device usb-host,hostbus=1,hostport=6.2.3,id=usb3 \
+-device usb-host,hostbus=1,hostport=6.2,id=usb4 \
+-device usb-host,hostbus=1,hostport=6.3,id=usb5 \
+-device usb-host,hostbus=1,hostport=6.4,id=usb6 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3 \
+-iscsi initiator-name=iqn.1993-08.org.debian:01:3f3df5515b13 \
+-drive file=/dev/pve/vm-101-disk-1,if=none,id=drive-virtio0,cache=writeback,format=raw,aio=threads,detect-zeroes=on \
+-device virtio-blk-pci,drive=drive-virtio0,id=virtio0,bus=pci.0,addr=0xa,bootindex=100 \
+-netdev type=tap,id=net0,ifname=tap101i0,script=/var/lib/qemu-server/pve-bridge,downscript=/var/lib/qemu-server/pve-bridgedown,vhost=on \
+-device virtio-net-pci,mac=4E:DD:47:D7:DF:C9,netdev=net0,bus=pci.0,addr=0x12,id=net0 \
+-rtc driftfix=slew,base=localtime \
+-machine type=q35 \
+-global kvm-pit.lost_tick_policy=discard
+
+
+KVM invocation 2:
+
+/usr/bin/kvm \
+-id 102 \
+-chardev socket,id=qmp,path=/var/run/qemu-server/102.qmp,server,nowait \
+-mon chardev=qmp,mode=control \
+-pidfile /var/run/qemu-server/102.pid \
+-daemonize \
+-smbios type=1,uuid=450e337e-244c-429b-9aa8-afb7aee037e8 \
+-drive if=pflash,format=raw,readonly,file=/usr/share/kvm/OVMF-pure-efi.fd \
+-drive if=pflash,format=raw,file=/root/102-OVMF_VARS-pure-efi.fd \
+-name Madzia-PC \
+-smp 12,sockets=1,cores=12,maxcpus=12 \
+-nodefaults \
+-boot menu=on,strict=on,reboot-timeout=1000 \
+-vga none \
+-nographic \
+-no-hpet \
+-cpu host,hv_vendor_id=Nvidia43FIX,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_runtime,hv_relaxed,+kvm_pv_unhalt,+kvm_pv_eoi,kvm=off \
+-m 512 \
+-object memory-backend-ram,id=ram-node0,size=512M \
+-numa node,nodeid=0,cpus=0-11,memdev=ram-node0 \
+-k en-us \
+-readconfig /usr/share/qemu-server/pve-q35.cfg \
+-device usb-tablet,id=tablet,bus=ehci.0,port=1 \
+-device vfio-pci,host=05:00.0,id=hostpci2,bus=ich9-pcie-port-3,addr=0x0 \
+-device vfio-pci,host=05:00.1,id=hostpci3,bus=ich9-pcie-port-4,addr=0x0 \
+-device usb-host,hostbus=2,hostport=2.1,id=usb0 \
+-device usb-host,hostbus=2,hostport=2.2,id=usb1 \
+-device usb-host,hostbus=2,hostport=2.3,id=usb2 \
+-device usb-host,hostbus=2,hostport=2.4,id=usb3 \
+-device usb-host,hostbus=2,hostport=2.5,id=usb4 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3 \
+-iscsi initiator-name=iqn.1993-08.org.debian:01:3f3df5515b13 \
+-drive file=/dev/pve/vm-102-disk-1,if=none,id=drive-virtio0,cache=writeback,format=raw,aio=threads,detect-zeroes=on \
+-device virtio-blk-pci,drive=drive-virtio0,id=virtio0,bus=pci.0,addr=0xa,bootindex=100 \
+-netdev type=tap,id=net0,ifname=tap102i0,script=/var/lib/qemu-server/pve-bridge,downscript=/var/lib/qemu-server/pve-bridgedown,vhost=on \
+-device virtio-net-pci,mac=4E:DD:47:D7:DF:C9,netdev=net0,bus=pci.0,addr=0x12,id=net0 \
+-rtc driftfix=slew,base=localtime \
+-machine type=q35 \
+-global kvm-pit.lost_tick_policy=discard
+
+
+Please let me know what additional information may be helpful, or how I can be of any assistance.
+
+The second invocation should show a second disk on separate physical media, like:
+
+-drive file=/mnt/images/102/vm-102-disk-1.qcow2,if=none,id=drive-virtio1,cache=writeback,format=qcow2,aio=threads,detect-zeroes=on \
+-device virtio-blk-pci,drive=drive-virtio1,id=virtio1,bus=pci.0,addr=0xb
+
+I forgot to mention that the Guest OS is Windows 10 64 in both cases.
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

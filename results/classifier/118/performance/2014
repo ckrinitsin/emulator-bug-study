@@ -1,0 +1,83 @@
+performance: 0.929
+device: 0.905
+graphic: 0.877
+architecture: 0.833
+debug: 0.770
+peripherals: 0.754
+socket: 0.731
+PID: 0.641
+network: 0.614
+VMM: 0.612
+semantic: 0.611
+mistranslation: 0.604
+virtual: 0.601
+hypervisor: 0.582
+register: 0.569
+kernel: 0.563
+x86: 0.554
+arm: 0.536
+ppc: 0.532
+TCG: 0.522
+vnc: 0.507
+i386: 0.482
+user-level: 0.474
+risc-v: 0.451
+boot: 0.406
+KVM: 0.377
+permissions: 0.328
+assembly: 0.321
+files: 0.319
+
+virtio: bounce.in_use==true in virtqueue_map_desc()
+Description of problem:
+
+Steps to reproduce:
+1. Build EDK II (edk2-stable202311) for riscv64
+2. Build UEFI SCT (commit 81dfa8d53d4290) for riscv64
+3. Run the UEFI SCT
+4. Observe the message "qemu: virtio: bogus descriptor or out of resources" after which the execution stalls.
+
+The full procedure is described in https://github.com/xypron/sct_release_test
+
+To save time you can call `sct -u` and select only test 'MediaAccessTest\\BlockIOProtocolTest'. Run it with `F9`.
+Additional information:
+virtqueue_map_desc() may be called for a large buffers size `sz`. It will then call dma_memory_map() multiple times in a loop. In address_space_map() `bounce.in_use` is set to `true` on the first call. Each subsequent call is bound to fail.
+
+To verify this is the cause I applied the following diff:
+
+```plaintext
+diff --git a/system/physmem.c b/system/physmem.c
+index a63853a7bc..12b3c2f828 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -3151,12 +3151,16 @@ void *address_space_map(AddressSpace *as,
+ 
+     if (!memory_access_is_direct(mr, is_write)) {
+         if (qatomic_xchg(&bounce.in_use, true)) {
++           fprintf(stderr, "bounce.in_use in address_space_map\n");
++
+             *plen = 0;
+             return NULL;
+         }
+         /* Avoid unbounded allocations */
+         l = MIN(l, TARGET_PAGE_SIZE);
+         bounce.buffer = qemu_memalign(TARGET_PAGE_SIZE, l);
++       if (!bounce.buffer)
++           fprintf(stderr, "Out of memory in address_space_map\n");
+         bounce.addr = addr;
+         bounce.len = l;
+```
+
+and saw this output:
+
+```plaintext
+Logfile: "\sct\Log\MediaAccessTest\BlockIOProtocolTest0\ReadBlocks_Conf_0_0_8261
+59D3-04A5-4CCE-8431-344707A8B57A.log"
+Test Started: 12/02/23  08:43a
+------------------------------------------------------------
+Current Device: Acpi(PNP0A03,0)/Pci(3|0)
+Bounce.in_use in address_space_map
+qemu: virtio: bogus descriptor or out of resources
+```
+
+See related bug #850.

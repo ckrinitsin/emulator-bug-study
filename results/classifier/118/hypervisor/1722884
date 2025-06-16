@@ -1,0 +1,173 @@
+hypervisor: 0.908
+peripherals: 0.901
+risc-v: 0.896
+ppc: 0.885
+TCG: 0.876
+arm: 0.867
+VMM: 0.855
+semantic: 0.852
+user-level: 0.849
+KVM: 0.837
+vnc: 0.836
+x86: 0.835
+permissions: 0.833
+graphic: 0.832
+debug: 0.830
+device: 0.828
+performance: 0.827
+i386: 0.823
+virtual: 0.816
+register: 0.792
+assembly: 0.776
+PID: 0.746
+mistranslation: 0.742
+network: 0.740
+boot: 0.735
+kernel: 0.694
+socket: 0.688
+architecture: 0.683
+files: 0.333
+
+keyboard input while mouse moving triggers mouse failure
+
+When QEMU is getting a ton of mouse input events if keys are pressed on the keyboard the scan code will be corrupted causing erroneous behavior. I have confirmed this problem in the latest version in git (530049bc1dcc24c1178a29d99ca08b6dd08413e0).
+
+After the erroneous behavior the operating system issues a keyboard reset which prevents the mouse from functioning until the operating system is restarted.
+
+This seems to only occur if the PS2 mouse is being used as the input, the tablet input device doesn't exhibit this behavior.
+
+The same problem was reported here also: https://openxt.atlassian.net/browse/OXT-562
+
+Host  : Debian 9
+CPU   : Ryzen 1700X
+RAM   : 16GB
+Kernel: 4.12.0-0.bpo.2-amd64
+
+Guest : Windows 10 (KVM)
+RAM   : 8GB (1GB Huge pages)
+
+Here is a backtrace of the PS2 reset event:
+
+#0  ps2_write_mouse (opaque=0x55804518ae30, val=255) at /home/geoff/Projects/qemu/qemu/hw/input/ps2.c:1033
+#1  0x00005580420e1dd9 in kbd_write_data (opaque=0x558045147aa0, addr=0, val=255, size=1) at /home/geoff/Projects/qemu/qemu/hw/input/pckbd.c:357
+#2  0x0000558041e7e64f in memory_region_write_accessor (mr=0x558045147ae0, addr=0, value=0x7f9ec016f478, size=1, shift=0, mask=255, attrs=...)
+    at /home/geoff/Projects/qemu/qemu/memory.c:560                                                                                            
+#3  0x0000558041e7e867 in access_with_adjusted_size (addr=0, value=0x7f9ec016f478, size=1, access_size_min=1, access_size_max=1,
+    access_fn=0x558041e7e565 <memory_region_write_accessor>, mr=0x558045147ae0, attrs=...) at /home/geoff/Projects/qemu/qemu/memory.c:627
+#4  0x0000558041e814e9 in memory_region_dispatch_write (mr=0x558045147ae0, addr=0, data=255, size=1, attrs=...)
+    at /home/geoff/Projects/qemu/qemu/memory.c:1503                                                            
+#5  0x0000558041e31302 in flatview_write_continue (fv=0x7f9e90010c10, addr=96, attrs=..., buf=0x7f9eee9de000 "\377\006", len=1, addr1=0, l=1,
+    mr=0x558045147ae0) at /home/geoff/Projects/qemu/qemu/exec.c:2900                                                                         
+#6  0x0000558041e31450 in flatview_write (fv=0x7f9e90010c10, addr=96, attrs=..., buf=0x7f9eee9de000 "\377\006", len=1)
+    at /home/geoff/Projects/qemu/qemu/exec.c:2945                                                                     
+#7  0x0000558041e31827 in flatview_rw (fv=0x7f9e90010c10, addr=96, attrs=..., buf=0x7f9eee9de000 "\377\006", len=1, is_write=true)
+    at /home/geoff/Projects/qemu/qemu/exec.c:3054                                                                                 
+#8  0x0000558041e318df in address_space_rw (as=0x558042a4c940 <address_space_io>, addr=96, attrs=..., buf=0x7f9eee9de000 "\377\006", len=1, is_write=true)
+    at /home/geoff/Projects/qemu/qemu/exec.c:3064                                                                                                         
+#9  0x0000558041e9617e in kvm_handle_io (port=96, attrs=..., data=0x7f9eee9de000, direction=1, size=1, count=1)
+    at /home/geoff/Projects/qemu/qemu/accel/kvm/kvm-all.c:1698                                                 
+#10 0x0000558041e968c2 in kvm_cpu_exec (cpu=0x5580444f4650) at /home/geoff/Projects/qemu/qemu/accel/kvm/kvm-all.c:1938
+#11 0x0000558041e670d9 in qemu_kvm_cpu_thread_fn (arg=0x5580444f4650) at /home/geoff/Projects/qemu/qemu/cpus.c:1128
+#12 0x00007f9ed49c5494 in start_thread (arg=0x7f9ec0172700) at pthread_create.c:333
+#13 0x00007f9ed4707aff in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+
+
+Further to this, it appears to be a race condition with reading from the i8042 controller. I have turned on debugging of PS2 and KBD and filtered out the event that causes the issue. I have split the below up to show the valid reads for the mouse and then the sequence that triggers a reset when the keyboard is used.
+
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x08
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x02
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00
+
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x18
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0xfe
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x02
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00
+
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x08
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x01
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00
+
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x1d <-- the status changed on the 2nd call.
+KBD: kbd: read status=0x1d
+KBD: kbd: read data=0x9e
+
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x18
+KBD: kbd: read data=0xff <-- two data reads without checking status
+KBD: kbd: read status=0x3d <-- guest looking for mouse movements
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x02   <-- first byte
+KBD: kbd: read status=0x3d
+KBD: kbd: read status=0x3d
+KBD: kbd: read data=0x00   <-- 2nd byte
+KBD: kbd: read status=0x1c <-- no more data, there should be two more bytes
+KBD: kbd: read status=0x1c
+KBD: kbd: read status=0x1c
+
+here the host attempts to reset the device
+
+KBD: kbd: write cmd=0xd4   <-- write to mouse cmd
+KBD: kbd: read status=0x1c
+KBD: kbd: read status=0x1c
+KBD: kbd: read status=0x1c
+KBD: kbd: write data=0xff  <-- reset mouse
+kbd: write mouse 0xff
+
+
+I believe I am onto the cause of this issue, because the input events are coming from a multi threaded source (in my instance spice) keyboard and mouse input share common code paths without any thread interlocking.
+
+Since keyboard input takes priority over mouse, when more mouse events are being handled it is overwriting and swapping out the data the guest was expecting with mouse input data.
+
+In short, there is a race condition here.
+
+This bug needs some attention, we just released Looking Glass which relies heavily on the relative input mode of SPICE which in turn relies heavily on the virtual i8042 controller. This project has the ability to completely eliminate the need to dual boot a Linux machine with windows and is gaining much public attention, if it wasn't for this bug it would be damn near perfect.
+
+Please see:
+
+https://looking-glass.hostfission.com
+https://github.com/gnif/LookingGlass
+https://level1techs.com/video/new-tech-iommu-users-looking-glass-headless-passthrough
+https://www.phoronix.com/scan.php?page=news_item&px=Looking-Glass-KVM-Frame-Relay
+
+I have already tried to trace this down but between Looking Glass and my day job I simply don't have time at the moment.
+
+
+I tried to look into this as well. One finding I have made is that the problem happens for -display gtk but not with -display sdl so I'm thinking it might not be reading of data from the ps2 controller that is problematic but the writing to it. I will need to investigate further.
+
+I tracked this down and fixed it last year, your issue is unrelated.
+
+https://github.com/qemu/qemu/commit/143c04c7e0639e53086519592ead15d2556bfbf2#diff-3b5bd599c018d558b135bd19647a00c6
+
+https://github.com/qemu/qemu/commit/7abe7eb29494b4e4a11ec99ae5623083409a2f1e#diff-3b5bd599c018d558b135bd19647a00c6
+
+Ok, so if this bug has been fixed, let's close this ticket.
+

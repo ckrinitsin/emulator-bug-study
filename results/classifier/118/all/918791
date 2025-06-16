@@ -1,0 +1,307 @@
+peripherals: 0.936
+semantic: 0.935
+device: 0.929
+register: 0.927
+user-level: 0.925
+permissions: 0.923
+PID: 0.916
+risc-v: 0.916
+hypervisor: 0.916
+architecture: 0.911
+debug: 0.908
+vnc: 0.905
+graphic: 0.905
+TCG: 0.897
+performance: 0.897
+virtual: 0.889
+ppc: 0.887
+VMM: 0.882
+assembly: 0.880
+network: 0.880
+arm: 0.879
+socket: 0.876
+KVM: 0.868
+kernel: 0.863
+x86: 0.862
+files: 0.852
+mistranslation: 0.838
+boot: 0.785
+i386: 0.729
+
+qemu-kvm dies when using vmvga driver and unity in the guest
+
+12.04's qemu-kvm has been unstable for me and Marc Deslauriers and I figured out it has something to do with the interaction of qemu-kvm, unity and the vmvga driver. This is a regression over qemu-kvm in 11.10.
+
+TEST CASE:
+1. start a VM that uses unity (eg, 11.04, 11.10 or 12.04). My tests use unity-2d on an amd64 host and amd64 guests
+2. on 11.04 and 11.10, open empathy via the messaging indicator and click 'Chat'. On 12.04, open empathy via the messaging indicator and click 'Chat', close the empathy wizard, move the empathy window over the unity luancher (so it autohides), then do 'ctrl+alt+t' to open a terminal
+
+When the launcher tries to auto(un)hide, qemu-kvm dies with this:
+[10574.958149] do_general_protection: 132 callbacks suppressed
+[10574.958154] kvm[13192] general protection ip:7fab9680ea0f sp:7ffff4440148 error:0 in qemu-system-x86_64[7fab966c4000+2c9000]
+
+Relevant libvirt xml:
+    <video>
+      <model type='vmvga' vram='9216' heads='1'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+
+If I change to using 'cirrus', then qemu-kvm no longer crashes. Eg:
+    <video>
+      <model type='cirrus' vram='9216' heads='1'/>
+      <alias name='video0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+
+The workaround is therefore to use the cirrus driver instead of vmvga, however being able to kill qemu-kvm in this manner is not ideal. Also, unfortunately unity-2d does not run with with cirrus driver under 11.04, so the security and SRU teams are unable to properly test updates in GUI applications under unity when using the current 12.04 qemu-kvm.
+
+I tried to report this via apport, but apport complained about a CRC error, so I could not.
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+I've seen this, as well, while using vmvga:
+
+kvm[26630] general protection ip:7f7ddf721a0f sp:7fff4c9a3968 error:0 in qemu-system-x86_64[7f7ddf5d7000+2c9000]
+
+
+
+I assume vmvga is 'vga vmware' in qemu parlance?  trying to reproduce, at least the livecd won't do it for me.
+
+(Ordinarely I'd call this low priority as there is a workaround, but since the workaround prevents you from doing what you need, i'm choosing medium)
+
+Just using vmware vga is not enough.  You (well, I) have to also use vnc to reproduce this.
+
+Under gdb I get:
+
+
+Program received signal SIGSEGV, Segmentation fault.
+set_bit (addr=<optimized out>, nr=-4) at ./bitops.h:122
+122	./bitops.h: No such file or directory.
+(gdb) where
+#0  set_bit (addr=<optimized out>, nr=-4) at ./bitops.h:122
+#1  vnc_dpy_update (ds=<optimized out>, x=-64, y=<optimized out>, w=64, h=<optimized out>) at ui/vnc.c:427
+#2  0x0000555555652c4f in dpy_update (s=0x5555567708c0, h=24, w=66, y=575, x=-66)
+    at /build/buildd/qemu-kvm-1.0+noroms/console.h:240
+#3  vmsvga_update_rect (h=24, w=66, y=575, x=-66, s=0x55555675d9a0) at /build/buildd/qemu-kvm-1.0+noroms/hw/vmware_vga.c:325
+#4  vmsvga_update_rect_flush (s=0x55555675d9a0) at /build/buildd/qemu-kvm-1.0+noroms/hw/vmware_vga.c:358
+#5  vmsvga_update_display (opaque=0x55555675d9a0) at /build/buildd/qemu-kvm-1.0+noroms/hw/vmware_vga.c:961
+#6  0x00005555556a0705 in vnc_refresh (opaque=0x7fffabe9e010) at ui/vnc.c:2475
+#7  0x0000555555673837 in qemu_run_timers (clock=0x555556324150) at qemu-timer.c:420
+#8  0x00005555556739b5 in qemu_run_timers (clock=<optimized out>) at qemu-timer.c:405
+#9  qemu_run_all_timers () at qemu-timer.c:483
+#10 0x0000555555655372 in main_loop_wait (nonblocking=<optimized out>) at main-loop.c:468
+#11 0x00005555555c060f in main_loop () at /build/buildd/qemu-kvm-1.0+noroms/vl.c:1482
+#12 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /build/buildd/qemu-kvm-1.0+noroms/vl.c:3523
+
+
+Don't see anything in upstream git that would have fixed this, so I *suspect* this will still happen upstream.  I've not yet tested though.
+
+I can reproduce this with upstream qemu - though i must point out that to do so i had to change the definition of VGA_RAM_SIZE in hw/vga_int.h to 16*1024*1024 (as it is in qemu-kvm) in order to be able to use the default high resolution.
+
+Command line was:
+
+./x86_64-softmmu/qemu-system-x86_64 -vga vmware -m 1024 -drive file=../../victim.img,if=virtio,cache=none,index=0 -vnc :1 -enable-kvm
+
+where victim.img is an ubuntu Precise desktop image running ubuntu-2d.  I open a terminal, move it to the launcher bar to make it auto-hide; click 'x' to close the terminal.  Then qemu crashes.
+
+I tried to build a 64-bit Precise desktop virt using libvirt manager, itself running on a 64-bit AMD 4-core box with Precise.   When specifying the vmvga/vmware option, qemu keeled over and died as soon as (in VNC) it looked like the card was going into graphics mode.
+
+I then built the image specifying 'cirrus' and launched it, played with it a bit w/unity 2d.   Slow, but functional in my setup.   I then relaunched the image specifying the 'vmware' vga option, and as soon as it looked as though the card were going into a high-res graphics mode, qemu SIGABRT-ed and died.
+
+I then built a non-optimized unstripped qemu-kvm and tried launching directly wihile running under 'gdb'.   I'm not all that familiar with dealing w/multi-threaded userspace code, but using the 'vmware' vga device, it doesn't take much to get a SEGFAULT (very repeatable with my setup):
+
+Program received signal SIGSEGV, Segmentation fault.
+0x00007ffff47733a1 in _int_malloc () from /lib/x86_64-linux-gnu/libc.so.6
+(gdb) bt
+#0  0x00007ffff47733a1 in _int_malloc () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007ffff4775d05 in malloc () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00005555556b85ae in malloc_and_trace (n_bytes=512) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/vl.c:2140
+#3  0x00007ffff792c9b9 in g_malloc () from /lib/x86_64-linux-gnu/libglib-2.0.so.0
+#4  0x00005555557c6982 in kvm_physical_sync_dirty_bitmap (start_addr=4244635648, end_addr=4261412864)
+    at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/kvm-all.c:413
+#5  0x00005555557c72f5 in kvm_client_sync_dirty_bitmap (client=0x555555c1c540, start_addr=4244635648, end_addr=4261412864)
+    at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/kvm-all.c:679
+#6  0x000055555579c04d in cpu_notify_sync_dirty_bitmap (start=4244635648, end=4261412864)
+    at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/exec.c:1753
+#7  0x000055555579d1bd in cpu_physical_sync_dirty_bitmap (start_addr=4244635648, end_addr=4261412864)
+    at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/exec.c:2141
+#8  0x00005555557d988e in memory_region_sync_dirty_bitmap (mr=0x555556c82bb0) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/memory.c:1077
+#9  0x000055555585b071 in vga_sync_dirty_bitmap (s=0x555556c82ba0) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/hw/vga.c:1570
+#10 0x000055555585b172 in vga_draw_graphic (s=0x555556c82ba0, full_update=0) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/hw/vga.c:1599
+#11 0x000055555585be27 in vga_update_display (opaque=0x555556c82ba0) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/hw/vga.c:1861
+#12 0x00005555556be4e4 in vmsvga_update_display (opaque=0x555556c82ba0) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/hw/vmware_vga.c:954
+#13 0x000055555562435c in vga_hw_update () at console.c:167
+#14 0x000055555573e962 in vnc_refresh (opaque=0x7fffec337010) at ui/vnc.c:2475
+#15 0x00005555556f2161 in qemu_run_timers (clock=0x55555643a1b0) at qemu-timer.c:420
+#16 0x00005555556f23e9 in qemu_run_all_timers () at qemu-timer.c:483
+#17 0x00005555556c1e64 in main_loop_wait (nonblocking=0) at main-loop.c:468
+#18 0x00005555556b6a76 in main_loop () at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/vl.c:1482
+#19 0x00005555556bbc9a in main (argc=43, argv=0x7fffffffe298, envp=0x7fffffffe3f8) at /home/justinlw/src/qemu/qemu-kvm-1.0+noroms/vl.c:3523
+
+
+
+
+@Jamie,
+
+if you feel the priority if this needs to be raised, please do raise it or comment here.
+
+@Jamie,
+
+> Also, unfortunately unity-2d does not run with with cirrus driver under 11.04, so
+> the security and SRU teams are unable to properly test updates in GUI applications
+> under unity when using the current 12.04 qemu-kvm
+
+Note that I can run unity-2d and unity-3d using spice, i.e.
+
+kvm-spice -enable-kvm -drive file=victim.img,cache=none,if=virtio,index=0 -m 1024 -net nic,model=virtio -net tap,ifname=tap0,script=no,downscript=no -spice port=5930,disable-ticketing
+
+followed by
+
+spicy -h localhost -p 5930
+
+That should hopefully at least be a usable workaround.
+
+Thanks. Does our libvirt support spice at this time? (We have standardized on libvirt for our testing).
+
+This patch probably isn't the right place in the stack to catch this, but it seems to work for me.
+
+With this patch, qemu doesn't crash for me.
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+@Jamie,
+
+yes libvirt supports spice.  You do have to set the video section accordingly.  Here is an example xml file that works for me:
+
+<domain type='kvm'>
+  <name>spice</name>
+  <memory>524288</memory>
+  <currentMemory>524288</currentMemory>
+  <vcpu>1</vcpu>
+  <os>
+    <type arch='x86_64' machine='pc-0.12'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <pae/>
+  </features>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>restart</on_crash>
+  <devices>
+    <emulator>/usr/bin/kvm-spice</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source file='/mnt/serge/spice.img'/>
+      <target dev='hda' bus='ide'/>
+      <address type='drive' controller='0' bus='0' unit='0'/>
+    </disk>
+    <controller type='ide' index='0'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x01' function='0x1'/>
+    </controller>
+<!-- Uncomment this in place of the following two lines to use a custom 'br0' bridge
+    <interface type='bridge'>
+      <source bridge='br0'/>
+-->
+    <interface type='network'>
+      <source network='default'/>
+    </interface>
+    <serial type='pty'>
+      <target port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <input type='mouse' bus='ps2'/>
+    <sound model='ac97'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x04' function='0x0'/>
+    </sound>
+    <graphics type='spice' port='5900' tlsPort='-1' autoport='yes'/>
+    <video>
+      <model type='qxl' vram='65536' heads='1'/>
+      <alias name='video0'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </video>
+    <memballoon model='virtio'>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x05' function='0x0'/>
+    </memballoon>
+
+
+  </devices>
+</domain>
+
+
+This bug was fixed in the package qemu-kvm - 1.0+noroms-0ubuntu7
+
+---------------
+qemu-kvm (1.0+noroms-0ubuntu7) precise; urgency=low
+
+  [ Dave Walker ]
+  * debian/patches/expose_vmx_qemu64cpu.patch: Expose VMX cpuid feature to the
+    default "qemu64" CPU type, supporting Intel compatible VMX nested
+    virtualization.
+
+  [ Serge Hallyn ]
+  * debian/patches/fix-vmware-vga-negative-vals - if x or y < 0, set them to 0
+    (and decrement width/height accordingly)  (LP: #918791)
+ -- Serge Hallyn <email address hidden>   Wed, 14 Mar 2012 14:52:44 -0500
+
+Serge, thanks for your work on this. I can confirm that I can run unity-2d on 11.04 without crashing qemu. Thanks! :)
+
+Is this still an issue in the -vmware package now?
+
+@Martin,
+
+No - I"m still not sure about its responsibilities, so I don't know whether it's deemed a bug that it is using negative values, but certainly (virtualized) hardware shouldn't crash due to it, so that's where we're fixing it.
+
+So I'll mark the -vmware package part of the bug invalid.
+
+Thanks.
+
+Hello Jamie, or anyone else affected,
+
+Accepted qemu-kvm into oneiric-proposed. The package will build now and be available in a few hours. Please test and give feedback here. See https://wiki.ubuntu.com/Testing/EnableProposed for documentation how to enable and use -proposed. Thank you in advance!
+
+"if x or y < 0, set them to 0 (and  decrement with/height accordingly)"
+
+If it is possible in this context to have negative x or y, it is also possible to have them larger than width and heigth by absolute value, so that when decrementing width/height accordingly, width/height becomes negative too.
+
+There's more: this function does not check for w/h being positive too, just like it doesn't for x/y.  And again, if it is possible to have x<0 or y<0 there, it might be just as well possible to have w<0 or h<0 here.
+
+And with w<0 or h<0, we'll most likely crash too.
+
+So indeed, some (upstream) verification is needed here -- where these negative values are coming from, whenever it is EVER okay to have them, what to do with these, and where to check (I guess the check should be done somewhere in the upper layer).
+
+
+Thanks,
+
+/mjt
+
+It looks like this bug is still around.  I was running a 12.04 guest with the vmvga graphics, and on logging the emulation just dies.  Running 0.14.0+noroms-0ubuntu7+dnjl1~lucid0  I have done almost no troubleshooting on this yet, and the vga driver works well enough for now.
+
+@houstonbofh
+
+which release is your host?  Please show the result of 'virsh dumpxml MACHINEID | grep machine'
+
+the oneiric-proposed fix was deleted by a security update.  As noone has verified it since march, I will wait until someone asks for it before re-uploading.  (simple debdiff from the cached .dsc's for 6.2 and 6.3)
+
+I've checked Serge's fix and it does fix crashes. Now I've pulled latest qemu-kvm git master, and it appears that this patch isn't there... I still have to apply it on top of latest git to avoid crashes.
+What progress is here?
+
+oneiric has seen the end of its life and is no longer receiving any updates. Marking the oneiric task for this ticket as "Won't Fix".
+
+This bug still exists with Ubuntu 12.04.5 LTS as host and Ubuntu Mate 14.04.01 in the VM.
+
+Using Mate in the VM with cirrus as video driver does work, but the screen resolution is limited to 1290x104 - insufficient for some graphics work. For vga it  is even worse.
+
+@ullix
+
+could you please give the precise full qemu command line which is failing, and a url to a boot cd I can use for the guest?
+
+As far as I can see, this should have been fixed in upstream QEMU by this commit here:
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=8cb6bfb54e91b1a31a
+... so closing this issue now.
+

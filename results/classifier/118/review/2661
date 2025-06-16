@@ -1,0 +1,93 @@
+architecture: 0.930
+performance: 0.854
+device: 0.800
+PID: 0.775
+TCG: 0.768
+graphic: 0.763
+peripherals: 0.740
+boot: 0.730
+ppc: 0.728
+files: 0.711
+arm: 0.701
+register: 0.659
+debug: 0.657
+network: 0.653
+socket: 0.620
+kernel: 0.614
+permissions: 0.601
+semantic: 0.531
+mistranslation: 0.480
+assembly: 0.480
+hypervisor: 0.446
+x86: 0.412
+risc-v: 0.411
+vnc: 0.403
+user-level: 0.388
+i386: 0.344
+virtual: 0.319
+VMM: 0.271
+KVM: 0.104
+--------------------
+ppc: 0.997
+virtual: 0.805
+debug: 0.139
+assembly: 0.088
+hypervisor: 0.027
+kernel: 0.019
+device: 0.012
+files: 0.012
+register: 0.011
+TCG: 0.010
+KVM: 0.009
+architecture: 0.008
+PID: 0.008
+VMM: 0.008
+semantic: 0.008
+socket: 0.006
+boot: 0.003
+vnc: 0.003
+network: 0.002
+user-level: 0.002
+permissions: 0.002
+peripherals: 0.002
+performance: 0.001
+risc-v: 0.001
+graphic: 0.001
+mistranslation: 0.001
+arm: 0.000
+x86: 0.000
+i386: 0.000
+
+powerpc: MSR_LE implemented incorrectly for processors before PPC970
+Description of problem:
+qemu does not emulate MSR_LE correctly for CPUs prior to PPC970.
+
+The implementation used in this scenario appears to be correct for newer PowerPC CPUs, but not for earlier ones.
+
+When MSR_LE is enabled on PowerPC G4 and prior CPUs, big endian accesses are performed, with the lower address bits XORed by a constant derived from the size of the access (8-bit: XOR 7, 16-bit: XOR 6, 32-bit: XOR 4, 64-bit and above: no operation). This means that anything loaded in big-endian mode, when byteswapped as 64-bit values, appears in the correct place in little endian mode.
+
+Any unaligned access is dealt with at the same time. I have not verified exactly what the real hardware does, but the following appears to be correct for 16- and 32-bit accesses (and technically 8-bit accesses too given that all operations but the XOR do nothing in that case):
+```c
+// sizeof_access is the access size in bytes
+size_t temp = ea & (sizeof_access - 1); // get offset of unaligned access
+ea &= ~sizeof_access; // align the address
+ea ^= (sizeof(uint64_t) - sizeof_access); // perform MSR_LE swizzle
+ea -= temp; // correct the address for the unaligned access
+```
+
+Note that the algorithm can be run again on a swizzled address, which will compute the original non-swizzled address.
+
+Additionally, GDB memory accesses need to be performed byte-wise using the same algorithm. (there's probably a faster way to do this involving bswap64, though!)
+
+As for the rest of the system: different chipsets did different things. Some memory controllers (for example those used in early PReP systems) had an endianness swap bit that endianness swapped all of memory and MMIO correctly (given MSR_LE swizzled addresses); later systems with a PCI bus had an endianness swap bit in the PCI host controller (Apple "Bandit", Motorola MPC105/6/7) that endianness swapped PCI address space from the CPU side and provided a correct view of main memory from PCI DMA.
+
+I'm not sure how to implement any of that, hence testing with mac99, where the PCI host controller is big-endian only (there is a uni-north register to swap PCI endianness, but it isn't implemented in hardware and flipping it does nothing). On such systems, hardware access-related swapping must be handled in software.
+Steps to reproduce:
+Booting from the correct `nt_arcfw_mac99.iso` will crash on a black screen instead of running the ppcel stage2 bootloader.
+Additional information:
+The following patch is my implementation. This is my first attempt at QEMU TCG-related code; in some places it may be 'too' safe (running the swizzling algorithm again to revert it in case the EA is used again afterwards), and it also uses the "internal only" `tcg_temp_free_*` functions, to avoid wasting temporary variables. So hopefully some more experienced devs can improve it.
+
+[msr_le.patch](/uploads/3f829ac58d9943faa0cad7b817569f1d/msr_le.patch)
+
+The following ISO is the one used for testing.
+[nt_arcfw_mac99.iso](/uploads/16aa5406284bab55ada205d6598e399a/nt_arcfw_mac99.iso)

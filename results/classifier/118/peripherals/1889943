@@ -1,0 +1,398 @@
+peripherals: 0.873
+semantic: 0.839
+permissions: 0.838
+user-level: 0.828
+graphic: 0.822
+risc-v: 0.821
+virtual: 0.817
+performance: 0.814
+architecture: 0.808
+VMM: 0.802
+hypervisor: 0.799
+arm: 0.796
+TCG: 0.796
+assembly: 0.795
+vnc: 0.795
+network: 0.793
+register: 0.786
+device: 0.784
+KVM: 0.779
+PID: 0.778
+socket: 0.776
+debug: 0.768
+boot: 0.761
+kernel: 0.758
+i386: 0.758
+ppc: 0.749
+x86: 0.715
+files: 0.697
+mistranslation: 0.663
+
+Improper TCP/IP packet splitting on e1000e/vmxnet3
+
+Problem Description:
+When using a tap interface and the guest sends a TCP packet that would need to be segmented, it is fragmented using IP fragmentation. The host does not reassemble the IP fragments and forwards them to the next hop. This causes issues on certain ISPs, which seemingly reject IP fragments(Verizon Fios). 
+This issue occurs on the e1000e and vmxnet3 NIC models, and possibly others. It does not occur on the virtio(which passes the entire packet through to the host w/o fragmentation or segmentation) or the e1000 model(). 
+
+Test scenario:
+Setup a tap and network bridge using the directions here: https://gist.github.com/extremecoders-re/e8fd8a67a515fee0c873dcafc81d811c
+Boot the machine into any modern guest(a Fedora 31 live iso was used for testing)
+Begin a wireshark capture on the host machine
+On the host(or another machine on the network) run: npx http-echo-server(See https://github.com/watson/http-echo-server)
+On the guest run
+Curl -d “Lorem ipsum dolor sit amet, consectetur adipiscing elit. Maecenas venenatis viverra ipsum, ac tincidunt est rhoncus eu. Suspendisse vehicula congue ante, non rhoncus elit tempus vitae. Duis ac leo massa. Donec rutrum condimentum turpis nec ultricies. Duis laoreet elit eu arcu pulvinar, vitae congue neque mattis. Mauris sed ante nunc. Vestibulum vitae urna a tellus maximus sagittis. Vivamus luctus pellentesque neque, vel tempor purus porta ut. Phasellus at quam bibendum, fermentum libero sit amet, ullamcorper mauris. In rutrum sit amet dui id maximus. Ut lectus ligula, hendrerit nec aliquam non, finibus a turpis. Proin scelerisque convallis ante, et pharetra elit. Donec nunc nisl, viverra vitae dui at, posuere rhoncus nibh. Mauris in massa quis neque posuere placerat quis quis massa. Donec quis lacus ligula. Donec mollis vel nisi eget elementum. Nam id magna porta nunc consectetur efficitur ac quis lorem. Cras faucibus vel ex porttitor mattis. Praesent in mattis tortor. In venenatis convallis quam, in posuere nibh. Proin non dignissim massa. Cras at mi ut lorem tristique fringilla. Nulla ac quam condimentum metus tincidunt vulputate ut at leo. Nunc pellentesque, nunc vel rhoncus condimentum, arcu sem molestie augue, in suscipit mauris odio mollis odio. Integer hendrerit lectus a leo facilisis, in accumsan urna maximus. Nam nec odio volutpat, varius est id, tempus libero. Vestibulum lobortis tortor quam, ac scelerisque urna rhoncus in. Etiam tempor, est sit amet vulputate molestie, urna neque sodales leo, sit amet blandit risus felis sed est. Nulla eu eros nec tortor dapibus maximus faucibus ut erat. Ut pharetra tempor massa in bibendum. Interdum et malesuada fames ac ante ipsum primis in faucibus. Etiam mattis molestie felis eu efficitur. Morbi tincidunt consectetur diam tincidunt feugiat. Morbi euismod ut lorem finibus pellentesque. Aliquam eu porta ex. Aliquam cursus, orci sit amet volutpat egestas, est est pulvinar erat, sed luctus nisl ligula eget justo vestibulum.” <ECHOSERVERIP:PORT>
+
+2000 bytes of Lorem Ipsum taken from https://www.lipsum.com/
+
+Compare results from an e1000, a virtio, and a e1000e card:
++--------+-----------+---------+------------+
+| Model  | Fragment  | Segment | Wire Size  |
++--------+-----------+---------+------------+
+| e1000e | Yes       | NO      | 1484 + 621 |
++--------+-----------+---------+------------+
+| e1000  | No        | Yes     | 1516 + 620 |
++--------+-----------+---------+------------+
+| Virtio | NO        | NO      | 2068       |
++--------+-----------+---------+------------+
+
+Expected Results:
+TCP Segment to proper size OR pass full size to host and let the host split if necessary.
+
+Configuration changes that did not work:
+Disable host, guest, router firewalls
+Different Hosts
+Different Physical NICs
+Libvirt based NAT/Routed modes
+Fedora 32 vs 31
+Qemu 4.2.0 vs github commit d74824cf7c8b352f9045e949dc636c7207a41eee
+
+System Information:
+lsb_release -rd
+Description:	Fedora release 32 (Thirty Two)
+Release:	32
+
+uname -a
+Linux pats-laptop-linux 5.7.10-201.fc32.x86_64 #1 SMP Thu Jul 23 00:58:39 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
+
+I can provide additional logs, debug info, etc. if needed.
+
+After reading through some of the code for the e1000, e1000e, and vmxnet3 device models, it appears that all 3 are capable of performing tcp segementation, however, in the net_tx_pkt_send function, there is a check   
+
+if (pkt->has_virt_hdr ||
+        pkt->virt_hdr.gso_type == VIRTIO_NET_HDR_GSO_NONE)
+
+that if true will send the tcp segmented packets. However, if false, it will do IP fragmentation instead. I could not easily decipher what determines whether or not the pkt->has_virt_hdr value would be true or false. 
+What differs is that in the e1000, there is no such check. It directly calls qemu_send_packet without first going through the net_tx_pkt_send.
+I will have to add in some debug prints on my local build to confirm that the tcp fragments are being created and then ignored. 
+
+After stepping through the code, it has become clear that the e1000e/vmxnet3 emulated models do not implement TCP segmentation, however they still "advertise" it as a feature to the guest OS. 
+
+Regarding my prior interpretation, the implementation is written to forward the entire packet to the host OS if the has_vnet_hdr variable is set, which is passed all the way up from the IFF_VNET_HDR on the tap/tun interface. I am not sure what the kernel considers when setting that flag, but it appears that it is true when in a host-only configuration, and false otherwise. I may look into the virtio implementation to see how it affects that because they are linked. 
+
+In order to fix this, it would likely be possible to modify the net_tx_pkt_do_sw_fragmentation function in net_tx_pkt.c to incorporate the full set of offloads, not just ipv4. 
+
+Because both the e1000e and the vmxnet3 implmentations share net_tx_pkt functions, this could fix both.
+
+Some more clarifications:
+It appears the QEMU does turn on the vnet_hdr flag of the tap interface in most cases, not just host-only networks. My previous assumption was due to the way the libvirt manages it, only setting it if the virtio interface is used.
+
+Still, for software fragmentation implementations, ip fragmentation should be a last resort.
+
+I have also confirmed a suspicion that the current implementation of sw fragmentation will not work with IPV6. It creates malformed packets as ipv6 requires a different setup of headers to fragment. Thanks to the many redundancies in the network stack, the packets eventually arrive at the host server correctly formed, but we should not rely on this fact.
+
+Hello Yan,
+
+I tryed the patches mentioned(the first one was already implemented in
+the git master, the second wasn't). It did fix the IPv6 fragmentation
+issue. So therefore, the focus needs to be on implementing proper layer
+4 segmentation. 
+
+--Patrick
+On Mon, 2020-08-03 at 09:37 +0300, Yan Vugenfirer wrote:
+> Hello Patrick,
+> 
+> If you are using  QEMU version 4.2, then it is missing recent patches
+> fixing IPv6 and TSO behaviour:
+> https://<email address hidden>/msg723411.html
+> https://<email address hidden>/msg723412.html
+> 
+> Can you check that the above patches solve your issues?
+> 
+> 
+> Best regards,
+> Yan.
+> 
+> > On 2 Aug 2020, at 6:59 PM, Patrick Magauran <
+> > <email address hidden>> wrote:
+> > 
+> > Some more clarifications:
+> > It appears the QEMU does turn on the vnet_hdr flag of the tap
+> > interface in most cases, not just host-only networks. My previous
+> > assumption was due to the way the libvirt manages it, only setting
+> > it if the virtio interface is used.
+> > 
+> > Still, for software fragmentation implementations, ip fragmentation
+> > should be a last resort.
+> > 
+> > I have also confirmed a suspicion that the current implementation
+> > of sw
+> > fragmentation will not work with IPV6. It creates malformed packets
+> > as
+> > ipv6 requires a different setup of headers to fragment. Thanks to
+> > the
+> > many redundancies in the network stack, the packets eventually
+> > arrive at
+> > the host server correctly formed, but we should not rely on this
+> > fact.
+> > 
+> > ** Description changed:
+> > 
+> > + Update: The sw implementation of fragmentation also creates
+> > malformed
+> > + IPv6 packets when their size is above the MTU. See comment #3
+> > + 
+> >  Problem Description:
+> > - When using a tap interface and the guest sends a TCP packet that
+> > would need to be segmented, it is fragmented using IP
+> > fragmentation. The host does not reassemble the IP fragments and
+> > forwards them to the next hop. This causes issues on certain ISPs,
+> > which seemingly reject IP fragments(Verizon Fios). 
+> > - This issue occurs on the e1000e and vmxnet3 NIC models, and
+> > possibly others. It does not occur on the virtio(which passes the
+> > entire packet through to the host w/o fragmentation or
+> > segmentation) or the e1000 model(). 
+> > + When using a tap interface and the guest sends a TCP packet that
+> > would need to be segmented, it is fragmented using IP
+> > fragmentation. The host does not reassemble the IP fragments and
+> > forwards them to the next hop. This causes issues on certain ISPs,
+> > which seemingly reject IP fragments(Verizon Fios).
+> > + This issue occurs on the e1000e and vmxnet3 NIC models, and
+> > possibly others. It does not occur on the virtio(which passes the
+> > entire packet through to the host w/o fragmentation or
+> > segmentation) or the e1000 model().
+> > 
+> >  Test scenario:
+> >  Setup a tap and network bridge using the directions here: 
+> > https://gist.github.com/extremecoders-re/e8fd8a67a515fee0c873dcafc81d811c
+> >  Boot the machine into any modern guest(a Fedora 31 live iso was
+> > used for testing)
+> >  Begin a wireshark capture on the host machine
+> >  On the host(or another machine on the network) run: npx http-echo-
+> > server(See https://github.com/watson/http-echo-server)
+> >  On the guest run
+> >  Curl -d “Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+> > Maecenas venenatis viverra ipsum, ac tincidunt est rhoncus eu.
+> > Suspendisse vehicula congue ante, non rhoncus elit tempus vitae.
+> > Duis ac leo massa. Donec rutrum condimentum turpis nec ultricies.
+> > Duis laoreet elit eu arcu pulvinar, vitae congue neque mattis.
+> > Mauris sed ante nunc. Vestibulum vitae urna a tellus maximus
+> > sagittis. Vivamus luctus pellentesque neque, vel tempor purus porta
+> > ut. Phasellus at quam bibendum, fermentum libero sit amet,
+> > ullamcorper mauris. In rutrum sit amet dui id maximus. Ut lectus
+> > ligula, hendrerit nec aliquam non, finibus a turpis. Proin
+> > scelerisque convallis ante, et pharetra elit. Donec nunc nisl,
+> > viverra vitae dui at, posuere rhoncus nibh. Mauris in massa quis
+> > neque posuere placerat quis quis massa. Donec quis lacus ligula.
+> > Donec mollis vel nisi eget elementum. Nam id magna porta nunc
+> > consectetur efficitur ac quis lorem. Cras faucibus vel ex porttitor
+> > mattis. Praesent in mattis tortor. In venenatis convallis quam, in
+> > posuere nibh. Proin non dignissim massa. Cras at mi ut lorem
+> > tristique fringilla. Nulla ac quam condimentum metus tincidunt
+> > vulputate ut at leo. Nunc pellentesque, nunc vel rhoncus
+> > condimentum, arcu sem molestie augue, in suscipit mauris odio
+> > mollis odio. Integer hendrerit lectus a leo facilisis, in accumsan
+> > urna maximus. Nam nec odio volutpat, varius est id, tempus libero.
+> > Vestibulum lobortis tortor quam, ac scelerisque urna rhoncus in.
+> > Etiam tempor, est sit amet vulputate molestie, urna neque sodales
+> > leo, sit amet blandit risus felis sed est. Nulla eu eros nec tortor
+> > dapibus maximus faucibus ut erat. Ut pharetra tempor massa in
+> > bibendum. Interdum et malesuada fames ac ante ipsum primis in
+> > faucibus. Etiam mattis molestie felis eu efficitur. Morbi tincidunt
+> > consectetur diam tincidunt feugiat. Morbi euismod ut lorem finibus
+> > pellentesque. Aliquam eu porta ex. Aliquam cursus, orci sit amet
+> > volutpat egestas, est est pulvinar erat, sed luctus nisl ligula
+> > eget justo vestibulum.” <ECHOSERVERIP:PORT>
+> > 
+> >  2000 bytes of Lorem Ipsum taken from https://www.lipsum.com/
+> > 
+> >  Compare results from an e1000, a virtio, and a e1000e card:
+> >  +--------+-----------+---------+------------+
+> >  | Model  | Fragment  | Segment | Wire Size  |
+> >  +--------+-----------+---------+------------+
+> >  | e1000e | Yes       | NO      | 1484 + 621 |
+> >  +--------+-----------+---------+------------+
+> >  | e1000  | No        | Yes     | 1516 + 620 |
+> >  +--------+-----------+---------+------------+
+> >  | Virtio | NO        | NO      | 2068       |
+> >  +--------+-----------+---------+------------+
+> > 
+> >  Expected Results:
+> >  TCP Segment to proper size OR pass full size to host and let the
+> > host split if necessary.
+> > 
+> >  Configuration changes that did not work:
+> >  Disable host, guest, router firewalls
+> >  Different Hosts
+> >  Different Physical NICs
+> >  Libvirt based NAT/Routed modes
+> >  Fedora 32 vs 31
+> >  Qemu 4.2.0 vs github commit
+> > d74824cf7c8b352f9045e949dc636c7207a41eee
+> > 
+> >  System Information:
+> >  lsb_release -rd
+> >  Description:	Fedora release 32 (Thirty Two)
+> >  Release:	32
+> > 
+> >  uname -a
+> >  Linux pats-laptop-linux 5.7.10-201.fc32.x86_64 #1 SMP Thu Jul 23
+> > 00:58:39 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
+> > 
+> >  I can provide additional logs, debug info, etc. if needed.
+> > 
+> > -- 
+> > You received this bug notification because you are a member of
+> > qemu-
+> > devel-ml, which is subscribed to QEMU.
+> > https://bugs.launchpad.net/bugs/1889943
+> > 
+> > Title:
+> >  Improper TCP/IP packet splitting on e1000e/vmxnet3
+> > 
+> > Status in QEMU:
+> >  New
+> > 
+> > Bug description:
+> >  Update: The sw implementation of fragmentation also creates
+> > malformed
+> >  IPv6 packets when their size is above the MTU. See comment #3
+> > 
+> >  Problem Description:
+> >  When using a tap interface and the guest sends a TCP packet that
+> > would need to be segmented, it is fragmented using IP
+> > fragmentation. The host does not reassemble the IP fragments and
+> > forwards them to the next hop. This causes issues on certain ISPs,
+> > which seemingly reject IP fragments(Verizon Fios).
+> >  This issue occurs on the e1000e and vmxnet3 NIC models, and
+> > possibly others. It does not occur on the virtio(which passes the
+> > entire packet through to the host w/o fragmentation or
+> > segmentation) or the e1000 model().
+> > 
+> >  Test scenario:
+> >  Setup a tap and network bridge using the directions here: 
+> > https://gist.github.com/extremecoders-re/e8fd8a67a515fee0c873dcafc81d811c
+> >  Boot the machine into any modern guest(a Fedora 31 live iso was
+> > used for testing)
+> >  Begin a wireshark capture on the host machine
+> >  On the host(or another machine on the network) run: npx http-echo-
+> > server(See https://github.com/watson/http-echo-server)
+> >  On the guest run
+> >  Curl -d “Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+> > Maecenas venenatis viverra ipsum, ac tincidunt est rhoncus eu.
+> > Suspendisse vehicula congue ante, non rhoncus elit tempus vitae.
+> > Duis ac leo massa. Donec rutrum condimentum turpis nec ultricies.
+> > Duis laoreet elit eu arcu pulvinar, vitae congue neque mattis.
+> > Mauris sed ante nunc. Vestibulum vitae urna a tellus maximus
+> > sagittis. Vivamus luctus pellentesque neque, vel tempor purus porta
+> > ut. Phasellus at quam bibendum, fermentum libero sit amet,
+> > ullamcorper mauris. In rutrum sit amet dui id maximus. Ut lectus
+> > ligula, hendrerit nec aliquam non, finibus a turpis. Proin
+> > scelerisque convallis ante, et pharetra elit. Donec nunc nisl,
+> > viverra vitae dui at, posuere rhoncus nibh. Mauris in massa quis
+> > neque posuere placerat quis quis massa. Donec quis lacus ligula.
+> > Donec mollis vel nisi eget elementum. Nam id magna porta nunc
+> > consectetur efficitur ac quis lorem. Cras faucibus vel ex porttitor
+> > mattis. Praesent in mattis tortor. In venenatis convallis quam, in
+> > posuere nibh. Proin non dignissim massa. Cras at mi ut lorem
+> > tristique fringilla. Nulla ac quam condimentum metus tincidunt
+> > vulputate ut at leo. Nunc pellentesque, nunc vel rhoncus
+> > condimentum, arcu sem molestie augue, in suscipit mauris odio
+> > mollis odio. Integer hendrerit lectus a leo facilisis, in accumsan
+> > urna maximus. Nam nec odio volutpat, varius est id, tempus libero.
+> > Vestibulum lobortis tortor quam, ac scelerisque urna rhoncus in.
+> > Etiam tempor, est sit amet vulputate molestie, urna neque sodales
+> > leo, sit amet blandit risus felis sed est. Nulla eu eros nec tortor
+> > dapibus maximus faucibus ut erat. Ut pharetra tempor massa in
+> > bibendum. Interdum et malesuada fames ac ante ipsum primis in
+> > faucibus. Etiam mattis molestie felis eu efficitur. Morbi tincidunt
+> > consectetur diam tincidunt feugiat. Morbi euismod ut lorem finibus
+> > pellentesque. Aliquam eu porta ex. Aliquam cursus, orci sit amet
+> > volutpat egestas, est est pulvinar erat, sed luctus nisl ligula
+> > eget justo vestibulum.” <ECHOSERVERIP:PORT>
+> > 
+> >  2000 bytes of Lorem Ipsum taken from https://www.lipsum.com/
+> > 
+> >  Compare results from an e1000, a virtio, and a e1000e card:
+> >  +--------+-----------+---------+------------+
+> >  | Model  | Fragment  | Segment | Wire Size  |
+> >  +--------+-----------+---------+------------+
+> >  | e1000e | Yes       | NO      | 1484 + 621 |
+> >  +--------+-----------+---------+------------+
+> >  | e1000  | No        | Yes     | 1516 + 620 |
+> >  +--------+-----------+---------+------------+
+> >  | Virtio | NO        | NO      | 2068       |
+> >  +--------+-----------+---------+------------+
+> > 
+> >  Expected Results:
+> >  TCP Segment to proper size OR pass full size to host and let the
+> > host split if necessary.
+> > 
+> >  Configuration changes that did not work:
+> >  Disable host, guest, router firewalls
+> >  Different Hosts
+> >  Different Physical NICs
+> >  Libvirt based NAT/Routed modes
+> >  Fedora 32 vs 31
+> >  Qemu 4.2.0 vs github commit
+> > d74824cf7c8b352f9045e949dc636c7207a41eee
+> > 
+> >  System Information:
+> >  lsb_release -rd
+> >  Description:	Fedora release 32 (Thirty Two)
+> >  Release:	32
+> > 
+> >  uname -a
+> >  Linux pats-laptop-linux 5.7.10-201.fc32.x86_64 #1 SMP Thu Jul 23
+> > 00:58:39 UTC 2020 x86_64 x86_64 x86_64 GNU/Linux
+> > 
+> >  I can provide additional logs, debug info, etc. if needed.
+> > 
+> > To manage notifications about this bug go to:
+> > https://bugs.launchpad.net/qemu/+bug/1889943/+subscriptions
+> > 
+> 
+> 
+
+
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" within the next 60 days (otherwise it will get
+closed as "Expired"). We will then eventually migrate the ticket auto-
+matically to the new system (but you won't be the reporter of the bug
+in the new system and thus won't get notified on changes anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

@@ -1,0 +1,216 @@
+permissions: 0.914
+semantic: 0.901
+register: 0.894
+user-level: 0.888
+debug: 0.884
+virtual: 0.871
+mistranslation: 0.868
+assembly: 0.862
+network: 0.861
+peripherals: 0.861
+device: 0.850
+hypervisor: 0.840
+PID: 0.838
+graphic: 0.830
+arm: 0.826
+kernel: 0.820
+boot: 0.819
+architecture: 0.817
+vnc: 0.811
+risc-v: 0.808
+files: 0.803
+KVM: 0.803
+performance: 0.777
+TCG: 0.774
+socket: 0.728
+VMM: 0.726
+ppc: 0.707
+x86: 0.675
+i386: 0.639
+
+-net user,hostfwd=... is not working
+
+QEMU version: git a46b3aaf6bb038d4f6f192a84df204f10929e75c
+
+ /opt/qemu.git/bin/qemu-system-aarch64 --version
+QEMU emulator version 2.2.50, Copyright (c) 2003-2008 Fabrice Bellard
+
+Hosts:
+ovs - host machine (Ubuntu 14.04.1, x86_64)
+debian8-arm64 - guest 
+
+Guest start:
+user@ovs:~$ /opt/qemu.git/bin/qemu-system-aarch64 -machine virt -cpu cortex-a57 -nographic -smp 1 -m 512 -kernel vmlinuz-run -initrd initrd-run.img -append "root=/dev/sda2 console=ttyAMA0" -global virtio-blk-device.scsi=off -device virtio-scsi-device,id=scsi -drive file=debian8-arm64.img,id=rootimg,cache=unsafe,if=none -device scsi-hd,drive=rootimg -netdev user,id=unet -device virtio-net-device,netdev=unet -net user,hostfwd=tcp:127.0.0.1:1122-:22
+
+root@debian8-arm64:~# netstat -ntplu | grep ssh
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      410/sshd        
+tcp6       0      0 :::22                   :::*                    LISTEN      410/sshd       
+
+(no firewall in guest vm)
+
+user@ovs:~$ netstat -ntplu | grep 1122
+tcp        0      0 127.0.0.1:1122          0.0.0.0:*               LISTEN      18722/qemu-system-a
+
+user@ovs:~$ time ssh user@127.0.0.1 -p 1122
+ssh_exchange_identification: read: Connection reset by peer
+
+real	1m29.341s
+user	0m0.005s
+sys	0m0.000s
+
+Inside guest vm sshd works fine:
+root@debian8-arm64:~# ssh user@127.0.0.1 -p 22
+user@127.0.0.1's password: 
+....
+user@debian8-arm64:~$ exit
+logout
+Connection to 127.0.0.1 closed.
+
+root@debian8-arm64:~# ssh user@10.0.2.15 -p 22
+user@10.0.2.15's password: 
+...
+user@debian8-arm64:~$ exit
+logout
+Connection to 10.0.2.15 closed.
+
+Also happens on Ubuntu 16.04.1 64-bit with QEMU 1:2.5+dfsg-5ubuntu10.4. I have the following settings added to instance xml config:
+
+<domain type='kvm' xmlns:qemu='http://libvirt.org/schemas/domain/qemu/1.0'>
+
+  <qemu:commandline>
+    <qemu:arg value='-net'/>
+    <qemu:arg value='user,hostfwd=tcp::2222-:22'/>
+  </qemu:commandline>
+
+It looks like forwarding does not happen at all. When I try to connect to guest instance, I get exactly the same results regardless of whether sshd is running in that instance or not.
+
+I think this is not a bug, but you are using the command line parameters in a wrong way. When you use "-net user,hostfwd=tcp:127.0.0.1:1122-:22" you are creating a *new*, second host network device which is not connected to the guest NIC device that you specified. Please try to avoid mixing "-net" and "-netdev" options. You should rather do something like this instead:
+
+ -netdev user,id=unet,hostfwd=tcp:127.0.0.1:1122-:22 -device virtio-net-device,netdev=unet
+
+
+Doesn't work even with proper hostfwd
+Doesn't work even with `-redir`
+
+$ qemu-system-x86_64 -machine type=pc,accel=kvm -netdev user,id=user.0,hostfwd=tcp::2851-:22 -display sdl -cpu host -smp cpus=2 -device rtl8139,netdev=user.0 -cdrom /home/kit/git/packer-xenserver/packer_cache/57f4a00eef5b4d4157f20847e586e5ef2a503ee05c83c9296c08fd0c2f0c8e4f.iso -boot once=d -vnc 127.0.0.1:19 -name XenServer62 -m 2048M -drive file=output-qemu/XenServer62,if=scsi,cache=writeback,discard=ignore,format=qcow2
+
+
+
+Redirect does happen, but no packets appear on guest interface: checked by iptables rule for `NEW` on `tcpport 22` inside guest.
+
+On host:
+
+$ sudo lsof -itcp | grep 2851
+packer    24233      kit    6u  IPv4 1532725      0t0  TCP localhost:52822->localhost:2851 (ESTABLISHED)
+qemu-syst 24286      kit   12u  IPv4 1530169      0t0  TCP *:2851 (LISTEN)
+qemu-syst 24286      kit   21u  IPv4 1575945      0t0  TCP localhost:2851->localhost:52820 (CLOSE_WAIT)
+qemu-syst 24286      kit   22u  IPv4 1532726      0t0  TCP localhost:2851->localhost:52822 (ESTABLISHED)
+qemu-syst 24286      kit   23u  IPv4 1532645      0t0  TCP localhost:2851->localhost:52812 (CLOSE_WAIT)
+qemu-syst 24286      kit   24u  IPv4 1532646      0t0  TCP localhost:2851->localhost:52814 (CLOSE_WAIT)
+
+
+Do we got any solution for this issue ?
+
+I am seeing similar issue for qemu-system-arm, I have tried  with "-nic user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:31258-:22,hostfwd=tcp:127.0.0.1:47175-:443,hostname=xxx.com" and also with "-net nic -net user,hostfwd=tcp:127.0.0.1:45276-:22,hostfwd=tcp:127.0.0.1:52541-:443,hostname=hostname=xxx.com"
+
+Is this issue resolved.?
+
+
+Finally I found what was the issue. in the /etc/ssh/sshd_config  after commenting the below lines I am able to ssh to the vm.
+# grep -i LISTEN /etc/ssh/sshd_config
+#ListenAddress 127.0.0.1
+#ListenAddress ::
+#
+check your sshd config.
+
+So is this now working for everybody with the correct ssh config (maybe also check your firewall settings)? Could we close this ticket nowadays? Or is somebody still having trouble?
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+Hello, I'm also experiencing such a problem, using qemu-system-x86_64 (hence the retitling of this issue).  More information and output is available at http://issues.guix.gnu.org/48739, but basically with the following QEMU command used to run a VM:
+
+/gnu/store/vbjfas8smw260r0qw1d5bbnh5hz08haz-qemu-5.2.0/bin/qemu-system-x86_64 -kernel /gnu/store/0fylx9z8lzyrbdivqa2jzn574gk8lcjv-linux-libre-5.12.7/bzImage -initrd /gnu/store/76ikiyg6arhd40pmq6yyi0vgdszfl08w-system/initrd -append "--root=/dev/vda1 --system=/gnu/store/76ikiyg6arhd40pmq6yyi0vgdszfl08w-system --load=/gnu/store/76ikiyg6arhd40pmq6yyi0vgdszfl08w-system/boot modprobe.blacklist=usbmouse,usbkbd quiet" -enable-kvm -no-reboot -object rng-random,filename=/dev/urandom,id=guixsd-vm-rng -device virtio-rng-pci,rng=guixsd-vm-rng -virtfs local,path="/gnu/store",security_model=none,mount_tag="TAGjoptajej2oynju6yvboauz7pl6uj" -vga std -drive file=/gnu/store/gj50g71n2b7xa2s9lgcfijprvr4vj66y-qemu-image,if=virtio,cache=writeback,werror=report,readonly -m 512 -nic user,hostfwd=tcp::3333-:22
+
+Trying to connect to the VM which has its sshd_config set to:
+Port 22
+PermitRootLogin yes
+PermitEmptyPasswords yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+X11Forwarding no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+GatewayPorts no
+PidFile /var/run/sshd.pi
+ChallengeResponseAuthentication no
+UsePAM yes
+PrintLastLog yes
+LogLevel DEBUG
+AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/authorized_keys.d/%u
+Subsytsem    sftp    internal-sftp
+
+The SSH client would hang with its last debug output being:
+
+debug1: Local version string SSH-2.0-OpenSSH_8.6
+
+Inside the guest, /var/log/secure doesn't show any activity so itd oesn't seem to be reached.
+
+Ideas?
+
+
+Here's what `tcpdump -i lo` reports during attempting the SSH access:
+
+17:09:30.573545 IP localhost.55526 > localhost.3333: Flags [S], seq 1198531632, win 65495, options [mss 65495,sackOK,TS val 1662149852 ecr 0,nop,wscale 7], length 0
+17:09:30.573569 IP localhost.3333 > localhost.55526: Flags [S.], seq 476868813, ack 1198531633, win 65483, options [mss 65495,sackOK,TS val 1662149852 ecr 1662149852,nop,wscale 7], length 0
+17:09:30.573588 IP localhost.55526 > localhost.3333: Flags [.], ack 1, win 512, options [nop,nop,TS val 1662149852 ecr 1662149852], length 0
+17:09:30.574162 IP localhost.55526 > localhost.3333: Flags [P.], seq 1:22, ack 1, win 512, options [nop,nop,TS val 1662149853 ecr 1662149852], length 21
+17:09:30.574176 IP localhost.3333 > localhost.55526: Flags [.], ack 22, win 512, options [nop,nop,TS val 1662149853 ecr 1662149853], length 0
+17:09:35.127136 IP localhost.3333 > localhost.55518: Flags [R.], seq 1, ack 1, win 512, options [nop,nop,TS val 1662154406 ecr 1662125014], length 0
+
+
+That's rather embarrassing, but the problem with my VM was that it was lacking networking support.  I turned this (too) minimal example of a Guix System:
+
+;;; file: os.scm
+(use-modules (gnu services ssh)
+             (gnu system)
+             (gnu tests))
+
+(simple-operating-system
+ (service openssh-service-type
+          (openssh-configuration
+           (permit-root-login #t)
+           (allow-empty-passwords? #t)
+           (log-level 'debug))))
+
+Into:
+;;; file: os.scm
+(use-modules (gnu services networking)
+             (gnu services ssh)
+             (gnu system)
+             (gnu tests))
+
+(simple-operating-system
+ (service dhcp-client-service-type)
+ (service openssh-service-type
+          (openssh-configuration
+           (permit-root-login #t)
+           (allow-empty-passwords? #t)
+           (log-level 'debug))))
+
+After which using the '-nic user,hostfwd=tcp::3333-:22' allowed me to SSH to localhost port 3333 successfully.  Closing!
+
+I have had the same problem, I tried logging into a buildroot image that was started using the following command line:
+
+    qemu-system-i386 -drive file=output/images/disk.img,format=raw,index=0,media=disk -vga std -nic user,ipv6=off,model=e1000,mac=10:10:10:10:10:10,hostfwd=tcp::4000-:22
+
+The ssh connection was picked up, but nothing happened. The problem was that the network device was not brought up! I added the following to /etc/network/interfaces
+
+    auto eth0
+    iface eth0 inet dhcp
+
+And voila, I can use
+
+    ssh username@localhost -p 4000
+
+to log into the machine using ssh.
+

@@ -1,0 +1,113 @@
+graphic: 0.966
+user-level: 0.960
+performance: 0.955
+device: 0.952
+risc-v: 0.949
+assembly: 0.948
+hypervisor: 0.943
+mistranslation: 0.941
+virtual: 0.940
+register: 0.933
+VMM: 0.933
+debug: 0.932
+arm: 0.930
+PID: 0.927
+KVM: 0.927
+permissions: 0.926
+peripherals: 0.917
+files: 0.913
+TCG: 0.912
+ppc: 0.906
+semantic: 0.900
+vnc: 0.884
+network: 0.884
+boot: 0.871
+socket: 0.855
+architecture: 0.844
+x86: 0.835
+kernel: 0.784
+i386: 0.758
+
+"Assertion `!r->req.sg' failed." during live migration with VirtIO
+
+We've hit this issue twice so far, but don't have an obvious repro yet. It's pretty rare for us to hit it but I'm still trying so I can get a core and backtrace. The guest was Windows running a constant workload. We were using VirtIO SCSI drivers in both cases.
+
+In both cases we hit the assert here:
+
+hw/scsi/scsi-generic.c:
+
+static void scsi_generic_save_request(QEMUFile *f, SCSIRequest *req)
+{
+    SCSIGenericReq *r = DO_UPCAST(SCSIGenericReq, req, req);
+
+    qemu_put_sbe32s(f, &r->buflen);
+    if (r->buflen && r->req.cmd.mode == SCSI_XFER_TO_DEV) {
+***     assert(!r->req.sg);
+        qemu_put_buffer(f, r->buf, r->req.cmd.xfer);
+    }
+}
+
+From code inspection, it seems that this will always happen if scsi_req_enqueue_internal in hw/scsi/scsi-bus.c is ever invoked.
+
+static void scsi_req_enqueue_internal(SCSIRequest *req)
+{
+    assert(!req->enqueued);
+    scsi_req_ref(req);
+    if (req->bus->info->get_sg_list) {
+        req->sg = req->bus->info->get_sg_list(req);
+    } else {
+        req->sg = NULL;
+    }
+    req->enqueued = true;
+    QTAILQ_INSERT_TAIL(&req->dev->requests, req, next);
+}
+
+req->bus->info->get_sg_list will return &req->qsgl for a virtio-scsi bus since it's a method stored on the SCSIBusInfo struct. I didn't see anything that would clear the req->sg if scsi_req_enqueue_internal is called at least once.
+
+I think this can only happen if scsi_dma_restart_bh in hw/scsi/scsi-bus.c is called. The only other location I see scsi_req_enqueue_internal is on the load side for the destination of a migration.
+
+static void scsi_dma_restart_bh(void *opaque)
+{
+    SCSIDevice *s = opaque;
+    SCSIRequest *req, *next;
+
+    qemu_bh_delete(s->bh);
+    s->bh = NULL;
+
+    QTAILQ_FOREACH_SAFE(req, &s->requests, next, next) {
+        scsi_req_ref(req);
+        if (req->retry) {
+            req->retry = false;
+            switch (req->cmd.mode) {
+            case SCSI_XFER_FROM_DEV:
+            case SCSI_XFER_TO_DEV:
+                scsi_req_continue(req);
+                break;
+            case SCSI_XFER_NONE:
+                scsi_req_dequeue(req);
+                scsi_req_enqueue(req); // *** this calls scsi_req_enqueue_internal
+                break;
+            }
+        }
+        scsi_req_unref(req);
+    }
+}
+
+Finally when put_scsi_requests is called for migration, it seems like it will call both virtio_scsi_save_request (from bus->info->save_request) and scsi_generic_save_request (from req->ops->save_request) and trigger the assert.
+
+I searched for a bit, but didn't find anyone else reporting this. Has anyone else seen this? It seems to me like that assert should check that the sg list is empty instead of checking that it exists. Is this an appropriate assessment? Assuming I find a repro, I'll try to test this solution.
+
+Thanks!
+
+Which version of QEMU are you using?
+
+Hi Thomas,
+
+Thanks for looking. We're using version 2.3.0.
+
+OK. QEMU version 2.3 is not maintained by the QEMU project any more. Can you reproduce it with the latest version (release candidate of 2.8 preferably, or at least 2.7)?
+
+Thanks Thomas. Will do.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

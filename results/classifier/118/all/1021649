@@ -1,0 +1,142 @@
+boot: 0.928
+user-level: 0.925
+debug: 0.912
+device: 0.909
+VMM: 0.908
+arm: 0.908
+assembly: 0.902
+virtual: 0.899
+ppc: 0.897
+risc-v: 0.895
+vnc: 0.894
+PID: 0.894
+graphic: 0.888
+performance: 0.887
+register: 0.877
+hypervisor: 0.876
+mistranslation: 0.865
+architecture: 0.861
+socket: 0.859
+semantic: 0.857
+TCG: 0.851
+peripherals: 0.851
+kernel: 0.849
+permissions: 0.845
+network: 0.834
+files: 0.828
+KVM: 0.827
+x86: 0.820
+i386: 0.510
+
+qemu 1.1.0 waits for a keypress at boot
+
+qemu 1.1.0 waits for a keypress at boot.  Please don't ever do this.
+
+Try the attached test script.  When run it will initially print nothing, until you hit a key on the keyboard.
+
+Removing -nographic fixes the problem.
+
+Using virtio-scsi instead of virtio-blk fixes the problem.
+
+
+
+Also affects upstream qemu from git.
+
+Using -device sga fixes the problem, but also means I cannot see what it's trying to wait for.
+
+I don't see this problem.  Are you sure you're not using the bios from Fedora?  Perhaps it's configured incorrectly.
+
+Yes, I tested it again and it does look like it's loading a Fedora ROM.  Dammit ...
+
+This is a bit more interesting.  I've got a bugreport in debian about the same thing, and verified it in debian qemu-kvm package - indeed, with -nographics, upstream 1.1 qemu and qemu-kvm refuses to boot without an extra keypress, but only when kernel_irqchip is enabled.  Ie, the following requires keypress:
+
+  qemu -machine pc,accel=kvm,kernel_irqchip=on -nographics
+  qemu-kvm -nographics
+
+and the following does not:
+
+  qemu -machine pc,accel=kvm -nographics
+  qemu-kvm  -no-kvm-irqchip -nographics
+
+Thanks,
+
+/mjt
+
+
+Well that's very interesting because one of the patches we have added in Fedora is:
+
+http://pkgs.fedoraproject.org/gitweb/?p=qemu.git;a=blob;f=0001-qemu-kvm-Add-missing-default-machine-options.patch;h=e785a708d0bf0861c2f0f1777b8cc477d12fe145;hb=HEAD
+
+when the guest is waiting for the keypress, it is sitting in KVM_RUN ioctl and eating 100% CPU.  When enabling Seabios debugging, the last lines before the stall is this:
+
+Returned 57344 bytes of ZoneHigh
+e820 map has 7 items:
+  0: 0000000000000000 - 000000000009dc00 = 1 RAM
+  1: 000000000009dc00 - 00000000000a0000 = 2 RESERVED
+  2: 00000000000f0000 - 0000000000100000 = 2 RESERVED
+  3: 0000000000100000 - 000000001fffe000 = 1 RAM
+  4: 000000001fffe000 - 0000000020000000 = 2 RESERVED
+  5: 00000000feffc000 - 00000000ff000000 = 2 RESERVED
+  6: 00000000fffc0000 - 0000000100000000 = 2 RESERVED
+enter handle_19:
+  NULL
+Booting from Hard Disk...
+_
+
+
+So far it only happens when "booting" from a VIRTIO hard disk.  With IDE disk it boots fine.
+
+So, in order for it to actually stall,
+
+  qemu -machine pc,accel=kvm,kernel_irqchip=on -drive file=foo,if=virtio -nographics
+
+is needed.
+
+Thanks,
+
+/mjt
+
+
+Jamie Heilman (the debian bug #680719 reporter) bisected this issue to this commit:
+
+7c7db75576bd5a31508208f153c5aada64b2c8df is the first bad commit
+commit 7c7db75576bd5a31508208f153c5aada64b2c8df
+Author: Stefano Stabellini <email address hidden>
+Date:   Fri Apr 13 19:35:04 2012 +0100
+
+    main_loop_wait: block indefinitely
+    
+    - remove qemu_calculate_timeout;
+    
+    - explicitly size timeout to uint32_t;
+    
+    - introduce slirp_update_timeout;
+    
+    - pass NULL as timeout argument to select in case timeout is the maximum
+    value;
+    
+    Signed-off-by: Stefano Stabellini <email address hidden>
+    Acked-by: Paul Brook <email address hidden>
+    Signed-off-by: Anthony Liguori <email address hidden>
+
+
+I encountered the same thing and created a patch that fixes the problem for me.
+
+This is not a real fix. All i have done is the following:
+- Clone the repo. 
+- Get a reverse diff for the commit in question "git diff 7c7db75..4ffd16f >foo1.patch".
+- Try to apply this on master "patch <foo1.patch" and skip all files that could not be found.
+- And finally do a "git diff >remove-7c7db75.patch"
+
+As i am a gentoo user i applied this patch within my ebuild and 
+
+This is definitely a wrong way to "fix" this issue.
+
+The patch at http://permalink.gmane.org/gmane.comp.emulators.qemu/162828 fixes it for ioeventfd=on (the bug is that the ioeventfd is not added to the select() arguments), but I and Avi disagreed on whether ioeventfd=off works. :)
+
+Jamie/Richard/Georg, can you test your respective reproducers without any patch but with -global virtio-blk-pci.ioeventfd=off?
+
+Can this issue still be reproduced with the latest version of QEMU, or can we close this bug nowadays?
+
+No this refers to a very old version of qemu.  This bug should be closed.
+

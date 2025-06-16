@@ -1,0 +1,132 @@
+peripherals: 0.652
+ppc: 0.603
+hypervisor: 0.601
+graphic: 0.583
+semantic: 0.570
+permissions: 0.566
+architecture: 0.558
+virtual: 0.546
+TCG: 0.543
+debug: 0.535
+PID: 0.530
+assembly: 0.525
+vnc: 0.523
+device: 0.515
+performance: 0.514
+user-level: 0.511
+register: 0.505
+network: 0.489
+files: 0.486
+VMM: 0.484
+x86: 0.474
+socket: 0.469
+arm: 0.440
+KVM: 0.436
+kernel: 0.426
+boot: 0.417
+risc-v: 0.374
+i386: 0.367
+mistranslation: 0.348
+
+Recent libslirp commit broke Qemu network stack: qemu and libslirp teams should settle on SOCKET handler type
+Description of problem:
+https://gitlab.freedesktop.org/slirp/libslirp/-/commit/72f85005a2307fd0961543e3cea861ad7a4d201e introduced regression causing QEMU compilation for Windows to error out due to missing 64-bit SOCKET handler pointer type.
+
+```
+x86_64-w64-mingw32-gcc -m64 ... -MD -MQ libcommon.a.p/net_slirp.c.obj -MF libcommon.a.p/net_slirp.c.obj.d -o libcommon.a.p/net_slirp.c.obj -c ../net/slirp.c
+../net/slirp.c:289:25: error: initialization of 'void (*)(slirp_os_socket,  void *)' {aka 'void (*)(long long unsigned int,  void *)'} from incompatible pointer type 'void (*)(int,  void *)' [-Wincompatible-pointer-types]
+  289 |     .register_poll_fd = net_slirp_register_poll_fd,
+      |                         ^~~~~~~~~~~~~~~~~~~~~~~~~~
+../net/slirp.c:289:25: note: (near initialization for 'slirp_cb.register_poll_fd')
+../net/slirp.c:290:27: error: initialization of 'void (*)(slirp_os_socket,  void *)' {aka 'void (*)(long long unsigned int,  void *)'} from incompatible pointer type 'void (*)(int,  void *)' [-Wincompatible-pointer-types]
+  290 |     .unregister_poll_fd = net_slirp_unregister_poll_fd,
+      |                           ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+../net/slirp.c:290:27: note: (near initialization for 'slirp_cb.unregister_poll_fd')
+../net/slirp.c: In function 'net_slirp_poll_notify':
+../net/slirp.c:367:28: error: passing argument 3 of 'slirp_pollfds_fill' from incompatible pointer type [-Wincompatible-pointer-types]
+  367 |                            net_slirp_add_poll, poll->pollfds);
+      |                            ^~~~~~~~~~~~~~~~~~
+      |                            |
+      |                            int (*)(int,  int,  void *)
+In file included from ../net/slirp.c:41:
+/home/cross-qemu-deps/include/slirp/libslirp.h:255:40: note: expected 'SlirpAddPollCb' {aka 'int (*)(long long unsigned int,  int,  void *)'} but argument is of type 'int (*)(int,  int,  void *)'
+  255 |                         SlirpAddPollCb add_poll, void *opaque);
+      |                         ~~~~~~~~~~~~~~~^~~~~~~~
+```
+
+Possible solution relying on cross-platform MACRO: https://handsonnetworkprogramming.com/articles/socket-function-return-value-windows-linux-macos/
+Steps to reproduce:
+1. Prepare cross-compilation build of qemu 9.1.0 using following steps (It's not necessary to set up a virtual machine if your main OS has good mingw repository, like Fedora, Arch linux, Manjaro. But if you're on Debian or Ubuntu, it's required):
+2. Download official Fedora workstation 40 x86_64 ISO and install it to a virtual disk and boot that disk.
+3. On Fedora, do:\
+   `wget https://download.qemu.org/qemu-9.1.0.tar.xz`\
+   ` tar xvJf qemu-9.1.0.tar.xz`\
+   ` cd qemu-9.1.0`
+4. `sudo yum install git meson ninja-build python3-sphinx python3-sphinx_rtd_theme gcc mingw64-gcc mingw64-pkg-config mingw64-glib2`
+5. `git clone https://gitlab.freedesktop.org/slirp/libslirp.git`
+6. create file x86_64-w64-mingw32.txt in qemu-9.1.0 directory with the content as follows:
+
+```
+[binaries]
+c = '/usr/bin/x86_64-w64-mingw32-gcc'
+cpp = '/usr/bin/x86_64-w64-mingw32-g++'
+ar = '/usr/bin/x86_64-w64-mingw32-ar'
+strip = '/usr/bin/x86_64-w64-mingw32-strip'
+pkg-config = '/usr/bin/x86_64-w64-mingw32-pkg-config'
+exe_wrapper = 'wine'
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'i686'
+endian = 'little'
+```
+
+ 7. Run 2 commands:
+
+    `export CROSS_QEMU_DEPS="/home/cross-qemu-deps"`\
+    ` sudo mkdir -p $CROSS_QEMU_DEPS`
+ 8. Install libslirp so that future qemu binaries can have internet access via \`-netdev user\`\
+    \
+    `cd libslirp`\
+    \
+    ` meson setup --cross-file ../x86_64-w64-mingw32.txt --prefix "$CROSS_QEMU_DEPS" build-mingw/`\
+    ` meson compile -C build-mingw`\
+    ` cd build-mingw`\
+    ` ninja install`
+ 9. Set environment variables for cross-compilation\
+    \
+    ` sudo find / -type f -name '*.pc'` and make sure all mingw \*.pc files live in /usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/. Correct this path in PKG_CONFIG_PATH if you see it was altered by mingw or package contributors.\
+    \
+    ` export PKG_CONFIG_PATH="/usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/:$PKG_CONFIG_PATH"`\
+    ` export PKG_CONFIG_LIBDIR="${CROSS_QEMU_DEPS}/lib/pkgconfig/:$PKG_CONFIG_LIBDIR"`\
+    ` export PKG_CONFIG_SYSROOT_DIR=""`
+10. Configure Qemu makefile:\
+    \
+    `cd ../../`\
+    `./configure --cross-prefix=x86_64-w64-mingw32- --enable-slirp`\
+    \
+    and make sure you see this in the output of configure:\
+    `Compilation`\
+    `host CPU : x86_64`\
+    `host endianness : little`\
+    `C compiler : x86_64-w64-mingw32-gcc -m64`\
+    `Host C compiler : cc`
+11. Cross-compile qemu: `` make -j`nproc` ``
+12. Get the error `initialization of 'void (*)(slirp_os_socket,  void *)' {aka 'void (*)(long long unsigned int,  void *)'} from incompatible pointer type 'void (*)(int,  void *)'` as above.
+Additional information:
+After having seen this bug, do these steps (revert to the commit right before the buggy one).
+
+`    cd libslirp`\
+`    git reset --hard 5e97a93b`
+
+`    meson setup --cross-file ../x86_64-w64-mingw32.txt --prefix "$CROSS_QEMU_DEPS" build-mingw/ --reconfigure`\
+`    meson compile -C build-mingw`\
+`    cd build-mingw`\
+`    ninja install`
+
+``     cd ../../ ``\
+``     ./configure --cross-prefix=x86_64-w64-mingw32- --enable-slirp ``\
+``    make -j`nproc` ``
+
+=\> Cross-compilation comes to an end just fine, building all compilation targets without any errors.

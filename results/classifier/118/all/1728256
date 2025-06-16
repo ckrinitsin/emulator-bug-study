@@ -1,0 +1,130 @@
+permissions: 0.965
+debug: 0.959
+semantic: 0.945
+network: 0.936
+architecture: 0.934
+assembly: 0.934
+graphic: 0.932
+device: 0.928
+mistranslation: 0.926
+register: 0.924
+virtual: 0.921
+kernel: 0.921
+performance: 0.918
+arm: 0.911
+boot: 0.906
+user-level: 0.897
+PID: 0.893
+peripherals: 0.888
+files: 0.866
+vnc: 0.851
+risc-v: 0.829
+TCG: 0.825
+VMM: 0.812
+socket: 0.811
+hypervisor: 0.802
+KVM: 0.765
+x86: 0.756
+ppc: 0.748
+i386: 0.416
+
+Memory corruption in Windows 10 guest / amd64
+
+I have a Win 10 Pro x64 guest inside a qemu/kvm running on an Arch x86_64 host. The VM has a physical GPU passed through, as well as the physical USB controllers, as well as a dedicated SSD attached via SATA; you can find the complete libvirt xml here: https://pastebin.com/U1ZAXBNg
+I built qemu from source using the qemu-minimal-git AUR package; you can find the build script here: https://aur.archlinux.org/cgit/aur.git/tree/PKGBUILD?h=qemu-minimal-git (if you aren't familiar with Arch, this is essentially a bash script where build() and package() are run to build the files, and then install them into the $pkgdir to later tar them up.)
+
+Starting with qemu v2.10.0, Windows crashes randomly with a bluescreen about CRITICAL_STRUCTURE_CORRUPTION. I also tested the git heads f90ea7ba7c, 861cd431c9 and e822e81e35, before I went back to v2.9.0, which is running stable for over 50 hours right now.
+
+During my tests I found that locking the memory pages alleviates the problem somewhat, but never completely avoids it. However, with the crashes occuring randomly, that could as well be false conclusions; I had crashes within minutes after boot with that too.
+
+I will now start `git bisect`ing; if you have any other suggestions on what I could try or possible patches feel free to leave them with me.
+
+I have a similar setup to yours, running on Ubuntu 17.10 Artful. Symptoms are the same. Did you find out what's wrong with 2.10? (Haven't tested 2.9 here)
+
+Unfortunately I have bad news, but I also have (kind of) good news.
+Bad news is, 2.9 is NOT stable, contrary to what I believed earlier.
+Good news is, I found a correlation between the crashes and converting large video files on an SMB share with ffmpeg, so effectively copying slowly with simultaneously high CPU load. In that constellation it crashed a few times after just hours (instead of days sometimes). I suspect it might be a network related issue. I am now testing the different virtual network hardware that qemu supports (which proved to be difficult due to lack of driver support in Windows).
+
+On that note, I remember right after setting up the VM I had some strange networking related hangup issues with the rtl8139 virtual adapter - the default -, where the VM would slowly grind to a complete halt over a few seconds when I started a very network-heavy task (like copying something from the host via SMB into the VM). I could prevent the hang when I paused the copying for a few seconds. At that time I assumed it was the hardware registering as 100Mbps adapter, but the actual load being about 4 times that on average (during copying of course), with peaks significantly higher (about 15-20 times). That issue completely went away after switching the virtual network hardware to virtio (which registers as 10Gbps adapter), and I considered that case closed.
+
+It happened again, both with the e1000 and the rtl8139 NICs under qemu 2.11.0.rc0-7-g4ffa88c99c. Kernel is the official Arch one, right now on 4.13.12.
+
+At this point I have no idea anymore what could be causing this, and am unable to test without having to remove basic functionality from the VM (e.g. the graphics card) or downgrading the host kernel (which I really want to avoid because I'm using btrfs).
+
+That said, during the last several days I did not experience these weird hangup issues that I described previously, however I did see very high CPU load in the guest that was caused by the network (listed in task manager as System Interrupts, and going as high as one full CPU core during large network operations).
+
+What is most interesting though is that it survived while I tried my best to get it to crash (stress-testing CPU and network, mostly), and then hit me with a Bluescreen in a most unexpected time almost a week later. Since then however it started crashing anywhere between a few hours and about two days of consecutive uptime again, just like before.
+
+@larsk, could you elaborate on your setup? Like, in which ways is it different (other than you using Ubuntu and thus different versions of the involved software)?
+Which hardware do you pass through, if any?
+
+I've also had the exact symptoms and issues you've described. I have also noticed that the VM would BSOD with the CRITICAL_STRUCTURE_CORRUPTION message when the host system would read VM memory from swap.
+
+After disabling swap on the host system I've completely managed to eliminate this BSOD issue. Hopefully it's also applicable to your system so you can atleast figure out how to move forward.
+
+I'm experiencing this BSOD issue as well. I'm also on Arch x64, and the same versions of everything (though not minimal qemu--just the normal package in the main repos). I also passthru a GPU and a USB card, but not an SSD. It will happen randomly, anytime, at least once a day, and it seems like demanding games make it much more frequent. Since you're on btrfs, I'll see what happens if I downgrade the kernel to 4.12. If that doesn't work, I guess I'll try to confirm the swapoff fix, but my host only gets 4GB of RAM when the VM is running, so no swap would hurt real bad.
+
+Specifically 4.12.12, because it seems that was the last version I was running before this issue started (I was on 4.12.13 when it started). I, too, can't find any other package upgrade that could have possibly been the culprit. The timing of my upgrades of any qemu or libvirt packages rule them out.
+
+I am on Arch as well, using a customized kernel using the vfio patchset (in this case 4.13.11). I was having the same issue as you guys, where my Windows 10 VM with an NVIDIA card passed in was getting the CRITICAL_STRUCTURE_CORRUPTION blue screen error message after running for a while. Usually I saw this when hitting some form of memory (GPU or system RAM), and it was quick (~3 hours) to crash while mining on the GPU (as that hits the GPU memory hard).
+
+It looks like what Jimi said above about swap seeming to be a contributing factor seems to be correct. I have disabled swap on my host and have seen no instability thus far. 
+
+Windows 7 also may be seeing similar issues, though it was just crashing though without displaying an error as far as I could see. This VM has an AMD card in it. Same goes for it, where it also has not crashed after more than a day after disabling swap.
+
+I have yet to try disabling swap, but in the 5 days since I downgraded the kernel to 4.12.12 from 4.12.13, I have not had a single BSOD. I think 4.12.13 is the culprit.
+
+I just reported the bug in the kernel: https://bugzilla.kernel.org/show_bug.cgi?id=197951
+
+If you reported or commented on the bug here, please go comment on that report confirming as well. A lot of open-source bugzilla projects tend to rarely pay attention to bug reports that only one person has confirmed/reported.
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+Got similar behavior with windows server 2012r2 VMs.
+
+Environment: 
+
+uname -a
+Linux ubuntu-q87 4.13.0-37-generic #42~16.04.1-Ubuntu SMP Wed Mar 7 16:03:28 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux
+
+ii  linux-image-4.13.0-36-generic                        4.13.0-36.40~16.04.1                                               amd64        Linux kernel image for version 4.13.0 on 64 bit x86 SMP
+
+apt policy qemu
+qemu:
+  Installed: (none)
+  Candidate: 1:2.11+dfsg-1ubuntu5~cloud0
+  Version table:
+     1:2.11+dfsg-1ubuntu5~cloud0 500
+
+Windows VMs error out and create a memory dump:
+
+The computer has rebooted from a bugcheck.  The bugcheck was: 0x00000109 (0xa3a01f5891f186c5, 0xb3b72bdee47188a0, 0x0000032000000000, 0x0000000000000017). A dump was saved in: C:\Windows\MEMORY.DMP. Report Id: 033018-31234-01.
+
+Based on microsoft docs:
+
+https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/bug-check-0x109---critical-structure-corruption
+CRITICAL_STRUCTURE_CORRUPTION Parameters
+Parameter  Description
+1 Reserved
+2 Reserved
+3 Reserved
+4 The type of the corrupted region. (See the following table later on this page.)
+
+...
+0x17 Local APIC modification <--- this
+
+
+Which is the same as with other reports out there:
+
+https://www.spinics.net/lists/kvm/msg159977.html
+https://forum.proxmox.com/threads/new-windows-vm-keeps-dying.39145/#post-193639
+
+
+From what I see the change was backported but there was no new build yet.
+ 
+http://kernel.ubuntu.com/git/ubuntu/ubuntu-xenial.git/commit/arch/x86/kvm/x86.c?h=hwe&id=78d2542b88d16
+
+See https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1738972
+
+I suggest this is marked as a duplicate to 1738972
+

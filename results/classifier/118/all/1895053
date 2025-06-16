@@ -1,0 +1,400 @@
+permissions: 0.952
+debug: 0.934
+virtual: 0.929
+risc-v: 0.919
+register: 0.916
+device: 0.916
+semantic: 0.910
+arm: 0.909
+boot: 0.909
+architecture: 0.904
+performance: 0.899
+user-level: 0.898
+network: 0.897
+assembly: 0.895
+PID: 0.891
+graphic: 0.889
+kernel: 0.886
+peripherals: 0.883
+ppc: 0.874
+vnc: 0.865
+files: 0.857
+VMM: 0.851
+socket: 0.848
+hypervisor: 0.845
+x86: 0.835
+mistranslation: 0.828
+TCG: 0.818
+i386: 0.784
+KVM: 0.782
+
+Cannot nspawn raspbian 10 [FAILED] Failed to start Journal Service.
+
+Hi, I'm using nspawn and asked the question @systemd-devel. They redirected me to you, guessing that nspawn calls a syscall or ioctl qemu isnt aware of and can't implement properly?
+They were like: "Sorry, that's not my department." ^^
+
+Maybe you can reproduce the issue or help me investigating whats wrong or put the ball right back into their court? :D
+￼
+From:	"chiasa.men" <email address hidden>
+To:	<email address hidden>
+Date:	09.09.20 14:20
+(cf. https://github.com/systemd/systemd/issues/16975)
+
+Testscript:
+wget https://downloads.raspberrypi.org/raspios_lite_armhf_latest -o r.zip
+unzip r.zip
+LOOP=$(losetup --show -Pf *raspios-buster-armhf-lite.img)
+mount ${LOOP}p2 /mnt
+mount ${LOOP}p1 /mnt/boot
+systemd-nspawn --bind /usr/bin/qemu-arm-static --boot --directory=/mnt -- systemd.log_level=debug
+
+
+Output:
+see attachment
+
+System:
+uname -a
+Linux MArch 5.8.7-arch1-1 #1 SMP PREEMPT Sat, 05 Sep 2020 12:31:32 +0000 
+x86_64 GNU/Linux
+
+systemd-nspawn --version 
+systemd 246 (246.4-1-arch)
++PAM +AUDIT -SELINUX -IMA -APPARMOR +SMACK -SYSVINIT +UTMP +LIBCRYPTSETUP 
++GCRYPT +GNUTLS +ACL +XZ +LZ4 +ZSTD +SECCOMP +BLKID +ELFUTILS +KMOD +IDN2 -IDN 
++PCRE2 default-hierarchy=hybrid
+
+
+
+Could you try with the patch attached to bug 1823790?
+
+ https://bugs.launchpad.net/qemu/+bug/1823790/+attachment/5405549/+files/SO_PEERGROUPS.patch
+
+Thanks for the quick response!
+I tried the whole day to get the PKGBUILD working...
+
+Your patch doesnt fix the issue though - see attached log
+
+can you reproduce the bug locally or is this a client problem?
+
+Le 10/09/2020 à 18:19, Petunia a écrit :
+> can you reproduce the bug locally or is this a client problem?
+> 
+
+I didn't try but I will as you describe it clearly.
+
+
+I'm sorry, it works fine for me on Fedora 32 with qemu built from GIT v5.1.0.
+
+$ uname -r
+5.8.4-200.fc32.x86_64
+
+wget https://downloads.raspberrypi.org/raspios_lite_armhf_latest
+mv raspios_lite_armhf_latest raspios_lite_armhf_latest.zip
+unzip raspios_lite_armhf_latest.zip
+modprobe loop max_part=8
+mkdir root
+sudo losetup -f 2020-08-20-raspios-buster-armhf-lite.img
+sudo mount /dev/loop0p2 root
+sudo mount /dev/loop0p1 root/boot
+sudo systemd-nspawn -D root --boot --bind $HOME/Objects/qemu/linux-user/qemu-arm:/qemu-arm
+Spawning container root on /raspios/root.
+Press ^] three times within 1s to kill container.
+systemd 241 running in system mode. (+PAM +AUDIT +SELINUX +IMA +APPARMOR +SMACK +SYSVINIT +UTMP +LIBCRYPTSETUP +GCRYPT +GNUTLS +ACL +XZ +LZ4 +SECCOMP +BLKID +ELFUTILS +KMOD -IDN2 +IDN -PCRE2 default-hierarchy=hybrid)
+Detected virtualization systemd-nspawn.
+Detected architecture arm.
+
+Welcome to Raspbian GNU/Linux 10 (buster)!
+....
+Raspbian GNU/Linux 10 raspberrypi console
+raspberrypi login: pi
+Password: 
+Last login: Thu Sep 10 19:40:15 CEST 2020 on pts/0
+Linux raspberrypi 5.8.4-200.fc32.x86_64 #1 SMP Wed Aug 26 22:28:08 UTC 2020 armv7l
+
+The programs included with the Debian GNU/Linux system are free software;
+the exact distribution terms for each program are described in the
+individual files in /usr/share/doc/*/copyright.
+
+Debian GNU/Linux comes with ABSOLUTELY NO WARRANTY, to the extent
+permitted by applicable law.
+pi@raspberrypi:~ $ /qemu-arm -version
+qemu-arm version 5.1.0 (v5.1.0)
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+pi@raspberrypi:~ $ 
+
+
+
+
+Perhaps the problem is triggered by the host systemd version as I have:
+
+$ systemd-nspawn --version
+systemd 245 (v245.7-1.fc32)
++PAM +AUDIT +SELINUX +IMA -APPARMOR +SMACK +SYSVINIT +UTMP +LIBCRYPTSETUP +GCRYPT +GNUTLS +ACL +XZ +LZ4 +SECCOMP +BLKID +ELFUTILS +KMOD +IDN2 -IDN +PCRE2 default-hierarchy=unified
+
+
+mhm thats somehow unfortunate since I dont know in what direction I would have to go to solve the issue :/
+
+I tried 245.7 but without success.
+
+Do you maybe have an idea on how to investigate further?
+Is this some kind of distribution problem? What is the actual problem anyway?
+
+We can try to see what is failing by enabling qemu strace.
+To do that, I don't know a better solution than using a wrapper.
+
+Once /mnt is mounted, copy qemu-arm-static inside with a new name:
+
+  sudo cp /usr/bin/qemu-arm-static /mnt/usr/bin/qemu-arm-org
+
+Then create the wrapper:
+
+cat > qemu-wrapper.c <<EOF
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+static const char *baseargv[] = {
+        "-strace",
+};
+
+int main(int argc, char **argv, char **envp) {
+        char *newargv[argc + sizeof(baseargv) / sizeof(char *) + 1];
+        int current = 0;
+
+        newargv[current] = argv[0];
+        current++;
+
+        memcpy(&newargv[current], baseargv, sizeof(baseargv));
+        current += sizeof(baseargv) / sizeof(char *);
+
+        memcpy(&newargv[current], &argv[1], sizeof(*argv) * (argc - 1));
+        current += argc - 1;
+
+        newargv[current] = NULL;
+
+        return execve("/usr/bin/qemu-arm-org", newargv, envp);
+}
+EOF
+  cc --static -o qemu-wrapper qemu-wrapper.c
+
+  sudo cp  qemu-wrapper /mnt/usr/bin/qemu-arm-static
+
+And then:
+
+  systemd-nspawn  --boot --directory=/mnt
+
+Hi thanks i ran the above, but where is the strace stored? its neither in the console output nor journalctl 
+
+Normally, they are on the standard output, something like:
+
+$ sudo systemd-nspawn -D root --boot
+Spawning container root on /mnt.
+Press ^] three times within 1s to kill container.
+1 brk(NULL) = 0x4013f000
+1 uname(0x3ffffa00) = 0
+1 access("/etc/ld.so.preload",R_OK) = 0
+1 openat(AT_FDCWD,"/etc/ld.so.preload",O_RDONLY|O_LARGEFILE|O_CLOEXEC) = 4
+1 fstat64(4,0x3ffffb38) = 0
+1 mmap2(NULL,54,PROT_READ|PROT_WRITE,MAP_PRIVATE,4,0) = 0x3f7cc000
+1 close(4) = 0
+1 readlink("/proc/self/exe",0x3fffe6f0,4096) = 2
+...
+
+Check the content of /mnt/usr/bin, you must have "qemu-arm" and "qemu-arg-org".
+
+You can try "sudo chroot /mnt" to see if you have some traces.
+
+Mhm, that doesnt work for me. My output is unchanged...
+
+file /mnt/usr/bin/qemu-arm-*
+/mnt/usr/bin/qemu-arm-org:    ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, stripped
+/mnt/usr/bin/qemu-arm-static: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, BuildID[sha1]=041f10cff5eeffbbaf3fc7acb3c53db76a52991c, for GNU/Linux 3.2.0, not stripped
+
+sudo systemd-nspawn --boot --directory=/mnt/
+Spawning container virtual1 on /mnt.
+Press ^] three times within 1s to kill container.
+systemd 241 running in system mode. (+PAM +AUDIT +SELINUX +IMA +APPARMOR +SMACK +SYSVINIT +UTMP +LIBCRYPTSETUP +GCRYPT +GNUTLS +ACL +XZ +LZ4 +SECCOMP +BLKID +ELFUTILS +KMOD -IDN2 +IDN -PCRE2 default-hierarchy=hybrid)
+Detected virtualization systemd-nspawn.
+Detected architecture arm.
+
+Welcome to Raspbian GNU/Linux 10 (buster)!
+
+
+How would the be called anyway? Some internal mechanism?
+
+
+sudo chroot /mnt/virtual1 /bin/bash
+/usr/bin/file /usr/bin/qemu-arm-* 
+/usr/bin/qemu-arm-org:    ELF 64-bit LSB shared object, x86-64, version 1 (SYSV), dynamically linked, stripped
+/usr/bin/qemu-arm-static: ELF 64-bit LSB executable, x86-64, version 1 (GNU/Linux), statically linked, BuildID[sha1]=041f10cff5eeffbbaf3fc7acb3c53db76a52991c, for GNU/Linux 3.2.0, not stripped
+
+
+But no traces either - i feel retarded :D
+
+What is the result of the following command?
+
+for file in /proc/sys/fs/binfmt_misc/* ; do echo "$file"; cat $file; done
+
+
+for file in /proc/sys/fs/binfmt_misc/* ; do echo "$file"; LANG=C cat $file; done
+/proc/sys/fs/binfmt_misc/aarch64
+enabled
+interpreter /usr/bin/qemu-aarch64-static
+flags: OCF
+offset 0
+magic 7f454c460201010000000000000000000200b7
+mask ffffffffffffff00fffffffffffffffffeffff
+/proc/sys/fs/binfmt_misc/arm
+enabled
+interpreter /usr/bin/qemu-arm-static
+flags: OCF
+offset 0
+magic 7f454c4601010100000000000000000002002800
+mask ffffffffffffff00fffffffffffffffffeffffff
+/proc/sys/fs/binfmt_misc/armeb
+enabled
+interpreter /usr/bin/qemu-armeb-static
+flags: OCF
+offset 0
+magic 7f454c4601020100000000000000000000020028
+mask ffffffffffffff00fffffffffffffffffffeffff
+/proc/sys/fs/binfmt_misc/CLR
+enabled
+interpreter /usr/bin/mono
+flags: 
+offset 0
+magic 4d5a
+/proc/sys/fs/binfmt_misc/DOSWin
+enabled
+interpreter /usr/bin/wine
+flags: 
+offset 0
+magic 4d5a
+/proc/sys/fs/binfmt_misc/register
+cat: /proc/sys/fs/binfmt_misc/register: Permission denied
+/proc/sys/fs/binfmt_misc/status
+enabled
+
+Could this be related to bug 1892604? Although I don't know how Laurent would not be seeing the
+problem.
+
+tldr: i dont have the same issue as described in your bug
+see my post there:
+https://bugs.launchpad.net/qemu/+bug/1892604/comments/6
+
+
+I take back everything and claim the opposite... same error as bug reporter
+
+Le 15/09/2020 à 00:03, Petunia a écrit :
+> for file in /proc/sys/fs/binfmt_misc/* ; do echo "$file"; LANG=C cat $file; done
+...
+> /proc/sys/fs/binfmt_misc/arm
+> enabled
+> interpreter /usr/bin/qemu-arm-static
+> flags: OCF
+> offset 0
+> magic 7f454c4601010100000000000000000002002800
+> mask ffffffffffffff00fffffffffffffffffeffffff
+
+'F'[1] flags means the interpreter is loaded from your host:
+your "--bind" arg is not needed and the file I asked you to copy inside
+the container is not used.
+
+So to enable the traces, the easier way to do is to rename the file
+directly on the host and to reload the configuration (but warning, if
+you have other containers running they will be also run with trace):
+
+sudo mv /usr/bin/qemu-arm-static /usr/vib/qemu-arm-org
+sudo cp qemu-wrapper /usr/bin/qemu-arm-static
+sudo systemctl restart systemd-binfmt.service
+systemd-nspawn  --boot --directory=/mnt
+
+[1] linux/Documentation/admin-guide/binfmt-misc.rst
+
+``F`` - fix binary
+      The usual behaviour of binfmt_misc is to spawn the
+      binary lazily when the misc format file is invoked.  However,
+      this doesn``t work very well in the face of mount namespaces and
+      changeroots, so the ``F`` mode opens the binary as soon as the
+      emulation is installed and uses the opened image to spawn the
+      emulator, meaning it is always available once installed,
+      regardless of how the environment changes.
+
+
+I had the same idea but didnt know about the restart part :D
+
+attached is the strace =)
+Thx
+
+Is that of any help?
+
+Le 29/09/2020 à 15:05, Petunia a écrit :
+> Is that of any help?
+> 
+
+We need also the content of /mnt/var/log/syslog that contains the
+straces for systemd.
+
+
+There is no syslog and everything else is empty:
+ls -ltrR /mnt/var/log/
+/mnt/var/log/:
+total 8
+drwxr-xr-x 2 root root 4096 20. Aug 12:33 apt
+-rw-r--r-- 1 root root    0 20. Aug 12:47 faillog
+-rw-r--r-- 1 root root    0 20. Aug 12:47 dpkg.log
+-rw-rw-r-- 1 root tor     0 20. Aug 12:47 lastlog
+-rw-r--r-- 1 root root    0 20. Aug 12:47 bootstrap.log
+-rw-rw---- 1 root tor     0 20. Aug 12:47 btmp
+-rw-r--r-- 1 root root    0 20. Aug 12:47 alternatives.log
+-rw-rw-r-- 1 root tor     0 20. Aug 12:47 wtmp
+drwxr-xr-x 2 root root 4096 13. Sep 21:58 journal
+
+/mnt/var/log/apt:
+total 0
+-rw-r----- 1 root adm  0 20. Aug 12:47 term.log
+-rw-r--r-- 1 root root 0 20. Aug 12:47 history.log
+-rw-r--r-- 1 root root 0 20. Aug 12:47 eipp.log.xz
+
+/mnt/var/log/journal:
+total 0
+
+
+Mhm, weird. On my other machine it works.
+There I used the AUR package qemu-user-static instead of qemu-arm-static.
+However that seems not to be the problem since it doesnt even work  after switching to qemu-user-static.
+
+With the working setup the log files are also created (which makes sense since it loops at "A start job is running for Journal Service")
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

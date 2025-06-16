@@ -1,0 +1,128 @@
+graphic: 0.611
+semantic: 0.601
+user-level: 0.581
+mistranslation: 0.548
+permissions: 0.486
+risc-v: 0.483
+virtual: 0.478
+PID: 0.475
+debug: 0.468
+TCG: 0.467
+arm: 0.455
+device: 0.427
+ppc: 0.426
+performance: 0.399
+register: 0.382
+architecture: 0.380
+KVM: 0.373
+network: 0.368
+hypervisor: 0.367
+VMM: 0.349
+assembly: 0.347
+boot: 0.340
+peripherals: 0.328
+socket: 0.320
+vnc: 0.320
+kernel: 0.290
+i386: 0.287
+files: 0.262
+x86: 0.241
+
+Tests cannot call g_error
+
+I stumbled on this writing a new test, using tests/qtest/e1000e-test.c as a template.
+
+g_error() causes SIGTRAP, not SIGABRT, and thus the abort handler doesn't get run.
+This in turn means qemu is not killed, which hangs the test because the tap-driver.pl script hangs waiting for more input.
+There are a few tests that call g_error().
+
+The SIGABRT handler explicitly kills qemu, e.g.:
+
+qos-test.c:
+    qtest_add_abrt_handler(kill_qemu_hook_func, s);
+
+ref:
+https://git.qemu.org/?p=qemu.git;a=blob;f=tests/qtest/libqtest.c;h=e49f3a1e45f4cd96279241fdb2bbe231029ab922;hb=HEAD#l272
+
+But not unexpectedly there's no such handler for SIGTRAP.
+
+Apply this patch to trigger a repro:
+
+diff --git a/tests/qtest/e1000e-test.c b/tests/qtest/e1000e-test.c
+index fc226fdfeb..e83ace1b5c 100644
+--- a/tests/qtest/e1000e-test.c
++++ b/tests/qtest/e1000e-test.c
+@@ -87,6 +87,9 @@ static void e1000e_send_verify(QE1000E *d, int *test_sockets, QGuestAllocator *a
+     /* Wait for TX WB interrupt */
+     e1000e_wait_isr(d, E1000E_TX0_MSG_ID);
+
++    g_message("Test g_error hang ...");
++    g_error("Pretend something timed out");
++
+     /* Check DD bit */
+     g_assert_cmphex(le32_to_cpu(descr.upper.data) & dsta_dd, ==, dsta_dd);
+
+Then:
+
+configure
+make
+make check-qtest-i386
+
+check-qtest-i386 will take awhile. To repro faster:
+
+$ grep qtest-i386/qos-test Makefile.mtest
+.test.name.229 := qtest-i386/qos-test
+$ make run-test-229
+Running test qtest-i386/qos-test
+** Message: 18:40:49.821: Test g_error hang ...
+
+** (tests/qtest/qos-test:3820728): ERROR **: 18:40:49.821: Pretend something timed out
+ERROR qtest-i386/qos-test - Bail out! FATAL-ERROR: Pretend something timed out
+
+At this point things are hung because tap-driver.pl is still waiting for input because qemu is still running.
+
+An alternative is of course to allow g_error to be called.
+One might restrict tests to not call it, but it might be impractical to impose that on all code that goes into a test.
+One will need to find a way to get glib to not call G_BREAKPOINT for this case.
+
+  if (debugger_present && breakpoint)
+    G_BREAKPOINT ();
+  else
+    g_abort ();
+
+https://gitlab.gnome.org/GNOME/glib/-/blob/master/glib/gmessages.c#L555
+
+I don't know QEMU that well yet, but the following question arises: Why can't QEMU be driven in a way that allows it to see that its controlling parent has died -> causing QEMU to terminate as well. That way the test doesn't need to care how it dies (e.g., we don't want a segfault to hang testing; and nor do we, I think, want to install signal handlers for every possible signal).
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

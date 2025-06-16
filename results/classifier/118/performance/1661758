@@ -1,0 +1,157 @@
+performance: 0.889
+device: 0.871
+user-level: 0.857
+graphic: 0.853
+risc-v: 0.849
+architecture: 0.847
+register: 0.838
+permissions: 0.832
+virtual: 0.831
+debug: 0.815
+assembly: 0.806
+arm: 0.787
+PID: 0.786
+peripherals: 0.782
+semantic: 0.775
+files: 0.769
+kernel: 0.759
+socket: 0.755
+network: 0.754
+vnc: 0.744
+boot: 0.728
+ppc: 0.719
+KVM: 0.717
+TCG: 0.712
+mistranslation: 0.700
+hypervisor: 0.697
+VMM: 0.608
+x86: 0.490
+i386: 0.409
+
+qemu-nbd causes data corruption in VDI-format disk images
+
+Hi,
+
+This is a duplicate of #1422307.  I can't figure out a way to re-open
+it--the status of "Fix Released" is changeable only by a project
+maintainer or bug supervisor--so I'm opening a new bug to make sure
+this gets looked at again.
+
+qemu-nbd will sometimes corrupt VDI disk images.  The bug was thought
+to be fixed in commit f0ab6f109630940146cbaf47d0cd99993ddba824, but
+I'm able to reproduce it in both that commit and in the latest commit
+(a951316b8a5c3c63254f20a826afeed940dd4cba).  I just needed to run more
+iterations of the test.  It's possible that it was partially fixed, or
+that the added serialization made it harder to catch this
+non-deterministic bug, but the same symptoms persist: data corruption
+of VDI-format disk images.
+
+This affects at least qemu-nbd.  I haven't tried reproducing the issue
+with qemu proper or qemu-img, but the original bug report suggests
+that the bug in the common VDI backend may corrupt data written by
+those programs.
+
+Please let me know if I can provide any further information or help
+with testing.  Thank you very much for looking into this!
+
+Test procedure
+**************
+
+The procedure used is the one given by Max Reitz (xanclic) in the
+original bug report, comment 3
+(https://bugs.launchpad.net/qemu/+bug/1422307/comments/3), in the
+section "VDI and NBD over /dev/nbd0", but with up to 1000 iterations
+instead of 10:
+
+  $ cd ~/qemu-origfix-f0ab6f1/bin
+  $ dd if=/dev/urandom of=blob.raw bs=1M count=64
+  64+0 records in
+  64+0 records out
+  67108864 bytes (67 MB) copied, 4.36475 s, 15.4 MB/s
+  $ sudo sh -c 'for i in $(seq 0 999); do ./qemu-img create -f vdi test.vdi 64M > /dev/null; ./qemu-nbd -c /dev/nbd0 test.vdi; sleep 1; ./qemu-img convert -n blob.raw /dev/nbd0; ./qemu-img convert /dev/nbd0 test1.raw; sync; echo 1 > /proc/sys/vm/drop_caches; ./qemu-img convert /dev/nbd0 test2.raw; ./qemu-nbd -d /dev/nbd0 > /dev/null; if ! ./qemu-img compare -q test1.raw test2.raw; then md5sum test1.raw test2.raw; echo "$i failed"; break; fi; done; echo "done"'
+27a66c3a8ac2cf06f2c925968ea9e964  test1.raw
+2da9bf169041a7c2bd144c4ab3a29aea  test2.raw
+64 failed
+done
+
+I've run this process a handful of times, and I've seen it take as
+little as 10 iterations and as many as 161 (taking 32 minutes in the
+latter case).  Please be patient.  Putting the images on tmpfs will
+probably help it go faster, and I have successfully reproduced the
+issue on tmpfs in addition to ext4.
+
+Nothing different was needed to reproduce the issue in a directory
+containing a build of the latest commit.  It still takes somewhere
+around 1-200 iterations to find, in my testing.
+
+Build procedure
+***************
+
+  $ git clone git://git.qemu-project.org/qemu.git
+  [omitted]
+  $ git clone qemu qemu-origfix-f0ab6f1
+  Cloning into 'qemu-origfix-f0ab6f1'...
+  done.
+  $ cd qemu-origfix-f0ab6f1
+  $ git checkout f0ab6f109630940146cbaf47d0cd99993ddba824
+  Note: checking out 'f0ab6f109630940146cbaf47d0cd99993ddba824'.
+  
+  You are in 'detached HEAD' state. You can look around, make experimental
+  changes and commit them, and you can discard any commits you make in this
+  state without impacting any branches by performing another checkout.
+  
+  If you want to create a new branch to retain commits you create, you may
+  do so (now or later) by using -b with the checkout command again. Example:
+  
+    git checkout -b new_branch_name
+  
+  HEAD is now at f0ab6f1... block/vdi: Add locking for parallel requests
+  $ mkdir bin
+  $ cd bin
+  $ script -c'time (../configure --enable-debug --target-list=x86_64-softmmu && make -j6; echo "result: $?")'
+  Script started, file is typescript
+  [omitted; the build typescript is attached separately]
+    LINK  x86_64-softmmu/qemu-system-x86_64
+  result: 0
+  
+  real    1m5.733s
+  user    2m3.904s
+  sys     0m13.828s
+  Script done, file is typescript
+
+Nothing different was done when building the latest commit (besides
+cloning to a different directory, and not running `git checkout`).
+
+Environment
+***********
+
+  * Machine: x86_64
+  
+  * Hypervisor: Xen 4.4 (Debian package xen-hypervisor-4.4-amd64,
+    version 4.4.1-9+deb8u8)
+  
+  * A Xen domU (guest) for building QEMU and reproducing the issue.
+    All testing was done within the virtual machine for convenience
+    and access to better hardware than what I have for my development
+    machine (I expected the build to take much longer than it really
+    does).
+  
+      - x86_64 architecture with six VCPUs and 1.2 GiB RAM allocated,
+        operating in HVM (fully virtualized) mode.
+      
+      - Distribution: Debian 8.7 Jessie amd64
+      
+      - Kernel: Linux 3.16.0 x86_64 (Debian package
+        linux-image-3.16.0-4-amd64, version 3.16.39-1)
+      
+      - Compiler: GCC 4.9.2 (Debian package gcc-4.9, version 4.9.2-10)
+
+
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting all older bugs to
+"Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

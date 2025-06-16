@@ -1,0 +1,135 @@
+user-level: 0.786
+mistranslation: 0.785
+risc-v: 0.652
+ppc: 0.641
+TCG: 0.640
+boot: 0.634
+vnc: 0.627
+VMM: 0.624
+permissions: 0.616
+debug: 0.605
+virtual: 0.602
+register: 0.590
+KVM: 0.589
+graphic: 0.582
+x86: 0.580
+device: 0.572
+i386: 0.568
+hypervisor: 0.562
+arm: 0.559
+performance: 0.559
+files: 0.557
+architecture: 0.553
+peripherals: 0.539
+PID: 0.535
+network: 0.532
+assembly: 0.529
+semantic: 0.528
+socket: 0.524
+kernel: 0.513
+
+Crash with UEFI, q35, AHCI, and <= SystemRescueCD 4.3.0
+
+I am getting a crash when booting <= SystemRescueCD 4.3.0 in UEFI mode with q35 machine and from a AHCI device with qemu 2.11.1 and 2.12.0.  The crash doesn't occur if I compile with --enable-trace-backends=simple or if I use virtio-scsi.  The original crash was noticed on Gentoo with hardened gcc 6.4.0 and an Intel CPU, the test system to reproduce the crash is on Gentoo with non-hardened gcc 5.4.0 and an Intel CPU.
+
+OVMF version is from Gentoo: edk2-ovmf-2017_p20180211-bin.tar.xz
+
+Here is the commands I have run on qemu 2.12.0 to reproduce the issue although it also crashes with accel=kvm removed:
+./configure --target-list="x86_64-softmmu"
+make
+qemu-system-x86_64 -nodefaults -machine q35,accel=kvm -cpu qemu64 -drive if=pflash,format=raw,unit=0,file=/usr/share/edk2-ovmf/OVMF_CODE.fd,readonly=on -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd -m 512 -drive file=systemrescuecd-x86-4.3.0.iso,if=none,id=cdrom-sysresc,readonly=on -device ide-cd,bus=ide.0,unit=0,drive=cdrom-sysresc,bootindex=5 -device VGA -display gtk
+
+Valgrind says "Bad permissions for mapped region at address 0x4C022FE0" for the crash.
+
+Here is a backtrace from gdb:
+Program received signal SIGSEGV, Segmentation fault.
+0x00007f42dcbc5833 in malloc () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007f42dcbc5833 in malloc () from /lib64/libc.so.6
+#1  0x00007f42e10117d9 in g_malloc () from /usr/lib64/libglib-2.0.so.0
+#2  0x000055a3ff9def8f in qemu_aio_get (aiocb_info=aiocb_info@entry=0x55a4001b39a0 <thread_pool_aiocb_info>, bs=bs@entry=0x0, cb=cb@entry=0x55a3ff9dfe20 <thread_pool_co_cb>, opaque=opaque@entry=0x7f42961e30b0) at util/aiocb.c:33
+#3  0x000055a3ff9e0249 in thread_pool_submit_aio (pool=pool@entry=0x55a400c038d0, func=func@entry=0x55a3ff956620 <aio_worker>, arg=arg@entry=0x55a400bd30b0, cb=cb@entry=0x55a3ff9dfe20 <thread_pool_co_cb>, 
+    opaque=opaque@entry=0x7f42961e30b0) at util/thread-pool.c:251
+#4  0x000055a3ff9e0423 in thread_pool_submit_co (pool=0x55a400c038d0, func=func@entry=0x55a3ff956620 <aio_worker>, arg=arg@entry=0x55a400bd30b0) at util/thread-pool.c:289
+#5  0x000055a3ff956b50 in paio_submit_co (bs=0x55a400bff180, fd=<optimized out>, offset=362702848, qiov=<optimized out>, bytes=2048, type=1) at block/file-posix.c:1536
+#6  0x000055a3ff95c82a in bdrv_driver_preadv (bs=bs@entry=0x55a400bff180, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=0) at block/io.c:924
+#7  0x000055a3ff960154 in bdrv_aligned_preadv (child=child@entry=0x55a400c03a20, req=req@entry=0x7f42961e32e0, offset=offset@entry=362702848, bytes=bytes@entry=2048, align=align@entry=1, qiov=qiov@entry=0x7f42961e3650, flags=0)
+    at block/io.c:1228
+#8  0x000055a3ff960434 in bdrv_co_preadv (child=0x55a400c03a20, offset=362702848, bytes=2048, qiov=0x7f42961e3650, flags=0) at block/io.c:1324
+#9  0x000055a3ff95c82a in bdrv_driver_preadv (bs=bs@entry=0x55a400bf8e50, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=0) at block/io.c:924
+#10 0x000055a3ff960154 in bdrv_aligned_preadv (child=child@entry=0x55a400be92c0, req=req@entry=0x7f42961e3510, offset=offset@entry=362702848, bytes=bytes@entry=2048, align=align@entry=512, qiov=qiov@entry=0x7f42961e3650, flags=0)
+    at block/io.c:1228
+#11 0x000055a3ff960434 in bdrv_co_preadv (child=0x55a400be92c0, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=flags@entry=0) at block/io.c:1324
+#12 0x000055a3ff94f4ce in blk_co_preadv (blk=0x55a400bf8ba0, offset=362702848, bytes=2048, qiov=0x7f42961e3650, flags=0) at block/block-backend.c:1158
+#13 0x000055a3ff94f5ac in blk_read_entry (opaque=0x7f42961e3670) at block/block-backend.c:1206
+#14 0x000055a3ff94e000 in blk_prw (blk=0x55a400bf8ba0, offset=362702848, buf=<optimized out>, bytes=bytes@entry=2048, co_entry=co_entry@entry=0x55a3ff94f590 <blk_read_entry>, flags=flags@entry=0) at block/block-backend.c:1243
+#15 0x000055a3ff94f076 in blk_pread (blk=<optimized out>, offset=<optimized out>, buf=<optimized out>, count=count@entry=2048) at block/block-backend.c:1409
+#16 0x000055a3ff7d8b93 in cd_read_sector_sync (s=0x55a401a0faa0) at hw/ide/atapi.c:124
+#17 ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:269
+#18 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#19 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#20 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#21 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#22 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#23 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#24 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#25 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#26 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#27 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#28 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#29 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#30 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#31 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#32 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#33 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#34 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#35 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#36 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#37 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#38 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#39 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#40 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#41 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#42 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#43 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#44 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#45 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+
+Hmm... Is this a stack size protection fault due to the hardening?
+
+We tried to fix the ATAPI recursion depth issue recently, but caused a regression that stops us from booting with SeaBIOS (maybe UEFI too?) and patches are pending to fix this, so sit tight and I'll have a git commit for you to try soon.
+
+--js
+
+Okay thanks.  I forgot to mention I am running the Gentoo version of kernel 4.14 series.  Here is the configure settings for gcc from my desktop system used to reproduce the crash that originally occurred on the hardened server, and even though the desktop system isn't using hardened profile, this gcc is using some hardened features:
+
+/var/tmp/portage/sys-devel/gcc-5.4.0-r3/work/gcc-5.4.0/configure --host=x86_64-pc-linux-gnu --build=x86_64-pc-linux-gnu --prefix=/usr --bindir=/usr/x86_64-pc-linux-gnu/gcc-bin/5.4.0 --includedir=/usr/lib/gcc/x86_64-pc-linux-gnu/5.4.0/include --datadir=/usr/share/gcc-data/x86_64-pc-linux-gnu/5.4.0 --mandir=/usr/share/gcc-data/x86_64-pc-linux-gnu/5.4.0/man --infodir=/usr/share/gcc-data/x86_64-pc-linux-gnu/5.4.0/info --with-gxx-include-dir=/usr/lib/gcc/x86_64-pc-linux-gnu/5.4.0/include/g++-v5 --with-python-dir=/share/gcc-data/x86_64-pc-linux-gnu/5.4.0/python --enable-languages=c,c++,fortran --enable-obsolete --enable-secureplt --disable-werror --with-system-zlib --enable-nls --without-included-gettext --enable-checking=release --with-bugurl=https://bugs.gentoo.org/ --with-pkgversion='Gentoo 5.4.0-r3 p1.3, pie-0.6.5' --enable-libstdcxx-time --enable-shared --enable-threads=posix --enable-__cxa_atexit --enable-clocale=gnu --enable-multilib --with-multilib-list=m32,m64 --disable-altivec --disable-fixed-point --enable-targets=all --disable-libgcj --enable-libgomp --disable-libmudflap --disable-libssp --disable-libcilkrts --disable-libmpx --enable-vtable-verify --enable-libvtv --enable-lto --without-isl --enable-libsanitizer
+
+With git bisect, I have narrowed down the crash to git commit: e4baa9f00b9ddf47ac2811eb58a3931434b848f7 .  For git commit: 0e168d35519ee04590a439cd6631f53cd954edd0 , I don't get the crash.
+
+It looks like this crash is fixed with git commit: bed9bcfa3275a9cfee82846a9f521c4858a9739a
+
+That's: 
+
+commit bed9bcfa3275a9cfee82846a9f521c4858a9739a
+Author: Paolo Bonzini <email address hidden>
+Date:   Wed Jun 6 15:09:51 2018 -0400
+
+    ide: push end_transfer_func out of start_transfer callback, rename callback
+    
+    Now that end_transfer_func is a tail call in ahci_start_transfer,
+    formalize the fact that the callback (of which ahci_start_transfer is
+    the sole implementation) takes care of the transfer too: rename it to
+    pio_transfer and, if it is present, call the end_transfer_func as soon
+    as it returns.
+
+
+Which is also in part what caused a regression that we later fixed;
+
+For anyone stumbling across this in google: you'll find that this should be settled properly for the QEMU 3.0 release.
+
+
+As to why a trace-events patch surfaces this crash in a 'hardened' binary, I'm not sure -- but the root cause is absolutely a stack depth bug which has been present in AHCI since it was checked in to QEMU.
+
+This bug can be considered fixed as of 3.0; thanks.
+

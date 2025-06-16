@@ -1,0 +1,232 @@
+performance: 0.989
+arm: 0.987
+debug: 0.986
+assembly: 0.986
+register: 0.986
+socket: 0.986
+architecture: 0.986
+virtual: 0.985
+semantic: 0.985
+device: 0.985
+peripherals: 0.985
+graphic: 0.985
+PID: 0.983
+risc-v: 0.981
+permissions: 0.981
+user-level: 0.981
+hypervisor: 0.978
+kernel: 0.977
+ppc: 0.975
+vnc: 0.973
+KVM: 0.969
+network: 0.968
+VMM: 0.966
+TCG: 0.965
+files: 0.958
+mistranslation: 0.950
+x86: 0.948
+boot: 0.933
+i386: 0.756
+
+QEMU mishandling of SO_PEERSEC forces systemd into tight loop
+
+While building Debian images for embedded ARM target systems I detected that QEMU seems to force newer systemd daemons into a tight loop.
+
+My setup is the following:
+
+Host machine: Ubuntu 18.04, amd64
+LXD container: Debian Buster, arm64, systemd 241
+QEMU: qemu-aarch64-static, 4.0.0-rc2 (custom build) and 3.1.0 (Debian 1:3.1+dfsg-7)
+
+To easily reproduce the issue I have created the following repository:
+https://github.com/lueschem/edi-qemu
+
+The call where systemd gets looping is the following:
+2837 getsockopt(3,1,31,274891889456,274887218756,274888927920) = -1 errno=34 (Numerical result out of range)
+
+Furthermore I also verified that the issue is not related to LXD.
+The same behavior can be reproduced using systemd-nspawn.
+
+This issue reported against systemd seems to be related:
+https://github.com/systemd/systemd/issues/11557
+
+As described on the systemd issue, the syscall we're getting wrong here is getsockopt(fd, SOL_SOCKET, SO_PEERSEC, ...). Our linux-user/syscall.c:do_getsockopt() doesn't have any special case code for the payload on this function, so we treat it as if it were just an integer payload, which is not correct here.
+
+Unfortunately I can't find any documentation on exactly what SO_PEERSEC does or what the payload format is, which makes it pretty hard to fix this bug :-( It's not listed in the socket(7) manpage -- https://linux.die.net/man/7/socket -- which is where I'd expect to find it, and the kernel source code is pretty confusing in this area.
+
+
+This is probably the tight loop that gets triggered:
+https://github.com/systemd/systemd/commit/217d89678269334f461e9abeeffed57077b21454
+
+It looks like the previous implementation was just a bit more "tolerant".
+
+I have just studied a bit the systemd code and this brought me to the following idea/temporary workaround: What about returning -1 (error) and setting errno when getsockopt(fd, SOL_SOCKET, SO_PEERSEC, ...) gets called? This would then let systemd know that SO_PEERSEC is not (yet) implemented.
+
+I filed the duplicate #1840252 of this bug.
+
+I think that the options SO_PEERCRED and SO_PEERSEC belong into the context of SELINUX. So maybe the format of the paylod can be found in the sources of libselinux?
+
+I'd like to compile qemu with a local hack to work around my current problem. Something like Matthias Lüscher suggested. 
+
+@Peter Maydell: could you point me to the location in the qemu source where I could apply such a hack?
+
+I patched linux-user/syscall.c (see below, branch stable-2.11) which works around my problem.
+So far so good, but the qemu-arm that i compiled is terribly slow compared to the one that came with Ubuntu 18.04. Any hints?
+I configured as this:
+./configure --static --enable-kvm --target-list=arm-linux-user
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 74d56e2ee6..4fa9a09b12 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3185,6 +3185,8 @@ static abi_long do_getsockopt(int sockfd, int level, int optname,
+         case TARGET_SO_SNDTIMEO:
+         case TARGET_SO_PEERNAME:
+             goto unimplemented;
++        case TARGET_SO_PEERSEC: /* added to escape infinite loop */
++            goto unimplemented;
+         case TARGET_SO_PEERCRED: {
+             struct ucred cr;
+             socklen_t crlen;
+
+
+
+I'm a bit surprised that this bug doesn't get more attention, as it makes it very hard to run qemu-emulated containers of Bionic hosted on Bionic. Running such containers is a common way to cross-compile packages for foreign architectures in the absence of sufficiently powerful target HW.
+
+The documentation on SO_PEERSEC is indeed sparse, but I do want to second Fritz in his approach. I don't see a reason, why treating the payload as incorrect and throwing it back at the application is better than handling it and saying it is not implemented (which is the case).
+
+Arguably, applications should be fixed to handle the error correctly, but I'm afraid that is a can of worms. I have encountered the same problem with systemd, apt and getent. Would the maintainers be open to an SRU request on QEMU for this?
+
+Could you test the attached patch?
+
+Thanks, Laurent! I'll get back to you, asap.
+
+> Could you test the attached patch?
+>
+
+Works great!
+
+This is my test setup:
+
+Host machine: Ubuntu 18.04, amd64
+LXD container: Debian Buster, arm64, systemd 241
+QEMU: qemu-aarch64(-static), compiled from source (4.2.0), patched with
+your patch.
+
+Many thanks!
+Matthias
+
+
+I carried out the following test:
+
+* fetched the QEMU coming with 18.04,
+* added this patch,
+* built an LXD container with arch arm64 and the patched qemu-aarch64-static inside,
+* launched it on amd64
+
+Previously various systemd services would not come up properly, now they are running like a charm. The only grief I have is that network configuration does not work, but that is due to
+
+    # ip addr
+    Unsupported setsockopt level=270 optname=11
+
+which is a different story.
+
+Well, it's kind of irrelevant but I am trying that on archlinux and this does not work for me.
+
+Using systemd-244.2-1 and qemu-user-static-4.2 that I built with Laurent's patch. May be I have done something wrong ?
+
+I still get that error that leads me here:
+
+Failed to enqueue loopback interface start request: Operation not supported
+Caught <SEGV>, dumped core as pid 3.
+Exiting PID 1...
+
+I am trying to boot with systemd-nspawn an archlinux-arm built for a rpi0. That's fine if I don't boot it.
+
+Laurent's patch worked for me as well.
+
+I grabbed the source for the Debian 10 qemu-user-static package, qemu_3.1+dfsg-8+deb10u3, applied the patch and re-built the qemu-arm-static binary. Copying the new binary into a Docker image based on arm32v7/debian:10-slim allowed /sbin/init to bring up the container with a responsive systemctl command.
+
+Prior to the patch, systemd did not start any services inside the container and systemctl would hang when executed directly.
+
+Thanks!
+-Charlie
+
+This seems to be the error reported in https://bugs.launchpad.net/qemu/+bug/1857811
+
+Fixed here:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=6d485a55d0cd
+
+
+Bisect worked and once you find it it seems obvious that this is exactly our case:
+
+commit 65b261a63a48fbb3b11193361d4ea0c38a3c3dfd
+Author: Laurent Vivier <email address hidden>
+Date:   Thu Jul 9 09:23:32 2020 +0200
+
+    linux-user: add netlink RTM_SETLINK command
+    
+    This command is needed to be able to boot systemd in a container.
+    
+      $ sudo systemd-nspawn -D /chroot/armhf/sid/ -b
+      Spawning container sid on /chroot/armhf/sid.
+      Press ^] three times within 1s to kill container.
+      systemd 245.6-2 running in system mode.
+      Detected virtualization systemd-nspawn.
+      Detected architecture arm.
+    
+      Welcome to Debian GNU/Linux bullseye/sid!
+    
+      Set hostname to <virt-arm>.
+      Failed to enqueue loopback interface start request: Operation not supported
+      Caught <SEGV>, dumped core as pid 3.
+      Exiting PID 1...
+      Container sid failed with error code 255.
+    
+    Signed-off-by: Laurent Vivier <email address hidden>
+    Message-Id: <email address hidden>
+
+ linux-user/fd-trans.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+Sorry, posted this on the wrong bug :-/
+I beg your pardon for the noise.
+
+Hmm, I'm using qemu-5.1.0 and I'm still seeing this (host is bionic, container image is focal)
+
+[..]
+getsockopt(31, SOL_SOCKET, SO_PEERGROUPS, 0x7ffdbd58941c, [4]) = -1 ERANGE (Numerical result out of range)
+getsockopt(31, SOL_SOCKET, SO_PEERGROUPS, 0x7ffdbd58941c, [4]) = -1 ERANGE (Numerical result out of range)
+getsockopt(31, SOL_SOCKET, SO_PEERGROUPS, 0x7ffdbd58941c, [4]) = -1 ERANGE (Numerical result out of range)
+[..]
+
+Regression?
+
+I can confirm that I see the same issue when trying to run Ubuntu 20.04 aarch64 in a container, strace shows a tight loop on:
+
+getsockopt(31, SOL_SOCKET, SO_PEERGROUPS, 0x7ffdbd58941c, [4]) = -1 ERANGE
+
+Re-building qemu-user-static with the patch has fixed Debian 10 armhf for me, but the same re-build does not seem to help with this Ubuntu issue.
+
+SO_PEERGROUPS is not implemented and processed as an "int" (this explains the ERANGE)
+
+Could you try the attached patch?
+
+In my case the issue with using Ubuntu 20.04 as a container host appears to have come down to the use of the F, or "fix binary", flag by binfmnt_misc:
+
+# cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+enabled
+interpreter /usr/bin/qemu-aarch64-static
+flags: OCF
+offset 0
+magic 7f454c460201010000000000000000000200b700
+mask ffffffffffffff00fffffffffffffffffeffffff
+
+This appears to be new in Ubuntu 20.04 relative to 18.04 and results in the qemu-user-static binaries being loaded and locked into memory _when the package is installed_.
+
+Therefore, what I observed as a regression of the issue was actually just the packaged binaries now taking precedence over patched versions that I had built and copied into place.
+
+Ubuntu 20.04 ships QEMU 4.2. Using the QEMU 5.1 packages from Debian Bullseye allows SystemD to run in a foreign architecture container without spinning in a loop:
+
+  https://packages.debian.org/bullseye/qemu-user-static
+

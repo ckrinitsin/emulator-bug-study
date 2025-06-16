@@ -1,0 +1,222 @@
+permissions: 0.598
+performance: 0.558
+virtual: 0.555
+KVM: 0.548
+TCG: 0.535
+debug: 0.528
+architecture: 0.526
+device: 0.506
+user-level: 0.500
+register: 0.499
+hypervisor: 0.497
+semantic: 0.491
+PID: 0.490
+graphic: 0.490
+VMM: 0.488
+boot: 0.486
+peripherals: 0.473
+files: 0.468
+socket: 0.465
+vnc: 0.464
+assembly: 0.464
+kernel: 0.445
+network: 0.443
+risc-v: 0.435
+ppc: 0.432
+arm: 0.429
+x86: 0.427
+mistranslation: 0.408
+i386: 0.336
+
+qemu-system-x86_64: util/hbitmap.c:614: serialization_chunk: Assertion `(last >> hb->granularity) < hb->size' failed
+Description of problem:
+If a named dirty bitmap already exists on a disk and another disk is added via hotplug after the guest has booted, it will definitely cause the hot migration to fail.
+Steps to reproduce:
+1. Create 2 images of type qcow2
+
+   ```
+   qemu-img create -f qcow2 vda.qcow2 50G
+   qemu-img create -f qcow2 vdb.qcow2 2G     # set to 2G
+   ```
+2. Start the guest using the following libvirt xml
+
+   ```
+   # virsh create i-btacsctt.xml
+   
+   <domain xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0" type="kvm">
+     <name>i-btacsctt</name>
+     <uuid>973f7352-ad1d-31ea-9a9f-237f3e9a384f</uuid>
+     <memory unit="MiB">2048</memory>
+     <vcpu current="2">2</vcpu>
+     <os>
+       <type arch="x86_64" machine="pc">hvm</type>
+     </os>
+     <features>
+       <acpi/>
+       <apic/>
+       <pae/>
+     </features>
+     <devices>
+       <emulator>/opt/qemu-5.1.0.9/usr/bin/qemu-system-x86_64</emulator>
+       <disk device="disk" type="file">
+         <driver cache="writeback" discard="ignore" io="threads" name="qemu" type="qcow2"/>
+         <source file="/tmp/echohu3/vda.qcow2"/>
+         <target dev="vda"/>
+       </disk>
+       <disk device="disk" type="file">
+         <driver cache="none" io="threads" name="qemu" type="qcow2"/>
+         <source file="/tmp/echohu3/vdb.qcow2"/>
+         <target dev="vdb"/>
+       </disk>
+     </devices>
+   </domain>
+   ```
+3. Create bitmap for vda
+
+   ```
+   # The node name of vda is "libvirt-2-format"
+   virsh qemu-monitor-command i-btacsctt --hmp "info block"
+   libvirt-2-format: /tmp/echohu3/vda.qcow2 (qcow2)
+       Attached to:      /machine/peripheral/virtio-disk0/virtio-backend
+       Cache mode:       writethrough
+   
+   libvirt-1-format: /tmp/echohu3/vdb.qcow2 (qcow2)
+       Attached to:      /machine/peripheral/virtio-disk1/virtio-backend
+       Cache mode:       writeback, direct
+   
+   # Create bitmap
+   virsh qemu-monitor-command i-btacsctt '{"execute":"block-dirty-bitmap-add","arguments":{"node":"libvirt-2-format","name":"bitmap0","persistent":true}}'
+   ```
+4. Create vdc and run hotpluggin
+
+   ```
+   qemu-img create -f qcow2 vdc.qcow2 50G
+   
+   cat disk.xml
+   <disk device="disk" type="file">
+      <driver cache="none" discard="ignore" io="threads" name="qemu" type="qcow2"/>
+      <source file="/tmp/echohu3/vdc.qcow2"/>
+      <target dev="vdc"/>
+   </disk>
+   
+   virsh attach-device i-btacsctt disk.xml 
+   ```
+5. Start live migrationg
+
+   ```
+   # scp *.qcow2 172.31.68.42:/tmp/echohu3/
+   virsh qemu-monitor-command i-btacsctt --hmp "migrate_set_capability dirty-bitmaps on"
+   virsh dumpxml --migratable i-btacsctt >/tmp/ivm-btacsctt.xml
+   virsh migrate --live --abort-on-error --xml /tmp/ivm-btacsctt.xml i-btacsctt qemu+tcp://172.31.68.42/system
+   error: internal error: qemu unexpectedly closed the monitor: qemu-system-x86_64: util/hbitmap.c:614: serialization_chunk: Assertion `(last >> hb->granularity) < hb->size' failed.
+   ```
+Additional information:
+Set breakpoints on the source side
+
+```
+gdb -p $pid -ex "break add_bitmaps_to_list" -ex "handle SIGUSR1 nostop" -ex "continue"
+(gdb) bt 
+#0  add_bitmaps_to_list (bs=bs@entry=0x55c5bbaf85d0, bs_name=0x55c5bbafc674 "libvirt-2-format", alias_map=alias_map@entry=0x0, s=<optimized out>) at migration/block-dirty-bitmap.c:502
+#1  0x000055c5ba3b2878 in init_dirty_bitmap_migration (s=0x55c5bb11a080 <dbm_state>) at migration/block-dirty-bitmap.c:660
+#2  dirty_bitmap_save_setup (f=0x55c5bc981c40, opaque=0x55c5bb11a080 <dbm_state>) at migration/block-dirty-bitmap.c:1226
+#3  0x000055c5ba3a3c4d in qemu_savevm_state_setup (f=0x55c5bc981c40) at migration/savevm.c:1176
+#4  0x000055c5ba39e16b in migration_thread (opaque=opaque@entry=0x55c5bbaa2400) at migration/migration.c:3487
+#5  0x000055c5ba530cf3 in qemu_thread_start (args=<optimized out>) at util/qemu-thread-posix.c:521
+#6  0x00007f39846d9609 in start_thread (arg=<optimized out>) at pthread_create.c:477
+#7  0x00007f3983d11293 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:95
+(gdb) p bs->node_name
+$4 = "libvirt-2-format", '\000' <repeats 15 times>
+(gdb) p bitmap->name
+$5 = 0x55c5bbaf13d0 "bitmap0"
+```
+
+Set a breakpoint on the target side after hitting the breakpoint on the source side.
+
+```
+gdb -p $pid -ex "break serialization_chunk if ((start + count - 1) >> hb->granularity) >= hb->size" -ex "break dirty_bitmap_load_header"  -ex "handle SIGUSR1 nostop" -ex "continue"
+(gdb) bt
+#0  dirty_bitmap_load_header (alias_map=0x0, s=0x557488aef0a8 <dbm_state+40>, f=0x55748bcfd8f0) at migration/block-dirty-bitmap.c:1146
+#1  dirty_bitmap_load (f=0x55748bcfd8f0, opaque=0x557488aef080 <dbm_state>, version_id=<optimized out>) at migration/block-dirty-bitmap.c:1187
+#2  0x0000557487d7759a in vmstate_load (se=0x55748adfb8b0, f=0x55748bcfd8f0) at migration/savevm.c:883
+#3  vmstate_load (f=0x55748bcfd8f0, se=0x55748adfb8b0) at migration/savevm.c:879
+#4  0x0000557487d79fdd in qemu_loadvm_section_part_end (mis=0x55748ad55be0, f=0x55748bcfd8f0) at migration/savevm.c:2365
+#5  qemu_loadvm_state_main (f=f@entry=0x55748bcfd8f0, mis=mis@entry=0x55748ad55be0) at migration/savevm.c:2518
+#6  0x0000557487d7b2ad in qemu_loadvm_state (f=0x55748bcfd8f0) at migration/savevm.c:2590
+#7  0x0000557487d7078f in process_incoming_migration_co (opaque=<optimized out>) at migration/migration.c:480
+#8  0x0000557487f15283 in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at util/coroutine-ucontext.c:173
+#9  0x00007f5360189660 in __start_context () at ../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+```
+
+in dirty_bitmap_load_header
+
+```
+s->bs = bdrv_lookup_bs(s->node_name, s->node_name, &local_err);   // node_name is "libvirt-2-format"
+s->bitmap = bdrv_find_dirty_bitmap(s->bs, s->bitmap_name);        // bitmap_name is "bitmap0"
+
+# Target side: “libvirt-2-format” is the node name of vdb.
+(gdb) p s->bs->node_name
+$10 = "libvirt-2-format", '\000' <repeats 15 times>
+(gdb) p s->bs->filename
+$11 = "/tmp/echohu3/vdb.qcow2", '\000' <repeats 4073 times>
+```
+
+We can also see from the target /var/log/libvirt/qemu/i-btacsctt.log file that “libvirt-2-format” is the node name of the vdb，while the node name of vda is libvirt-3-format.
+
+```
+-blockdev '{"driver":"file","filename":"/tmp/echohu3/vda.qcow2","aio":"threads","node-name":"libvirt-3-storage","cache":{"direct":false,"no-flush":false},"auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-3-format","read-only":false,"discard":"ignore","cache":{"direct":false,"no-flush":false},"driver":"qcow2","file":"libvirt-3-storage","backing":null}' \
+-device virtio-blk-pci,bus=pci.0,addr=0x2,drive=libvirt-3-format,id=virtio-disk0,bootindex=1,write-cache=on \
+-blockdev '{"driver":"file","filename":"/tmp/echohu3/vdb.qcow2","aio":"threads","node-name":"libvirt-2-storage","cache":{"direct":true,"no-flush":false},"auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-2-format","read-only":false,"cache":{"direct":true,"no-flush":false},"driver":"qcow2","file":"libvirt-2-storage","backing":null}' \
+-device virtio-blk-pci,bus=pci.0,addr=0x3,drive=libvirt-2-format,id=virtio-disk1,write-cache=on \
+-blockdev '{"driver":"file","filename":"/tmp/echohu3/vdc.qcow2","aio":"threads","node-name":"libvirt-1-storage","cache":{"direct":true,"no-flush":false},"auto-read-only":true,"discard":"unmap"}' \
+-blockdev '{"node-name":"libvirt-1-format","read-only":false,"discard":"ignore","cache":{"direct":true,"no-flush":false},"driver":"qcow2","file":"libvirt-1-storage","backing":null}' \
+```
+
+From the source code, we know that HBitmap.size is from vdb size (2G), but bitmap is from vda (50G), so it triggers assert exception in serialization_chunk.
+
+```
+(gdb) bt
+#0  serialization_chunk (hb=hb@entry=0x55748ba28470, start=2147483648, count=536870912, first_el=first_el@entry=0x7f53503ffd20, el_count=el_count@entry=0x7f53503ffd18) at util/hbitmap.c:610
+#1  0x0000557487f18654 in hbitmap_deserialize_zeroes (hb=0x55748ba28470, start=start@entry=2147483648, count=count@entry=536870912, finish=finish@entry=false) at util/hbitmap.c:701
+#2  0x0000557487e7cfb0 in bdrv_dirty_bitmap_deserialize_zeroes (bitmap=<optimized out>, offset=offset@entry=2147483648, bytes=bytes@entry=536870912, finish=finish@entry=false) at block/dirty-bitmap.c:749
+#3  0x0000557487d86b51 in dirty_bitmap_load_bits (s=0x557488aef0a8 <dbm_state+40>, f=0x55748bcfd8f0) at migration/block-dirty-bitmap.c:992
+#4  dirty_bitmap_load (f=0x55748bcfd8f0, opaque=0x557488aef080 <dbm_state>, version_id=<optimized out>) at migration/block-dirty-bitmap.c:1198
+#5  0x0000557487d7759a in vmstate_load (se=0x55748adfb8b0, f=0x55748bcfd8f0) at migration/savevm.c:883
+#6  vmstate_load (f=0x55748bcfd8f0, se=0x55748adfb8b0) at migration/savevm.c:879
+#7  0x0000557487d79fdd in qemu_loadvm_section_part_end (mis=0x55748ad55be0, f=0x55748bcfd8f0) at migration/savevm.c:2365
+#8  qemu_loadvm_state_main (f=f@entry=0x55748bcfd8f0, mis=mis@entry=0x55748ad55be0) at migration/savevm.c:2518
+#9  0x0000557487d7b2ad in qemu_loadvm_state (f=0x55748bcfd8f0) at migration/savevm.c:2590
+#10 0x0000557487d7078f in process_incoming_migration_co (opaque=<optimized out>) at migration/migration.c:480
+#11 0x0000557487f15283 in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at util/coroutine-ucontext.c:173
+#12 0x00007f5360189660 in __start_context () at ../sysdeps/unix/sysv/linux/x86_64/__start_context.S:91
+#13 0x00007ffffb29c410 in  ()
+#14 0x0000000000000000 in  ()
+(gdb) p *hb
+$16 = {orig_size = 2147483648, size = 32768, count = 0, granularity = 16, meta = 0x0, levels = {0x55748ad55ad0, 0x55748acd8df0, 0x55748b0866a0, 0x55748acf8c10, 0x55748b1c4180, 0x55748b154f60, 0x55748adf2370}, sizes = {1, 1, 1, 1, 1, 8,
+    512}}
+```
+
+```
+(gdb) f  4
+#4  dirty_bitmap_load (f=0x55748bcfd8f0, opaque=0x557488aef080 <dbm_state>, version_id=<optimized out>) at migration/block-dirty-bitmap.c:1198
+(gdb) p *s->bs
+$21 = {open_flags = 10274, read_only = false, encrypted = false, sg = false, probed = false, force_share = false, implicit = false, drv = 0x557488aa2ee0 <bdrv_qcow2>, opaque = 0x55748acf8c90, aio_context = 0x55748acd1080,
+  aio_notifiers = {lh_first = 0x0}, walking_aio_notifiers = false, filename = "/tmp/echohu3/vdb.qcow2", '\000' <repeats 4073 times>, backing_file = '\000' <repeats 4095 times>, auto_backing_file = '\000' <repeats 4095 times>,
+  backing_format = '\000' <repeats 15 times>, full_open_options = 0x55748b3c68e0, exact_filename = "/tmp/echohu3/vdb.qcow2", '\000' <repeats 4073 times>, backing = 0x0, file = 0x55748aa5de40, bl = {request_alignment = 1,
+    max_pdiscard = 0, pdiscard_alignment = 65536, max_pwrite_zeroes = 0, pwrite_zeroes_alignment = 65536, opt_transfer = 0, max_transfer = 0, min_mem_alignment = 512, opt_mem_alignment = 4096, max_iov = 1024}, supported_write_flags = 0,
+  supported_zero_flags = 260, supported_truncate_flags = 2, node_name = "libvirt-2-format", '\000' <repeats 15 times>, node_list = {tqe_next = 0x55748adeb060, tqe_circ = {tql_next = 0x55748adeb060, tql_prev = 0x55748ad4d0e8}},
+  bs_list = {tqe_next = 0x55748adeb060, tqe_circ = {tql_next = 0x55748adeb060, tql_prev = 0x55748ad4d0f8}}, monitor_list = {tqe_next = 0x55748adeb060, tqe_circ = {tql_next = 0x55748adeb060, tql_prev = 0x55748ad4d108}}, refcnt = 2,
+  op_blockers = {{lh_first = 0x0} <repeats 16 times>}, inherits_from = 0x0, children = {lh_first = 0x55748aa5de40}, parents = {lh_first = 0x55748bbc0380}, options = 0x55748ad4d2d0, explicit_options = 0x55748ad525a0,
+  detect_zeroes = BLOCKDEV_DETECT_ZEROES_OPTIONS_OFF, backing_blocker = 0x0, total_sectors = 4194304, before_write_notifiers = {notifiers = {lh_first = 0x0}}, write_threshold_offset = 0, write_threshold_notifier = {notify = 0x0, node = {
+      le_next = 0x0, le_prev = 0x0}}, dirty_bitmap_mutex = {lock = {__data = {__lock = 0, __count = 0, __owner = 0, __nusers = 0, __kind = 0, __spins = 0, __elision = 0, __list = {__prev = 0x0, __next = 0x0}},
+      __size = '\000' <repeats 39 times>, __align = 0}, initialized = true}, dirty_bitmaps = {lh_first = 0x55748b4655f0}, wr_highest_offset = {value = 0}, copy_on_read = 0, in_flight = 0, serialising_in_flight = 0, io_plugged = 0,
+  enable_write_cache = 0, quiesce_counter = 0, recursive_quiesce_counter = 0, write_gen = 0, reqs_lock = {locked = 0, ctx = 0x0, from_push = {slh_first = 0x0}, to_pop = {slh_first = 0x0}, handoff = 0, sequence = 0, holder = 0x0},
+  tracked_requests = {lh_first = 0x0}, flush_queue = {entries = {sqh_first = 0x0, sqh_last = 0x55748ad52570}}, active_flush_req = false, flushed_gen = 0, never_freeze = false}
+```
+
+When we merge into commit https://gitlab.com/qemu-project/qemu/-/commit/31e4c354b38cd42a051ad030eb7779d5e7ee32fe and then run `block-bitmap-mapping` before migration, the hot migration can be completed successfully. I would like to confirm with the community whether this solution is reasonable and if there are any other solutions to address this issue.
+
+```
+virsh qemu-monitor-command i-btacsctt '{"execute": "migrate-set-parameters", "arguments":{"block-bitmap-mapping":[{"node-name":"libvirt-2-format", "alias":"libvirt-3-format","bitmaps":[{"name":"bitmap0", "alias":"bitmap0"}]}]}}'
+```

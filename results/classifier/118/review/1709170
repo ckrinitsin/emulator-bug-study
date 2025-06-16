@@ -1,0 +1,179 @@
+risc-v: 0.930
+mistranslation: 0.909
+ppc: 0.903
+user-level: 0.880
+virtual: 0.856
+KVM: 0.854
+vnc: 0.853
+debug: 0.853
+TCG: 0.852
+hypervisor: 0.850
+graphic: 0.848
+network: 0.846
+arm: 0.843
+VMM: 0.843
+peripherals: 0.838
+device: 0.838
+register: 0.838
+PID: 0.835
+assembly: 0.833
+semantic: 0.826
+socket: 0.826
+performance: 0.823
+permissions: 0.820
+kernel: 0.818
+architecture: 0.814
+files: 0.813
+boot: 0.742
+x86: 0.712
+i386: 0.523
+--------------------
+arm: 0.156
+virtual: 0.126
+kernel: 0.124
+debug: 0.110
+TCG: 0.092
+register: 0.088
+files: 0.082
+hypervisor: 0.072
+risc-v: 0.071
+PID: 0.070
+vnc: 0.057
+socket: 0.035
+user-level: 0.035
+device: 0.035
+boot: 0.030
+network: 0.019
+semantic: 0.019
+VMM: 0.015
+mistranslation: 0.007
+peripherals: 0.005
+ppc: 0.004
+architecture: 0.003
+performance: 0.003
+permissions: 0.003
+assembly: 0.002
+graphic: 0.001
+x86: 0.001
+i386: 0.001
+KVM: 0.001
+
+QEMU fails to honor O_TMPFILE
+
+When making a call like
+
+  open("/tmp", O_TMPFILE | O_RDWR);
+
+under QEMU, we ged -EISDIR.
+
+Under any kernel 3.11 or later, we are supposed to get an unnamed file in /tmp. In case the filesystem for /tmp does not support unnamed files, we are supposed to get EOPNOTSUPP.
+
+[I don't know the QEMU version, since this happened in a system I don't have access to]
+
+Hi Thiago,
+
+What is the version of glibc on the targets you are building to? There was an O_TMPFILE bug in older glibc's:
+
+https://sourceware.org/bugzilla/show_bug.cgi?id=17912
+
+On Mon, Aug 07, 2017 at 08:18:04PM -0000, Thiago Macieira wrote:
+> Public bug reported:
+> 
+> When making a call like
+> 
+>   open("/tmp", O_TMPFILE | O_RDWR);
+> 
+> under QEMU, we ged -EISDIR.
+> 
+> Under any kernel 3.11 or later, we are supposed to get an unnamed file
+> in /tmp. In case the filesystem for /tmp does not support unnamed files,
+> we are supposed to get EOPNOTSUPP.
+
+Actually, -EISDIR is valid error when underlying system doesn't support O_TMPFILE.
+See man openat or the kernel definition for O_TMPFILE.
+
+Regardless, I'm submitting a patch to properly translate the O_TMPFILE.
+
+Riku
+
+
+Since O_TMPFILE might differ between guest and host,
+add it to the bitmask_transtbl. While at it, fix the definitions
+of O_DIRECTORY etc on arm64, which are identical to arm32 according
+to kernel sources.
+
+This fixes open14 and openat03 ltp testcases. 
+
+Fixes: https://bugs.launchpad.net/qemu/+bug/1709170
+
+---
+ linux-user/strace.c       | 4 ++++
+ linux-user/syscall.c      | 3 +++
+ linux-user/syscall_defs.h | 8 +++++++-
+ 3 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/linux-user/strace.c b/linux-user/strace.c
+index d821d165ff..bd897a3f20 100644
+--- a/linux-user/strace.c
++++ b/linux-user/strace.c
+@@ -838,6 +838,10 @@ UNUSED static struct flags open_flags[] = {
+ #ifdef O_PATH
+     FLAG_TARGET(O_PATH),
+ #endif
++#ifdef O_TMPFILE
++    FLAG_TARGET(O_TMPFILE),
++    FLAG_TARGET(__O_TMPFILE),
++#endif
+     FLAG_END,
+ };
+ 
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 54343c06be..b3aa8099b4 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -342,6 +342,9 @@ static bitmask_transtbl fcntl_flags_tbl[] = {
+ #if defined(O_PATH)
+   { TARGET_O_PATH,      TARGET_O_PATH,      O_PATH,      O_PATH       },
+ #endif
++#if defined(O_TMPFILE)
++  { TARGET_O_TMPFILE,   TARGET_O_TMPFILE,   O_TMPFILE,   O_TMPFILE    },
++#endif
+   /* Don't terminate the list prematurely on 64-bit host+guest.  */
+ #if TARGET_O_LARGEFILE != 0 || O_LARGEFILE != 0
+   { TARGET_O_LARGEFILE, TARGET_O_LARGEFILE, O_LARGEFILE, O_LARGEFILE, },
+diff --git a/linux-user/syscall_defs.h b/linux-user/syscall_defs.h
+index 40c5027e93..6e2287e918 100644
+--- a/linux-user/syscall_defs.h
++++ b/linux-user/syscall_defs.h
+@@ -2416,7 +2416,7 @@ struct target_statfs64 {
+ #define TARGET_O_CLOEXEC     010000000
+ #define TARGET___O_SYNC      000100000
+ #define TARGET_O_PATH        020000000
+-#elif defined(TARGET_ARM) || defined(TARGET_M68K)
++#elif defined(TARGET_ARM) || defined(TARGET_M68K) || defined(TARGET_AARCH64)
+ #define TARGET_O_DIRECTORY      040000 /* must be a directory */
+ #define TARGET_O_NOFOLLOW      0100000 /* don't follow links */
+ #define TARGET_O_DIRECT        0200000 /* direct disk access hint */
+@@ -2513,6 +2513,12 @@ struct target_statfs64 {
+ #ifndef TARGET_O_PATH
+ #define TARGET_O_PATH        010000000
+ #endif
++#ifndef TARGET___O_TMPFILE
++#define TARGET___O_TMPFILE   020000000
++#endif
++#ifndef TARGET_O_TMPFILE
++#define TARGET_O_TMPFILE     (TARGET___O_TMPFILE | TARGET_O_DIRECTORY)
++#endif
+ #ifndef TARGET_O_NDELAY
+ #define TARGET_O_NDELAY  TARGET_O_NONBLOCK
+ #endif
+-- 
+2.11.0
+
+
+
+It was a Yocto 2.0 sysroot running on an Ubuntu 16.04 host.
+
+Fix has been released with QEMU 2.11:
+https://git.qemu.org/?p=qemu.git;a=commitdiff;h=5f9cee46cd4ec4600e1a
+

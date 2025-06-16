@@ -1,0 +1,86 @@
+peripherals: 0.836
+performance: 0.761
+hypervisor: 0.760
+KVM: 0.756
+graphic: 0.753
+permissions: 0.740
+boot: 0.719
+semantic: 0.712
+device: 0.711
+assembly: 0.707
+user-level: 0.707
+PID: 0.706
+virtual: 0.705
+ppc: 0.700
+risc-v: 0.697
+debug: 0.695
+register: 0.693
+arm: 0.692
+files: 0.689
+TCG: 0.678
+architecture: 0.666
+vnc: 0.641
+mistranslation: 0.633
+network: 0.606
+VMM: 0.586
+kernel: 0.580
+socket: 0.513
+x86: 0.501
+i386: 0.373
+
+Support guest shutdown of Alpine Linux in guest agent
+Description of problem:
+The qemu-guest-agent's shutdown calls `/sbin/shutdown` with the apropriate flags to shut down a posix system. On Alpine Linux, which is based on busybox, there is no `/sbin/shutdown`, instead there are `/sbin/poweroff`, `/sbin/halt` and `/sbin/reboot`. We have used a downstream patch for years that will exec those as a fallback in case execing `/sbin/shutdown` fails.
+
+With qemu 9.2 this patch no longer applies and it is probably time to solve this properly in upstream qemu.
+
+The question is how?
+
+Some options:
+
+- Set the powerdown, halt and reboot commands via build time configure option
+- Add a fallback if the `execlp` fails (similar to what downstream Alpine's patch does now). We could for example give `ga_run_command` a `const char **argv[]`, and try `execvp` all of them before erroring out.
+- Test the existence of `/sbin/shutdown` before calling `ga_run_command`.
+- Do nothing. Let downstream Alpine Linux handle it.
+Steps to reproduce:
+1. Build qemu-guest-agent for Alpine Linux
+2. boot a Alpine linux VM and install the qemu-guest-agent
+3. Try shutdown the VM via qmp command.
+Additional information:
+The patch that we previously used that no longer applies:
+```diff
+diff --git a/qga/commands-posix.c b/qga/commands-posix.c
+index 954efed01..61427652c 100644
+--- a/qga/commands-posix.c
++++ b/qga/commands-posix.c
+@@ -84,6 +84,7 @@ static void ga_wait_child(pid_t pid, int *status, Error **errp)
+ void qmp_guest_shutdown(bool has_mode, const char *mode, Error **errp)
+ {
+     const char *shutdown_flag;
++    const char *fallback_cmd = NULL;
+     Error *local_err = NULL;
+     pid_t pid;
+     int status;
+@@ -101,10 +102,13 @@ void qmp_guest_shutdown(bool has_mode, const char *mode, Error **errp)
+     slog("guest-shutdown called, mode: %s", mode);
+     if (!has_mode || strcmp(mode, "powerdown") == 0) {
+         shutdown_flag = powerdown_flag;
++        fallback_cmd = "/sbin/poweroff";
+     } else if (strcmp(mode, "halt") == 0) {
+         shutdown_flag = halt_flag;
++        fallback_cmd = "/sbin/halt";
+     } else if (strcmp(mode, "reboot") == 0) {
+         shutdown_flag = reboot_flag;
++        fallback_cmd = "/sbin/reboot";
+     } else {
+         error_setg(errp,
+                    "mode is invalid (valid values are: halt|powerdown|reboot");
+@@ -125,6 +129,7 @@ void qmp_guest_shutdown(bool has_mode, const char *mode, Error **errp)
+ #else
+         execl("/sbin/shutdown", "shutdown", "-h", shutdown_flag, "+0",
+                "hypervisor initiated shutdown", (char *)NULL);
++        execle(fallback_cmd, fallback_cmd, (char*)NULL, environ);
+ #endif
+         _exit(EXIT_FAILURE);
+     } else if (pid < 0) {
+```
