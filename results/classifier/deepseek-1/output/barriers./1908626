@@ -1,0 +1,163 @@
+
+Atomic test-and-set instruction does not work on qemu-user
+
+I try to compile and run PostgreSQL/Greenplum database inside docker container/qemu-aarch64-static:
+```
+ host: CentOS7 x86_64
+ container: centos:centos7.9.2009 --platform linux/arm64/v8
+ qemu-user-static: https://github.com/multiarch/qemu-user-static/releases/
+```
+
+However, GP/PG's spinlock always gets stuck and reports PANIC errors. It seems its spinlock
+has something wrong.
+```
+https://github.com/greenplum-db/gpdb/blob/master/src/include/storage/s_lock.h
+https://github.com/greenplum-db/gpdb/blob/master/src/backend/storage/lmgr/s_lock.c
+```
+
+So I extract its spinlock implementation into one test C source file (see attachment file),
+and get reprodcued:
+
+```
+$ gcc spinlock_qemu.c
+$ ./a.out 
+C -- slock inited, lock value is: 0
+parent 139642, child 139645
+P -- slock lock before, lock value is: 0
+P -- slock locked, lock value is: 1
+P -- slock unlock after, lock value is: 0
+C -- slock lock before, lock value is: 1
+P -- slock lock before, lock value is: 1
+C -- slock locked, lock value is: 1
+C -- slock unlock after, lock value is: 0
+C -- slock lock before, lock value is: 1
+P -- slock locked, lock value is: 1
+P -- slock unlock after, lock value is: 0
+P -- slock lock before, lock value is: 1
+C -- slock locked, lock value is: 1
+C -- slock unlock after, lock value is: 0
+P -- slock locked, lock value is: 1
+C -- slock lock before, lock value is: 1
+P -- slock unlock after, lock value is: 0
+C -- slock locked, lock value is: 1
+P -- slock lock before, lock value is: 1
+C -- slock unlock after, lock value is: 0
+P -- slock locked, lock value is: 1
+C -- slock lock before, lock value is: 1
+P -- slock unlock after, lock value is: 0
+C -- slock locked, lock value is: 1
+P -- slock lock before, lock value is: 1
+C -- slock unlock after, lock value is: 0
+P -- slock locked, lock value is: 1
+C -- slock lock before, lock value is: 1
+P -- slock unlock after, lock value is: 0
+P -- slock lock before, lock value is: 1
+spin timeout, lock value is 1 (pid 139642)
+spin timeout, lock value is 1 (pid 139645)
+spin timeout, lock value is 1 (pid 139645)
+spin timeout, lock value is 1 (pid 139642)
+spin timeout, lock value is 1 (pid 139645)
+spin timeout, lock value is 1 (pid 139642)
+...
+...
+...
+```
+
+NOTE: this code always works on PHYSICAL ARM64 server.
+
+
+
+Interestingly, the spinlock test works after I change tas() implementation
+FROM
+  __sync_lock_test_and_set(lock, 1);
+TO
+  __sync_val_compare_and_swap(lock, 0, 1);
+
+## gcc (GCC) 8.3.1 20190311 (Red Hat 8.3.1-3)
+
+====
+__sync_lock_test_and_set(lock, 1) disassembly:
+
+```
+objdump -S a.out
+
+000000000040073c <tas>:
+  40073c:	d10043ff 	sub	sp, sp, #0x10
+  400740:	f90007e0 	str	x0, [sp, #8]
+  400744:	f94007e0 	ldr	x0, [sp, #8]
+  400748:	52800021 	mov	w1, #0x1                   	// #1
+  40074c:	885f7c02 	ldxr	w2, [x0]
+  400750:	88037c01 	stxr	w3, w1, [x0]
+  400754:	35ffffc3 	cbnz	w3, 40074c <tas+0x10>
+  400758:	d5033bbf 	dmb	ish
+  40075c:	2a0203e0 	mov	w0, w2
+  400760:	910043ff 	add	sp, sp, #0x10
+  400764:	d65f03c0 	ret
+```
+
+====
+__sync_val_compare_and_swap(lock, 0, 1); disassembly:
+
+```
+objdump -S a.out
+
+000000000040073c <tas>:
+  40073c:	d10043ff 	sub	sp, sp, #0x10
+  400740:	f90007e0 	str	x0, [sp, #8]
+  400744:	f94007e0 	ldr	x0, [sp, #8]
+  400748:	52800021 	mov	w1, #0x1                   	// #1
+  40074c:	885f7c02 	ldxr	w2, [x0]
+  400750:	35000062 	cbnz	w2, 40075c <tas+0x20>
+  400754:	8803fc01 	stlxr	w3, w1, [x0]
+  400758:	35ffffa3 	cbnz	w3, 40074c <tas+0x10>
+  40075c:	7100005f 	cmp	w2, #0x0
+  400760:	d5033bbf 	dmb	ish
+  400764:	2a0203e0 	mov	w0, w2
+  400768:	910043ff 	add	sp, sp, #0x10
+  40076c:	d65f03c0 	ret
+```
+
+The QEMU project is currently moving its bug tracking to another system.
+For this we need to know which bugs are still valid and which could be
+closed already. Thus we are setting the bug state to "Incomplete" now.
+
+If the bug has already been fixed in the latest upstream version of QEMU,
+then please close this ticket as "Fix released".
+
+If it is not fixed yet and you think that this bug report here is still
+valid, then you have two options:
+
+1) If you already have an account on gitlab.com, please open a new ticket
+for this problem in our new tracker here:
+
+    https://gitlab.com/qemu-project/qemu/-/issues
+
+and then close this ticket here on Launchpad (or let it expire auto-
+matically after 60 days). Please mention the URL of this bug ticket on
+Launchpad in the new ticket on GitLab.
+
+2) If you don't have an account on gitlab.com and don't intend to get
+one, but still would like to keep this ticket opened, then please switch
+the state back to "New" or "Confirmed" within the next 60 days (other-
+wise it will get closed as "Expired"). We will then eventually migrate
+the ticket automatically to the new system (but you won't be the reporter
+of the bug in the new system and thus you won't get notified on changes
+anymore).
+
+Thank you and sorry for the inconvenience.
+
+
+[Expired for QEMU because there has been no activity for 60 days.]
+
+
+This is an automated cleanup. This bug report has been moved to QEMU's
+new bug tracker on gitlab.com and thus gets marked as 'expired' now.
+Please continue with the discussion here:
+
+ https://gitlab.com/qemu-project/qemu/-/issues/509
+
+
+Hi taos! Could you please check whether this has been fixed already in QEMU v6.1.0-rc1 ?
+
+Thanks. Tested, the problem is gone.
+

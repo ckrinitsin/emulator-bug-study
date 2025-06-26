@@ -1,0 +1,584 @@
+
+OpenJDK JVM segfaults on qemu-sh4 (regression)
+
+Some of the recent changes introduced a regression which makes the OpenJDK JVM crash on qemu-sh4:
+
+(sid-sh4-sbuild)root@nofan:/# java -version
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault
+(sid-sh4-sbuild)root@nofan:/#
+
+An older version works fine:
+
+(sid-sh4-sbuild)root@nofan:/# java -version
+openjdk version "9.0.1"
+OpenJDK Runtime Environment (build 9.0.1+11-Debian-1)
+OpenJDK Zero VM (build 9.0.1+11-Debian-1, interpreted mode)
+(sid-sh4-sbuild)root@nofan:/#
+
+Haven't had time for bisecting this yet.
+
+Adrian
+
+This sounds like it may be the bug fixed by this patchset: https://lists.gnu.org/archive/html/qemu-devel/2017-11/msg05067.html
+
+
+On 11/30/2017 01:19 PM, Peter Maydell wrote:
+> This sounds like it may be the bug fixed by this patchset:
+> https://lists.gnu.org/archive/html/qemu-devel/2017-11/msg05067.html
+
+Unfortunately not. I will upload a prepared chroot for testing later
+and link it in this bug report.
+
+Adrian
+
+-- 
+  .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+   `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+The offending commit is:
+
+d25f2a72272b9ffe0d06710d6217d1169bc2cc7d is the first bad commit
+commit d25f2a72272b9ffe0d06710d6217d1169bc2cc7d
+Author: Alex Bennée <email address hidden>
+Date:   Mon Nov 13 13:55:27 2017 +0000
+
+    accel/tcg/translate-all: expand cpu_restore_state addr check
+
+    We are still seeing signals during translation time when we walk over
+    a page protection boundary. This expands the check to ensure the host
+    PC is inside the code generation buffer. The original suggestion was
+    to check versus tcg_ctx.code_gen_ptr but as we now segment the
+    translation buffer we have to settle for just a general check for
+    being inside.
+
+    I've also fixed up the declaration to make it clear it can deal with
+    invalid addresses. A later patch will fix up the call sites.
+
+    Signed-off-by: Alex Bennée <email address hidden>
+    Reported-by: Peter Maydell <email address hidden>
+    Reviewed-by: Laurent Vivier <email address hidden>
+    Reviewed-by: Richard Henderson <email address hidden>
+    Message-id: <email address hidden>
+    Suggested-by: Paolo Bonzini <email address hidden>
+    Cc: Richard Henderson <email address hidden>
+    Tested-by: Peter Maydell <email address hidden>
+    Signed-off-by: Peter Maydell <email address hidden>
+
+:040000 040000 da50c4c43089d3ee7d1e9ad50d3c9036114e5f11 cd6a0dcaa1d284fe5439f6f3b61547d4b0662768 M      accel
+:040000 040000 c294a7c102d27295f8d81cc06b5d4d17357440ad 5a1268b7634f69f0806f22161ec7d6a1a26c8812 M      include
+
+Reverting the commit resolves the issue.
+
+-- 
+ .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+  `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+
+Thomas Huth <email address hidden> writes:
+
+> On 01.12.2017 00:25, John Paul Adrian Glaubitz wrote:
+>> The offending commit is:
+>> 
+>> d25f2a72272b9ffe0d06710d6217d1169bc2cc7d is the first bad commit
+>> commit d25f2a72272b9ffe0d06710d6217d1169bc2cc7d
+>> Author: Alex Bennée <email address hidden>
+>> Date:   Mon Nov 13 13:55:27 2017 +0000
+>> 
+>>     accel/tcg/translate-all: expand cpu_restore_state addr check
+>> 
+>>     We are still seeing signals during translation time when we walk over
+>>     a page protection boundary. This expands the check to ensure the host
+>>     PC is inside the code generation buffer. The original suggestion was
+>>     to check versus tcg_ctx.code_gen_ptr but as we now segment the
+>>     translation buffer we have to settle for just a general check for
+>>     being inside.
+>> 
+>>     I've also fixed up the declaration to make it clear it can deal with
+>>     invalid addresses. A later patch will fix up the call sites.
+>> 
+>>     Signed-off-by: Alex Bennée <email address hidden>
+>>     Reported-by: Peter Maydell <email address hidden>
+>>     Reviewed-by: Laurent Vivier <email address hidden>
+>>     Reviewed-by: Richard Henderson <email address hidden>
+>>     Message-id: <email address hidden>
+>>     Suggested-by: Paolo Bonzini <email address hidden>
+>>     Cc: Richard Henderson <email address hidden>
+>>     Tested-by: Peter Maydell <email address hidden>
+>>     Signed-off-by: Peter Maydell <email address hidden>
+>> 
+>> :040000 040000 da50c4c43089d3ee7d1e9ad50d3c9036114e5f11 cd6a0dcaa1d284fe5439f6f3b61547d4b0662768 M      accel
+>> :040000 040000 c294a7c102d27295f8d81cc06b5d4d17357440ad 5a1268b7634f69f0806f22161ec7d6a1a26c8812 M      include
+>> 
+>> Reverting the commit resolves the issue.
+>> 
+>
+> Alex, any ideas what might be wrong here?
+
+It's hard to imagine a scenario where taking the tb_lock() for resolving
+something that will fail is going to be an improvement. However maybe
+there is a subtle difference with sh4's javavm implementation.
+
+A backtrace QEMU after the segv would be useful here.
+
+-- 
+Alex Bennée
+
+
+On 12/04/2017 10:29 AM, Alex Bennée wrote:
+> It's hard to imagine a scenario where taking the tb_lock() for resolving
+> something that will fail is going to be an improvement. However maybe
+> there is a subtle difference with sh4's javavm implementation.
+
+So, OpenJDK doesn't have a SH-specific implementation of the JVM, it just
+uses the Zero variant, which is a pure C++ implementation of the JVM.
+
+The same implementation is used on any other architecture like older ARM
+(< ARMv7). I just tested it on ARMv4T and it doesn't crash there on
+qemu-user.
+
+However, SH4 is special due to its implementation of atomics in user
+space called gUSA for which support to qemu-user has been recently
+added by Richard Hendersson. Maybe the problem lies there.
+
+> A backtrace QEMU after the segv would be useful here.
+
+I forgot what the proper procedure is for running qemu-user inside
+GDB. Could you help me with that?
+
+The strace looks like this in any case:
+
+28856 access("/etc/ld.so.nohwcap",F_OK) = -1 errno=2 (No such file or directory)
+28856 open("/lib/sh4-linux-gnu/libgcc_s.so.1",O_RDONLY|O_CLOEXEC) = 3
+28856 read(3,0x7fffacd4,512) = 512
+28856 fstat64(3,0x7fffabe8) = 0
+28856 mmap(NULL,189084,PROT_EXEC|PROT_READ,MAP_PRIVATE|MAP_DENYWRITE,3,0) = 0x7ee27000
+28856 mprotect(0x7ee45000,61440,PROT_NONE) = 0
+28856 mmap(0x7ee54000,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_DENYWRITE|MAP_FIXED,3,0x1d000) = 0x7ee54000
+28856 close(3) = 0
+28856 mprotect(0x7ee54000,4096,PROT_READ) = 0
+28856 mprotect(0x7eee8000,4096,PROT_READ) = 0
+28856 mprotect(0x7f05c000,20480,PROT_READ) = 0
+28856 mprotect(0x7f5c8000,53248,PROT_READ) = 0
+28856 getpid() = 28856
+28856 munmap(0x7f065000,50134) = 0
+28856 getpid() = 28856
+28856 mmap(NULL,1572864,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|0x20000,-1,0) = 0x7eca7000
+28856 mprotect(0x7eca7000,4096,PROT_NONE) = 0
+28856 clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID,child_stack=0x7ee26048,parent_tidptr=0x7ee26528,tls=0x7ee26930,child_tidptr=0x7ee26528) = 28860
+28856 futex(0x7ee26528,FUTEX_WAIT,28860,NULL,0x7f77c6e8,2138556136)28856 set_robust_list(2128766256,12,-1,2128766652,-1,2128764832) = -1 errno=38 (Function not implemented)
+--- SIGSEGV {si_signo=SIGSEGV, si_code=1, si_addr=0x289da000} ---
+qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+Segmentation fault
+(sid-sh4-sbuild)root@nofan:/local_scratch/sid-sh4-sbuild#
+
+Adrian
+
+-- 
+  .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+   `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+
+John Paul Adrian Glaubitz <email address hidden> writes:
+
+> On 12/04/2017 10:29 AM, Alex Bennée wrote:
+>> It's hard to imagine a scenario where taking the tb_lock() for resolving
+>> something that will fail is going to be an improvement. However maybe
+>> there is a subtle difference with sh4's javavm implementation.
+>
+> So, OpenJDK doesn't have a SH-specific implementation of the JVM, it just
+> uses the Zero variant, which is a pure C++ implementation of the JVM.
+>
+> The same implementation is used on any other architecture like older ARM
+> (< ARMv7). I just tested it on ARMv4T and it doesn't crash there on
+> qemu-user.
+>
+> However, SH4 is special due to its implementation of atomics in user
+> space called gUSA for which support to qemu-user has been recently
+> added by Richard Hendersson. Maybe the problem lies there.
+>
+>> A backtrace QEMU after the segv would be useful here.
+>
+> I forgot what the proper procedure is for running qemu-user inside
+> GDB. Could you help me with that?
+
+Either call directly:
+
+  gdb --args qemu-foo <userspace args>
+
+Or alternatively:
+
+  qemu-foo -g 1234 <userspace args>
+
+And then:
+
+  gdb qemu-foo -p <pid of qemu-foo>
+
+And finally attaching to the gdbstub:
+
+  gdb-multiarch -ex "target remote localhost:1234"
+  c
+
+Or just make sure your environment is generating core dumps you can
+backtrace at leisure:
+
+  gdb qemu-foo core
+  bt
+
+
+>
+> The strace looks like this in any case:
+>
+> 28856 access("/etc/ld.so.nohwcap",F_OK) = -1 errno=2 (No such file or directory)
+> 28856 open("/lib/sh4-linux-gnu/libgcc_s.so.1",O_RDONLY|O_CLOEXEC) = 3
+> 28856 read(3,0x7fffacd4,512) = 512
+> 28856 fstat64(3,0x7fffabe8) = 0
+> 28856 mmap(NULL,189084,PROT_EXEC|PROT_READ,MAP_PRIVATE|MAP_DENYWRITE,3,0) = 0x7ee27000
+> 28856 mprotect(0x7ee45000,61440,PROT_NONE) = 0
+> 28856 mmap(0x7ee54000,8192,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_DENYWRITE|MAP_FIXED,3,0x1d000) = 0x7ee54000
+> 28856 close(3) = 0
+> 28856 mprotect(0x7ee54000,4096,PROT_READ) = 0
+> 28856 mprotect(0x7eee8000,4096,PROT_READ) = 0
+> 28856 mprotect(0x7f05c000,20480,PROT_READ) = 0
+> 28856 mprotect(0x7f5c8000,53248,PROT_READ) = 0
+> 28856 getpid() = 28856
+> 28856 munmap(0x7f065000,50134) = 0
+> 28856 getpid() = 28856
+> 28856 mmap(NULL,1572864,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|0x20000,-1,0) = 0x7eca7000
+> 28856 mprotect(0x7eca7000,4096,PROT_NONE) = 0
+> 28856 clone(CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID,child_stack=0x7ee26048,parent_tidptr=0x7ee26528,tls=0x7ee26930,child_tidptr=0x7ee26528) = 28860
+> 28856 futex(0x7ee26528,FUTEX_WAIT,28860,NULL,0x7f77c6e8,2138556136)28856 set_robust_list(2128766256,12,-1,2128766652,-1,2128764832) = -1 errno=38 (Function not implemented)
+> --- SIGSEGV {si_signo=SIGSEGV, si_code=1, si_addr=0x289da000} ---
+> qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+> Segmentation fault
+> (sid-sh4-sbuild)root@nofan:/local_scratch/sid-sh4-sbuild#
+>
+> Adrian
+>
+> --
+>   .''`.  John Paul Adrian Glaubitz
+> : :' :  Debian Developer - <email address hidden>
+> `. `'   Freie Universitaet Berlin - <email address hidden>
+>    `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+--
+Alex Bennée
+
+
+
+John Paul Adrian Glaubitz <email address hidden> writes:
+
+> Public bug reported:
+>
+> Some of the recent changes introduced a regression which makes the
+> OpenJDK JVM crash on qemu-sh4:
+>
+> (sid-sh4-sbuild)root@nofan:/# java -version
+> qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+> Segmentation fault
+> (sid-sh4-sbuild)root@nofan:/#
+
+With an --enable-debug build I managed to replicate:
+
+  root@6e10336e48ac:/etc/apt# java --version
+  qemu-sh4: /home/alex/lsrc/qemu/qemu.git/tcg/tcg.h:703: temp_idx: Assertion `n >= 0 && n < tcg_ctx->nb_temps' failed.
+  qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+  Segmentation fault (core dumped)
+
+Which implies the front end has gotten something wrong. Maybe this
+somehow tripped up the fault resolution in the end? Can you try with an
+--enable-debug build?
+
+>
+> An older version works fine:
+>
+> (sid-sh4-sbuild)root@nofan:/# java -version
+> openjdk version "9.0.1"
+> OpenJDK Runtime Environment (build 9.0.1+11-Debian-1)
+> OpenJDK Zero VM (build 9.0.1+11-Debian-1, interpreted mode)
+> (sid-sh4-sbuild)root@nofan:/#
+>
+> Haven't had time for bisecting this yet.
+>
+> Adrian
+>
+> ** Affects: qemu
+>      Importance: Undecided
+>          Status: New
+
+
+--
+Alex Bennée
+
+
+On 12/05/2017 04:02 PM, Alex Bennée wrote:
+> With an --enable-debug build I managed to replicate:
+> 
+>    root@6e10336e48ac:/etc/apt# java --version
+>    qemu-sh4: /home/alex/lsrc/qemu/qemu.git/tcg/tcg.h:703: temp_idx: Assertion `n >= 0 && n < tcg_ctx->nb_temps' failed.
+>    qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+>    Segmentation fault (core dumped)
+> 
+> Which implies the front end has gotten something wrong. Maybe this
+> somehow tripped up the fault resolution in the end? Can you try with an
+> --enable-debug build?
+Will do. Thank you for giving me a heads-up!
+
+Adrian
+
+-- 
+  .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+   `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+This fixes bug #1735384 while running java under qemu-sh4. When debug
+was enabled it showed a problem with TCG temps. Once fixed I was able
+to run java -version normally.
+
+Reported-by: John Paul Adrian Glaubitz <email address hidden>
+Suggested-by: Richard Henderson <email address hidden>
+Signed-off-by: Alex Bennée <email address hidden>
+---
+ target/sh4/translate.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/target/sh4/translate.c b/target/sh4/translate.c
+index 703020fe87..b4b5c822d0 100644
+--- a/target/sh4/translate.c
++++ b/target/sh4/translate.c
+@@ -2189,7 +2189,7 @@ static int decode_gusa(DisasContext *ctx, CPUSH4State *env, int *pmax_insns)
+     }
+ 
+     /* If op_src is not a valid register, then op_arg was a constant.  */
+-    if (op_src < 0) {
++    if (op_src < 0 && !TCGV_IS_UNUSED(op_arg)) {
+         tcg_temp_free_i32(op_arg);
+     }
+ 
+-- 
+2.15.1
+
+
+
+Hi Alex!
+
+Wow, thanks! I wanted to run your suggested test today as I ran out of time yesterday and now you already fixed it :-).
+
+Thanks a lot!
+
+Adrian
+
+> On Dec 6, 2017, at 10:30 AM, Alex Bennée <email address hidden> wrote:
+> 
+> This fixes bug #1735384 while running java under qemu-sh4. When debug
+> was enabled it showed a problem with TCG temps. Once fixed I was able
+> to run java -version normally.
+> 
+> Reported-by: John Paul Adrian Glaubitz <email address hidden>
+> Suggested-by: Richard Henderson <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+> ---
+> target/sh4/translate.c | 2 +-
+> 1 file changed, 1 insertion(+), 1 deletion(-)
+> 
+> diff --git a/target/sh4/translate.c b/target/sh4/translate.c
+> index 703020fe87..b4b5c822d0 100644
+> --- a/target/sh4/translate.c
+> +++ b/target/sh4/translate.c
+> @@ -2189,7 +2189,7 @@ static int decode_gusa(DisasContext *ctx, CPUSH4State *env, int *pmax_insns)
+>     }
+> 
+>     /* If op_src is not a valid register, then op_arg was a constant.  */
+> -    if (op_src < 0) {
+> +    if (op_src < 0 && !TCGV_IS_UNUSED(op_arg)) {
+>         tcg_temp_free_i32(op_arg);
+>     }
+> 
+> -- 
+> 2.15.1
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1735384
+> 
+> Title:
+>  OpenJDK JVM segfaults on qemu-sh4 (regression)
+> 
+> Status in QEMU:
+>  New
+> 
+> Bug description:
+>  Some of the recent changes introduced a regression which makes the
+>  OpenJDK JVM crash on qemu-sh4:
+> 
+>  (sid-sh4-sbuild)root@nofan:/# java -version
+>  qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+>  Segmentation fault
+>  (sid-sh4-sbuild)root@nofan:/#
+> 
+>  An older version works fine:
+> 
+>  (sid-sh4-sbuild)root@nofan:/# java -version
+>  openjdk version "9.0.1"
+>  OpenJDK Runtime Environment (build 9.0.1+11-Debian-1)
+>  OpenJDK Zero VM (build 9.0.1+11-Debian-1, interpreted mode)
+>  (sid-sh4-sbuild)root@nofan:/#
+> 
+>  Haven't had time for bisecting this yet.
+> 
+>  Adrian
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1735384/+subscriptions
+
+
+
+On 12/06/2017 10:30 AM, Alex Bennée wrote:
+> This fixes bug #1735384 while running java under qemu-sh4. When debug
+> was enabled it showed a problem with TCG temps. Once fixed I was able
+> to run java -version normally.
+> 
+> Reported-by: John Paul Adrian Glaubitz <email address hidden>
+> Suggested-by: Richard Henderson <email address hidden>
+> Signed-off-by: Alex Bennée <email address hidden>
+
+I can confirm that this fixes the issue for me, too.
+
+So, just in case:
+
+Tested-by: John Paul Adrian Glaubitz <email address hidden>
+
+-- 
+ .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+  `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+
+John Paul Adrian Glaubitz <email address hidden> writes:
+
+> Hi Alex!
+>
+> Wow, thanks! I wanted to run your suggested test today as I ran out of
+> time yesterday and now you already fixed it :-).
+
+Can you confirm you've tested it and your happy it works?
+
+>
+> Thanks a lot!
+>
+> Adrian
+>
+>> On Dec 6, 2017, at 10:30 AM, Alex Bennée <email address hidden> wrote:
+>>
+>> This fixes bug #1735384 while running java under qemu-sh4. When debug
+>> was enabled it showed a problem with TCG temps. Once fixed I was able
+>> to run java -version normally.
+>>
+>> Reported-by: John Paul Adrian Glaubitz <email address hidden>
+>> Suggested-by: Richard Henderson <email address hidden>
+>> Signed-off-by: Alex Bennée <email address hidden>
+>> ---
+>> target/sh4/translate.c | 2 +-
+>> 1 file changed, 1 insertion(+), 1 deletion(-)
+>>
+>> diff --git a/target/sh4/translate.c b/target/sh4/translate.c
+>> index 703020fe87..b4b5c822d0 100644
+>> --- a/target/sh4/translate.c
+>> +++ b/target/sh4/translate.c
+>> @@ -2189,7 +2189,7 @@ static int decode_gusa(DisasContext *ctx, CPUSH4State *env, int *pmax_insns)
+>>     }
+>>
+>>     /* If op_src is not a valid register, then op_arg was a constant.  */
+>> -    if (op_src < 0) {
+>> +    if (op_src < 0 && !TCGV_IS_UNUSED(op_arg)) {
+>>         tcg_temp_free_i32(op_arg);
+>>     }
+>>
+>> --
+>> 2.15.1
+>>
+>> --
+>> You received this bug notification because you are subscribed to the bug
+>> report.
+>> https://bugs.launchpad.net/bugs/1735384
+>>
+>> Title:
+>>  OpenJDK JVM segfaults on qemu-sh4 (regression)
+>>
+>> Status in QEMU:
+>>  New
+>>
+>> Bug description:
+>>  Some of the recent changes introduced a regression which makes the
+>>  OpenJDK JVM crash on qemu-sh4:
+>>
+>>  (sid-sh4-sbuild)root@nofan:/# java -version
+>>  qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+>>  Segmentation fault
+>>  (sid-sh4-sbuild)root@nofan:/#
+>>
+>>  An older version works fine:
+>>
+>>  (sid-sh4-sbuild)root@nofan:/# java -version
+>>  openjdk version "9.0.1"
+>>  OpenJDK Runtime Environment (build 9.0.1+11-Debian-1)
+>>  OpenJDK Zero VM (build 9.0.1+11-Debian-1, interpreted mode)
+>>  (sid-sh4-sbuild)root@nofan:/#
+>>
+>>  Haven't had time for bisecting this yet.
+>>
+>>  Adrian
+>>
+>> To manage notifications about this bug go to:
+>> https://bugs.launchpad.net/qemu/+bug/1735384/+subscriptions
+
+
+--
+Alex Bennée
+
+
+On 12/06/2017 11:52 AM, Alex Bennée wrote:
+>> Wow, thanks! I wanted to run your suggested test today as I ran out of
+>> time yesterday and now you already fixed it :-).
+> 
+> Can you confirm you've tested it and your happy it works?
+
+I already confirmed it, but in case my previous mail got lost:
+
+Tested-by: John Paul Adrian Glaubitz <email address hidden>
+
+And, yes, I'm happy it works :-). Can now switch back to using the latest
+qemu snapshot for building packages for Debian sh4.
+
+Adrian
+
+-- 
+ .''`.  John Paul Adrian Glaubitz
+: :' :  Debian Developer - <email address hidden>
+`. `'   Freie Universitaet Berlin - <email address hidden>
+  `-    GPG: 62FF 8A75 84E0 2956 9546  0006 7426 3B37 F5B5 F913
+
+
+This has been fixed now and Java works fine again on qemu-sh4 on git master:
+
+(sid-sh4-sbuild)root@nofan:/# java --version
+openjdk 10 2018-03-20
+OpenJDK Runtime Environment (build 10+46-Debian-5)
+OpenJDK Zero VM (build 10+46-Debian-5, interpreted mode)
+(sid-sh4-sbuild)root@nofan:/#
+

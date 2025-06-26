@@ -1,0 +1,136 @@
+
+qemu-arm-static bug in signal handling causes mono and java to hang
+
+Note, this bug is already reported to debian, but it seems to also affect the upstream code.
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=748043
+
+running mono in a chroot environment with qemu-user-static is not posible
+because at least one signal used during termination of mono is routed to the
+host.
+
+This can be reproduced by:
+debootstrap --include=mono-runtime --foreign --arch=armel "wheezy" "mono-test" "http://ftp.de.debian.org//debian"
+cp /usr/bin/qemu-arm-static mono-test/usr/bin
+mount -t proc none mono-test/proc
+mount -o bind /dev mono-test/dev
+mount -o bind /sys mono-test/sys
+chroot mono-test
+../debootstrap/debootstrap --second-stage
+exit
+mount -t proc none mono-test/proc
+mount -o bind /sys mono-test/sys
+chroot mono-test
+QEMU_STRACE=1 /usr/bin/mono /usr/lib/mono/4.0/gacutil.exe
+
+This will block on a futex:
+
+--8<--
+18663 sched_yield(0,0,2582980,0,0,2582928) = 0
+18663 clock_gettime(1,-150996384,2,1,2585016,2585600) = 0
+18663 tgkill(18663,18664,30,18664,30,-161951744) = 0
+18663 futex(0x00293774,FUTEX_PRIVATE_FLAG|FUTEX_WAIT,0,NULL,NULL,0)
+--8<--
+
+If you use mono within strace on a native x86 box you can see, that signals
+between threads are used during termination:
+
+strace -f -o log.txt /usr/bin/mono /usr/lib/mono/4.0/gacutil.exe
+
+--8<--
+14075 sched_yield()                     = 0                                     
+14075 tgkill(14075, 14083, SIGPWR)      = 0                                     
+14075 futex(0x983f00, FUTEX_WAIT_PRIVATE, 0, NULL <unfinished ...>              
+14083 <... futex resumed> )             = ? ERESTARTSYS (To be restarted)       
+14083 --- SIGPWR (Power failure) @ 0 (0) ---                                    
+14083 futex(0x983f00, FUTEX_WAKE_PRIVATE, 1) = 1                                
+14075 <... futex resumed> )             = 0                                     
+14083 rt_sigsuspend(~[INT QUIT ABRT TERM XCPU RTMIN RT_1] <unfinished ...>      
+14075 futex(0x94d9a4, FUTEX_CMP_REQUEUE_PRIVATE, 1, 2147483647, 0x94da20, 24) = 3
+14078 <... futex resumed> )             = 0                                     
+14078 futex(0x94da20, FUTEX_WAKE_PRIVATE, 1) = 1                                
+14077 <... futex resumed> )             = 0                                     
+14075 futex(0x94d9a4, FUTEX_CMP_REQUEUE_PRIVATE, 1, 2147483647, 0x94da20, 26 <unfinished ...>
+--8<--
+
+This also blocks the installation of libnunit2.6-cil within a armel chroot,
+because it uses mono in its postinst script.
+E.g. (/usr/bin/mono /usr/share/mono/MonoGetAssemblyName.exe /usr/lib/cli/nunit.core-2.6/nunit.core.dll)
+
+Obviously the same as described in:
+http://lists.opensuse.org/opensuse-arm/2011-12/msg00000.html
+is happening here.
+
+There is an openSuSE patch against qemu:
+https://build.opensuse.org/package/view_file/Virtualization:Qemu/qemu/0002-XXX-work-around-SA_RESTART-race-wit.patch?expand=1
+
+This patch also applies against qemu from backports-wheezy and resolves this
+issue.
+
+As it seems, that this issue is not Debian specific i will also report it to
+the qemu project and reference this bug report.
+
+On 13 May 2014 16:56, manut <email address hidden> wrote:
+> running mono in a chroot environment with qemu-user-static is not posible
+> because at least one signal used during termination of mono is routed to the
+> host.
+>
+> This can be reproduced by:
+> debootstrap --include=mono-runtime --foreign --arch=armel "wheezy" "mono-test" "http://ftp.de.debian.org//debian"
+> cp /usr/bin/qemu-arm-static mono-test/usr/bin
+> mount -t proc none mono-test/proc
+> mount -o bind /dev mono-test/dev
+> mount -o bind /sys mono-test/sys
+> chroot mono-test
+> ../debootstrap/debootstrap --second-stage
+> exit
+> mount -t proc none mono-test/proc
+> mount -o bind /sys mono-test/sys
+> chroot mono-test
+> QEMU_STRACE=1 /usr/bin/mono /usr/lib/mono/4.0/gacutil.exe
+>
+> This will block on a futex:
+>
+> --8<--
+> 18663 sched_yield(0,0,2582980,0,0,2582928) = 0
+> 18663 clock_gettime(1,-150996384,2,1,2585016,2585600) = 0
+> 18663 tgkill(18663,18664,30,18664,30,-161951744) = 0
+> 18663 futex(0x00293774,FUTEX_PRIVATE_FLAG|FUTEX_WAIT,0,NULL,NULL,0)
+> --8<--
+>
+> If you use mono within strace on a native x86 box you can see, that signals
+> between threads are used during termination:
+
+Multithreaded guest process are unreliable under qemu
+linux-user mode anyway, even ignoring the signal handling
+related races here.
+
+See also:
+https://bugs.launchpad.net/qemu/+bug/955379
+
+> There is an openSuSE patch against qemu:
+> https://build.opensuse.org/package/view_file/Virtualization:Qemu/qemu/0002-XXX-work-around-SA_RESTART-race-wit.patch?expand=1
+
+This patch is a very hacky bandaid papering over the
+real problem. It is not suitable for upstream (and
+personally I wouldn't ship it in a distro either :-)).
+
+thanks
+-- PMM
+
+
+Status changed to 'Confirmed' because the bug affects multiple users.
+
+also causes problems with java.
+
+Recent changes to QEMU's handling of signals fix this hang trying to run mono under QEMU; they should be out in QEMU 2.7.
+
+
+Did this fix end up making it into QEMU 2.7?
+
+Yes it did.
+
+
+Fixed in 2.7 and thereby >=Zesty
+
+I can't guess very well how important this would be for an SRU (or not), leaving that up for user feedback to be decided.
+

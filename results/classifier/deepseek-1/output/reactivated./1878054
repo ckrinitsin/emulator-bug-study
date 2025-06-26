@@ -1,0 +1,225 @@
+
+Hang with high CPU usage in sdhci_data_transfer
+
+Hello,
+While fuzzing, I found an input that causes QEMU to hang with 100% CPU usage.
+I have waited several minutes, and QEMU is still unresponsive. Using gdb, It
+appears that it is stuck in an sdhci_data_transfer:
+
+#0   memory_region_access_valid (mr=<optimized out>, addr=0x10284920, size=<optimized out>, is_write=0xff, attrs=...) at /home/alxndr/Development/qemu/memory.c:1378
+#1   memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=<optimized out>, op=MO_32, attrs=...) at /home/alxndr/Development/qemu/memory.c:1463
+#2   flatview_write_continue (fv=<optimized out>, addr=0x10284920, attrs=..., ptr=<optimized out>, len=0xb7, addr1=0x5555582798e0, l=<optimized out>, mr=0x5555582798e0 <io_mem_unassigned>) at /home/alxndr/Development/qemu/exec.c:3137
+#3   flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+#4   address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+#5   address_space_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, attrs=..., attrs@entry=..., buf=0xaaaab04f325, len=0x4, is_write=0xb8, is_write@entry=0x1) at
+/home/alxndr/Development/qemu/exec.c:3278
+#6   dma_memory_rw_relaxed (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:87
+#7   dma_memory_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:110
+#8   dma_memory_write (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/include/sysemu/dma.h:122
+#9   sdhci_sdma_transfer_multi_blocks (s=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:618
+#10  sdhci_data_transfer (opaque=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:891
+#11  sdhci_send_command (s=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:364
+#12  sdhci_write (opaque=<optimized out>, offset=0xc, val=<optimized out>, size=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:1158
+#13  memory_region_write_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at
+/home/alxndr/Development/qemu/memory.c:483
+#14  access_with_adjusted_size (addr=<optimized out>, value=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=<optimized out>, mr=0x61e0000219f0, attrs=...) at /home/alxndr/Development/qemu/memory.c:544
+#15  memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=0x1ffe0ff, op=<optimized out>, attrs=...) at /home/alxndr/Development/qemu/memory.c:1476
+#16  flatview_write_continue (fv=<optimized out>, addr=0xe106800c, attrs=..., ptr=<optimized out>, len=0xff3, addr1=0x5555582798e0, l=<optimized out>, mr=0x61e0000219f0) at /home/alxndr/Development/qemu/exec.c:3137
+#17  flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+#18  address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., attrs@entry=..., buf=0xaaaab04f325, buf@entry=0x62100008ad00, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+#19  qtest_process_command (chr=<optimized out>, chr@entry=0x55555827c040 <qtest_chr>, words=<optimized out>) at /home/alxndr/Development/qemu/qtest.c:567
+#20  qtest_process_inbuf (chr=0x55555827c040 <qtest_chr>, inbuf=0x61900000f640) at /home/alxndr/Development/qemu/qtest.c:710
+
+
+I am attaching the qtest commands for reproducing it.
+I can reproduce it in a qemu 5.0 build using:
+
+qemu-system-i386 -M pc-q35-5.0 -qtest stdio -device sdhci-pci,sd-spec-version=3 -device sd-card,drive=mydrive -drive if=sd,index=0,file=null-co://,format=raw,id=mydrive -nographic -nographic -serial none -monitor none < attachment
+
+Please let me know if I can provide any further info.
+-Alex
+
+Forgot the attachment..
+
++Peter who was the previous maintainer.
+
+On 5/11/20 7:23 PM, Alexander Bulekov wrote:
+> Public bug reported:
+> 
+> Hello,
+> While fuzzing, I found an input that causes QEMU to hang with 100% CPU usage.
+> I have waited several minutes, and QEMU is still unresponsive. Using gdb, It
+> appears that it is stuck in an sdhci_data_transfer:
+
+Quick analysis of the attached file show the SDHCI starts multi-block 
+DMA transfer (for 0xffea blocks), while the SD card is not initialized.
+
+The card keeps returning zero data (because not in the SENDING state).
+
+The problem seems related to this comment in 
+sdhci_sdma_transfer_multi_blocks():
+
+     /* XXX: Some sd/mmc drivers (for example, u-boot-slp) do not 
+account for
+      * possible stop at page boundary if initial address is not page 
+aligned,
+      * allow them to work properly */
+     if ((s->sdmasysad % boundary_chk) == 0) {
+         page_aligned = true;
+     }
+
+Setting page_aligned to false avoid the infinite loop.
+
+You found a case where s->blkcnt is never decremented (thus the infinite 
+loop & unresponsiveness). See:
+
+             if (((boundary_count + begin) < block_size) && page_aligned) {
+                 s->data_count = boundary_count + begin;
+                 boundary_count = 0;
+              } else {
+                 s->data_count = block_size;
+                 boundary_count -= block_size - begin;
+                 if (s->trnmod & SDHC_TRNS_BLK_CNT_EN) {
+                     s->blkcnt--;
+                 }
+             }
+
+> 
+> #0   memory_region_access_valid (mr=<optimized out>, addr=0x10284920, size=<optimized out>, is_write=0xff, attrs=...) at /home/alxndr/Development/qemu/memory.c:1378
+> #1   memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=<optimized out>, op=MO_32, attrs=...) at /home/alxndr/Development/qemu/memory.c:1463
+> #2   flatview_write_continue (fv=<optimized out>, addr=0x10284920, attrs=..., ptr=<optimized out>, len=0xb7, addr1=0x5555582798e0, l=<optimized out>, mr=0x5555582798e0 <io_mem_unassigned>) at /home/alxndr/Development/qemu/exec.c:3137
+> #3   flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+> #4   address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+> #5   address_space_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, attrs=..., attrs@entry=..., buf=0xaaaab04f325, len=0x4, is_write=0xb8, is_write@entry=0x1) at
+> /home/alxndr/Development/qemu/exec.c:3278
+> #6   dma_memory_rw_relaxed (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:87
+> #7   dma_memory_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:110
+> #8   dma_memory_write (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/include/sysemu/dma.h:122
+> #9   sdhci_sdma_transfer_multi_blocks (s=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:618
+> #10  sdhci_data_transfer (opaque=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:891
+> #11  sdhci_send_command (s=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:364
+> #12  sdhci_write (opaque=<optimized out>, offset=0xc, val=<optimized out>, size=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:1158
+> #13  memory_region_write_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at
+> /home/alxndr/Development/qemu/memory.c:483
+> #14  access_with_adjusted_size (addr=<optimized out>, value=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=<optimized out>, mr=0x61e0000219f0, attrs=...) at /home/alxndr/Development/qemu/memory.c:544
+> #15  memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=0x1ffe0ff, op=<optimized out>, attrs=...) at /home/alxndr/Development/qemu/memory.c:1476
+> #16  flatview_write_continue (fv=<optimized out>, addr=0xe106800c, attrs=..., ptr=<optimized out>, len=0xff3, addr1=0x5555582798e0, l=<optimized out>, mr=0x61e0000219f0) at /home/alxndr/Development/qemu/exec.c:3137
+> #17  flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+> #18  address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., attrs@entry=..., buf=0xaaaab04f325, buf@entry=0x62100008ad00, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+> #19  qtest_process_command (chr=<optimized out>, chr@entry=0x55555827c040 <qtest_chr>, words=<optimized out>) at /home/alxndr/Development/qemu/qtest.c:567
+> #20  qtest_process_inbuf (chr=0x55555827c040 <qtest_chr>, inbuf=0x61900000f640) at /home/alxndr/Development/qemu/qtest.c:710
+> 
+> 
+> I am attaching the qtest commands for reproducing it.
+> I can reproduce it in a qemu 5.0 build using:
+> 
+> qemu-system-i386 -M pc-q35-5.0 -qtest stdio -device sdhci-pci,sd-spec-
+> version=3 -device sd-card,drive=mydrive -drive if=sd,index=0,file=null-
+> co://,format=raw,id=mydrive -nographic -nographic -serial none -monitor
+> none < attachment
+> 
+> Please let me know if I can provide any further info.
+> -Alex
+> 
+> ** Affects: qemu
+>       Importance: Undecided
+>           Status: New
+> 
+
+
+The latest version of QEMU seems to refuse the provided command line:
+
+qemu-system-i386: -drive if=sd,index=0,file=null-co://,format=raw,id=mydrive: machine type does not support if=sd,bus=0,unit=0
+
+... is there still a way to reproduce this issue with the latest QEMU version?
+
+I think to fix the reproducer we can swap the if=sd for if=none:
+qemu-system-i386 -M pc-q35-5.0 \
+-qtest stdio \
+-device sdhci-pci,sd-spec-version=3 -device sd-card,drive=mydrive \
+-drive if=none,index=0,file=null-co://,format=raw,id=mydrive \
+-nographic -nographic -serial none -monitor none < attachment2
+
+I confirmed that this reproducer triggers the high-cpu usage for the
+QEMU 5.2 build I got from Debian.
+
+That said, this no longer times-out in my 6.0 build, so I think this is
+fixed.
+
+-Alex
+
+On 210603 1500, Thomas Huth wrote:
+> The latest version of QEMU seems to refuse the provided command line:
+> 
+> qemu-system-i386: -drive if=sd,index=0,file=null-
+> co://,format=raw,id=mydrive: machine type does not support
+> if=sd,bus=0,unit=0
+> 
+> ... is there still a way to reproduce this issue with the latest QEMU
+> version?
+> 
+> ** Changed in: qemu
+>        Status: New => Incomplete
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1878054
+> 
+> Title:
+>   Hang with high CPU usage in sdhci_data_transfer
+> 
+> Status in QEMU:
+>   Incomplete
+> 
+> Bug description:
+>   Hello,
+>   While fuzzing, I found an input that causes QEMU to hang with 100% CPU usage.
+>   I have waited several minutes, and QEMU is still unresponsive. Using gdb, It
+>   appears that it is stuck in an sdhci_data_transfer:
+> 
+>   #0   memory_region_access_valid (mr=<optimized out>, addr=0x10284920, size=<optimized out>, is_write=0xff, attrs=...) at /home/alxndr/Development/qemu/memory.c:1378
+>   #1   memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=<optimized out>, op=MO_32, attrs=...) at /home/alxndr/Development/qemu/memory.c:1463
+>   #2   flatview_write_continue (fv=<optimized out>, addr=0x10284920, attrs=..., ptr=<optimized out>, len=0xb7, addr1=0x5555582798e0, l=<optimized out>, mr=0x5555582798e0 <io_mem_unassigned>) at /home/alxndr/Development/qemu/exec.c:3137
+>   #3   flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+>   #4   address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+>   #5   address_space_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, attrs=..., attrs@entry=..., buf=0xaaaab04f325, len=0x4, is_write=0xb8, is_write@entry=0x1) at
+>   /home/alxndr/Development/qemu/exec.c:3278
+>   #6   dma_memory_rw_relaxed (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:87
+>   #7   dma_memory_rw (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4, dir=DMA_DIRECTION_FROM_DEVICE) at /home/alxndr/Development/qemu/include/sysemu/dma.h:110
+>   #8   dma_memory_write (as=0x5555572509ac <unassigned_mem_ops+44>, addr=0x5555582798e0, buf=0xaaaab04f325, len=0x4) at /home/alxndr/Development/qemu/include/sysemu/dma.h:122
+>   #9   sdhci_sdma_transfer_multi_blocks (s=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:618
+>   #10  sdhci_data_transfer (opaque=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:891
+>   #11  sdhci_send_command (s=0x61e000021080) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:364
+>   #12  sdhci_write (opaque=<optimized out>, offset=0xc, val=<optimized out>, size=<optimized out>) at /home/alxndr/Development/qemu/hw/sd/sdhci.c:1158
+>   #13  memory_region_write_accessor (mr=<optimized out>, addr=<optimized out>, value=<optimized out>, size=<optimized out>, shift=<optimized out>, mask=<optimized out>, attrs=...) at
+>   /home/alxndr/Development/qemu/memory.c:483
+>   #14  access_with_adjusted_size (addr=<optimized out>, value=<optimized out>, size=<optimized out>, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=<optimized out>, mr=0x61e0000219f0, attrs=...) at /home/alxndr/Development/qemu/memory.c:544
+>   #15  memory_region_dispatch_write (mr=<optimized out>, addr=<optimized out>, data=0x1ffe0ff, op=<optimized out>, attrs=...) at /home/alxndr/Development/qemu/memory.c:1476
+>   #16  flatview_write_continue (fv=<optimized out>, addr=0xe106800c, attrs=..., ptr=<optimized out>, len=0xff3, addr1=0x5555582798e0, l=<optimized out>, mr=0x61e0000219f0) at /home/alxndr/Development/qemu/exec.c:3137
+>   #17  flatview_write (fv=0x606000045da0, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at /home/alxndr/Development/qemu/exec.c:3177
+>   #18  address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., attrs@entry=..., buf=0xaaaab04f325, buf@entry=0x62100008ad00, len=0x4) at /home/alxndr/Development/qemu/exec.c:3268
+>   #19  qtest_process_command (chr=<optimized out>, chr@entry=0x55555827c040 <qtest_chr>, words=<optimized out>) at /home/alxndr/Development/qemu/qtest.c:567
+>   #20  qtest_process_inbuf (chr=0x55555827c040 <qtest_chr>, inbuf=0x61900000f640) at /home/alxndr/Development/qemu/qtest.c:710
+> 
+>   
+>   I am attaching the qtest commands for reproducing it.
+>   I can reproduce it in a qemu 5.0 build using:
+> 
+>   qemu-system-i386 -M pc-q35-5.0 -qtest stdio -device sdhci-pci,sd-spec-
+>   version=3 -device sd-card,drive=mydrive -drive if=sd,index=0,file
+>   =null-co://,format=raw,id=mydrive -nographic -nographic -serial none
+>   -monitor none < attachment
+> 
+>   Please let me know if I can provide any further info.
+>   -Alex
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1878054/+subscriptions
+
+
+So we have 2 bugs then...
+Filled https://gitlab.com/qemu-project/qemu/-/issues/387, once solve I plan to reopen this issue.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

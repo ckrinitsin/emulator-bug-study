@@ -1,0 +1,653 @@
+
+Low 2D graphics performance with Windows 10 (1803) VGA passthrough VM using "Spectre" protection
+
+Windows 10 (1803) VM using VGA passthrough via qemu script.
+
+After upgrading Windows 10 Pro VM to version 1803, or possibly after applying the March/April security updates from Microsoft, the VM would show low 2D graphics performance (sluggishness in 2D applications and low Passmark results).
+
+Turning off Spectre vulnerability protection in Windows remedies the issue.
+
+Expected behavior:
+qemu/kvm hypervisor to expose firmware capabilities of host to guest OS - see https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/CVE-2017-5715-and-hyper-v-vms
+
+Background:
+
+Starting in March or April Microsoft began to push driver updates in their updates / security updates. See https://support.microsoft.com/en-us/help/4073757/protect-your-windows-devices-against-spectre-meltdown
+
+One update concerns the Intel microcode - see https://support.microsoft.com/en-us/help/4100347. It is activated by default within Windows.
+
+Once the updates are applied within the Windows guest, 2D graphics performance drops significantly. Other performance benchmarks are not affected.
+
+A bare metal Windows installation does not display a performance loss after the update. See https://heiko-sieger.info/low-2d-graphics-benchmark-with-windows-10-1803-kvm-vm/
+
+Similar reports can be found here:
+https://www.reddit.com/r/VFIO/comments/97unx4/passmark_lousy_2d_graphics_performance_on_windows/
+
+Hardware:
+
+6 core Intel Core i7-3930K (-MT-MCP-)
+
+Host OS:
+Linux Mint 19/Ubuntu 18.04
+Kernel: 4.15.0-32-generic x86_64
+Qemu: QEMU emulator version 2.11.1
+Intel microcode (host): 0x714
+dmesg | grep microcode
+[    0.000000] microcode: microcode updated early to revision 0x714, date = 2018-05-08
+[    2.810683] microcode: sig=0x206d7, pf=0x4, revision=0x714
+[    2.813340] microcode: Microcode Update Driver: v2.2.
+
+Note: I manually updated the Intel microcode on the host from 0x713 to 0x714. However, both microcode versions produce the same result in the Windows guest.
+
+Guest OS:
+Windows 10 Pro 64 bit, release 1803
+
+
+
+QEMU is already capable of exposing the new CPU features to guests, so possibly a mis-configuration. Please provide the full QEMU command line args you are using for this guest too.
+
+Thanks for the reply. I understand that the CPU features are exposed. However, is the host-side Intel microcode exposed to the guest?
+
+Here is my qemu command:
+
+qemu-system-x86_64 \
+  -runas user \
+  -monitor stdio \
+  -serial none \
+  -parallel none \
+  -nodefaults \
+  -nodefconfig \
+  -name $vmname,process=$vmname \
+  -machine q35,accel=kvm,kernel_irqchip=on \
+-cpu host,kvm=off,hv_vendor_id=1234567890ab,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff \
+  -smp 12,sockets=1,cores=6,threads=2 \
+  -m 16G \
+  -mem-path /dev/hugepages \
+  -mem-prealloc \
+  -balloon none \
+  -rtc base=localtime,clock=host \
+  -vga none \
+  -nographic \
+  -soundhw hda \
+  -device vfio-pci,host=02:00.0,multifunction=on \
+  -device vfio-pci,host=02:00.1 \
+  -device vfio-pci,host=00:1a.0 \
+  -device vfio-pci,host=08:00.0 \
+  -drive if=pflash,format=raw,readonly,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=/tmp/my_vars.fd \
+  -boot order=c \
+  -drive id=disk0,if=virtio,cache=none,format=raw,aio=native,discard=unmap,detect-zeroes=unmap,file=/dev/mapper/lm13-win10 \
+  -drive id=disk1,if=virtio,cache=none,format=raw,aio=native,file=/dev/mapper/photos-photo_stripe \
+  -drive id=disk2,if=virtio,cache=none,format=raw,aio=native,file=/dev/mapper/media-photo_raw \
+  -netdev type=tap,id=net0,ifname=vmtap0,vhost=on \
+  -device virtio-net-pci,netdev=net0,mac=00:16:3e:00:01:01
+
+
+By the way, the same 2D performance drop happens when I run the VM as root.
+
+
+You're mis-understanding how microcode works a little. Microcode is loaded into physical CPUs in the host. This affects everything that runs on these CPUs thereafter. A KVM guest is merely a process running on the host CPUs, so it is affected by the updated microcode. There is no notion of the virtual CPUs having a different microcode.
+
+The doc you pointed to above
+
+https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/CVE-2017-5715-and-hyper-v-vms
+
+indicates that you must install the microcode in the host, which enables new CPUs features. These features should then be exposed to the guest. 
+
+You say you've installed the microcode which is good, but did you also update the kernel ?
+
+Host kernel updates were required in order for KVM to be able to expose the new features from the microcode, to the guest. Essentially if your guest kernel shows  "pti ssbd ibrs ibpb stibp"  features as present, then thanks to your "-cpu host" usage, the guest should see them too.
+
+
+
+Thanks for your explanations - I thought so too.
+
+The new Intel microcode is applied, as you can see:
+dmesg | grep microcode
+[ 0.000000] microcode: microcode updated early to revision 0x714, date = 2018-05-08
+[ 2.810683] microcode: sig=0x206d7, pf=0x4, revision=0x714
+[ 2.813340] microcode: Microcode Update Driver: v2.2.
+
+The host kernel has the features you listed:
+cat /proc/cpuinfo | grep flags
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx lahf_lm epb pti ssbd ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid xsaveopt dtherm ida arat pln pts flush_l1d
+
+I'm still looking for a way to display the CPU flags under Windows.
+
+Here is my systeminfo (Windows) output:
+
+ systeminfo
+
+Host Name:                 DESKTOP-K3DEAH0
+OS Name:                   Microsoft Windows 10 Pro
+OS Version:                10.0.17134 N/A Build 17134
+OS Manufacturer:           Microsoft Corporation
+OS Configuration:          Standalone Workstation
+OS Build Type:             Multiprocessor Free
+Registered Owner:          win
+Registered Organization:
+Product ID:                00330-80000-00000-AA554
+Original Install Date:     05-Jun-18, 22:58:49
+System Boot Time:          25-Aug-18, 00:17:19
+System Manufacturer:       QEMU
+System Model:              Standard PC (Q35 + ICH9, 2009)
+System Type:               x64-based PC
+Processor(s):              1 Processor(s) Installed.
+                           [01]: Intel64 Family 6 Model 45 Stepping 7 GenuineIntel ~3200 Mhz
+BIOS Version:              EFI Development Kit II / OVMF 0.0.0, 06-Feb-15
+Windows Directory:         C:\WINDOWS
+System Directory:          C:\WINDOWS\system32
+Boot Device:               \Device\HarddiskVolume2
+System Locale:             en-us;English (United States)
+Input Locale:              en-us;English (United States)
+Time Zone:                 (UTC+02:00) Jerusalem
+Total Physical Memory:     16,380 MB
+Available Physical Memory: 12,955 MB
+Virtual Memory: Max Size:  17,380 MB
+Virtual Memory: Available: 13,233 MB
+Virtual Memory: In Use:    4,147 MB
+Page File Location(s):     C:\pagefile.sys
+Domain:                    WORKGROUP
+Logon Server:              \\DESKTOP-K3DEAH0
+Hotfix(s):                 4 Hotfix(s) Installed.
+                           [01]: KB4338832
+                           [02]: KB4343669
+                           [03]: KB4343902
+                           [04]: KB4343909
+Network Card(s):           1 NIC(s) Installed.
+                           [01]: Red Hat VirtIO Ethernet Adapter
+                                 Connection Name: Ethernet 6
+                                 DHCP Enabled:    No
+                                 IP address(es)
+                                 [01]: 192.168.0.200
+Hyper-V Requirements:      A hypervisor has been detected. Features required for Hyper-V will not be displayed.
+
+Daniel Berrange: ...Essentially if your guest kernel shows "pti ssbd ibrs ibpb stibp" features as present, then thanks to your "-cpu host" usage, the guest should see them too.
+
+1. I changed my qemu start script and added +vmx:
+-cpu host,kvm=off,hv_vendor_id=1234567890ab,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff,+vmx \
+
+2. I installed cygwin on the Windows guest and ran cat /proc/cpuinfo. Here the output:
+
+processor       : 11
+vendor_id       : GenuineIntel
+cpu family      : 6
+model           : 45
+model name      : Intel(R) Core(TM) i7-3930K CPU @ 3.20GHz
+stepping        : 7
+cpu MHz         : 3200.000
+cache size      : 4096 KB
+physical id     : 0
+siblings        : 12
+core id         : 5
+cpu cores       : 6
+apicid          : 11
+initial apicid  : 11
+fpu             : yes
+fpu_exception   : yes
+cpuid level     : 13
+wp              : yes
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht pni vmx ssse3 cx16 sse4_1 sse4_2 x2apic popcnt aes xsave osxsave avx hypervisor lahf_lm arat xsaveopt tsc_adjust
+clflush size    : 64
+cache_alignment : 64
+address sizes   : 40 bits physical, 48 bits virtual
+power management:
+
+The flags  "pti ssbd ibrs ibpb stibp" are not listed! How do I pass these flags/features to the Windows guest?
+
+For comparison, here the Linux/host cat /proc/cpuinfo (partial):
+
+processor	: 11
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 45
+model name	: Intel(R) Core(TM) i7-3930K CPU @ 3.20GHz
+stepping	: 7
+microcode	: 0x714
+cpu MHz		: 4200.015
+cache size	: 12288 KB
+physical id	: 0
+siblings	: 12
+core id		: 5
+cpu cores	: 6
+apicid		: 11
+initial apicid	: 11
+fpu		: yes
+fpu_exception	: yes
+cpuid level	: 13
+wp		: yes
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf pni pclmulqdq dtes64 monitor ds_cpl vmx est tm2 ssse3 cx16 xtpr pdcm pcid dca sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx lahf_lm epb pti ssbd ibrs ibpb stibp tpr_shadow vnmi flexpriority ept vpid xsaveopt dtherm ida arat pln pts flush_l1d
+bugs		: cpu_meltdown spectre_v1 spectre_v2 spec_store_bypass l1tf
+bogomips	: 6399.97
+clflush size	: 64
+cache_alignment	: 64
+address sizes	: 46 bits physical, 48 bits virtual
+power management:
+
+
+I'm not convinced we can trust the output from cygwin wrt CPU flags.  A better test would be to install a modern Linux guest which has the mitigations, and see if that reports the flags.
+
+
+Thanks, I will do that tomorrow and report back.
+
+Whew, after some hurdles I managed to install a Linux Mint 19 guest (Ubuntu 18.04). After all updates, here the output:
+
+$ dmesg | grep microcode
+[    0.036780] core: PEBS disabled due to CPU errata, please upgrade microcode
+
+So the microcode in the guest is not loaded! But see below:
+
+$ cat /proc/cpuinfo | grep flags
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology cpuid pni pclmulqdq vmx ssse3 cx16 pcid sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx hypervisor lahf_lm cpuid_fault pti ssbd ibrs ibpb tpr_shadow vnmi flexpriority ept vpid tsc_adjust xsaveopt arat
+
+Here is the qemu command I use for this Linux guest (it is almost identical to the Windows 10 VM command):
+
+qemu-system-x86_64 \
+  -runas user \
+  -monitor stdio \
+  -serial none \
+  -parallel none \
+  -nodefaults \
+  -nodefconfig \
+  -name $vmname,process=$vmname \
+  -machine q35,accel=kvm,kernel_irqchip=on \
+-cpu host,kvm=off,hv_vendor_id=1234567890ab,hv_vapic,hv_time,hv_relaxed,hv_spinlocks=0x1fff \
+  -smp 6,sockets=1,cores=3,threads=2 \
+  -m 16G \
+  -mem-path /dev/hugepages \
+  -mem-prealloc \
+  -balloon none \
+  -rtc base=localtime,clock=host \
+  -vga none \
+  -nographic \
+  -soundhw hda \
+  -device vfio-pci,host=02:00.0,multifunction=on \
+  -device vfio-pci,host=02:00.1 \
+  -device vfio-pci,host=00:1a.0 \
+  -device vfio-pci,host=08:00.0 \
+  -drive if=pflash,format=raw,readonly,file=/usr/share/OVMF/OVMF_CODE.fd \
+  -drive if=pflash,format=raw,file=/tmp/my_vars.fd \
+  -boot order=c \
+  -drive id=disk0,if=virtio,cache=none,format=raw,file=/home/user/win.img \
+  -netdev type=tap,id=net0,ifname=vmtap0,vhost=on \
+  -device virtio-net-pci,netdev=net0,mac=00:16:3e:00:01:01
+
+
+Kernel: 4.15.0-33-generic x86_64
+
+$ grep microcode /proc/cpuinfo
+microcode	: 0x1
+microcode	: 0x1
+microcode	: 0x1
+microcode	: 0x1
+microcode	: 0x1
+microcode	: 0x1
+
+In essence:
+The microcode is NOT loaded in the Linux VM. However, the following feature flags are listed: "pti ssbd ibrs ibpb". The "stibp" flag is missing.
+
+Hope this helps.
+
+Downloaded and ran the spectre-meltdown-checker.sh
+
+$ spectre-meltdown-checker.sh 
+Spectre and Meltdown mitigation detection tool v0.39+
+
+Checking for vulnerabilities on current system
+Kernel is Linux 4.15.0-33-generic #36-Ubuntu SMP Wed Aug 15 16:00:05 UTC 2018 x86_64
+CPU is Intel(R) Core(TM) i7-3930K CPU @ 3.20GHz
+
+Hardware check
+* Hardware support (CPU microcode) for mitigation techniques
+  * Indirect Branch Restricted Speculation (IBRS)
+    * SPEC_CTRL MSR is available:  YES 
+    * CPU indicates IBRS capability:  YES  (SPEC_CTRL feature bit)
+  * Indirect Branch Prediction Barrier (IBPB)
+    * PRED_CMD MSR is available:  YES 
+    * CPU indicates IBPB capability:  YES  (SPEC_CTRL feature bit)
+  * Single Thread Indirect Branch Predictors (STIBP)
+    * SPEC_CTRL MSR is available:  YES 
+    * CPU indicates STIBP capability:  NO 
+  * Speculative Store Bypass Disable (SSBD)
+    * CPU indicates SSBD capability:  YES  (Intel SSBD)
+  * L1 data cache invalidation
+    * FLUSH_CMD MSR is available:  YES 
+  * Enhanced IBRS (IBRS_ALL)
+    * CPU indicates ARCH_CAPABILITIES MSR availability:  NO 
+    * ARCH_CAPABILITIES MSR advertises IBRS_ALL capability:  NO 
+  * CPU explicitly indicates not being vulnerable to Meltdown (RDCL_NO):  NO 
+  * CPU explicitly indicates not being vulnerable to Variant 4 (SSB_NO):  NO 
+  * Hypervisor indicates host CPU might be vulnerable to RSB underflow (RSBA):  NO 
+  * CPU microcode is known to cause stability problems:  NO  (model 0x2d family 0x6 stepping 0x7 ucode 0x1 cpuid 0x206d7)
+  * CPU microcode is the latest known available version:  NO  (latest known version is 0x714 according to Intel Microcode Guidance, August 8 2018)
+* CPU vulnerability to the speculative execution attack variants
+  * Vulnerable to Variant 1:  YES 
+  * Vulnerable to Variant 2:  YES 
+  * Vulnerable to Variant 3:  YES 
+  * Vulnerable to Variant 3a:  YES 
+  * Vulnerable to Variant 4:  YES 
+  * Vulnerable to Variant l1tf:  YES 
+
+CVE-2017-5753 [bounds check bypass] aka 'Spectre Variant 1'
+* Mitigated according to the /sys interface:  YES  (Mitigation: __user pointer sanitization)
+* Kernel has array_index_mask_nospec:  YES  (1 occurrence(s) found of x86 64 bits array_index_mask_nospec())
+* Kernel has the Red Hat/Ubuntu patch:  NO 
+* Kernel has mask_nospec64 (arm64):  NO 
+> STATUS:  NOT VULNERABLE  (Mitigation: __user pointer sanitization)
+
+CVE-2017-5715 [branch target injection] aka 'Spectre Variant 2'
+* Mitigated according to the /sys interface:  YES  (Mitigation: Full generic retpoline, IBPB, IBRS_FW)
+* Mitigation 1
+  * Kernel is compiled with IBRS support:  YES 
+    * IBRS enabled and active:  YES  (for kernel and firmware code)
+  * Kernel is compiled with IBPB support:  YES 
+    * IBPB enabled and active:  YES 
+* Mitigation 2
+  * Kernel has branch predictor hardening (arm):  NO 
+  * Kernel compiled with retpoline option:  YES 
+    * Kernel compiled with a retpoline-aware compiler:  YES  (kernel reports full retpoline compilation)
+> STATUS:  NOT VULNERABLE  (Full retpoline + IBPB are mitigating the vulnerability)
+
+CVE-2017-5754 [rogue data cache load] aka 'Meltdown' aka 'Variant 3'
+* Mitigated according to the /sys interface:  YES  (Mitigation: PTI)
+* Kernel supports Page Table Isolation (PTI):  YES 
+  * PTI enabled and active:  YES 
+  * Reduced performance impact of PTI:  YES  (CPU supports PCID, performance impact of PTI will be reduced)
+* Running as a Xen PV DomU:  NO 
+> STATUS:  NOT VULNERABLE  (Mitigation: PTI)
+
+CVE-2018-3640 [rogue system register read] aka 'Variant 3a'
+* CPU microcode mitigates the vulnerability:  YES 
+> STATUS:  NOT VULNERABLE  (your CPU microcode mitigates the vulnerability)
+
+CVE-2018-3639 [speculative store bypass] aka 'Variant 4'
+* Mitigated according to the /sys interface:  YES  (Mitigation: Speculative Store Bypass disabled via prctl and seccomp)
+* Kernel supports speculation store bypass:  YES  (found in /proc/self/status)
+> STATUS:  NOT VULNERABLE  (Mitigation: Speculative Store Bypass disabled via prctl and seccomp)
+
+CVE-2018-3615/3620/3646 [L1 terminal fault] aka 'Foreshadow & Foreshadow-NG'
+* Mitigated according to the /sys interface:  YES  (Mitigation: PTE Inversion; VMX: conditional cache flushes, SMT vulnerable)
+> STATUS:  NOT VULNERABLE  (Mitigation: PTE Inversion; VMX: conditional cache flushes, SMT vulnerable)
+
+
+
+It shows that the microcode is not updated, and reports vulnerability.
+
+If I understand correctly, the Linux VM should not install the microcode, but report the microcode features of the host.
+
+     * CPU indicates STIBP capability:  NO
+
+Obviously stibp is not passed to the guest.
+
+Is there any other/better way to pass the host cpu capabilities to the VM?
+
+
+> Whew, after some hurdles I managed to install a Linux Mint 19 guest (Ubuntu 18.04). After all updates, here the output:
+>
+> $ dmesg | grep microcode
+> [ 0.036780] core: PEBS disabled due to CPU errata, please upgrade microcode
+>
+> So the microcode in the guest is not loaded! But see below:
+
+As mentioned earlier there is no concept of loading microcode in the guest. Once it is loaded in the host it applies to everything running on that host.
+
+This message appears to be caused by fact that we do not expose the current microcode version to the guest, so the guest always sees 0x1 as the microcode version, causing this PEBS check to fail. I don't think this is related to the meltdown/spectre fixes - you'd likely get that error message even on older systems before meltdown/spectre
+
+> $ cat /proc/cpuinfo | grep flags
+> flags : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc arch_perfmon rep_good nopl xtopology cpuid pni pclmulqdq vmx ssse3 cx16 pcid sse4_1 sse4_2 x2apic popcnt tsc_deadline_timer aes xsave avx hypervisor lahf_lm cpuid_fault pti ssbd ibrs ibpb tpr_shadow vnmi flexpriority ept vpid tsc_adjust xsaveopt arat
+
+This looks correct - the guest has seen the ssbd, ibrs, ibpb features as required.
+
+> The microcode is NOT loaded in the Linux VM. However, the following feature flags are listed: "pti > ssbd ibrs ibpb". The "stibp" flag is missing.
+
+The "stipb" flag is not relevant to guests, it is only needed by the hypervisor, so it is to be expected that the guest doesn't see it.
+
+Everything seen from this Linux guest says that QEMU / KVM is doing the right thing and the guest has the features needed to mitigate Spectre/Meltdown.
+
+The possibilities left are that either your Windows guest is lacking software updates that could perhaps improve its performance, or that 2D graphics really is that awful in combination with spectre/meltdown fixes. 
+
+>The possibilities left are that either your Windows guest is lacking software updates that could perhaps improve its performance, or that 2D graphics really is that awful in combination with spectre/meltdown fixes.
+
+Thanks Daniel. There are two problems with this explanation:
+
+1. A native "bare metal" Windows 10 (1803) installation with all updates applied does NOT have any 2D performance problems. See my attachment (benchmarks) in the original post.
+
+2. Both the Windows VM and the Linux VM do not see the microcode (version?), and therefore do not know about the Spectre vulnerability mitigation in the host kernel. However, the Microsoft document https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/CVE-2017-5715-and-hyper-v-vms suggests that Microsoft Hyper-V can be configured to expose new processor capabilities to guest virtual machines, specifically the ones made available through the microcode updates. Here a quote from the above Microsoft website:
+"Firmware updates from your OEM may contain new processor capabilities that can be used to protect against CVE-2017-5715 (IBRS, STIBP, IBPB). Once the virtualization host's firmware has been updated, the hypervisor can make these additional capabilities available to guest virtual machines after taking the following steps."
+
+The ideal behavior of qemu/kvm would be to expose the microcode capabilities to the guest (I suppose this happens partially as seen by the presence of the "pti  ssbd ibrs ibpb" flags), but obviously something is missing.
+
+But the real important question is this:
+In the above scenario, are the VMs protected from Spectre vulnerabilities, simply by having the microcode installed in the host? Even when I disable the Spectre protection inside the Windows VM?
+
+There is always a performance differential between bare metal & VMs. The actual amount varies depending on alot of different factors and meltdown/spectre have had an effect here - the actual perf hit depends on the CPU models & virtual hardware and more besides - ranging anywhere from 0% to 40% perf hit
+
+The guest VM *does* know about the Spectre mitigation because it is being given the "ibrs" feature which is sufficient for guest OS to mitigate the problem.  STIBP is only needed by the host.  Exposing microcode version to the guest is not required as OS should only need to look at the features provided to determine if it can mitigate the flaws. The complaints about microcode version from spectre-meltdown-checker.sh are a bug in that script. The important parts are the "STATUS: NOT VULNERABLE" lines
+
+If you disable Spectre protection in the Windows VM, then it is not protected from Spectre. The hypervisor protects itself, and exposes the CPU feature(s) that enable the guest to activate its own protection. The hypervisor won't protect the guest directly - it just gives it the tools needed to protect itself.
+
+> If you disable Spectre protection in the Windows VM, then it is not protected from Spectre. The hypervisor protects itself, and exposes the CPU feature(s) that enable the guest to activate its own protection. The hypervisor won't protect the guest directly - it just gives it the tools needed to protect itself.
+
+Thanks for the indepth explanation. In other words, Spectre protection inside the Windows VM needs to be enabled to work.
+
+The only problem is that Windows (or a Linux VM for that matter) either
+1. does not recognize some CPU features (as introduced by the microcode on the host);
+2. uses code to mitigate the Spectre vulnerability that doesn't work well inside a VM.
+
+Since I have a comparison versus Windows bare metal with Spectre protection enabled, there might be something that needs improving in the hypervisor.
+
+In any case, Spectre protection has to be enabled in the Windows VM to be effective, which is a real bummer considering the performance penalty.
+
+Any chance someone can look into the why there is this performance hit ONLY inside the qemu-kvm VM? Maybe there is a solution to it.
+
+I find it interesting this is a slow down with PCI passthrough - that's pretty much the case you'd expect there to be least change; it shouldn't be generating lots of vm exit's for example which you'd expect could have been made slower by the recent security changes.
+
+I suppose one thing you could try is profiling on the host to see if more time is spent in the host kernel or qemu when running the 2d tests with the new vs older windows;  if it points to some particular hot spot there then perhaps it might be possible to understand why.
+
+
+Here is another person confirming the bug, with a little more details:
+
+https://bugzilla.kernel.org/show_bug.cgi?id=200877#c2
+
+Sorry for reporting the bug twice, but it is unclear to me whose going to take action.
+
+I don't have the nvidia for pass through to try this with; but I suggest that you try the following:
+
+  a) Start a windows vm running an older version unaffected by the bug and start a 2d test 
+  b) run 'perf top' on the host while the test is running and capture the results
+     - make sure you have debug symbols for both qemu (and related libraries) and the kernel 
+  c) now repeat a/b for the newer version of windows that's affected
+
+add the results of the 'perf top' to this bug; hopefully we'll be able to see qemu or the kernel spending a lot more time in some particular routine in the new version.
+
+I won’t be able to run any tests for the next 16 days at the very least, as I’m traveling.
+
+
+
+> On 5 Sep 2018, at 13:21, Dr. David Alan Gilbert <email address hidden> wrote:
+> 
+> I don't have the nvidia for pass through to try this with; but I suggest
+> that you try the following:
+> 
+>  a) Start a windows vm running an older version unaffected by the bug and start a 2d test 
+>  b) run 'perf top' on the host while the test is running and capture the results
+>     - make sure you have debug symbols for both qemu (and related libraries) and the kernel 
+>  c) now repeat a/b for the newer version of windows that's affected
+> 
+> add the results of the 'perf top' to this bug; hopefully we'll be able
+> to see qemu or the kernel spending a lot more time in some particular
+> routine in the new version.
+> 
+> -- 
+> You received this bug notification because you are subscribed to the bug
+> report.
+> https://bugs.launchpad.net/bugs/1788665
+> 
+> Title:
+>  Low 2D graphics performance with Windows 10 (1803) VGA passthrough VM
+>  using "Spectre" protection
+> 
+> Status in QEMU:
+>  New
+> 
+> Bug description:
+>  Windows 10 (1803) VM using VGA passthrough via qemu script.
+> 
+>  After upgrading Windows 10 Pro VM to version 1803, or possibly after
+>  applying the March/April security updates from Microsoft, the VM would
+>  show low 2D graphics performance (sluggishness in 2D applications and
+>  low Passmark results).
+> 
+>  Turning off Spectre vulnerability protection in Windows remedies the
+>  issue.
+> 
+>  Expected behavior:
+>  qemu/kvm hypervisor to expose firmware capabilities of host to guest OS - see https://docs.microsoft.com/en-us/virtualization/hyper-v-on-windows/CVE-2017-5715-and-hyper-v-vms
+> 
+>  Background:
+> 
+>  Starting in March or April Microsoft began to push driver updates in
+>  their updates / security updates. See https://support.microsoft.com
+>  /en-us/help/4073757/protect-your-windows-devices-against-spectre-
+>  meltdown
+> 
+>  One update concerns the Intel microcode - see
+>  https://support.microsoft.com/en-us/help/4100347. It is activated by
+>  default within Windows.
+> 
+>  Once the updates are applied within the Windows guest, 2D graphics
+>  performance drops significantly. Other performance benchmarks are not
+>  affected.
+> 
+>  A bare metal Windows installation does not display a performance loss
+>  after the update. See https://heiko-sieger.info/low-2d-graphics-
+>  benchmark-with-windows-10-1803-kvm-vm/
+> 
+>  Similar reports can be found here:
+>  https://www.reddit.com/r/VFIO/comments/97unx4/passmark_lousy_2d_graphics_performance_on_windows/
+> 
+>  Hardware:
+> 
+>  6 core Intel Core i7-3930K (-MT-MCP-)
+> 
+>  Host OS:
+>  Linux Mint 19/Ubuntu 18.04
+>  Kernel: 4.15.0-32-generic x86_64
+>  Qemu: QEMU emulator version 2.11.1
+>  Intel microcode (host): 0x714
+>  dmesg | grep microcode
+>  [    0.000000] microcode: microcode updated early to revision 0x714, date = 2018-05-08
+>  [    2.810683] microcode: sig=0x206d7, pf=0x4, revision=0x714
+>  [    2.813340] microcode: Microcode Update Driver: v2.2.
+> 
+>  Note: I manually updated the Intel microcode on the host from 0x713 to
+>  0x714. However, both microcode versions produce the same result in the
+>  Windows guest.
+> 
+>  Guest OS:
+>  Windows 10 Pro 64 bit, release 1803
+> 
+> To manage notifications about this bug go to:
+> https://bugs.launchpad.net/qemu/+bug/1788665/+subscriptions
+
+
+
+Hello All,
+
+I can reproduce this on two different systems with Ivy-Bridge CPUs:
+Xeon E5 2667v2 / X9SRA running Fedora 28, with Windows 10 1803 as KVM guest
+Xeon E3 1270v2 / X9SCM running Archlinux, with Windows 10 1803 as KVM guest
+
+The performance degradation doesn't occur when the Windows 10 guest disables the spectre mitigation using "InSpectre.exe", or when the spec-ctrl flag is disabled in libvirt, or when the cpu-microcode isn't updated in the host.
+
+I followed the latest suggestion, and enabled "--enable-debug" in qemu-3.0 and also compiled kernel-4.17.19 with CONFIG_DEBUG_INFO=y. However I cannot see any differences while running "perf top" in the host between the affected/unaffected version of windows. CPU usage seems to be the same.
+
+Any hints would be greatly appreciated.
+
+Best,
+George
+
+I did a git-bisect between 4.14.18(bad) and 4.14.10(good). Unsurprisingly, this is the first "bad" commit:
+
+  KVM/VMX: Allow direct access to MSR_IA32_SPEC_CTRL
+
+  commit d28b387fb74da95d69d2615732f50cceb38e9a4d
+
+
+George
+
+George: Can you confirm how your graphics is setup; the original reporter had an Nvidia card with PCI passthrough; is yours the same?
+
+Yes, it's an Nvidia GTX 1060 6GB with PCI passthrough to a Windows 1803 KVM guest. As far as I can tell my setup is very similar to Heiko's, only I am using libvirt, not qemu directly.
+
+It seems that this "bug" affects only 2D-performance mediated through GDI in Windows (CPU-, not GPU-driven). There have been reports that GDI switches a lot between user/kernel space. 
+
+Are vmexits triggered when the guest switches from user- to kernel-space? Could this be subsequently causing IRBS swaps and degradation of performance? Then again, "perf kvm --host stat live" doesn't report an increase in vmexits.
+
+It would be interesting to know whether this behavior persists under other hypervisors (ESXi or Windows Server 2016).
+
+I don't think we should see a vmexit on a guest user<->kernel switch.
+
+You could try a kvm trace:
+
+trace-cmd record -b 20000 -e kvm
+
+run your test, then ctrl-c
+then
+
+trace-cmd report
+
+and you can see all the reasons for exit and see if there are any major differences.
+
+Yes, it would be good to know if it happened under other hypervisors; although this one is tricky since it's Windows guest with nvidia closed drivers, so it's a bit tricky to know what's going on.
+
+David, your suggestion seemed helpful, at least there is a difference in the pattern of vmentries and vmexits. See the snapshot attached.
+
+Explanation of snapshot_1:
+Two windows of kernelshark with trace.dats obtained using the command from above; the left window (trace.dat) is with spec-ctrl feature disabled, the right window with spec-ctrl enabled (default).
+CPU9 runs the emulator (emulatorpin), and the spikes seen are kvm_set_irq every 16ms. CPUs 2-7 and 19-15 run the vcpu threads.
+Halfway through the trace in the snapshot the test begins (passmark 2d image rendering). The VM without spec-ctrl triggers vmentries/vmexits much more often than the VM with spec-ctrl. I could not spot a difference in the pattern of the vmentries/vmexits themselves (snapshot_2 below), only their frequency seems to differ.
+
+Does anybody have an idea of what is going on?
+
+George
+
+snapshot_2 showing the pattern of vmentries/vmexits from the previous comment ("zoom-in").
+
+Have we got this the right way around????
+So you're saying the one with spec-ctrl disabled is faster, but has a lot more kvm-exits?
+
+Just to be sure, I repeated it, with the same result. I have the impression that it might be the time spent between a vmentry and a vmexit that matters in the CPU performance of the guest. I am no expert though. 
+
+This is what I am seeing in the graphs: 
+vmentry----interval A(s)----vmexit----interval B(s)----vmentry....
+"interval A" seems to be constant, whereas "interval B" seems to be shorter in the VM without spec-ctrl. This would mean that the CPU performs a vmentry much quicker than in the VM with spec-ctrl enabled. I cannot see why though.
+
+I uploaded the traces here: 
+https://drive.google.com/open?id=1_2T79_bvLUX-o12XtPRnDQf_nlH7a2tF
+
+I also tried to give ESXi a try. VMware lets me download only 6.7 from their site. Although I have a workstation motherboard (Supermicro X9SRA), it won't let me start a VM with IOMMU enabled, it complains about failing to register the passthrough GPU.
+
+It doesn't surprise me too much that the time spent on the host between exit&entry is higher on a host dealing with spec-ctrl;  but I wouldn't really expect it to change depending on the guests settings.
+
+The QEMU project is currently considering to move its bug tracking to another system. For this we need to know which bugs are still valid and which could be closed already. Thus we are setting older bugs to "Incomplete" now.
+If you still think this bug report here is valid, then please switch the state back to "New" within the next 60 days, otherwise this report will be marked as "Expired". Or mark it as "Fix Released" if the problem has been solved with a newer version of QEMU already. Thank you and sorry for the inconvenience.
+
+I've switched hosts so I would have to run a series of tests to compare.
+
+There are a number of new variables:
+
+1. Windows 10 release (I'm now on Windows 2004)
+2. My host OS is now Manjaro
+3. CPU is now AMD Ryzen 3900X (before it was Intel 3930k)
+4. Kernel is 5.8.18-1-MANJARO
+5. qemu 5.1.0
+6. libvirt 6.5.0
+7. New VM configuration using virt-manager/libvirt with EPYC-IBPB model instead of host-passthrough, instead of a qemu bash script to launch the VM.
+
+Time permitting, I plan to replace Manjaro for a Ubuntu 20.04 based distro. But this will not happen in the very near future.
+
+In the meantime I will do some a/b tests with spectre protection under Windows enabled/disabled to see if it is still an issue.
+
+[Expired for QEMU because there has been no activity for 60 days.]
+

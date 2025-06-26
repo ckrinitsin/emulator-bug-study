@@ -4,6 +4,7 @@ mkShell {
   buildInputs = [
     python312Packages.transformers
     python312Packages.torch
+    python312Packages.ollama
   ];
   shellHook = ''
     # fixes libstdc++ issues and libgl.so issues

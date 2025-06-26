@@ -1,0 +1,89 @@
+
+sig-abort / coredump observed from aio_ctx_finalize
+
+Observing occasional sig-abort based on v5.2.0 (tag) of QEMU. The VMM is configured for Kata use case, launching with a nvdimm/pmem based rootfs, and a set of workloads which are heavily utilizing virtio-fs.
+
+Sample qemu-cmdline:
+/usr/bin/qemu-kata-system-x86_64
+-name sandbox-9dc314445bbb2cd02e6d30126ea8355a4f8acd36c866ea32171486931dc2b99c
+-uuid cd58d78d-ad44-4d26-9eab-66efab3fb23b
+-machine pc,accel=kvm,kernel_irqchip,nvdimm=on
+-cpu host,pmu=off
+-qmp unix:/run/vc/vm/9dc314445bbb2cd02e6d30126ea8355a4f8acd36c866ea32171486931dc2b99c/qmp.sock,server,nowait
+-m 2048M,slots=10,maxmem=386381M
+-device pci-bridge,bus=pci.0,id=pci-bridge-0,chassis_nr=1,shpc=on,addr=2,romfile=
+-device virtio-serial-pci,disable-modern=false,id=serial0,romfile=,max_ports=2
+-device virtconsole,chardev=charconsole0,id=console0
+-chardev socket,id=charconsole0,path=/run/vc/vm/9dc314445bbb2cd02e6d30126ea8355a4f8acd36c866ea32171486931dc2b99c/console.sock,server,nowait
+-device nvdimm,id=nv0,memdev=mem0
+-object memory-backend-file,id=mem0,mem-path=/usr/share/kata-containers/kata-containers.img,size=536870912
+-object rng-random,id=rng0,filename=/dev/urandom
+-device virtio-rng-pci,rng=rng0,romfile=
+-device vhost-vsock-pci,disable-modern=false,vhostfd=3,id=vsock-3054067214,guest-cid=3054067214,romfile=
+-chardev socket,id=char-770bb156466e8ed5,path=/run/vc/vm/9dc314445bbb2cd02e6d30126ea8355a4f8acd36c866ea32171486931dc2b99c/vhost-fs.sock
+-device vhost-user-fs-pci,chardev=char-770bb156466e8ed5,tag=kataShared,romfile=
+-netdev tap,id=network-0,vhost=on,vhostfds=4,fds=5
+-device driver=virtio-net-pci,netdev=network-0,mac=9e:ad:0c:d1:58:e0,disable-modern=false,mq=on,vectors=4,romfile=
+-rtc base=utc,driftfix=slew,clock=host
+-global kvm-pit.lost_tick_policy=discard
+-vga none
+-no-user-config
+-nodefaults
+-nographic
+--no-reboot
+-daemonize
+-object memory-backend-file,id=dimm1,size=2048M,mem-path=/dev/shm,share=on
+-numa node,memdev=dimm1
+-kernel /usr/share/kata-containers/vmlinuz
+-append tsc=reliable no_timer_check rcupdate.rcu_expedited=1 i8042.direct=1 i8042.dumbkbd=1 i8042.nopnp=1 i8042.noaux=1 noreplace-smp reboot=k console=hvc0 console=hvc1 cryptomgr.notests net.ifnames=0 pci=lastbus=0 root=/dev/pmem0p1 rootflags=dax,data=ordered,errors=remount-ro ro rootfstype=ext4 quiet systemd.show_status=false panic=1 nr_cpus=32 systemd.unit=kata-containers.target systemd.mask=systemd-networkd.service systemd.mask=systemd-networkd.socket
+-pidfile /run/vc/vm/9dc314445bbb2cd02e6d30126ea8355a4f8acd36c866ea32171486931dc2b99c/pid
+-smp 1,cores=1,threads=1,sockets=32,maxcpus=32
+
+From the core file I was able to obtain a backtrace:
+
+```
+(gdb) info thread
+  Id   Target Id         Frame
+  6    Thread 0x7f92feffd700 (LWP 14678) 0x00007f93b23a0a35 in pthread_cond_wait@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+  5    Thread 0x7f92fffff700 (LWP 13860) 0x00007f93b23a0a35 in pthread_cond_wait@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+  4    Thread 0x7f930dcff700 (LWP 13572) 0x00007f93b23a0a35 in pthread_cond_wait@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+  3    Thread 0x7f92ff7fe700 (LWP 14179) 0x00007f93b23a0a35 in pthread_cond_wait@@GLIBC_2.3.2 () from /lib64/libpthread.so.0
+  2    Thread 0x7f93aed03700 (LWP 13565) 0x00007f93b20bfd19 in syscall () from /lib64/libc.so.6
+* 1    Thread 0x7f93c718dcc0 (LWP 13564) 0x00007f93b1ffd3d7 in raise () from /lib64/libc.so.6
+(gdb) bt trace
+No symbol table is loaded.  Use the "file" command.
+(gdb) bt
+#0  0x00007f93b1ffd3d7 in raise () from /lib64/libc.so.6
+#1  0x00007f93b1ffeac8 in abort () from /lib64/libc.so.6
+#2  0x00007f93b1ff61a6 in __assert_fail_base () from /lib64/libc.so.6
+#3  0x00007f93b1ff6252 in __assert_fail () from /lib64/libc.so.6
+#4  0x00000000007c6955 in aio_ctx_finalize ()
+#5  0x00007f93c64223d1 in g_source_unref_internal () from /lib64/libglib-2.0.so.0
+#6  0x00007f93c64225f5 in g_source_iter_next () from /lib64/libglib-2.0.so.0
+#7  0x00007f93c642362d in g_main_context_unref () from /lib64/libglib-2.0.so.0
+#8  0x00007f93c6425628 in g_main_loop_unref () from /lib64/libglib-2.0.so.0
+#9  0x00000000006dbaa0 in iothread_instance_finalize ()
+#10 0x00000000006c01e9 in object_unref ()
+#11 0x00000000006be647 in object_property_del_child ()
+#12 0x000000000075ad79 in monitor_cleanup ()
+#13 0x0000000000630635 in qemu_cleanup ()
+#14 0x000000000040fed3 in main ()
+```
+
+I *think* we're hitting this assert: https://github.com/qemu/qemu/blob/master/util/async.c#L339 based on 
+```
+(gdb) up
+#4  0x00000000007c6955 in aio_ctx_finalize ()
+```
+
+The error is relatively infrequent, but a catastrophic core dump none the less.
+
+Please let me know if there's more I can pull from the core, or more info I can share to help facilitate debugging this error.
+
+Please install debuginfo and run "p *ctx" in GDB from the aio_ctx_finalize frame. That should show ctx->scheduled_coroutines, ctx->bh_slice_list, etc.
+
+Thanks to Stefan for the help -- IRL we debugged this to the following assert failure: 
+    assert(QSIMPLEQ_EMPTY(&ctx->bh_slice_list));
+
+This has been resolved upstream in https://github.com/qemu/qemu/commit/c81219a7dd36a815bd85beed9932fc973d4f5d51
+

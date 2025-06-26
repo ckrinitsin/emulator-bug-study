@@ -1,0 +1,99 @@
+<think>
+Okay, I need to fix a bug where, after disabling and enabling the display without changing the framebuffer, the screen remains blank. The user mentioned that this happens because of an optimization added by commit 3954ff10e06e, which skips setting the scanout if the framebuffer didn't change.
+
+So, let me look into how the current code works. From what I understand, the virtio-gpu driver is trying to optimize by skipping unnecessary operations when the framebuffer hasn't changed. But in this specific case, it's causing issues because the modeset isn't happening when it should.
+
+The user suggests adding a boolean flag called needs_modeset in the struct virtio_gpu_output. This flag will help determine if a modeset is required even if other conditions are met. 
+
+Looking at the code changes provided:
+
+1. **virtgpu_display.c**: The function `virtio_gpu_crtc_atomic_flush` is modified to check if a modeset is needed using `drm_atomic_crtc_needs_modeset()`. If it does, it sets `output->needs_modeset` to true.
+
+2. **virtgpu_drv.h**: A new boolean field `needs_modeset` is added to the struct `virtio_gpu_output`.
+
+3. **virtgpu_plane.c**: In the `plane_update` function, an additional condition checks if `output->needs_modeset` is true or if any of the source coordinates have changed. If so, it proceeds with updating and resets `needs_modeset` to false.
+
+So, the plan is:
+
+- When a modeset is needed during the CRTC's atomic flush, set `needs_modeset` to true.
+- During the plane update, if `needs_modeset` is true or any relevant parameters have changed, perform the necessary operations and reset the flag.
+
+This ensures that even if the framebuffer hasn't technically changed, a modeset will still occur when required, preventing the screen from staying blank.
+
+I should test this by simulating the disable/enable cycle. If the flag correctly triggers the modeset, the issue should be resolved.
+</think>
+
+To address the bug where the display remains blank after a disable/enable cycle without changing the framebuffer, we've introduced a `needs_modeset` boolean in the `virtio_gpu_output` structure. This ensures that a modeset is forced when necessary.
+
+**Fix:**
+
+```diff
+diff --git a/drivers/gpu/drm/virtio/virtgpu_display.c b/drivers/gpu/drm/virtio/virtgpu_display.c
+index af55b334be2f..35b5c80f5d85 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_display.c
++++ b/drivers/gpu/drm/virtio/virtgpu_display.c
+@@ -123,6 +123,17 @@ static int virtio_gpu_crtc_atomic_check(struct drm_crtc *crtc,
+ static void virtio_gpu_crtc_atomic_flush(struct drm_crtc *crtc,
+ 					 struct drm_crtc_state *old_state)
+ {
++	struct virtio_gpu_output *output = drm_crtc_to_virtio_gpu_output(crtc);
++
++	/*
++	 *virtio-gpu can't do modeset and plane update operations
++	 *independently. So the actual modeset happens in the
++	 *plane update callback, and here we just check whether
++	 *we must force the modeset.
++	 */
++	if (drm_atomic_crtc_needs_modeset(crtc->state)) {
++		output->needs_modeset = true;
++	}
+ }
+ 
+ static const struct drm_crtc_helper_funcs virtio_gpu_crtc_helper_funcs = {
+diff --git a/drivers/gpu/drm/virtio/virtgpu_drv.h b/drivers/gpu/drm/virtio/virtgpu_drv.h
+index 9ff9f4ac0522..4ab1b0ba2925 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_drv.h
++++ b/drivers/gpu/drm/virtio/virtgpu_drv.h
+@@ -138,6 +138,7 @@ struct virtio_gpu_output {
+ 	int cur_x;
+ 	int cur_y;
+ 	bool enabled;
++	bool needs_modeset;
+ };
+ #define drm_crtc_to_virtio_gpu_output(x) \
+ 	container_of(x, struct virtio_gpu_output, crtc)
+diff --git a/drivers/gpu/drm/virtio/virtgpu_plane.c b/drivers/gpu/drm/virtio/virtgpu_plane.c
+index 52d24179bcec..65757409d9ed 100644
+--- a/drivers/gpu/drm/virtio/virtgpu_plane.c
++++ b/drivers/gpu/drm/virtio/virtgpu_plane.c
+@@ -389,7 +389,8 @@ static void virtio_gpu_plane_update(struct drm_plane *plane,
+ 	if (new_state->src_x != old_state->src_x ||
+ 	    new_state->src_y != old_state->src_y ||
+ 	    new_state->dst_x != old_state->dst_x ||
+-	    new_state->dst_y != old_state->dst_y) {
++	    new_state->dst_y != old_state->dst_y ||
++	    output->needs_modeset) {
+ 		ret = virtio_gpu_update_plane(virtgpu, plane, new_state);
+ 
+ 		if (ret < 0)
+@@ -397,6 +398,7 @@ static void virtio_gpu_plane_update(struct drm_plane *plane,
+ 
+ 		output->last_width = new_state->width;
+ 		output->last_height = new_state->height;
++		output->needs_modeset = false;
+ 	}
+ }
+```
+
+**Explanation:**
+
+1. **Adding `needs_modeset` Flag:**
+   - A boolean field `needs_modeset` is added to the `virtio_gpu_output` struct in `virtgpu_drv.h`. This flag will be used to track whether a modeset is required.
+
+2. **Setting `needs_modeset` in `crtc_atomic_flush`:**
+   - In `virtgpu_display.c`, during the CRTC's atomic flush, we check if a modeset is needed using `drm_atomic_crtc_needs_modeset()`. If true, set `output->needs_modeset` to `true`.
+
+3. **Handling Modeset in Plane Update:**
+   - In `virtgpu_plane.c`, within the `plane_update` function, an additional condition checks if `output->needs_modeset` is `true` or if any of the source/destination coordinates have changed. If either condition is met, it proceeds to update the plane and resets `needs_modeset` to `false`.
+
+This ensures that a modeset is forced when necessary, preventing the screen from remaining blank after re-enabling without framebuffer changes.

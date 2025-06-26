@@ -1,0 +1,193 @@
+
+qemu-img convert qcow2 to raw fails on OS X
+
+I try to convert a image from qcow2 to raw and the result is a not bootable image.
+I dont know if it is a bug in qemu-img convert or with the image it self.
+
+See this error report for better readability:
+https://github.com/coreos/bugs/issues/1121#issuecomment-351968518
+
+As a reply here they use 2.9.0 version of 
+
+
+$ qemu-img -V
+qemu-img version 2.11.0
+Copyright (c) 2003-2017 Fabrice Bellard and the QEMU Project developers
+
+$ uname -v
+Darwin Kernel Version 17.2.0
+
+$ mount ./
+/dev/disk1s1 on / (apfs, local, journaled)
+
+$  wget https://beta.release.core-os.net/amd64-usr/current/coreos_production_openstack_image.img.bz2
+
+$ date
+Fri Dec 14 17:15:57 CET 2017
+
+$ bunzip2 coreos_production_openstack_image.img.bz2
+
+
+$ cp -a coreos_production_openstack_image.img.org coreos_production_openstack_image.img
+
+$ shasum coreos_production_openstack_image.img.org
+ae2119c6f0390dc36f247f7016923ea85de5d8e6  coreos_production_openstack_image.img.org
+
+$ qemu-img convert -f qcow2 -O raw coreos_production_openstack_image.img.org coreos_production_openstack_image.bin
+
+$ qemu-system-x86_64 -m 256 -nographic -hda coreos_production_openstack_image.img -boot c
+SeaBIOS (version rel-1.11.0-0-g63451fca13-prebuilt.qemu-project.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 C980 PCI2.10 PnP PMM+0FF915A0+0FEF15A0 C980
+                                                                               
+
+
+Booting from Hard Disk...
+GRUB loading....
+Welcome to GRUB!
+....
+
+$ qemu-system-x86_64 -m 256 -nographic -hda coreos_production_openstack_image.bin -boot c
+
+SeaBIOS (version rel-1.11.0-0-g63451fca13-prebuilt.qemu-project.org)
+
+
+iPXE (http://ipxe.org) 00:03.0 C980 PCI2.10 PnP PMM+0FF915A0+0FEF15A0 C980
+                                                                               
+
+
+Booting from Hard Disk...
+Boot failed: not a bootable disk
+....
+
+
+$ head -c 8192 coreos_production_openstack_image.bin | hexdump -C
+00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+00002000
+
+$ qemu-img info coreos_production_openstack_image.bin
+image: coreos_production_openstack_image.bin
+file format: raw
+virtual size: 8.5G (9116319744 bytes)
+disk size: 217M
+
+$ qemu-img info coreos_production_openstack_image.img
+image: coreos_production_openstack_image.img
+file format: qcow2
+virtual size: 8.5G (9116319744 bytes)
+disk size: 785M
+cluster_size: 65536
+Format specific information:
+    compat: 0.10
+    refcount bits: 16
+
+The same version works on Ubuntu so it looks like its only the Mac version or the new APFS filesystem.
+
+We've had APFS bugs before, if memory serves... perhaps something to do with sparse gap handling?
+
+Do you have the ability to take a "good" conversion of the qcow2 file (made on a non-APFS partition) and compare it against the "bad" conversion?
+
+Highlighting the differences might inspire some ideas as to where this has gone wrong, but at present I don't have an OSX computer to test this with, personally.
+
+
+I gave it a try here:
+http://termbin.com/ufv4
+
+Its only the first 4096 bytes.
+
+
+
+
+
+
+I tried to make a quick grep of the start of the disk in the "bad" raw image and it does not exist anywhere so there is more ot it then just a offset issue.
+
+rg -M 20 -a --encoding=ascii '\xeb\x63\x90\x00\x00\x00\x00\x00\x00\x00\x00\x00' coreos_production_openstack_image.bin.apfs
+or
+rg -M 20 -a --encoding=ascii 'GRUB \x00Geom\x00Hard Disk\x00Read\x00 Error' coreos_production_openstack_image.bin.apfs
+
+The actual data seams to start here:
+$ hexdump -C coreos_production_openstack_image.bin.apfs | head
+00000000  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+0cc4f000  48 8b 4c 24 58 48 89 4c  24 08 48 89 44 24 10 e8  |H.L$XH.L$.H.D$..|
+0cc4f010  3c a5 c5 ff 48 8b 44 24  18 48 8b 4c 24 20 48 8d  |<...H.D$.H.L$ H.|
+0cc4f020  15 9b e9 3f 00 48 39 c2  75 22 48 8b 44 24 48 48  |...?.H9.u"H.D$HH|
+0cc4f030  8b 00 48 89 44 24 10 48  89 0c 24 66 c7 44 24 08  |..H.D$.H..$f.D$.|
+0cc4f040  00 00 e8 c9 00 00 00 e9  70 ff ff ff 48 89 04 24  |........p...H..$|
+0cc4f050  48 89 54 24 08 48 8d 05  e4 cf 3e 00 48 89 44 24  |H.T$.H....>.H.D$|
+0cc4f060  10 e8 1a f1 bb ff 0f 0b  e8 a3 5a c0 ff e9 7e fe  |..........Z...~.|
+0cc4f070  ff ff cc cc cc cc cc cc  cc cc cc cc cc cc cc cc  |................|
+
+and ends here:
+261bf040  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|
+*
+21f600000
+
+There are som small small zones of zeroes here and there also but not much.
+
+And the file size seams small and wrong. 
+$ ls -lah coreos_production_openstack_image.bin.apfs
+
+$ du -hs coreos_production_openstack_image.bin.apfs
+ 16M	coreos_production_openstack_image.bin.apfs
+
+
+
+
+
+
+
+
+
+Adding "-S 0" on the APFS convert only makes the file 8.5Gb but its still "bad".
+
+
+The image apfs2 here is created with "-S 0"and the .bin is a working one generated on a ubuntu machine.
+
+Strange thing is that this say they are identical:
+$ time qemu-img compare -f qcow2 -F raw coreos_production_openstack_image.img.org coreos_production_openstack_image.bin.apfs
+Images are identical.
+
+real    0m0.078s
+user    0m0.016s
+sys     0m0.054s
+
+But these are not:
+$ time qemu-img compare -f qcow2 -F raw coreos_production_openstack_image.img.org coreos_production_openstack_image.bin.apfs2
+Content mismatch at offset 0!
+
+real    0m0.026s
+user    0m0.009s
+sys     0m0.010s
+
+But hese are identical :)
+$ diff coreos_production_openstack_image.bin.apfs coreos_production_openstack_image.bin.apfs2
+$ echo $?
+0
+
+And of cause these are not identical:
+$ diff coreos_production_openstack_image.bin coreos_production_openstack_image.bin.apfs2
+Binary files coreos_production_openstack_image.bin and coreos_production_openstack_image.bin.apfs2 differ
+
+$ diff coreos_production_openstack_image.bin coreos_production_openstack_image.bin.apfs
+Binary files coreos_production_openstack_image.bin and coreos_production_openstack_image.bin.apfs differ
+
+
+
+
+
+In the termbin:
+
+So the "good" one is on the left, and the "bad" one is on the right. The bad one is ... completely blank for the first 200+ MB? That's not great.
+
+so:
+.bin.apfs: broken raw file, made on apfs, no arguments(?)
+.bin.apfs2: broken raw file, made on apfs, `-S 0` ?
+.img.org: qcow2 file (original/working?)
+.bin: working raw file, made on Ubuntu?
+
+Do I have that right?
+

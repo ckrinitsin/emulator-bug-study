@@ -1,0 +1,69 @@
+
+Parallel builds fail (make -j >=2) when using --extra-cflags "--save-temps"
+
+specs:
+Host kernel: Linux 4.19.16-1-lts
+Host type: x86_64 GNU/Linux
+Host distro: Archlinux
+Guest: we never get that far
+QEMU commit: 9f33051abce238ab43a23125e237aac8b0931b88
+
+
+steps:
+# fresh copy of the latest commit
+> git clone https://git.qemu.org/git/qemu.git
+
+# separate build dir
+> mkdir build
+> cd build
+
+# sample configuration for riscv (this happens for other targets as well)
+> ../qemu/configure --target-list=riscv64-softmmu --enable-debug --extra-cflags='-O0 -g3 -save-temps' --prefix=/install/riscv-qemu
+
+# this will fail (see attached log file)
+> make -j 2
+
+
+
+It seems the --save-temps is what breaks things for me, the following works:
+
+  ../qemu.git/configure --target-list=riscv64-softmmu --enable-debug --extra-cflags="-O0 -g3" && make -j9
+
+rm -rf and start again with:
+
+  ../qemu.git/configure --target-list=riscv64-softmmu --enable-debug --extra-cflags="-O0 -g3 --save-temps"
+
+falls over with lines like:
+
+  block/trace.h: In function ‘_nocheck__trace_nbd_co_request_fail’:
+block/trace.h:3141:73: error: ‘_TRACE_NBD_CO_REQUEST_FAIL_DSTATE’ undeclared (first use in this function); did you mean ‘TRACE_NBD_CO_REQUEST_FAIL_BACKEND_DSTATE’?
+     if (trace_event_get_state(TRACE_NBD_CO_REQUEST_FAIL) && qemu_loglevel_mask(LOG_TRACE)) {
+                                                                         ^~~~~~~~~~~~~~~~~~~~
+                                                                         TRACE_NBD_CO_REQUEST_FAIL_BACKEND_DSTATE
+
+which implies something getting in the way of making the trace files.
+
+
+it seems like that "-save-temps" in "cflags" is the culprit. I removed it and it was possible to build with 8 instances:
+
+# removed "-save-temps" from the "cflags"
+> ./qemu/configure --target-list=riscv64-softmmu --enable-debug --extra-cflags='-O0 -g3' --prefix=/install/riscv-qemu
+
+# build without any problem
+> make -j 8
+
+A workaround for this is to use "-save-temps=obj" which ensures the temps are dumped in the object directory. I suspect there is a clash somewhere between what save temps dumps and some of the files we generate for tracing.
+
+putting the temporary files in object dir works as well: -save-temps=obj
+
+# "-save-temps=obj" from the "cflags"
+> ./qemu/configure --target-list=riscv64-softmmu --enable-debug --extra-cflags='-O0 -g3 -save-temps=obj' --prefix=/install/riscv-qemu
+
+# build again without any problem
+> make -j 8 
+
+Hi; I'm going to close this bug because there's no way that QEMU's build process can handle being passed -save-temps via --extra-cflags, because this will cause GCC to use the same output files for multiple different source files, and they will clash. (Even with a non-parallel build, one compile is going to win, and the temp files for the first compile of the pair will just be overwritten and lost.) 
+
+As you've discovered, the right way to do this is to use -save-temps=obj, which will correctly put the temporary files in different places for each generated object file, so they don't conflict with each other.
+
+
