@@ -1,0 +1,42 @@
+
+qemu user calls malloc after fork in multi-threaded process
+
+qemu user may hang in malloc on a musl based system because
+it calls malloc after fork (in a pthread_atfork handler)
+in the child process.
+
+this is undefined behaviour since the parent process is
+multi-threaded and only as-safe functions may be called
+in the child then. (if malloc/free is called concurrently
+with fork the malloc state will be corrupted in the child,
+it works on glibc because glibc takes the malloc locks
+before the fork syscall, but that breaks the as-safety of
+fork and thus non-conforming to posix)
+
+discussed at
+https://www.openwall.com/lists/musl/2019/01/26/1
+
+the bug is hard to reproduce (requires the call_rcu thread
+to call free concurrently with do_fork in the main thread),
+this one is observed with qemu-arm 3.1.0 running on x86_64
+executing an arm busybox sh:
+
+(gdb) bt
+#0  malloc (n=<optimized out>, n@entry=9) at src/malloc/malloc.c:306
+#1  0x0000000060184ad3 in g_malloc (n_bytes=n_bytes@entry=9) at gmem.c:99
+#2  0x000000006018bcab in g_strdup (str=<optimized out>, str@entry=0x60200abf "call_rcu") at gstrfuncs.c:363
+#3  0x000000006016e31d in qemu_thread_create (thread=thread@entry=0x7ffe367d1870, name=name@entry=0x60200abf "call_rcu", 
+    start_routine=start_routine@entry=0x60174c00 <call_rcu_thread>, arg=arg@entry=0x0, mode=mode@entry=1)
+    at /home/pmos/build/src/qemu-3.1.0/util/qemu-thread-posix.c:526
+#4  0x0000000060174b99 in rcu_init_complete () at /home/pmos/build/src/qemu-3.1.0/util/rcu.c:327
+#5  0x00000000601c4fac in __fork_handler (who=1) at src/thread/pthread_atfork.c:26
+#6  0x00000000601be8db in fork () at src/process/fork.c:33
+#7  0x000000006009d191 in do_fork (env=0x627aaed0, flags=flags@entry=17, newsp=newsp@entry=0, parent_tidptr=parent_tidptr@entry=0, 
+    newtls=newtls@entry=0, child_tidptr=child_tidptr@entry=0) at /home/pmos/build/src/qemu-3.1.0/linux-user/syscall.c:5528
+#8  0x00000000600af894 in do_syscall1 (cpu_env=cpu_env@entry=0x627aaed0, num=num@entry=2, arg1=arg1@entry=0, arg2=arg2@entry=-8700192, 
+    arg3=<optimized out>, arg4=8, arg5=1015744, arg6=-74144, arg7=0, arg8=0) at /home/pmos/build/src/qemu-3.1.0/linux-user/syscall.c:7042
+#9  0x00000000600a835c in do_syscall (cpu_env=cpu_env@entry=0x627aaed0, num=2, arg1=0, arg2=-8700192, arg3=<optimized out>, 
+    arg4=<optimized out>, arg5=1015744, arg6=-74144, arg7=0, arg8=0) at /home/pmos/build/src/qemu-3.1.0/linux-user/syscall.c:11533
+#10 0x00000000600c265f in cpu_loop (env=env@entry=0x627aaed0) at /home/pmos/build/src/qemu-3.1.0/linux-user/arm/cpu_loop.c:360
+#11 0x00000000600417a2 in main (argc=<optimized out>, argv=0x7ffe367d57b8, envp=<optimized out>)
+    at /home/pmos/build/src/qemu-3.1.0/linux-user/main.c:819

@@ -1,0 +1,71 @@
+
+ZDI-CAN-10904: QEMU Plan 9 File System TOCTOU Privilege Escalation Vulnerability
+
+-- CVSS -----------------------------------------
+
+7.5: AV:L/AC:H/PR:H/UI:N/S:C/C:H/I:H/A:H
+
+-- ABSTRACT -------------------------------------
+
+Trend Micro's Zero Day Initiative has identified a vulnerability affecting the following products:
+QEMU - QEMU
+
+-- VULNERABILITY DETAILS ------------------------
+
+Version tested:5.0.0-rc3
+Installer file:qemu-5.0.0-rc3.tar.xz
+Platform tested:ubuntu 18.04 x64 desktop
+Analysis Basically v9fs* functions called from guest kernel are executed under specific thread(I call it main thread later). But when it calls some file related system calls, qemu uses its own coroutine thread(worker thread). Then it returns(yield return) without waiting result of system call and start to execute next v9fs* function.
+
+In v9fsmarkfidsunreclaim() function, it stores fidlist member (head of singly linked list) to its stack.
+
+ -> https://github.com/qemu/qemu/blob/f3bac27cc1e303e1860cc55b9b6889ba39dee587/hw/9pfs/9p.c#L506
+
+And if it uses coroutine, it restore fid_list from stack and restart whole loop.
+
+ -> https://github.com/qemu/qemu/blob/f3bac27cc1e303e1860cc55b9b6889ba39dee587/hw/9pfs/9p.c#L526
+
+v9fsclunk() function calls clunkfid() which unlink fid from list, and free it.
+
+ -> https://github.com/qemu/qemu/blob/f3bac27cc1e303e1860cc55b9b6889ba39dee587/hw/9pfs/9p.c#L2060-L2091
+
+So if v9fsclunk() is called while v9fsmarkfidsunreclaim()'s coroutine is being executed, it restores "FREED" fidp from stack and use it.
+
+it can be reproduced with the qemu binary, which is given
+it can also be reproduced with own ASAN build (5.0.0-rc3 and 4.2.0 are tested)
+
+../qemu-5.0.0-rc3/x86_64-softmmu/qemu-system-x86_64 -M pc -kernel ./bzImage -initrd ./rootfs.cpio -append "root=/dev/ram console=tty1 console=ttyS0 rdinit=/bin/sh" -nographic -enable-kvm -fsdev local,id=test_dev,path=/home/xxx/sandbox,security_model=none -device virtio-9p-pci,fsdev=test_dev,mount_tag=victim_tag
+
+$ ./do.sh
+expected ASAN report is printed
+the race is in coroutine, so the threads are the same one
+
+=================================================================
+ ==46645==ERROR: AddressSanitizer: heap-use-after-free on address 0x610000047948 at pc 0x5563d8c28f0f bp0
+READ of size 2 at 0x610000047948 thread T0
+
+   #0 0x5563d8c28f0e in v9fs_mark_fids_unreclaim hw/9pfs/9p.c:508
+   #1 0x5563d8c3e9e3 in v9fs_remove hw/9pfs/9p.c:2988
+   #2 0x5563d98d310d in coroutine_trampoline util/coroutine-ucontext.c:115
+   #3 0x7fadac6396af  (/lib/x86_64-linux-gnu/libc.so.6+0x586af)
+
+   0x610000047948 is located 8 bytes inside of 192-byte region [0x610000047940,0x610000047a00) freed by thread T0 here:
+
+  #0 0x7fadafa5f7a8 in __interceptor_free (/usr/lib/x86_64-linux-gnu/libasan.so.4+0xde7a8)
+  #1 0x5563d8c27a60 in free_fid hw/9pfs/9p.c:371
+  #2 0x5563d8c27fcc in put_fid hw/9pfs/9p.c:396
+  #3 0x5563d8c37267 in v9fs_clunk hw/9pfs/9p.c:2085
+  #4 0x5563d98d310d in coroutine_trampoline util/coroutine-ucontext.c:115
+  #5 0x7fadac6396af  (/lib/x86_64-linux-gnu/libc.so.6+0x586af)
+
+previously allocated by thread T0 here:
+   #0 0x7fadafa5fd28 in __interceptor_calloc (/usr/lib/x86_64-linux-gnu/libasan.so.4+0xded28)
+   #1 0x7fadaf0c8b10 in g_malloc0 (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x51b10)
+   #2 0x5563d8c30ecc in v9fs_attach hw/9pfs/9p.c:1412
+   #3 0x5563d98d310d in coroutine_trampoline util/coroutine-ucontext.c:115
+   #4 0x7fadac6396af  (/lib/x86_64-linux-gnu/libc.so.6+0x586af)
+
+
+This vulnerability was discovered by:
+
+Ryota Shiga(@Garyo) of Flatt Security working with Trend Micro Zero Day Initiative

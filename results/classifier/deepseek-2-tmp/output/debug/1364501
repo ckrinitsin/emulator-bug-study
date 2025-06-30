@@ -1,0 +1,21 @@
+
+Gdb hangs when trying to single-step after an invalid instruction
+
+When using Gdb to remote-debug a program and manually setting its PC to point to an address containing an invalid instruction, then doing a single step Qemu will never return control to the remote Gdb.
+
+For instance, let's say address 0x114 contains an invalid instruction. On the remote Gdb, we'd do:
+
+(gdb) set $pc = 0x114
+(gdb) stepi
+
+After doing that we won't get the (gdb) prompt unless we do a Ctrl-C. If we do so we'll be left at 0x114 instead of going towards the exception handler as we should. This happens with stepi, step and next. If instead of single-stepping we used continue, the program will proceed into the exception handler as it should.
+
+The reason this is happening is that when Qemu realizes it's about to translate an instruction it doesn't recognize it'll generate a call to helper_exception_with_syndrome(), which will register the exception and then call cpu_loop_exit(). At the same time, because we're doing a single-step, Qemu will also generate a call to helper_exception_internal() passing it an EXCP_DEBUG, which lets the system know it'll give control back to the remote debugger, and it also ends with a call to cpu_loop_exit(). However, because the syndrome exception calls cpu_loop_exit() first, the call to the internal exception won't be reached and Qemu will be stuck in a loop without returning control to the remote debugger.
+
+What makes this a bit tricky to fix is that we must call cpu_loop_exit() at the end of helper_exception_with_syndrome(), otherwise the target exception will go undetected and its handler won't be excecuted.
+
+Tested on latest head by emulating a Stellaris lm3s6965 board and running RTEMS 4.11:
+
+$ qemu-system-arm -nographic -s -S -M lm3s6965evb -kernel my_rtems_app
+
+Commit hash in qemu.git: 30eaca3acdf17d7bcbd1213eb149c02037edfb0b

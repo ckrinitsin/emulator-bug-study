@@ -1,0 +1,111 @@
+<think>
+Okay, I'm trying to understand what's happening here. From the user's message, it seems like they're dealing with some issues related to block devices and snapshots in a virtualization environment, possibly using QEMU or similar tools.
+
+They mentioned that after executing two commands: one for taking a snapshot and another for querying the block devices, there was a loss of a bitmap named "bitmap-2022-09-19-16-10-23". They also provided some JSON outputs which I think are results from these queries.
+
+Looking at their explanation, they note that the bitmap is attached to the active backing store (BS), and when the active BS changes, the bitmap gets lost. This makes sense because if you switch the active image, any associated metadata like bitmaps might not be carried over unless explicitly handled.
+
+So, I need to figure out why the bitmap was lost after changing the active BS and how to prevent that in the future.
+
+First, let me break down what's happening step by step. The user probably has a virtual machine with a disk image that's stored as a QCOW2 file. This format supports snapshots through the use of backing files. When you take a snapshot, it creates a new image (the active BS) and links to the previous state.
+
+The bitmap mentioned is likely used for efficient storage management, perhaps tracking which parts of the image have been modified so that only those sections need to be copied or synced when changes occur.
+
+In their scenario, after taking a snapshot using `blockdev-snapshot-sync`, they probably changed the active BS. When this happens, if the system doesn't update or reattach the bitmap correctly, it gets lost, leading to potential data loss or corruption in the snapshot.
+
+So, the key points I need to address are:
+
+1. Why does changing the active BS cause the bitmap to be lost?
+2. How can we ensure that the bitmap is preserved when switching between backing images?
+
+I should also consider best practices for managing snapshots and bitmaps in such environments to prevent data loss.
+</think>
+
+To address the issue where the bitmap was lost after changing the active backing store (BS), follow these steps to manage your virtual machine's disk images properly:
+
+### 1. **Understand Snapshot and Bitmap Management**
+   - In QCOW2, snapshots are managed using backing files linked via a chain of images.
+   - Bitmaps track modifications in the current snapshot, helping to optimize storage usage.
+
+### 2. **Steps to Preserve Bitmappings When Changing BS**
+
+#### Step 1: **Attach Both BS and Bitmap Before Taking Snapshot**
+   - Ensure both the active BS and its associated bitmap are properly linked before taking a new snapshot.
+   - Use commands like `change` to attach these, ensuring the system recognizes both.
+
+#### Step 2: **Use Proper Commands for Snapshotting**
+
+   1. **Attach Images and Bitmappings:**
+      ```bash
+      qemu-system-x86_64 ... \
+         -drive file.driver=raw,file.filename=/path/to/base.qcow2 \
+         -blockdev node-name="base",driver=raw,filename=/path/to/base.qcow2 \
+         node-name="snapshot1",driver=qcow2,backing=node-base,filename=/path/to/snapshot1.qcow2 \
+         node-name="bitmap1",driver=bitmap,backing=node-snapshot1
+      ```
+
+   2. **Take a Snapshot:**
+      ```bash
+      qemu-img create -b /path/to/base.qcow2 -f qcow2 /path/to/snapshot2.qcow2
+      ```
+
+#### Step 3: **Use `blockdev-snapshot-sync` for Synchronous Snapshots**
+
+   After creating the new snapshot, ensure the bitmap is synced to prevent data loss:
+   ```bash
+   qemu-img convert -f raw /path/to/current_image.raw \
+      -O qcow2 /path/to/new_image.qcow2
+   ```
+
+#### Step 4: **Check and Verify Bitmappings Post-Snapshot**
+
+   After taking the snapshot, query the block devices to ensure both the new BS and bitmap are correctly attached:
+   ```bash
+   qemu-img info /path/to/snapshot1.qcow2
+   ```
+
+### 3. **Automate or Script for Repetitive Tasks**
+   - If you're frequently changing BS, consider scripting the process to automate attaching both images and their bitmaps, reducing the chance of human error.
+
+### 4. **Best Practices**
+
+   - **Test Snapshots**: Before fully relying on a new snapshot, test it in a controlled environment.
+   - **Regular Backups**: Always keep backups of your snapshots and base images.
+   - **Monitor Logs**: Check QEMU/KVM logs for any errors or warnings during the snapshotting process.
+
+### 5. **Example Workflow**
+
+   ```bash
+   # Attach the base image and create the first snapshot
+   qemu-system-x86_64 ... \
+      -blockdev node-name=base,driver=raw,filename=/path/to/base.qcow2 \
+      node-name=snapshot1,driver=qcow2,backing=node-base,filename=/path/to/snapshot1.qcow2
+
+   # Take a new snapshot
+   qemu-img create -b /path/to/base.qcow2 -f qcow2 /path/to/snapshot2.qcow2
+
+   # Attach the new snapshot and its bitmap
+   qemu-system-x86_64 ... \
+      -blockdev node-name=base,driver=raw,filename=/path/to/base.qcow2 \
+      node-name=snapshot2,driver=qcow2,backing=node-base,filename=/path/to/snapshot2.qcow2 \
+      node-name=bmap-snapshot2,driver=bitmap,backing=node-snapshot2
+
+   # Take a backup or proceed with the new snapshot
+   ```
+
+### 6. **Common Pitfalls to Avoid**
+
+   - **Forgetting to Attach Bitmappings**: Always ensure both the BS and its bitmap are properly linked.
+   - **Not Syncing Changes**: Use `blockdev-snapshot-sync` or similar commands to finalize changes.
+   - **Improper Order of Operations**: Attach images in the correct sequence (base first, then snapshot).
+
+### 7. **Troubleshooting**
+
+   If you encounter issues where bitmaps are lost:
+   
+   - **Check Block Device Tree**: Use `qemu-img info` to verify the structure.
+   - **Ensure Proper Attachment**: Confirm that both BS and bitmap nodes are correctly linked in your QEMU command line.
+
+### Conclusion
+
+By carefully managing how you attach backing images and their associated bitmappings, you can prevent data loss when switching between snapshots. Always test changes in a non-critical environment and maintain thorough backups to safeguard against unexpected issues.

@@ -1,0 +1,36 @@
+
+Physical memory usage spikes after migration for a VM using memory-backend-memfd memory
+Description of problem:
+When starting a virtual machine using the memory-backend-memfd type memory, configuring the virtual machine memory to 256GB or any other size, the QEMU process initially allocates only a little over 4GB of physical memory. However, after migrating the virtual machine, the physical memory occupied by the QEMU process almost equals 256GB. In an overcommitted memory environment, the increase in physical memory usage by the virtual machine can lead to insufficient host memory, triggering Out-Of-Memory (OOM).
+Steps to reproduce:
+1. start vm
+./qemu-system-x86_64  -accel kvm -cpu SandyBridge  -object memory-backend-memfd,id=mem1,size=256G -machine memory-backend=mem1  -smp 4  -drive file=/nvme0n1/luzhipeng/fusionos.qcow2,if=none,id=drive0,cache=none  -device virtio-blk,drive=drive0,bootindex=1  -monitor stdio -vnc :0
+2. start vm on another host
+./qemu-system-x86_64  -accel kvm -cpu SandyBridge  -object memory-backend-memfd,id=mem1,size=256G -machine memory-backend=mem1  -smp 4  -drive file=/nvme0n1/luzhipeng/fusionos.qcow2,if=none,id=drive0,cache=none  -device virtio-blk,drive=drive0,bootindex=1  -monitor stdio -vnc :0 -incoming tcp:0.0.0.0:4444
+3. migrate vm
+migrate -d tcp:xx.xx.xx.xx:4444
+4.
+Check QEMU process memory usage with the top command
+
+```
+top - 14:01:05 up 35 days, 20:16,  2 users,  load average: 0.22, 0.23, 0.18
+Tasks:   1 total,   0 running,   1 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.2 us,  0.1 sy,  0.0 ni, 99.8 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem : 514595.3 total,   2642.6 free, 401703.3 used, 506435.3 buff/cache
+MiB Swap:      0.0 total,      0.0 free,      0.0 used. 112892.0 avail Mem
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+3865345 root      20   0  257.7g 256.1g 256.0g S   1.3  51.0   3:14.44 qemu-system-x86
+```
+Additional information:
+```
+The relevant code:
+void ram_handle_zero(void *host, uint64_t size)
+{
+    if (!buffer_is_zero(host, size)) {
+        memset(host, 0, size);
+    }
+}
+```
+
+In the memory migration process, for the migration of zero pages, the destination side calls buffer_is_zero to check whether the corresponding page is entirely zero. If it is not zero, it actively sets it as a full page. For memory of the memfd type, the first access will allocate physical memory, resulting in physical memory allocation for all zero pages of the virtual machine.

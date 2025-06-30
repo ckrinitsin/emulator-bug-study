@@ -1,0 +1,41 @@
+
+Segfault using GTK display with dmabuf (iGVT-g) on Wayland
+
+When using...
+ a) Intel virtualized graphics (iGVT-g) with dmabuf output
+ b) QEMU's GTK display with GL output enabled (-display gtk,gl=on)
+ c) A Wayland compositor (Sway in my case)
+a segfault occurs at some point on boot (I guess as soon as the guest starts using the virtual graphics card?)
+
+The origin is the function dpy_gl_scanout_dmabuf in ui/console.c, where it calls
+    con->gl->ops->dpy_gl_scanout_dmabuf(con->gl, dmabuf);
+However, the ops field (struct DisplayChangeListenerOps) does not have dpy_gl_scanout_dmabuf set because it is set to dcl_gl_area_ops which does not have dpy_gl_scanout_dmabuf set.
+Only dcl_egl_ops has dpy_gl_scanout_dmabuf set.
+Currently, the GTK display uses EGL on X11 displays, but GtkGLArea on Wayland. This can be observed in early_gtk_display_init() in ui/gtk.c, where it says (simplified code):
+
+if (opts->has_gl && opts->gl != DISPLAYGL_MODE_OFF) {
+        if (GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) {
+            gtk_use_gl_area = true;
+            gtk_gl_area_init();
+        } else {
+            DisplayGLMode mode = opts->has_gl ? opts->gl : DISPLAYGL_MODE_ON;
+            gtk_egl_init(mode);
+        }
+}
+
+To reproduce the findings above, add this assertion to dpy_gl_scanout_dmabuf:
+    assert(con->gl->ops->dpy_gl_scanout_dmabuf);
+This will make the segfault turn into an assertion failure.
+
+A workaround is to force QEMU to use GDK's X11 backend (using GDK_BACKEND=x11).
+
+Note: This might be a duplicate of 1775011, however the information provided in that bug report is not sufficient to make the assertion.
+
+QEMU version: b0ce3f021e0157e9a5ab836cb162c48caac132e1 (from Git master branch)
+OS: Arch Linux, Kernel Version 5.17.0-1
+
+Relevant flags of the QEMU invocation:
+qemu-system-x86_64 \
+  -vga none \
+  -device vfio-pci-nohotplug,sysfsdev="$GVT_DEV",romfile="${ROMFILE}",display=on,x-igd-opregion=on,ramfb=on \
+  -display gtk,gl=on

@@ -1,0 +1,35 @@
+
+s390x TCG migration failure
+Description of problem:
+We're seeing failures running s390x migration kvm-unit-tests tests with TCG.
+
+Some initial findings:
+
+What seems to be happening is that after migration a control block header accessed by the test code is all zeros which causes an unexpected exception.
+
+I did a bisection which points to c8df4a7aef ("migration: Split save_live_pending() into state_pending_*") as the culprit.
+The migration issue persists after applying the fix e264705012 ("migration: I messed state_pending_exact/estimate") on top of c8df4a7aef.
+
+Applying
+
+```
+diff --git a/migration/ram.c b/migration/ram.c
+index 56ff9cd29d..2dc546cf28 100644
+--- a/migration/ram.c
++++ b/migration/ram.c
+@@ -3437,7 +3437,7 @@ static void ram_state_pending_exact(void *opaque, uint64_t max_size,
+ 
+     uint64_t remaining_size = rs->migration_dirty_pages * TARGET_PAGE_SIZE;
+ 
+-    if (!migration_in_postcopy()) {
++    if (!migration_in_postcopy() && remaining_size < max_size) {
+         qemu_mutex_lock_iothread();
+         WITH_RCU_READ_LOCK_GUARD() {
+             migration_bitmap_sync_precopy(rs);
+```
+on top fixes or hides the issue. (The comparison was removed by c8df4a7aef.)
+
+I arrived at this by experimentation, I haven't looked into why this makes a difference.
+Steps to reproduce:
+1. Run ACCEL=tcg ./run_tests.sh migration-skey-sequential with current QEMU master
+2. Repeat until the test fails (doesn't happen every time, but still easy to reproduce)

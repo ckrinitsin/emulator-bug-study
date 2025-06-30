@@ -1,0 +1,42 @@
+
+Qemu6 regression causing disabled usb controller upon usbredir device_add
+Description of problem:
+I'm encountering a nagging issue with usbredir and a windows guest, but although I did pinpoint the commit that caused the issue, I have a hard time understanding it.
+
+The issue occurs when two usbredir devices are added to a guest windows vm (any vm installed from the official iso will reproduce the issue). When the second device is added, the UHCI usb controller is disabled by windows with an error code 43 (can be seen with in the usb adapters section of the device manager).
+Steps to reproduce:
+1. take/create an intalled windows image and run it with `qemu-system-x86_64 -M pc -cpu host,hv_time,hv_synic,hv_stimer,hv_vpindex -enable-kvm -m 4096 -device piix3-usb-uhci,id=uhci -qmp tcp:127.0.0.1:4444,server=on,wait=off,ipv4 -drive <disk-parameters> --snapshot` (snapshot not necessary but useful for multiples testing to avoid side effects as the usb status sometime lingers after a shutdown, not sure why)
+2. Open windows device manager
+3. add devices via [this qmp python script](/uploads/5f2f9240dce1b55ceb148b32f3d6073c/qmp-usb-adds.py)
+Additional information:
+The commit causing the issue (everything works well when reverting it) is 7bed89958bfbf40df9ca681cefbdca63abdde39d : device_core: use `drain_call_rcu` in in `qmp_device_add`.
+
+I narrowed the problem to the unlock of the iothread: the minimum `drain_call_rcu` code that still reproduce the issue is:
+
+```c
+void drain_call_rcu(void)
+{
+     bool locked = qemu_mutex_iothread_locked();
+     if (locked) {
+         qemu_mutex_unlock_iothread();
+     }
+     usleep(50000); // time spent draining the rcu on a few slow cases.
+
+     if (locked) {
+         qemu_mutex_lock_iothread();
+     }
+}
+```
+
+About the qemu command line: The hv parameters are needed to trigger the issue I do not know why.
+
+I tried to find what was able to take advantage of the free iothread lock, but the only thing I got so far is that the iothread lock is not taken during the first drain (from the first device add), but is taken many times during the second drain by physmem's IOs (from kvm-accel, but at this point, I'm a bit lost).
+
+I'm looking for pointers as to what could trigger the issue in order to narrow it down, as, so far, I do not understand exactly what causes the regression.
+I am unsure of how this would even transcribe in a linux vm so i didn't try to reproduce the issue with one.
+
+With the attached [reproduction python script](/uploads/5f2f9240dce1b55ceb148b32f3d6073c/qmp-usb-adds.py), the issue triggers nearly 100% of the time.
+
+Note 1: Related to #650 as the commit causing the regression is the same, although the cause is probably different since the rcu is not implied.
+
+Note 2: This is a restranscription of [this ml report](https://lore.kernel.org/qemu-devel/20210930134844.f4kh72vpeknr2vmk@gmail.com/) as i wasn't aware, the correct way to report issue was through gitlab now.

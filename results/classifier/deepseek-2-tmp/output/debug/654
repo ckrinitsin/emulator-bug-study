@@ -1,0 +1,24 @@
+
+Strace Log Output Mangled
+Description of problem:
+The syscall log entries from the strace logging capability can be interrupted by other log messages before the full syscall line is
+complete.
+This makes parsing the strace syscall lines from the log output difficult.
+Steps to reproduce:
+1. Run the supplied command with a simple dynamically linked binary, or a binary that performs mmaps
+2. Notice that the strace 'mmap' syscall log entries in the trace file are interrupted by the page log output
+Additional information:
+I have attached an example log from a dynamically linked 'hello world' binary, which demonstrates the bug in the mmap syscall strace entries. [output.trace](/uploads/88c83273582d00241fbf95af735dcc61/output.trace)
+
+
+I believe this bug caused by a couple of things:
+Firstly, in the linux-user/syscall.c file: the strace syscall entry is not output atomically, but instead split across two calls:
+The first half is at `print_syscall`: https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/syscall.c#L13153
+And the return value (and new line) is printed in `print_syscall_ret`: https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/syscall.c#L13160
+
+In the case of the mmap syscall, the function `log_page_dump` is called between these two functions resulting in the mangled log output:
+https://gitlab.com/qemu-project/qemu/-/blob/master/linux-user/mmap.c#L633
+There may be other syscalls that behave similarly, but this was noticed due to the mmap behavior.
+
+
+Internally to the `print_syscall` and `print_syscall_ret` functions, `qemu_log` is called multiple times to compose the full log entry, and it seems that it is inside `qemu_log` that the logfile lock is obtained and dropped - so theoretically another thread can output to the log during the printing of a single syscall entry between these `qemu_log` calls. I do not know if this actually happens in practice besides the mmap scenario described above.

@@ -1,0 +1,39 @@
+
+qemu linux-user doesn't translate host/target data for iovec I/O
+
+When using iovec I/O functions (like `readv`), no data translation happens. I'm hitting this issue with libevent upon constructing a bufferevent over an inotify descriptor, and then building for either ppc64 or s390x (both big-endian) on x86_64 (little-endian) and running resulting code with qemu-ppc64 or qemu-s390x on Gentoo using latest QEMU version available (5.0.0-r2).
+
+The code in question is in https://github.com/transmission/transmission/blob/master/libtransmission/watchdir-inotify.c (`tr_watchdir_inotify_new`, `tr_watchdir_inotify_on_event`).
+
+While `read` syscall is handled properly, `readv` (which libevent is using in my case) doesn't have any logic to call `host_to_target_data_inotify` or any other translation function, leaving inotify data unchanged (with values in little-endian), which then leads to unit test failures. Quoting `do_syscall1` implementation bits for the reference:
+
+---8<---begin---
+    case TARGET_NR_read:
+        if (arg2 == 0 && arg3 == 0) {
+            return get_errno(safe_read(arg1, 0, 0));
+        } else {
+            if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
+                return -TARGET_EFAULT;
+            ret = get_errno(safe_read(arg1, p, arg3));
+            if (ret >= 0 &&
+                fd_trans_host_to_target_data(arg1)) {
+                ret = fd_trans_host_to_target_data(arg1)(p, ret);
+            }
+            unlock_user(p, arg2, ret);
+        }
+        return ret;
+...
+    case TARGET_NR_readv:
+        {
+            struct iovec *vec = lock_iovec(VERIFY_WRITE, arg2, arg3, 0);
+            if (vec != NULL) {
+                ret = get_errno(safe_readv(arg1, vec, arg3));
+                unlock_iovec(vec, arg2, arg3, 1);
+            } else {
+                ret = -host_to_target_errno(errno);
+            }
+        }
+        return ret;
+---8<---end---
+
+To reiterate, the issue is not only with `readv` but with other iovec functions as well.

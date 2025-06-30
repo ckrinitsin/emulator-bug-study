@@ -1,0 +1,113 @@
+
+ARM M: Systick first wrap delayed (qemu-timers/icount prb?)
+
+When running this kind of code with qemu:
+
+static void SysTickISR(void)
+{
+	printf("SysTick\n");
+}
+
+void main()
+{
+	volatile int i, j;
+	printf("setup timer\n");
+	*(uint32_t*) 0xE000E014 = 0x8FFFFF; //reload value
+	*(uint32_t*) 0xE000E018 = 0;        //force reload
+	*(uint32_t*) 0xE000E010 = 7;        //cpu clk + ISR + enable 
+
+	for (j = 0; j < 0x100; j++) {
+		for (i = 0; i < 0x100000; i++)
+			;
+		printf("cnt %08x  -- %8x\n", *(uint32_t*) 0xE000E018, *(uint32_t*)0xE000E010);
+	}
+}
+
+I get the following output (comments added after '#'):
+
+setup timer
+cnt 007cccca  --        7
+cnt 006998a2  --        7
+cnt 00566479  --        7
+cnt 0043304f  --        7
+cnt 002ffc26  --        7
+cnt 001cc7fd  --        7
+cnt 000993d5  --        7
+cnt 00000000  --        7  <--- problem here, systick should wrap and raise isr
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+cnt 00000000  --        7
+SysTick                     <--- delayed isr occuring here
+cnt 000986e0  --    10007
+SysTick
+cnt 00865290  --    10007   <---- then running fine as long as regs not modified
+cnt 00731e51  --        7
+cnt 005fea27  --        7
+cnt 004cb5ff  --        7
+cnt 003981d6  --        7
+cnt 00264dad  --        7
+cnt 00131984  --        7
+SysTick
+cnt 008fe545  --    10007
+cnt 007cb106  --        7
+cnt 00697cdd  --        7
+cnt 005648b4  --        7
+cnt 0043148b  --        7
+cnt 002fe061  --        7
+cnt 001cac38  --        7
+cnt 00097810  --        7
+SysTick
+cnt 008643d6  --    10007
+cnt 00730f97  --        7
+cnt 005fdb6d  --        7
+cnt 004ca745  --        7
+cnt 0039731c  --        7
+cnt 00263ef3  --        7
+cnt 00130aca  --        7
+SysTick
+cnt 008fd68b  --    10007
+cnt 007ca24c  --        7
+cnt 00696e23  --        7
+cnt 005639fa  --        7
+cnt 004305d1  --        7
+cnt 002fd1a8  --        7
+cnt 001c9d7f  --        7
+cnt 00096956  --        7
+SysTick
+cnt 0086351d  --    10007
+cnt 007300dd  --        7
+cnt 005fccb4  --        7
+cnt 004c988c  --        7
+cnt 00396463  --        7
+cnt 00263039  --        7
+cnt 0012fc10  --        7
+[...]
+
+Command line and version:
+qemu-system-arm -M lm3s6965evb -nographic -kernel hello.bin -monitor stdio -serial file:/dev/pts/6 -icount 4 -cpu cortex-m4
+QEMU 2.11.50
+
+I am compiling from git repo, head is:
+commit f32408f3b472a088467474ab152be3b6285b2d7b
+Author: Daniel P. Berrangé <email address hidden>
+Date:   Tue Mar 6 13:43:17 2018 +0000
+
+Config options:
+./configure --target-list=arm-softmmu --enable-debug --disable-slirp --enable-tcg-interpreter --disable-blobs --disable-docs --disable-guest-agent --disable-gnutls --disable-nettle --disable-gcrypt --disable-sdl --disable-gtk --disable-vnc --disable-virtfs --disable-mpath --disable-xen --disable-brlapi --disable-curl --disable-bluez --disable-kvm --disable-hax --disable-hvf --disable-whpx --disable-rdma --disable-vde --disable-netmap --disable-linux-aio --disable-cap-ng --disable-attr --disable-vhost-net --disable-spice --disable-rbd --disable-libiscsi --disable-libnfs --disable-smartcard --disable-libusb --disable-live-block-migration --disable-usb-redir --disable-lzo --disable-snappy --disable-bzip2 --disable-seccomp --disable-glusterfs --disable-tpm --disable-libssh2 --disable-numa --disable-libxml2 --disable-tcmalloc --disable-jemalloc --disable-replication --disable-vhost-vsock --disable-opengl --disable-virglrenderer --disable-xfsctl --disable-qom-cast-debug --disable-vxhs --disable-crypto-afalg --disable-vhost-user --disable-capstone --disable-pie --extra-cflags=-mtune=native
+
+
+Not working with git tag 2.10.0 (almost same config)
+
+Working with stock qemu-arm 2.5.0 from Ubuntu 16.04.
+
+I started investigating, though I am not familiar with qemu code and I could see that the execution is not geting out of qemu_tcg_rr_cpu_thread_fn() 'while' loop and timers are not triggered because the values in cpu->icount_extra or cpu->icount_budget are not to modified accordingly after the timer is set (host side) when the systick register is written (target side).

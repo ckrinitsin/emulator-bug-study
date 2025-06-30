@@ -1,0 +1,53 @@
+<think>
+Okay, I'm trying to figure out why the CPU context isn't being set correctly when using NtContinue or SetContextThread in Wine. The issue seems to be that after restoring the context, the thread doesn't return to the correct stack and instruction pointer (IP). Instead, it just returns to the function that called NtContinue(), which is dispatch_exception(), not where the exception was originally raised.
+
+Looking at the provided assembly code for set_full_cpu_context, I notice a few things. The function starts by setting some segment registers from the context structure. It's using %ecx as an index into the context data, which seems to hold the saved state of the CPU registers.
+
+The code first sets SegGs, SegFs, SegEs, Edi, Esi, Ebx, Ebp, and then checks if the current stack segment (ss) matches the one from the context. If it doesn't, it handles a different case by pushing various values onto the target stack before changing ESP. Otherwise, in the main path, it sets up the esp, eflags, cs, eip, and eax directly.
+
+Wait, there's an 'iret' instruction at the end of this code. IRET is used to return from an interrupt handler, but in this case, we're not in an interrupt context. The comment mentions that it's being called with a jmp, which might mean that the stack isn't properly set up for iret.
+
+I'm thinking that using 'iret' here could be problematic because it assumes that the stack is correctly aligned and has the right state to return to. If the exception handler was called via jmp instead of a call, the stack might not have the necessary return information. This would cause the context restore to go back to dispatch_exception() rather than the original instruction pointer.
+
+Also, in the main path, after setting up all the registers and the stack, it does 'movl %eax,%esp' which sets ESP to the value from EAX. But then it pops eax with 'popl %eax' before iret. That might be causing an issue because popping EAX could interfere with the saved state.
+
+Another thing is that after setting all these registers, using 'iret' might not correctly handle the stack when there was no prior interrupt. It expects a certain number of words on the stack for return address and flags, which might not be present if called via jmp.
+
+So, the main issue seems to be that set_full_cpu_context is using iret without ensuring that the stack is in a state suitable for it. Since the exception handler was called with a jmp, there's no proper return address on the stack, leading to the function returning incorrectly.
+
+To fix this, perhaps we should replace the 'iret' instruction with a normal 'ret' or set up the stack correctly before calling iret. Alternatively, maybe the way the context is restored isn't properly handling the transition back to the original thread's execution flow.
+
+I'm also thinking that maybe the function needs to ensure that the stack segment and pointer are correctly set before performing the iret. If the stack wasn't properly set up when the exception was handled, then trying to return via iret would fail.
+
+In summary, the problem lies in how the CPU context is restored using set_full_cpu_context with an 'iret' instruction that assumes a proper interrupt stack, which doesn't apply here since the function was called via jmp. The fix might involve adjusting the way the return from the context restoration happens, possibly by not using iret and instead using ret or ensuring that the stack has the correct state before returning.
+</think>
+
+The issue arises because the `set_full_cpu_context` function in Wine incorrectly uses the `iret` instruction to restore the CPU context after an exception. Since the exception handler was called with a `jmp`, the stack isn't set up correctly for `iret`, causing it to return to the wrong location.
+
+**Step-by-Step Explanation:**
+
+1. **Problem Identification:** The function `set_full_cpu_context` uses `iret`, which assumes the stack has a valid interrupt frame. However, when called via `jmp`, no such frame exists, leading to incorrect restoration.
+
+2. **Incorrect Stack Handling:** The current code sets up ESP and other registers but then uses `iret`, expecting a valid return address on the stack, which isn't present in this scenario.
+
+3. **Solution Approach:** Replace `iret` with a proper return using `ret` or ensure that the stack is correctly prepared to mimic an interrupt frame before calling `iret`.
+
+4. **Code Adjustment:** Modify the assembly code to either:
+   - Remove `iret` and use `ret` after setting up the context.
+   - Manually push necessary values onto the stack to simulate an interrupt frame before using `iret`.
+
+**Answer:**
+
+The CPU context restoration issue in Wine's `set_full_cpu_context` is due to using `iret` without a valid interrupt stack. To fix this, replace the `iret` instruction with a normal return using `ret` or ensure the stack is set up correctly before calling `iret`.
+
+**Revised Assembly Code:**
+
+```assembly
+; Replace 'iret' with 'ret'
+...
+movl %eax, %esp
+popl %ebx      ; Adjust as necessary
+ret
+```
+
+This adjustment ensures that the function returns to the correct instruction pointer after restoring the context.

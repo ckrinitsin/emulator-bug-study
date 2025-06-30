@@ -1,0 +1,70 @@
+
+Extra SIGTRAP when breakpoint + watchpoint occur on same instruction
+Description of problem:
+If a breakpoint and watchpoint occur on the same instruction in TCG, gdb receives a breakpoint notification, a watchpoint notification, and then a SIGTRAP not corresponding to any set breakpoint/watchpoint.
+Steps to reproduce:
+Start QEMU via:
+
+```
+./qemu-system-i386 -display none -accel tcg -kernel kernel.elf -s -S
+```
+
+Here's the gdb session:
+
+```
+(gdb) file kernel.elf
+Reading symbols from kernel.elf...done.
+(gdb) tar rem :1234
+Remote debugging using :1234
+0x0000fff0 in ?? ()
+(gdb) b _start
+Breakpoint 1 at 0x10000c: file kernel.s, line 17.
+(gdb) c
+Continuing.
+
+Breakpoint 1, _start () at kernel.s:17
+17          mov eax, 3
+(gdb) b bp
+Breakpoint 2 at 0x100011: file kernel.s, line 20.
+(gdb) watch *(int*)&value
+Hardware watchpoint 3: *(int*)&value
+(gdb) c
+Continuing.
+
+Breakpoint 2, bp () at kernel.s:20
+20          mov dword ptr value, eax
+(gdb) c
+Continuing.
+
+Hardware watchpoint 3: *(int*)&value
+
+Old value = 0
+New value = 3
+done () at kernel.s:23
+23          jmp done
+(gdb) c
+Continuing.
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+done () at kernel.s:23
+23          jmp done
+```
+Additional information:
+This patch fixes it by disabling the extra debug interrupt if the CPU is already singlestepping, but I'm not certain it's the 'correct' fix?
+
+```patch
+--- a/softmmu/physmem.c
++++ b/softmmu/physmem.c
+@@ -894,7 +894,9 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
+          * trigger after the current instruction.
+          */
+         qemu_mutex_lock_iothread();
+-        cpu_interrupt(cpu, CPU_INTERRUPT_DEBUG);
++        if ((cpu->singlestep_enabled & SSTEP_NOIRQ) == 0) {
++            cpu_interrupt(cpu, CPU_INTERRUPT_DEBUG);
++        }
+         qemu_mutex_unlock_iothread();
+         return;
+     }
+
+```

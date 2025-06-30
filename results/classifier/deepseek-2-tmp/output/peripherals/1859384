@@ -1,0 +1,40 @@
+
+arm gic: gic_acknowledge_irq doesn't clear line level for other cores for 1-n level-sensitive interrupts and gic_clear_pending uses GIC_DIST_TEST_MODEL (even on v2 where it always read 0 - "N-N")
+
+For a 1-N interrupt (any SPI on the GICv2), as mandated by the TRM, only one CPU can acknowledge the IRQ until it becomes inactive.
+
+The TRM also mandates that SGIs and PPIs follow the N-N model and that SPIs follow the 1-N model.
+
+However this is not currently the case with QEMU. I have locally (no minimal test case) seen e.g. uart interrupts being acknowledged twice before having been deactivated (expected: irqId on one CPU and 1023 on the other instead).
+
+I have narrowed the issue down to the following:
+
+1) arm_gic_common_reset resets all irq_state[id] fields to 0. This means all IRQ will use the N-N model, and if s->revision != REV_11MPCORE, then there's no way to set any interrupt to 1-N.
+
+**If fixed locally** with a hackjob, I still have the following trace:
+
+pl011_irq_state 534130.800 pid=2424 level=0x1
+gic_set_irq 2.900 pid=2424 irq=0x21 level=0x1 cpumask=0xff target=0xff
+gic_update_set_irq 3.300 pid=2424 cpu=0x0 name=irq level=0x1
+gic_update_set_irq 4.200 pid=2424 cpu=0x1 name=irq level=0x1
+gic_acknowledge_irq 539.400 pid=2424 s=cpu cpu=0x1 irq=0x21
+gic_update_set_irq 269.800 pid=2424 cpu=0x0 name=irq level=0x1
+gic_cpu_read 4.100 pid=2424 s=cpu cpu=0x1 addr=0xc val=0x21
+gic_acknowledge_irq 15.600 pid=2424 s=cpu cpu=0x0 irq=0x21
+gic_cpu_read 265.000 pid=2424 s=cpu cpu=0x0 addr=0xc val=0x21
+pl011_write 1594.700 pid=2424 addr=0x44 value=0x50
+pl011_irq_state 2.000 pid=2424 level=0x0
+gic_set_irq 1.300 pid=2424 irq=0x21 level=0x0 cpumask=0xff target=0xff
+pl011_write 30.700 pid=2424 addr=0x38 value=0x0
+pl011_irq_state 1.200 pid=2424 level=0x0
+gic_cpu_write 110.600 pid=2424 s=cpu cpu=0x0 addr=0x10 val=0x21
+gic_cpu_write 193.400 pid=2424 s=cpu cpu=0x0 addr=0x1000 val=0x21
+pl011_irq_state 1169.500 pid=2424 level=0x0
+
+This is because:
+
+2) gic_acknowledge_irq calls gic_clear_pending which uses GIC_DIST_CLEAR_PENDING but this usually has no effect on level-sensitive interrupts.
+
+With this often being a no-op (ie. assuming ispendr was not written to), any 1-n level-sensitive interrupt is still improperly pending on all the other cores.
+
+(Also, I don't really know how the qemu thread model works, there might be race conditions in the acknowledgment logic if gic_acknowledge_irq is called by multiple threads, too.)

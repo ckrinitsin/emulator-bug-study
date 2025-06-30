@@ -1,0 +1,44 @@
+
+mirror: the block-job-cancel command can put qemu to the endless error loop
+Description of problem:
+If the destination VM will crash (or network is down) right before the completion of the block device mirroring job (`block-job-cancel`), then there will be a possibility to put QEMU in the error loop.
+Steps to reproduce:
+1. Run both QEMU VMs: source + target.
+2. On the target side prepare NBD server for blockdev mirroring process by using QMP commands similar to the one below:
+```
+{"execute": "nbd-server-start", "arguments": { "addr": { "data": { "host": "::", "port": "49153" }, "type": "inet" } } }
+{ "execute": "nbd-server-add", "arguments": { "device": "drive_main01", "writable": true } }
+```
+3. On the source side, prepare VM for the migration and start driver mirror job:
+```
+{"execute":"migrate-set-capabilities","arguments":{"capabilities":[{"capability":"pause-before-switchover","state":true}]}}
+{ "execute": "drive-mirror", "arguments": { "device": "drive_main01", "mode": "existing", "job-id": "job0", "target": "nbd:127.0.0.1:49153:exportname=drive_main01", "sync": "top", "on-source-error": "stop", "on-target-error": "stop", "format": "raw", "speed": 0 } }
+```
+4. On the source side wait for the `BLOCK_JOB_READY` event:
+```
+{"timestamp": {"seconds": 1625586327, "microseconds": 833805}, "event": "BLOCK_JOB_READY", "data": {"device": "job0", "len": 21474836480, "offset": 21474836480, "speed": 0, "type": "mirror"}}
+```
+5. Start migration on the source side:
+```
+{ "execute": "migrate", "arguments": { "uri": "tcp:127.0.0.1:8091" } }
+```
+6. Wait for the `pre-switchover` state of the migration:
+```
+{ "execute": "query-migrate" }
+{"return": {"expected-downtime": 300, "status": "pre-switchover", "setup-time": 3, "total-time": 11343, "ram": {"total": 8725020672, "postcopy-requests": 0, "dirty-sync-count": 2, "multifd-bytes": 0, "pages-per-second": 39550, "page-size": 4096, "remaining": 2871296, "mbps": 1073.7734399999999, "transferred": 963647065, "duplicate": 1899491, "dirty-pages-rate": 84, "skipped": 0, "normal-bytes": 944705536, "normal": 230641}}}
+```
+7. Kill target QEMU to reproduce an issue.
+8. Cancel the job on the source side:
+```
+{ "execute": "block-job-cancel", "arguments": { "device": "job0" } }
+```
+
+Got the endless errror loop:
+```
+...
+{"timestamp": {"seconds": 1625586487, "microseconds": 413847}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+{"timestamp": {"seconds": 1625586487, "microseconds": 413865}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+{"timestamp": {"seconds": 1625586487, "microseconds": 413885}, "event": "BLOCK_JOB_ERROR", "data": {"device": "job0", "operation": "write", "action": "stop"}}
+...
+```
+Source qemu could be stopped only by using SIGKILL.

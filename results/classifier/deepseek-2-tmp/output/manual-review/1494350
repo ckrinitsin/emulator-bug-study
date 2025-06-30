@@ -1,0 +1,258 @@
+
+QEMU: causes vCPU steal time overflow on live migration
+
+I'm pasting in text from Debian Bug 785557
+https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=785557
+b/c I couldn't find this issue reported.
+
+It is present in QEMU 2.3, but I haven't tested later versions.  Perhaps someone else will find this bug and confirm for later versions.  (Or I will when I have time!)
+
+--------------------------------------------------------------------------------------------
+
+Hi,
+
+I'm trying to debug an issue we're having with some debian.org machines 
+running in QEMU 2.1.2 instances (see [1] for more background). In short, 
+after a live migration guests running Debian Jessie (linux 3.16) stop 
+accounting CPU time properly. /proc/stat in the guest shows no increase 
+in user and system time anymore (regardless of workload) and what stands 
+out are extremely large values for steal time:
+
+ % cat /proc/stat
+ cpu  2400 0 1842 650879168 2579640 0 25 136562317270 0 0
+ cpu0 1366 0 1028 161392988 1238598 0 11 383803090749 0 0
+ cpu1 294 0 240 162582008 639105 0 8 39686436048 0 0
+ cpu2 406 0 338 163331066 383867 0 4 333994238765 0 0
+ cpu3 332 0 235 163573105 318069 0 1 1223752959076 0 0
+ intr 355773871 33 10 0 0 0 0 3 0 1 0 0 36 144 0 0 1638612 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 5 5001741 41 0 8516993 0 3669582 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ ctxt 837862829
+ btime 1431642967
+ processes 8529939
+ procs_running 1
+ procs_blocked 0
+ softirq 225193331 2 77532878 172 7250024 819289 0 54 33739135 176552 105675225
+ 
+Reading the memory pointed to by the steal time MSRs pre- and 
+post-migration, I can see that post-migration the high bytes are set to 
+0xff:
+
+(qemu) xp /8b 0x1fc0cfc0
+000000001fc0cfc0: 0x94 0x57 0x77 0xf5 0xff 0xff 0xff 0xff
+
+The "jump" in steal time happens when the guest is resumed on the 
+receiving side.
+
+I've also been able to consistently reproduce this on a Ganeti cluster 
+at work, using QEMU 2.1.3 and kernels 3.16 and 4.0 in the guests. The 
+issue goes away if I disable the steal time MSR using `-cpu 
+qemu64,-kvm_steal_time`.
+
+So, it looks to me as if the steal time MSR is not set/copied properly 
+during live migration, although AFAICT this should be the case after 
+917367aa968fd4fef29d340e0c7ec8c608dffaab.
+
+After investigating a bit more, it looks like the issue comes from an overflow
+in the kernel's accumulate_steal_time() (arch/x86/kvm/x86.c:2023):
+
+  static void accumulate_steal_time(struct kvm_vcpu *vcpu)
+  {
+          u64 delta;
+  
+          if (!(vcpu->arch.st.msr_val & KVM_MSR_ENABLED))
+                  return;
+  
+          delta = current->sched_info.run_delay - vcpu->arch.st.last_steal;
+  
+Using systemtap with the attached script to trace KVM execution on the 
+receiving host kernel, we can see that shortly before marking the vCPUs 
+as runnable on a migrated KVM instance with 2 vCPUs, the following 
+happens (** marks lines of interest):
+
+ **  0 qemu-system-x86(18446): kvm_arch_vcpu_load: run_delay=7856949 ns steal=7856949 ns
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_load
+     0 vhost-18446(18447): -> kvm_arch_vcpu_should_kick
+     5 vhost-18446(18447): <- kvm_arch_vcpu_should_kick
+    23 qemu-system-x86(18446): <- kvm_arch_vcpu_load
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_ioctl
+     2 qemu-system-x86(18446): <- kvm_arch_vcpu_ioctl
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_put
+     2 qemu-system-x86(18446):  -> kvm_put_guest_fpu
+     3 qemu-system-x86(18446):  <- kvm_put_guest_fpu
+     4 qemu-system-x86(18446): <- kvm_arch_vcpu_put
+ **  0 qemu-system-x86(18446): kvm_arch_vcpu_load: run_delay=7856949 ns steal=7856949 ns
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_load
+     1 qemu-system-x86(18446): <- kvm_arch_vcpu_load
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_ioctl
+     1 qemu-system-x86(18446): <- kvm_arch_vcpu_ioctl
+     0 qemu-system-x86(18446): -> kvm_arch_vcpu_put
+     1 qemu-system-x86(18446):  -> kvm_put_guest_fpu
+     2 qemu-system-x86(18446):  <- kvm_put_guest_fpu
+     3 qemu-system-x86(18446): <- kvm_arch_vcpu_put
+ **  0 qemu-system-x86(18449): kvm_arch_vcpu_load: run_delay=40304 ns steal=7856949 ns
+     0 qemu-system-x86(18449): -> kvm_arch_vcpu_load
+ **  7 qemu-system-x86(18449): delta: 18446744073701734971 ns, steal=7856949 ns, run_delay=40304 ns
+    10 qemu-system-x86(18449): <- kvm_arch_vcpu_load
+ **  0 qemu-system-x86(18449): -> kvm_arch_vcpu_ioctl_run
+     4 qemu-system-x86(18449):  -> kvm_arch_vcpu_runnable
+     6 qemu-system-x86(18449):  <- kvm_arch_vcpu_runnable
+     ...
+     0 qemu-system-x86(18448): kvm_arch_vcpu_load: run_delay=0 ns steal=7856949 ns
+     0 qemu-system-x86(18448): -> kvm_arch_vcpu_load
+ ** 34 qemu-system-x86(18448): delta: 18446744073701694667 ns, steal=7856949 ns, run_delay=0 ns
+    40 qemu-system-x86(18448): <- kvm_arch_vcpu_load
+ **  0 qemu-system-x86(18448): -> kvm_arch_vcpu_ioctl_run
+     5 qemu-system-x86(18448):  -> kvm_arch_vcpu_runnable
+
+Now, what's really interesting is that current->sched_info.run_delay 
+gets reset because the tasks (threads) using the vCPUs change, and thus 
+have a different current->sched_info: it looks like task 18446 created 
+the two vCPUs, and then they were handed over to 18448 and 18449 
+respectively. This is also verified by the fact that during the 
+overflow, both vCPUs have the old steal time of the last vcpu_load of 
+task 18446. However, according to Documentation/virtual/kvm/api.txt:
+
+ - vcpu ioctls: These query and set attributes that control the operation
+   of a single virtual cpu.
+
+   Only run vcpu ioctls from the same thread that was used to create the vcpu.
+
+
+ 
+So it seems qemu is doing something that it shouldn't: calling vCPU 
+ioctls from a thread that didn't create the vCPU. Note that this 
+probably happens on every QEMU startup, but is not visible because the 
+guest kernel zeroes out the steal time on boot.
+
+There are at least two ways to mitigate the issue without a kernel
+recompilation:
+
+ - The first one is to disable the steal time propagation from host to 
+   guest by invoking qemu with `-cpu qemu64,-kvm_steal_time`. This will 
+   short-circuit accumulate_steal_time() due to (vcpu->arch.st.msr_val & 
+   KVM_MSR_ENABLED) and will completely disable steal time reporting in 
+   the guest, which may not be desired if people rely on it to detect 
+   CPU congestion.
+
+ - The other one is using the following systemtap script to prevent the 
+   steal time counter from overflowing by dropping the problematic 
+   samples (WARNING: systemtap guru mode required, use at your own 
+   risk):
+
+      probe module("kvm").statement("*@arch/x86/kvm/x86.c:2024") {
+        if (@defined($delta) && $delta < 0) {
+          printk(4, "kvm: steal time delta < 0, dropping")
+          $delta = 0
+        }
+      }
+
+Note that not all *guests* handle this condition in the same way: 3.2 
+guests still get the overflow in /proc/stat, but their scheduler 
+continues to work as expected. 3.16 guests OTOH go nuts once steal time 
+overflows and stop accumulating system & user time, while entering an 
+erratic state where steal time in /proc/stat is *decreasing* on every 
+clock tick.
+-------------------------------------------- Revised statement:
+> Now, what's really interesting is that current->sched_info.run_delay 
+> gets reset because the tasks (threads) using the vCPUs change, and 
+> thus have a different current->sched_info: it looks like task 18446 
+> created the two vCPUs, and then they were handed over to 18448 and 
+> 18449 respectively. This is also verified by the fact that during the 
+> overflow, both vCPUs have the old steal time of the last vcpu_load of 
+> task 18446. However, according to Documentation/virtual/kvm/api.txt:
+
+The above is not entirely accurate: the vCPUs were created by the 
+threads that are used to run them (18448 and 18449 respectively), it's 
+just that the main thread is issuing ioctls during initialization, as 
+illustrated by the strace output on a different process:
+
+ [ vCPU #0 thread creating vCPU #0 (fd 20) ]
+ [pid  1861] ioctl(14, KVM_CREATE_VCPU, 0) = 20
+ [pid  1861] ioctl(20, KVM_X86_SETUP_MCE, 0x7fbd3ca40cd8) = 0
+ [pid  1861] ioctl(20, KVM_SET_CPUID2, 0x7fbd3ca40ce0) = 0
+ [pid  1861] ioctl(20, KVM_SET_SIGNAL_MASK, 0x7fbd380008f0) = 0
+ 
+ [ vCPU #1 thread creating vCPU #1 (fd 21) ]
+ [pid  1862] ioctl(14, KVM_CREATE_VCPU, 0x1) = 21
+ [pid  1862] ioctl(21, KVM_X86_SETUP_MCE, 0x7fbd37ffdcd8) = 0
+ [pid  1862] ioctl(21, KVM_SET_CPUID2, 0x7fbd37ffdce0) = 0
+ [pid  1862] ioctl(21, KVM_SET_SIGNAL_MASK, 0x7fbd300008f0) = 0
+ 
+ [ Main thread calling kvm_arch_put_registers() on vCPU #0 ]
+ [pid  1859] ioctl(20, KVM_SET_REGS, 0x7ffc98aac230) = 0
+ [pid  1859] ioctl(20, KVM_SET_XSAVE or KVM_SIGNAL_MSI, 0x7fbd38001000) = 0
+ [pid  1859] ioctl(20, KVM_PPC_ALLOCATE_HTAB or KVM_SET_XCRS, 0x7ffc98aac010) = 0
+ [pid  1859] ioctl(20, KVM_SET_SREGS, 0x7ffc98aac050) = 0
+ [pid  1859] ioctl(20, KVM_SET_MSRS, 0x7ffc98aab820) = 87
+ [pid  1859] ioctl(20, KVM_SET_MP_STATE, 0x7ffc98aac230) = 0
+ [pid  1859] ioctl(20, KVM_SET_LAPIC, 0x7ffc98aabd80) = 0
+ [pid  1859] ioctl(20, KVM_SET_MSRS, 0x7ffc98aac1b0) = 1
+ [pid  1859] ioctl(20, KVM_SET_PIT2 or KVM_SET_VCPU_EVENTS, 0x7ffc98aac1b0) = 0
+ [pid  1859] ioctl(20, KVM_SET_DEBUGREGS or KVM_SET_TSC_KHZ, 0x7ffc98aac1b0) = 0
+ 
+ [ Main thread calling kvm_arch_put_registers() on vCPU #1 ]
+ [pid  1859] ioctl(21, KVM_SET_REGS, 0x7ffc98aac230) = 0
+ [pid  1859] ioctl(21, KVM_SET_XSAVE or KVM_SIGNAL_MSI, 0x7fbd30001000) = 0
+ [pid  1859] ioctl(21, KVM_PPC_ALLOCATE_HTAB or KVM_SET_XCRS, 0x7ffc98aac010) = 0
+ [pid  1859] ioctl(21, KVM_SET_SREGS, 0x7ffc98aac050) = 0
+ [pid  1859] ioctl(21, KVM_SET_MSRS, 0x7ffc98aab820) = 87
+ [pid  1859] ioctl(21, KVM_SET_MP_STATE, 0x7ffc98aac230) = 0
+ [pid  1859] ioctl(21, KVM_SET_LAPIC, 0x7ffc98aabd80) = 0
+ [pid  1859] ioctl(21, KVM_SET_MSRS, 0x7ffc98aac1b0) = 1
+ [pid  1859] ioctl(21, KVM_SET_PIT2 or KVM_SET_VCPU_EVENTS, 0x7ffc98aac1b0) = 0
+ [pid  1859] ioctl(21, KVM_SET_DEBUGREGS or KVM_SET_TSC_KHZ, 0x7ffc98aac1b0) = 0
+ 
+Using systemtap again, I noticed that the main thread's run_delay is copied to
+last_steal only after a KVM_SET_MSRS ioctl which enables the steal time 
+MSR is issued by the main thread (see linux 
+3.16.7-ckt11-1/arch/x86/kvm/x86.c:2162). Taking an educated guess, I 
+reverted the following qemu commits:
+
+ commit 0e5035776df31380a44a1a851850d110b551ecb6
+ Author: Marcelo Tosatti <email address hidden>
+ Date:   Tue Sep 3 18:55:16 2013 -0300
+ 
+     fix steal time MSR vmsd callback to proper opaque type
+     
+     Convert steal time MSR vmsd callback pointer to proper X86CPU type.
+     
+     Signed-off-by: Marcelo Tosatti <email address hidden>
+     Signed-off-by: Paolo Bonzini <email address hidden>
+ 
+ commit 917367aa968fd4fef29d340e0c7ec8c608dffaab
+ Author: Marcelo Tosatti <email address hidden>
+ Date:   Tue Feb 19 23:27:20 2013 -0300
+ 
+     target-i386: kvm: save/restore steal time MSR
+     
+     Read and write steal time MSR, so that reporting is functional across
+     migration.
+     
+     Signed-off-by: Marcelo Tosatti <email address hidden>
+     Signed-off-by: Gleb Natapov <email address hidden>
+ 
+and the steal time jump on migration went away. However, steal time was 
+not reported at all after migration, which is expected after reverting 
+917367aa.
+
+So it seems that after 917367aa, the steal time MSR is correctly saved 
+and copied to the receiving side, but then it is restored by the main 
+thread (probably during cpu_synchronize_all_post_init()), causing the 
+overflow when the vCPU threads are unpaused.

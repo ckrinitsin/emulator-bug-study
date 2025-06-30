@@ -1,0 +1,110 @@
+
+guest migration 100% cpu freeze bug
+
+# Investigate migration cpu hog(100%) bug
+
+I have some issues when migrating from kernel 4.14.63 running qemu 2.11.2 to kernel 4.19.43 running qemu 2.11.2.
+The hypervisors are running on debian jessie with libvirt v5.3.0.
+Linux, libvirt and qemu are all custom compiled.
+
+I migrated around 10.000 vms and every once in a while a vm is stuck at 100% cpu after what we can see right now is that the target hypervisor runs on linux 4.19.53. This happened with 4 vms so far. It is not that easy to debug, we found this out pretty quickly because we are running monitoring on frozen vms after migrations.
+
+Last year we were having the same "kind of" bug https://bugs.launchpad.net/qemu/+bug/1775555 when trying to upgrade qemu 2.6 to 2.11.
+This bug was fixed after applying the following patch: http://lists.nongnu.org/archive/html/qemu-devel/2018-04/msg00820.html
+
+This patch is still applied as you can see because of the available pre_load var on the kvmclock_vmsd struct:
+(gdb) ptype kvmclock_vmsd
+type = const struct VMStateDescription {
+    const char *name;
+    int unmigratable;
+    int version_id;
+    int minimum_version_id;
+    int minimum_version_id_old;
+    MigrationPriority priority;
+    LoadStateHandler *load_state_old;
+    int (*pre_load)(void *);                                                
+    int (*post_load)(void *, int);
+    int (*pre_save)(void *);
+    _Bool (*needed)(void *);
+    VMStateField *fields;
+    const VMStateDescription **subsections;
+}
+
+I attached gdb to a vcpu thread of one stuck vm, and a bt showed the following info:
+Thread 4 (Thread 0x7f3a431a4700 (LWP 37799)):
+#0  0x00007f3a576f5017 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x000055d84d15de57 in kvm_vcpu_ioctl (cpu=cpu@entry=0x55d84fca78d0, type=type@entry=44672) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x000055d84d15dfc6 in kvm_cpu_exec (cpu=cpu@entry=0x55d84fca78d0) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x000055d84d13ab64 in qemu_kvm_cpu_thread_fn (arg=0x55d84fca78d0) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1136
+#4  0x00007f3a579ba4a4 in start_thread (arg=0x7f3a431a4700) at pthread_create.c:456
+#5  0x00007f3a576fcd0f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+Thread 3 (Thread 0x7f3a439a5700 (LWP 37798)):
+#0  0x00007f3a576f5017 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x000055d84d15de57 in kvm_vcpu_ioctl (cpu=cpu@entry=0x55d84fc5cbb0, type=type@entry=44672) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x000055d84d15dfc6 in kvm_cpu_exec (cpu=cpu@entry=0x55d84fc5cbb0) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x000055d84d13ab64 in qemu_kvm_cpu_thread_fn (arg=0x55d84fc5cbb0) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1136
+#4  0x00007f3a579ba4a4 in start_thread (arg=0x7f3a439a5700) at pthread_create.c:456
+#5  0x00007f3a576fcd0f in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+The ioctl call is a ioctl(18, KVM_RUN and it looks like it is looping inside the vm itself.
+
+I saved the state of the VM (with `virsh save`) after I found it was hanging on its vcpu threads. Then I restored this vm on a test environment running the same kernel, QEMU and libvirt version). After the restore the VM still was haning at 100% cpu usage on all the vcpus.
+I tried to use the perf kvm guest option to trace the guest vm with a copy of the kernel, modules and kallsyms files from inside the guest vm and I got to the following perf stat:
+
+ Event                                         Total %Total CurAvg/s
+ kvm_entry                                   5198993   23.1   277007
+ kvm_exit                                    5198976   23.1   277006
+ kvm_apic                                    1732103    7.7    92289
+ kvm_msr                                     1732101    7.7    92289
+ kvm_inj_virq                                1731904    7.7    92278
+ kvm_eoi                                     1731900    7.7    92278
+ kvm_apic_accept_irq                         1731900    7.7    92278
+ kvm_hv_timer_state                          1731780    7.7    92274
+ kvm_pv_eoi                                  1731701    7.7    92267
+ kvm_ple_window                                   36    0.0        2
+ Total                                      22521394         1199967
+
+We tried to run the crash tool against a dump of guest vm memory and that gave us the following backtrace:
+crash> bt
+PID: 0      TASK: ffffffff81610040  CPU: 0   COMMAND: "swapper/0"
+    [exception RIP: native_read_tsc+2]
+    RIP: ffffffff810146a9  RSP: ffff88003fc03df0  RFLAGS: 00000046
+    RAX: 000000008762c0fa  RBX: ffff88003fc13680  RCX: 0000000000000001
+    RDX: 0000000000fe4871  RSI: 0000000000000000  RDI: ffff88003fc13603
+    RBP: 000000000003052c   R8: 0000000000000200   R9: ffffffff8169b180
+    R10: 0000000000000020  R11: 0000000000000005  R12: 006a33290b40455c
+    R13: 00000000df1fd292  R14: 000000002ca284ff  R15: 00fe485f3febe21a
+    CS: 0010  SS: 0018
+ #0 [ffff88003fc03df0] pvclock_clocksource_read at ffffffff8102cbb3
+ #1 [ffff88003fc03e40] kvm_clock_read at ffffffff8102c2c9
+ #2 [ffff88003fc03e50] timekeeping_get_ns at ffffffff810691b0
+ #3 [ffff88003fc03e60] ktime_get at ffffffff810695c8
+ #4 [ffff88003fc03e90] sched_rt_period_timer at ffffffff8103e4f5
+ #5 [ffff88003fc03ee0] __run_hrtimer at ffffffff810652d3
+ #6 [ffff88003fc03f20] hrtimer_interrupt at ffffffff81065abd
+ #7 [ffff88003fc03f90] smp_apic_timer_interrupt at ffffffff81024ba8
+ #8 [ffff88003fc03fb0] apic_timer_interrupt at ffffffff813587e2
+--- <IRQ stack> ---
+ #9 [ffffffff81601e98] apic_timer_interrupt at ffffffff813587e2
+    [exception RIP: native_safe_halt+2]
+    RIP: ffffffff8102c360  RSP: ffffffff81601f40  RFLAGS: 00010246
+    RAX: 0000000000000000  RBX: ffffffff81601fd8  RCX: 00000000ffffffff
+    RDX: 00000000ffffffff  RSI: 0000000000000000  RDI: 0000000000000001
+    RBP: 0000000000000000   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000020  R11: 0000000000000005  R12: ffffffff816f5d80
+    R13: ffffffffffffffff  R14: 000000000008c800  R15: 0000000000000000
+    ORIG_RAX: ffffffffffffff10  CS: 0010  SS: 0018
+#10 [ffffffff81601f40] default_idle at ffffffff81014c35
+#11 [ffffffff81601f50] cpu_idle at ffffffff8100d258
+
+So it seems like the vm is reading its clock constantly trying to catch up some time after the migration.
+
+Last time it was a bug that was only triggered on newer Gold cpu hardware, but this time we also see this coming back on older Intel E5 cpus we tried to reproduce with a migrate loop of 3 days times between kernel 4.14.63 and 4.19.43 but this gave us no results. 
+
+The vms were running ubuntu 14.04, centos 7, debian 7, debian 8 these vms are running linux kernel 3.*.
+
+The thing is that we are out of ideas for reproducing this, it seems like it the same kind of bug we are hitting, just like last time the vm is basically only trying to read the clock. Perhaps we can try to read the clock data and also try to read what the guest is actually waiting for, which value of the counter does it want to reach.
+
+I am not sure how to pinpoint the cause of this issue, I would like some help and possible some extra tips on debugging.
+We are able to read the guests kernel which makes it a bit easier to debug, reproducing and finding the source of the problem is still something we are trying to figure out.

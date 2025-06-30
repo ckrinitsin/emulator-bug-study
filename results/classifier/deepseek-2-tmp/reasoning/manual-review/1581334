@@ -1,0 +1,83 @@
+<think>
+Okay, so I'm trying to help someone who's having trouble with QEMU running on their system. They provided some CPU and perf top output, which shows high kernel usage, especially in raw_spin_lock, futex functions, and malloc. 
+
+First, I need to understand what these metrics mean. The CPU percentages show that most of the time is spent in system mode (sy), which means the CPU is executing kernel code. This could indicate that the application is waiting for I/O or there's some kind of blocking issue.
+
+Looking at the perf top output, the highest user is [kernel], with _raw_spin_lock taking up 75% of the time. That suggests a lot of lock contention. Futex functions like futex_wait_setup and futex_wake are also showing up, which points towards issues with inter-thread communication—maybe some threads are blocking on mutexes or semaphores.
+
+The fact that they're using QEMU with kernel RBD (which I think stands for Red Hat Block Driver) might be relevant. If it's working fine, then the issue isn't with RBD itself but perhaps how QEMU is interacting with other parts of the system.
+
+They mentioned using perf top to profile and suspect a thread deadlock problem. So maybe their application is getting stuck because threads are waiting indefinitely for some resource or lock that isn't being released.
+
+I should consider possible causes: high context switching, I/O wait on disks, or deadlocks in user space due to improper locking mechanisms. Also, since malloc is showing up, there might be memory allocation issues causing blocking.
+
+To address this, they could try checking system logs for any warnings or errors related to locks or I/O. Tools like strace or dtrace might help trace the blocking calls. Increasing priority with nice/ionice could reduce interruptions but not necessarily fix deadlocks.
+
+Another thought: if QEMU is pegging the CPU so much, maybe there's a bug in their specific setup causing it to spin on locks without releasing them, leading to all CPUs being used by kernel functions trying to acquire those locks.
+
+I should also consider whether they're using the latest version of QEMU and any relevant patches. Maybe a known issue exists with certain configurations that cause high contention on these kernel primitives.
+
+In summary, their system is spending most of its time in kernel-level locking mechanisms, which could indicate either heavy I/O operations or actual deadlocks in user space causing the kernel to wait on futexes and spin locks. They need to check for any blocking calls, ensure proper locking in their application, and maybe tune QEMU's configuration or adjust system resources.
+</think>
+
+The provided data shows high CPU usage by the QEMU process with significant time spent in kernel-mode functions such as `_raw_spin_lock` and `futex` operations, which are often related to inter-process communication (IPC) or synchronization between threads. Additionally, there is noticeable memory allocation activity (`malloc`) in user space.
+
+### Key Observations:
+1. **High Kernel Mode Usage**:
+   - The `%sy` column shows that the CPU is spending most of its time executing kernel-mode code. This could indicate significant I/O operations (e.g., disk or network) or synchronization issues.
+   
+2. **Futex and Spin Lock Contention**:
+   - `futex_wait_setup`, `futex_wake`, and `_raw_spin_lock` are part of the Linux kernel's primitives for thread synchronization. High usage here suggests potential deadlocks, priority inversion, or heavy contention between threads.
+
+3. **Memory Allocation**:
+   - The presence of `malloc` in user space indicates that memory allocation operations might be contributing to the performance issue, possibly due to fragmentation or excessive allocations.
+
+4. **QEMU Process**:
+   - The QEMU process (`PID 30349`) is using a significant amount of CPU and system resources, which could indicate issues with how virtual machines are being managed or how I/O is handled within QEMU.
+
+### Possible Causes:
+1. **Thread Deadlock or Livelock**:
+   - If threads in the QEMU process are waiting indefinitely for locks to be released (deadlock) or spinning without making progress (livelock), this could cause high CPU usage and poor system responsiveness.
+
+2. **Heavy I/O Operations**:
+   - If QEMU is performing a lot of disk I/O, it might be waiting on the storage subsystem, leading to high `wa` values (wait time). However, in your case, the `wa` value is 0 for all CPUs, so this may not be the primary issue.
+
+3. **Resource Contention**:
+   - If multiple processes or threads are competing for shared resources (e.g., CPU cores, memory), this can lead to increased lock contention and higher kernel-mode activity.
+
+4. **Improper Synchronization**:
+   - If the synchronization primitives (like mutexes, semaphores) used in QEMU or your application are not implemented correctly, it could result in excessive waiting or spinning on locks.
+
+### Recommendations:
+1. **Check for Deadlocks**:
+   - Use tools like `strace`, `lsof`, or `systemtap` to trace the execution of the QEMU process and identify if any threads are stuck in a deadlock scenario.
+   
+2. **Analyze Futex Usage**:
+   - Use `futex_analyzer` (available in newer Linux kernels) or debug with `perf` to get detailed information about futex operations and contention points.
+
+3. **Review Memory Management**:
+   - Investigate memory usage patterns in QEMU. Check for memory leaks, excessive allocation, or fragmentation using tools like `valgrind`, `gdb`, or `pmap`.
+
+4. **Optimize Synchronization Primitives**:
+   - If QEMU uses custom synchronization mechanisms, review their implementation to ensure they are efficient and correctly handling contention scenarios.
+
+5. **Monitor System Resources**:
+   - Use monitoring tools (e.g., `htop`, `top`, `iostat`, `vmstat`) to track CPU, memory, and I/O usage in real-time. Look for signs of resource starvation or imbalance.
+
+6. **Update QEMU and Kernel**:
+   - Ensure that you are running the latest version of QEMU and the Linux kernel, as bugs related to synchronization and I/O handling might have been fixed in newer releases.
+
+7. **Consider Priority Configuration**:
+   - Use `nice` and `ionice` to adjust the priority of the QEMU process if it's interfering with other system tasks. However, this is more of a tuning measure rather than a fix for underlying issues.
+
+8. **Check for System Logs**:
+   - Look into logs (e.g., `/var/log/syslog`, `/var/log/kern.log`) for any warnings or errors related to process scheduling, I/O errors, or kernel messages that might indicate the source of the problem.
+
+9. **Distribute Workload Across CPUs**:
+   - If possible, balance the workload across multiple CPUs or adjust the CPU affinity settings using `taskset` to prevent over-saturation on specific cores.
+
+10. **Test with Reduced Load**:
+    - Try running QEMU under lower load conditions to see if the issue persists. This can help isolate whether the problem is related to resource constraints when the system is heavily loaded.
+
+### Conclusion:
+The high CPU usage and kernel-mode activity suggest that there are significant synchronization issues or deadlocks in your system, likely within the QEMU process itself or due to improper handling of resources by QEMU. To resolve this, you should systematically investigate the causes using the tools and techniques mentioned above, starting with checking for deadlocks and resource contention.

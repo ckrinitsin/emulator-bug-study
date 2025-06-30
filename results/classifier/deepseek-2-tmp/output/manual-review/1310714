@@ -1,0 +1,86 @@
+
+User mode networking SLIRP rapid memory leak
+
+QEMU compiled from git HEAD at 2d03b49c3f225994c4b0b46146437d8c887d6774 and reproducible at tag v2.0.0. I first noticed this bug using Ubuntu Trusty's QEMU 2.0.0~rc1. I used to run QEMU 1.7 without this problem.
+
+This is the command I ran:
+
+qemu-system-x86_64 -enable-kvm -smp 2 -m 1G -usbdevice tablet -net nic,model=e1000 -net user -vnc localhost:99 -drive if=ide,file=test.img,cache=none -net nic -net user,tftp=/tmp/tftpdata -no-reboot
+
+The guest is Windows 7 64-bit. The VM starts off normally, but after a couple of minutes, the memory usage starts to swell. If let running, it eventually consumes all host memory and grinds the host to a halt due to heavy swapping.
+
+When running under gdb, I set a breakpoint on mmap, and this is the stack trace I obtained.
+
+Breakpoint 1, mmap64 () at ../sysdeps/unix/syscall-template.S:81
+81	in ../sysdeps/unix/syscall-template.S
+(gdb) where
+#0  mmap64 () at ../sysdeps/unix/syscall-template.S:81
+#1  0x00007ffff0e65091 in new_heap (size=135168, size@entry=1728, 
+    top_pad=<optimized out>) at arena.c:554
+#2  0x00007ffff0e687b2 in sysmalloc (av=0x7fffd0000020, nb=1664)
+    at malloc.c:2386
+#3  _int_malloc (av=0x7fffd0000020, bytes=1650) at malloc.c:3740
+#4  0x00007ffff0e69f50 in __GI___libc_malloc (bytes=1650) at malloc.c:2855
+#5  0x00005555557a091a in m_get (slirp=0x5555561fe960)
+    at /src/qemu/slirp/mbuf.c:73
+#6  0x00005555557a3151 in slirp_input (slirp=0x5555561fe960, 
+    pkt=0x7ffff7e94b20 "RU\n", pkt_len=<optimized out>)
+    at /src/qemu/slirp/slirp.c:747
+#7  0x0000555555758b24 in net_slirp_receive (nc=<optimized out>, 
+    buf=<optimized out>, size=54) at /src/qemu/net/slirp.c:113
+#8  0x00005555557567d1 in qemu_deliver_packet (sender=<optimized out>, 
+    flags=<optimized out>, data=<optimized out>, size=<optimized out>, 
+    opaque=<optimized out>) at /src/qemu/net/net.c:471
+#9  0x00005555557588d3 in qemu_net_queue_deliver (size=54, 
+    data=0x7ffff7e94b20 "RU\n", flags=0, sender=0x5555561fe5e0, 
+    queue=0x5555561fe1d0) at /src/qemu/net/queue.c:157
+#10 qemu_net_queue_send (queue=0x5555561fe1d0, sender=0x5555561fe5e0, flags=0, 
+    data=0x7ffff7e94b20 "RU\n", size=54, sent_cb=<optimized out>)
+    at /src/qemu/net/queue.c:192
+---Type <return> to continue, or q <return> to quit---
+#11 0x000055555575536b in net_hub_receive (len=54, buf=0x7ffff7e94b20 "RU\n", 
+    source_port=0x5555561fe310, hub=<optimized out>) at /src/qemu/net/hub.c:55
+#12 net_hub_port_receive (nc=0x5555561fe310, buf=0x7ffff7e94b20 "RU\n", len=54)
+    at /src/qemu/net/hub.c:114
+#13 0x00005555557567d1 in qemu_deliver_packet (sender=<optimized out>, 
+    flags=<optimized out>, data=<optimized out>, size=<optimized out>, 
+    opaque=<optimized out>) at /src/qemu/net/net.c:471
+#14 0x00005555557588d3 in qemu_net_queue_deliver (size=54, 
+    data=0x7ffff7e94b20 "RU\n", flags=0, sender=0x555556531920, 
+    queue=0x5555561fe090) at /src/qemu/net/queue.c:157
+#15 qemu_net_queue_send (queue=0x5555561fe090, sender=0x555556531920, flags=0, 
+    data=0x7ffff7e94b20 "RU\n", size=54, sent_cb=<optimized out>)
+    at /src/qemu/net/queue.c:192
+#16 0x00005555556db95d in xmit_seg (s=0x7ffff7e72010)
+    at /src/qemu/hw/net/e1000.c:628
+#17 0x00005555556dbd38 in process_tx_desc (dp=0x7fffdf7fda30, s=0x7ffff7e72010)
+    at /src/qemu/hw/net/e1000.c:723
+#18 start_xmit (s=0x7ffff7e72010) at /src/qemu/hw/net/e1000.c:778
+#19 set_tctl (s=0x7ffff7e72010, index=<optimized out>, val=<optimized out>)
+    at /src/qemu/hw/net/e1000.c:1142
+#20 0x0000555555840fb0 in access_with_adjusted_size (addr=14360, 
+    value=0x7fffdf7fdb10, size=4, access_size_min=<optimized out>, 
+    access_size_max=<optimized out>, 
+---Type <return> to continue, or q <return> to quit---
+    access=0x555555841160 <memory_region_write_accessor>, mr=0x7ffff7e747c0)
+    at /src/qemu/memory.c:478
+#21 0x00005555558462fe in memory_region_dispatch_write (size=4, data=454, 
+    addr=14360, mr=0x7ffff7e747c0) at /src/qemu/memory.c:990
+#22 io_mem_write (mr=0x7ffff7e747c0, addr=14360, val=<optimized out>, size=4)
+    at /src/qemu/memory.c:1744
+#23 0x00005555557e8717 in address_space_rw (
+    as=0x555556159c80 <address_space_memory>, addr=4273485848, 
+    buf=0x7ffff7fed028 "\306\001", len=4, is_write=true)
+    at /src/qemu/exec.c:2034
+#24 0x000055555583ff65 in kvm_cpu_exec (cpu=<optimized out>)
+    at /src/qemu/kvm-all.c:1704
+#25 0x00005555557ddb6c in qemu_kvm_cpu_thread_fn (arg=0x55555651b730)
+    at /src/qemu/cpus.c:873
+#26 0x00007ffff11b6182 in start_thread (arg=0x7fffdf7fe700)
+    at pthread_create.c:312
+#27 0x00007ffff0ee1b2d in clone ()
+    at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+
+Let me know if you have any questions. Thanks.
+
+liulk

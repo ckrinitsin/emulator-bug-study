@@ -1,0 +1,47 @@
+
+linux-user as binfmt_misc fails to recognize AT_EXECFD if it's 0 and leaves it open as stdin
+Description of problem:
+When a `*-linux-user` is used as binfmt_misc, and...
+
+- The `O` (i.e. open-binary) flag is set
+- File descriptor 0 is closed when running the executable
+
+FD 0 is opened to point at the executable and passed as `AT_EXECFD`, which QEMU fails to recognize and leaves open before handing control over to the executable, leading to the program to think stdin is opened for reading its own executable.
+
+Some use cases rely on closed stdin to behave correctly. For example, this problem causes the `tests/tail/follow-stdin.sh` and `tests/tac/tac-2-nonseekable.sh` tests in GNU coreutils to fail. In any case, having the executable itself be stdin is definitely incorrect and quite surprising behavior.
+Steps to reproduce:
+1. Set up qemu-riscv64 as binfmt_misc with `qemu-binfmt-conf.sh`, with the `--credential` flag (which enables open-binary)
+2. Get a coreutils built for riscv64 (Let's say it can be found in `riscv64-coreutils/bin`)
+3. Run it with something like `riscv64-coreutils/bin/cat <&- | xxd | head` (`xxd | head` to catch the binary output)
+
+The correct behavior is (You can see by running the native `cat <&-`):
+
+```
+cat: -: Bad file descriptor
+cat: closing standard input: Bad file descriptor
+```
+
+Instead, the executable `cat` itself is dumped to stdout.
+
+Perhaps slightly more clear is `riscv64-coreutils/bin/ls -l /proc/self/fd <&-` which shows fd 0 unexpectedly pointing to the coreutils executable.
+Additional information:
+I'm interested in writing a patch to fix this issue but I'm uncertain how to proceed. This is what I've found so far:
+
+In `linux-user/main.c` if (effectively) `getauxval(AT_EXECFD)` is 0 it's treated as nonexistent. (https://gitlab.com/qemu-project/qemu/-/blob/0d9f1016d43302108d33d1268304a06cc3fb2021/linux-user/main.c#L758-765)
+
+```c
+    execfd = qemu_getauxval(AT_EXECFD);
+    if (execfd == 0) {
+        execfd = open(exec_path, O_RDONLY);
+        if (execfd < 0) {
+            printf("Error while loading %s: %s\n", exec_path, strerror(errno));
+            _exit(EXIT_FAILURE);
+        }
+    }
+```
+
+However as we've seen `getauxval(AT_EXECFD)` can have 0 as a valid value.
+
+`qemu_getauxval` in `util/getauxval.c` implements several strategies to get the auxv, but doesn't currently give a way to distinguish not found and 0. FreeBSD `elf_aux_info` has `EINVAL` and `ENOENT` error codes but it's ignored here. On Linux, glibc sets `errno` to `ENOENT` to distinguish the two cases but only on glibc >= 2.19. Musl's `getauxval` has always had setting `errno` to `ENOENT`.
+
+Once we add a proper "`AT_EXECFD` doesn't exist" check this will no longer be a problem since (IIUC) `execfd` will eventually be closed after loading. How should we add "not found" support to `qemu_getauxval`? Is just simply relying on libc's `getauxval` setting `errno` okay?

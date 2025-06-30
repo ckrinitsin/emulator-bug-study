@@ -1,0 +1,90 @@
+<think>
+Alright, so I'm trying to figure out why my L2 VM is crashing when I try to run an Ubuntu 16.04.5 LTS cloud image inside a KVM virtual machine on another Ubuntu 16.04.5 VM (which itself is running on physical hardware). Let's go through the information provided and see what might be causing this issue.
+
+First, from the logs, I see that there are warnings about the host not supporting requested features related to CPUID. Specifically, it mentions "CPUID.07H:EBX.invpcid [bit 10]" twice. That seems significant because it's pointing out a missing feature in the host (which is my L1 VM) that the guest (L2 VM) might be expecting.
+
+Let me break down what I know:
+
+1. **Host and Guest OS Versions**:
+   - The L0 hypervisor is running Ubuntu 18.04 with KVM/QEMU.
+   - The L1 VM is running Ubuntu 16.04.5 LTS using a cloud image.
+   - The L2 VM attempts to run the same or another Ubuntu 16.04.5 cloud image but fails.
+
+2. **Working Scenarios**:
+   - When all levels (L0, L1, L2) are running Ubuntu 18.04, it works fine.
+   - When L0 and L1 are 18.04, and L2 is 16.04.5, it also works.
+
+3. **Problematic Scenario**:
+   - All levels being 16.04.5 causes the crash in L2 VM with kernel panic or general protection fault.
+
+Looking at the logs again, the warnings about CPUID features not being supported might be the key here. These features are part of Intel's virtualization technology (VT-x), and they're essential for nested virtualization to work correctly.
+
+In the provided details, the user mentioned that KVM acceleration is enabled (`kvm-ok` shows it can be used) and that nested virtualization is also allowed (`nested` parameter in kvm_intel is set to Y). That means the hardware supports nested KVM, but perhaps there's an issue with how these features are being exposed or handled by the L1 VM when running the 16.04.5 cloud image.
+
+I remember that older versions of libvirt and QEMU might not handle nested virtualization as efficiently as newer ones. The user is using libvirt version 4.0.0, which should support nested KVM, but maybe there's a regression or specific configuration needed when running certain guest OS versions.
+
+Another thing to consider is the CPU model being exposed to the L2 VM. If the L1 VM isn't properly exposing the necessary CPU features (like invpcid), the L2 VM might not be able to function correctly. The warnings in the logs suggest that the host (L1) doesn't support this feature, which could mean that either:
+
+- The L1 VM's CPU configuration doesn't include the required features.
+- The hypervisor on L1 isn't properly passing these features through to the L2 VM.
+
+I also recall that cloud images are optimized for certain environments and might have specific requirements regarding virtualization. It's possible that the 16.04.5 cloud image expects a more recent version of KVM/QEMU or has different virtualization settings than what's being provided in the nested environment.
+
+Looking at the `virt-install` script, I notice that it specifies `--cpu host`, which tells the hypervisor to expose the same CPU as the host. If the L1 VM is running on a system with newer CPU features and the 16.04.5 cloud image expects those features when running nested KVM, but perhaps something isn't being translated correctly.
+
+Another angle could be that there's an issue with the way disk images or network settings are configured for the L2 VM, but since Cirros works fine, it's less likely to be a hardware configuration problem and more about software compatibility.
+
+I should also check if the libvirt version on the L1 VM is compatible with running nested KVM for Ubuntu 16.04.5 guests. Perhaps there was an update in libvirt that fixed this issue, or maybe a certain version introduced a regression when dealing with older guest OS versions.
+
+In summary, the main clues point towards CPUID feature mismatches between the L1 VM and the L2 guest. The warnings about missing features suggest that the virtualization setup might not be correctly exposing these to the nested VM. Since it works with Ubuntu 18.04 guests, maybe the 16.04.5 cloud image is expecting or requiring certain CPU extensions that aren't being properly handled in the nested environment.
+
+To troubleshoot further, I could try:
+
+- Updating libvirt and QEMU on the L1 VM to see if a newer version resolves the issue.
+- Checking the CPU configuration exposed to the L2 VM using `virsh` commands or by looking at the VM's XML definition to ensure it matches what the guest expects.
+- Testing with different CPU models or configurations in the L1 VM to see if that affects the outcome.
+- Looking into libvirt and KVM documentation for known issues regarding nested virtualization with older guest OS versions.
+
+It might also be helpful to look at any kernel parameters or module settings related to virtualization on both the L0 hypervisor and the L1 VM. Ensuring that all necessary modules are loaded and configured correctly could prevent such issues.
+
+In conclusion, the problem likely stems from CPU feature exposure during nested virtualization, where the L2 guest (Ubuntu 16.04.5) expects certain features not properly supported by the L1 VM's hypervisor setup, leading to crashes.
+</think>
+
+The issue arises due to CPUID feature mismatches when running a nested KVM environment with Ubuntu 16.04.5 LTS guests on an L1 VM. The warnings indicate that the L2 guest expects certain Intel VT-x features (like invpcid), which aren't properly exposed by the L1 hypervisor, causing crashes.
+
+**Solution Steps:**
+
+1. **Update Software Components:**
+   - Ensure both libvirt and QEMU are updated to their latest versions on the L1 VM to benefit from improvements in nested virtualization support.
+
+2. **Check CPU Configuration:**
+   - Use `virsh` commands or inspect the VM's XML configuration to verify that the exposed CPU model includes all necessary features for the guest OS.
+   - Example command:
+     ```bash
+     virsh edit <l1-vm-name>
+     ```
+     Look for `<cpu mode='host-passthrough' ... />` and ensure it includes required features.
+
+3. **Adjust CPU Model in VM Definition:**
+   - Modify the L1 VM's CPU configuration to explicitly include the necessary features (e.g., `invpcid`) if they are supported by the host.
+   - Example XML snippet:
+     ```xml
+     <cpu mode='host-passthrough' check='none'>
+       <feature name='invpcid' state='on'/>
+     </cpu>
+     ```
+
+4. **Restart Services:**
+   - After making changes to VM definitions, restart libvirt services to apply them.
+     ```bash
+     sudo systemctl restart libvirtd
+     ```
+
+5. **Test with Different Guest OS Versions:**
+   - If possible, test the setup using different guest versions to isolate whether the issue is specific to 16.04.5.
+
+6. **Review Documentation and Known Issues:**
+   - Consult libvirt and QEMU documentation for any known issues regarding nested virtualization and older guest operating systems.
+   - Check community forums or bug trackers for similar issues and resolutions.
+
+By addressing the CPU feature exposure and ensuring all necessary components are up-to-date, the L2 VM should run without crashes.
