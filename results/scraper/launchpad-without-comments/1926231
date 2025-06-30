@@ -1,0 +1,37 @@
+SCSI passthrough of SATA cdrom -> errors & performance issues
+
+qemu 5.0, compiled from git
+
+I am passing through a SATA cdrom via SCSI passthrough, with this libvirt XML:
+
+    <hostdev mode='subsystem' type='scsi' managed='no' sgio='unfiltered' rawio='yes'>
+      <source>
+        <adapter name='scsi_host3'/>
+        <address bus='0' target='0' unit='0'/>
+      </source>
+      <alias name='hostdev0'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </hostdev>
+
+It seems to mostly work, I have written discs with it, except I am getting errors that cause reads to take about 5x as long as they should, under certain circumstances.  It appears to be based on the guest's read block size.
+
+I found that if on the guest I run, say `dd if=$some_large_file bs=262144|pv > /dev/null`, `iostat` and `pv` disagree about how much is being read by a factor of about 2.  Also many kernel messages like this happen on the guest:
+
+[  190.919684] sr 0:0:0:0: [sr0] tag#160 FAILED Result: hostbyte=DID_OK driverbyte=DRIVER_SENSE cmd_age=0s
+[  190.919687] sr 0:0:0:0: [sr0] tag#160 Sense Key : Aborted Command [current] 
+[  190.919689] sr 0:0:0:0: [sr0] tag#160 Add. Sense: I/O process terminated
+[  190.919691] sr 0:0:0:0: [sr0] tag#160 CDB: Read(10) 28 00 00 18 a5 5a 00 00 80 00
+[  190.919694] blk_update_request: I/O error, dev sr0, sector 6460776 op 0x0:(READ) flags 0x80700 phys_seg 5 prio class 0
+
+If I change to bs=131072 the errors stop and performance is normal.
+
+(262144 happens to be the block size ultimately used by md5sum, which is how I got here)
+
+I also ran strace on the qemu process while it was happening, and noticed SG_IO calls like this:
+
+21748 10:06:29.330910 ioctl(22, SG_IO, {interface_id='S', dxfer_direction=SG_DXFER_FROM_DEV, cmd_len=10, cmdp="\x28\x00\x00\x12\x95\x5a\x00\x00\x80\x00", mx_sb_len=252, iovec_count=0, dxfer_len=262144, timeout=4294967295, flags=SG_FLAG_DIRECT_IO <unfinished ...>
+21751 10:06:29.330976 ioctl(22, SG_IO, {interface_id='S', dxfer_direction=SG_DXFER_FROM_DEV, cmd_len=10, cmdp="\x28\x00\x00\x12\x94\xda\x00\x00\x02\x00", mx_sb_len=252, iovec_count=0, dxfer_len=4096, timeout=4294967295, flags=SG_FLAG_DIRECT_IO <unfinished ...>
+21749 10:06:29.331586 ioctl(22, SG_IO, {interface_id='S', dxfer_direction=SG_DXFER_FROM_DEV, cmd_len=10, cmdp="\x28\x00\x00\x12\x94\xdc\x00\x00\x02\x00", mx_sb_len=252, iovec_count=0, dxfer_len=4096, timeout=4294967295, flags=SG_FLAG_DIRECT_IO <unfinished ...>
+[etc]
+
+I suspect qemu is the culprit because I have tried a 4.19 guest kernel as well as a 5.9 one, with the same result.

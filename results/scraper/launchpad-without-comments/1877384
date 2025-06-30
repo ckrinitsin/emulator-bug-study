@@ -1,0 +1,25 @@
+9pfs file create with mapped-xattr can fail on overlayfs
+
+QEMU Version: 3.1.0 as packaged in debian buster, but the code appears to do the same in master.
+qemu command-line: qemu-system-x86_64 -m 1G -nographic -nic "user,model=virtio-net-pci,tftp=$(pwd),net=10.0.2.0/24,host=10.0.2.2" -fsdev local,id=fs,path=$thisdir/..,security_model=mapped-xattr -device virtio-9p-pci,fsdev=fs,mount_tag=fs -drive "file=$rootdisk,if=virtio,format=raw" -kernel "$kernel" -initrd "$initrd" -append "$append"
+
+
+I'm using CI that runs in a Docker container and runs a qemu VM with code and results shared via virtio 9p.
+The 9p fsdev is configured with security_model=mapped-xattr
+When the test code attempts to create a log file in an existing directory, open with O_CREAT fails with -ENOENT.
+
+The relevant strace excerpt is:
+
+28791 openat(11, ".", O_RDONLY|O_NOFOLLOW|O_PATH|O_DIRECTORY) = 20
+28791 openat(20, "src", O_RDONLY|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW|O_DIRECTORY) = 21
+28791 fcntl(21, F_SETFL, O_RDONLY|O_DIRECTORY) = 0
+28791 close(20)                         = 0
+28791 openat(21, "client.log", O_WRONLY|O_CREAT|O_NOCTTY|O_NONBLOCK|O_NOFOLLOW, 0600) = 20
+28791 fcntl(20, F_SETFL, O_WRONLY|O_CREAT|O_NONBLOCK|O_NOFOLLOW) = 0
+28791 lsetxattr("/proc/self/fd/21/client.log", "user.virtfs.uid", "\0\0\0", 4, 0) = -1 ENOENT (No such file or directory)
+
+My hypothesis for what's going wrong is since the Docker container's overlayfs copies-up on writes, when it opens the file it's created a new version of the `src` directory containing a `client.log`, but this new src directory isn't accessible by file descriptor 20 and the lsetxattr call is instead attempting to set attributes on the path in the old `src` directory.
+
+Looking at the code, a fix would be to change `hw/9pfs/9p-local.c` and change `local_open2` to instead of calling `local_set_xattrat` to set the xattrs by directory file descriptor and file name, to have a version of local_set_xattrat` which uses `fsetxattr` to set the virtfs attributes instead of the `fsetxattrat_nofollow` helper.
+
+This reliably happened for me in CI, but I don't have access to the CI host or the time to strip the test down to make a minimal test case, and had difficulty reproducing the error on other machines.

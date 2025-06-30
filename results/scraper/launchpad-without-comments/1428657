@@ -1,0 +1,70 @@
+qemu-system-arm does not ignore the lowest bit of pc when returning from interrrupt
+
+This was observed in qemu v2.1.3, running a sample app from 
+
+FreeRTOS(FreeRTOSV7.5.2/FreeRTOS/Demo/CORTEX_LM3Sxxxx_Eclipse/RTOSDemo)
+
+In the sample code compiled with arm-none-eabi-gcc , version 4.8.2 (4.8.2-14ubuntu1+6) .
+
+qemu seems to be executing the wrong instrunction after returning from the SVCHandler. The svc handler changes the PSP register and the new stack contains an add return address, which should be allowed(http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.faqs/ka12545.html). The lowest bit of the address should be ignored, but it seems that qemu executes garbage after returning from the interrupt.
+
+qemu is run like this:
+
+qemu-system-arm -semihosting -machine lm3s6965evb -kernel RTOSDemo.axf -gdb tcp::1234 -S
+
+
+this is the arm-gdb trace
+Program received signal SIGINT, Interrupt.
+IntDefaultHandler () at startup.c:231
+231	{
+(gdb) bt
+#0  IntDefaultHandler () at startup.c:231
+#1  0xfffffffc in ?? ()
+
+(gdb) info registers 
+r0             0x0	0
+r1             0x14b4b4b4	347387060
+r2             0xa5a5a5a5	-1515870811
+r3             0xa5a5a53d	-1515870915
+r4             0xa5a5a5a5	-1515870811
+r5             0xa5a5a5a5	-1515870811
+r6             0xa5a5a5a5	-1515870811
+r7             0x40d00542	1087374658
+r8             0xa5a5a5a5	-1515870811
+r9             0xa5a5a5a5	-1515870811
+r10            0xa5a5a5a5	-1515870811
+r11            0xa5a5a5a5	-1515870811
+r12            0xa5a5a5a5	-1515870811
+sp             0x20008380	0x20008380
+lr             0xfffffffd	-3
+pc             0xc648	0xc648 <IntDefaultHandler>
+cpsr           0x20000173	536871283
+
+this exception occur after running SVC handler code
+
+(gdb) disassemble vPortSVCHandler 
+Dump of assembler code for function vPortSVCHandler:
+   0x0000c24c <+0>:	ldr	r3, [pc, #24]	; (0xc268 <vPortSVCHandler+28>)
+   0x0000c24e <+2>:	ldr	r1, [r3, #0]
+   0x0000c250 <+4>:	ldr	r0, [r1, #0]
+   0x0000c252 <+6>:	ldmia.w	r0!, {r4, r5, r6, r7, r8, r9, r10, r11}
+   0x0000c256 <+10>:	msr	PSP, r0
+   0x0000c25a <+14>:	mov.w	r0, #0
+   0x0000c25e <+18>:	msr	BASEPRI, r0
+   0x0000c262 <+22>:	orr.w	lr, lr, #13
+   0x0000c266 <+26>:	bx	lr
+   0x0000c268 <+28>:	andcs	r2, r0, r12, ror #5
+End of assembler dump.
+
+This stores this stack in PSP register:
+(gdb) x /32 0x200052c8
+0x200052c8:	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5
+0x200052d8:	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5	0xa5a5a5a5
+0x200052e8:	0x00000000	0x14b4b4b4	0xa5a5a5a5	0xa5a5a53d
+0x200052f8:	0xa5a5a5a5	0x00000000	0x00003b49	0x21000000
+0x20005308:	0xa5a5a5a5	0xa5a5a5a5	0x200081b8	0x00000058
+0x20005318:	0x00000000	0x00000000	0x00000000	0x00000000
+0x20005328:	0x00000000	0x20005330	0xffffffff	0x20005330
+0x20005338:	0x20005330	0x00000000	0x20005344	0xffffffff
+
+It seems that qemu actually executes 0x00003b49 after the interrupt, but it should execute 0x00003b48

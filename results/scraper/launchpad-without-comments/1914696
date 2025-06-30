@@ -1,0 +1,90 @@
+aarch64: migration failed: Segmentation fault (core dumped)
+
+reproduce:
+
+arch: aarch64
+source qemu: v4.2.0
+destination qemu: 1ed9228f63ea4bcc0ae240365305ee264e9189ce
+
+cmdline:
+source: 
+$ ./aarch64-softmmu/qemu-system-aarch64     -name 'avocado-vt-vm1'    -machine virt-4.2,gic-version=host,graphics=on     -nodefaults     -m 1024      -smp 2      -cpu 'host'     -vnc :10      -enable-kvm     -monitor stdio
+(qemu) 
+(qemu) migrate -d tcp:10.19.241.167:888
+(qemu) info status
+VM status: paused (postmigrate)
+
+destination: 
+./build/aarch64-softmmu/qemu-system-aarch64 -name 'avocado-vt-vm1'  -machine virt-4.2,gic-version=host,graphics=on     -nodefaults     -m 1024      -smp 2      -cpu 'host'     -vnc :10      -enable-kvm     -monitor stdio -incoming tcp:0:888
+QEMU 5.2.50 monitor - type 'help' for more information
+(qemu) Segmentation fault (core dumped)
+
+
+i have bisected and confirmed that the first bad commit is: [f9506e162c33e87b609549157dd8431fcc732085] target/arm: Remove ARM_FEATURE_VFP*
+
+bisect log:
+git bisect log
+# bad: [1ed9228f63ea4bcc0ae240365305ee264e9189ce] Merge remote-tracking branch 'remotes/ericb/tags/pull-nbd-2021-02-02-v2' into staging
+git bisect bad 1ed9228f63ea4bcc0ae240365305ee264e9189ce
+# good: [b0ca999a43a22b38158a222233d3f5881648bb4f] Update version for v4.2.0 release
+git bisect good b0ca999a43a22b38158a222233d3f5881648bb4f
+# bad: [59093cc407cb044c72aa786006a07bd404eb36b9] hw/char: Convert the Ibex UART to use the registerfields API
+git bisect bad 59093cc407cb044c72aa786006a07bd404eb36b9
+# bad: [4dabf39592e92d692c6f2a1633571114ae25d843] aspeed/smc: Fix DMA support for AST2600
+git bisect bad 4dabf39592e92d692c6f2a1633571114ae25d843
+# good: [93c86fff53a267f657e79ec07dcd04b63882e330] Merge remote-tracking branch 'remotes/pmaydell/tags/pull-target-arm-20200207' into staging
+git bisect good 93c86fff53a267f657e79ec07dcd04b63882e330
+# bad: [2ac031d171ccd18c973014d9978b4a63f0ad5fb0] Merge remote-tracking branch 'remotes/palmer/tags/riscv-for-master-5.0-sf3' into staging
+git bisect bad 2ac031d171ccd18c973014d9978b4a63f0ad5fb0
+# good: [4036b7d1cd9fb1097a5f4bc24d7d31744256260f] target/arm: Use isar_feature function for testing AA32HPD feature
+git bisect good 4036b7d1cd9fb1097a5f4bc24d7d31744256260f
+# good: [002375895c10df40615fc615e2639f49e0c442fe] tests/iotests: be a little more forgiving on the size test
+git bisect good 002375895c10df40615fc615e2639f49e0c442fe
+# good: [c695724868ce4049fd79c5a509880dbdf171e744] target/riscv: Emulate TIME CSRs for privileged mode
+git bisect good c695724868ce4049fd79c5a509880dbdf171e744
+# good: [f67957e17cbf8fc3cc5d1146a2db2023404578b0] target/arm: Add isar_feature_aa32_{fpsp_v2, fpsp_v3, fpdp_v3}
+git bisect good f67957e17cbf8fc3cc5d1146a2db2023404578b0
+# bad: [a1229109dec4375259d3fff99f362405aab7917a] target/arm: Implement v8.4-RCPC
+git bisect bad a1229109dec4375259d3fff99f362405aab7917a
+# bad: [906b60facc3d3dd3af56cb1a7860175d805e10a3] target/arm: Add formats for some vfp 2 and 3-register insns
+git bisect bad 906b60facc3d3dd3af56cb1a7860175d805e10a3
+# good: [c52881bbc22b50db99a6c37171ad3eea7d959ae6] target/arm: Replace ARM_FEATURE_VFP4 with isar_feature_aa32_simdfmac
+git bisect good c52881bbc22b50db99a6c37171ad3eea7d959ae6
+# good: [f0f6d5c81be47d593e5ece7f06df6fba4c15738b] target/arm: Move the vfp decodetree calls next to the base isa
+git bisect good f0f6d5c81be47d593e5ece7f06df6fba4c15738b
+# bad: [f9506e162c33e87b609549157dd8431fcc732085] target/arm: Remove ARM_FEATURE_VFP*
+git bisect bad f9506e162c33e87b609549157dd8431fcc732085
+# good: [bfa8a370d2f5d4ed03f7a7e2987982f15fe73758] linux-user/arm: Replace ARM_FEATURE_VFP* tests for HWCAP
+git bisect good bfa8a370d2f5d4ed03f7a7e2987982f15fe73758
+# first bad commit: [f9506e162c33e87b609549157dd8431fcc732085] target/arm: Remove ARM_FEATURE_VFP*
+
+
+the root cause is that, some feature bit is not consistent any more with below changes in this commit:
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index b29b0eddfc..05aa9711cd 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -1880,7 +1880,6 @@ QEMU_BUILD_BUG_ON(ARRAY_SIZE(((ARMCPU *)0)->ccsidr) <= R_V7M_CSSELR_INDEX_MASK);
+  * mapping in linux-user/elfload.c:get_elf_hwcap().
+  */
+ enum arm_features {
+-    ARM_FEATURE_VFP,
+     ARM_FEATURE_AUXCR,  /* ARM1026 Auxiliary control register.  */
+     ARM_FEATURE_XSCALE, /* Intel XScale extensions.  */
+     ARM_FEATURE_IWMMXT, /* Intel iwMMXt extension.  */
+@@ -1889,7 +1888,6 @@ enum arm_features {
+     ARM_FEATURE_V7,
+     ARM_FEATURE_THUMB2,
+     ARM_FEATURE_PMSA,   /* no MMU; may have Memory Protection Unit */
+-    ARM_FEATURE_VFP3,
+     ARM_FEATURE_NEON,
+     ARM_FEATURE_M, /* Microcontroller profile.  */
+     ARM_FEATURE_OMAPCP, /* OMAP specific CP15 ops handling.  */
+@@ -1900,7 +1898,6 @@ enum arm_features {
+     ARM_FEATURE_V5,
+     ARM_FEATURE_STRONGARM,
+     ARM_FEATURE_VAPA, /* cp15 VA to PA lookups */
+-    ARM_FEATURE_VFP4, /* VFPv4 (implies that NEON is v2) */
+     ARM_FEATURE_GENERIC_TIMER,
+     ARM_FEATURE_MVFR, /* Media and VFP Feature Registers 0 and 1 */
+     ARM_FEATURE_DUMMY_C15_REGS, /* RAZ/WI all of cp15 crn=15 */

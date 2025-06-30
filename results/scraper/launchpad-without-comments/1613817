@@ -1,0 +1,56 @@
+x86: ret, lret and iret with noncanonical IP saves wrong IP on the exception stack
+
+This test program:
+
+# compile with: gcc -nostartfiles -nostdlib
+_start:         .globl  _start
+                mov     %ss,%eax
+                push    %rax
+                push    %rsp
+                pushf
+                mov     %cs,%eax
+                push    %rax
+                mov     $0x1234567812345678,%rax
+                push    %rax
+//qemu bug: ip=1234567812345678, should be ip=0000000000400abc:
+                iretq
+1:
+                jmp     1b
+
+should segfault on IRET instruction because return address on stack is invalid
+(it is not canonical). And it does, both on native CPU and in qemu.
+But there is a difference: on native CPU, it fails before instruction is executed,
+IOW: saved IP points to the failed IRET:
+
+# strace -i ./bad_ip_in_iret 
+[00007fa609805d57] execve("./bad_ip_in_iret", ["./bad_ip_in_iret"], [/* 54 vars */]) = 0
+[00000000004000e7] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+ ^^^^^^^^^^^^^^^^-NOTE THIS
+[????????????????] +++ killed by SIGSEGV (core dumped) +++
+
+
+In qemu, evidently instruction succeeds, and then emulated CPU throws an exception because fetching instructions from non-canonical addresses is not allowed:
+
+/ # strace -i ./bad_ip_in_iret
+[000000000041a790] execve("./bad_ip_in_iret", ["./bad_ip_in_iret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+ ^^^^^^^^^^^^^^^^-NOTE THIS
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault
+
+Thus, the emulation is not the same as real CPU.
+
+This is not specific to IRET, the same happens with "far return" LRET,
+and with ordinary RET instructions as well.
+In qemu:
+
+/ # strace -i ./bad_ip_in_lret
+[000000000041a790] execve("./bad_ip_in_lret", ["./bad_ip_in_lret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault
+/ # strace -i ./bad_ip_in_ret
+[000000000041a790] execve("./bad_ip_in_ret", ["./bad_ip_in_ret"], [/* 5 vars */]) = 0
+[1234567812345678] --- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=0} ---
+[????????????????] +++ killed by SIGSEGV +++
+Segmentation fault

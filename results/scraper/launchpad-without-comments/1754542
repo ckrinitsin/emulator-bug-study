@@ -1,0 +1,68 @@
+colo:  vm crash with segmentation fault
+
+I use Arch Linux x86_64
+both qemu 2.11.1 Zhang Chen's(https://github.com/zhangckid/qemu/commits/colo-with-virtio-net-internal-jul10)
+Following document 'COLO-FT.txt',
+I test colo feature on my hosts
+
+I run this command
+Primary:
+sudo qemu-system-x86_64 -boot c   -enable-kvm -m 2048 -smp 2  -qmp stdio  -name primary \
+-device piix3-usb-uhci \
+-device usb-tablet -netdev tap,id=hn0,vhost=off \
+-device virtio-net-pci,id=net-pci0,netdev=hn0 \
+-drive if=virtio,id=colo-disk0,driver=quorum,read-pattern=fifo,vote-threshold=1,children.0.file.filename=/var/lib/libvirt/images/1.raw,children.0.driver=raw -S
+
+Secondary:
+sudo qemu-system-x86_64 -boot c -enable-kvm -m 2048 -smp 2 -qmp stdio  -name secondary \
+-device piix3-usb-uhci \
+-device usb-tablet -netdev tap,id=hn0,vhost=off \
+-device virtio-net-pci,id=net-pci0,netdev=hn0 \
+-drive if=none,id=colo-disk0,file.filename=/var/lib/libvirt/images/2.raw,driver=raw,node-name=node0 \
+-drive if=virtio,id=active-disk0,driver=replication,mode=secondary,\
+file.driver=qcow2,top-id=active-disk0,\
+file.file.filename=/mnt/ramfs/active_disk.img,\
+file.backing.driver=qcow2,\
+file.backing.file.filename=/mnt/ramfs/hidden_disk.img,\
+file.backing.backing=colo-disk0 \
+-incoming tcp:0:8888
+
+Secondary:
+{'execute':'qmp_capabilities'}
+{ 'execute': 'nbd-server-start',
+  'arguments': {'addr': {'type': 'inet', 'data': {'host': '192.168.0.33', 'port': '8889'} } }
+}
+{'execute': 'nbd-server-add', 'arguments': {'device': 'colo-disk0', 'writable': true } }
+
+Primary:
+{'execute':'qmp_capabilities'}
+{ 'execute': 'human-monitor-command',
+  'arguments': {'command-line': 'drive_add -n buddy driver=replication,mode=primary,file.driver=nbd,file.host=192.168.0.33,file.port=8889,file.export=colo-disk0,node-name=nbd_client0'}}
+{ 'execute':'x-blockdev-change', 'arguments':{'parent': 'colo-disk0', 'node': 'nbd_client0' } }
+{ 'execute': 'migrate-set-capabilities',
+      'arguments': {'capabilities': [ {'capability': 'x-colo', 'state': true } ] } }
+{ 'execute': 'migrate', 'arguments': {'uri': 'tcp:192.168.0.33:8888' } }
+{ 'execute': 'migrate-set-parameters' , 'arguments':{ 'x-checkpoint-delay': 2000 } }
+
+Above are all OK.Two VM syncing.
+
+Primary:
+{ 'execute': 'x-blockdev-change', 'arguments': {'parent': 'colo-disk0', 'child': 'children.1'}}
+{ 'execute': 'human-monitor-command','arguments': {'command-line': 'drive_del blk-buddy0'}}
+
+Secondary:
+{ 'execute': 'nbd-server-stop' }
+{ 'execute': 'x-colo-lost-heartbeat' }
+
+But When I execute x-colo-lost-heartbeat.Primary run Secondary cash
+
+
+ { 'execute': 'nbd-server-stop' }
+{"return": {}}
+qemu-system-x86_64: Disconnect client, due to: Unexpected end-of-file before all bytes were read
+ { 'execute': 'x-colo-lost-heartbeat' }
+{"return": {}}
+qemu-system-x86_64: Can't receive COLO message: Input/output error
+**
+ERROR:/build/qemu/src/qemu-2.11.1/qom/object.c:907:object_unref: assertion failed (obj->ref > 0): (0 > 0)
+[1]    2972 abort      sudo /usr/bin/qemu-system-x86_64 -boot c -enable-kvm -m 2048 -smp 2 -qmp stdi

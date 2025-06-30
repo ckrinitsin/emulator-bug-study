@@ -1,0 +1,70 @@
+qemu spinning on serial port writes
+
+As originally found at http://<email address hidden>/msg08745.html from 3 years ago! 
+
+Basically qemu seizes up in the event that the file descriptor for its emulated serial port has a full buffer, i.e. write() returns EAGAIN.  For me, this happened when the serial port was being directed through a UNIX socket, with a default-sized 4KB buffer.  Just the normal output from a Linux kernel boot caused it to seize up, and stop the main emulation / select loop.
+
+My suggestion is to remove the detection of EAGAIN in qemu-char.c:521, so that if the buffer is full, KVM discards the byte(s) it was trying to write.  This is a surely better outcome than the process spinning forever.
+
+I will submit a separate patch to control the buffer sizes when creating UNIX sockets, which will help allow slow-reading processes to tune things so that they don't miss any output.
+
+Additionally, in the context of a hosted environment, if the -serial option is used, this could be a small security issue. An untrusted user of a guest system, knowing their serial output is going via a small buffer, could spew output to their /dev/ttyS0 at a rate fast enough to trigger this bug and eat a CPU core on the host.
+
+To quote David S. Ahern's original bug report (mine was the same, only with the latest version from git, so line numbers may have changed - my suggested fix above is accurate though):
+
+I am trying to redirect a guest's boot output through the host's serial
+port.  Shortly after launching qemu, the main thread is spinning on:
+
+write(9, "0", 1)   = -1 EAGAIN (Resource temporarily unavailable)
+
+fd 9 is the serial port, ttyS0.
+
+
+The backtrace for the thread is:
+
+#0  0x00002ac3433f8c0b in write () from /lib64/libpthread.so.0
+#1  0x0000000000475df9 in send_all (fd=9, buf=<value optimized out>,
+len1=1) at qemu-char.c:477
+#2  0x000000000043a102 in serial_xmit (opaque=<value optimized out>) at
+/root/kvm-81/qemu/hw/serial.c:311
+#3  0x000000000043a591 in serial_ioport_write (opaque=0x14971790,
+addr=<value optimized out>, val=48)
+    at /root/kvm-81/qemu/hw/serial.c:366
+#4  0x00000000410eeedc in ?? ()
+#5  0x0000000000129000 in ?? ()
+#6  0x0000000014821fa0 in ?? ()
+#7  0x0000000000000007 in ?? ()
+#8  0x00000000004a54c5 in tlb_set_page_exec (env=0x10ab4,
+vaddr=46912496956816, paddr=1, prot=-1, mmu_idx=0, is_softmmu=1)
+    at /root/kvm-81/qemu/exec.c:388
+#9  0x0000000000512f3b in tlb_fill (addr=345446292, is_write=1,
+mmu_idx=-1, retaddr=0x0)
+    at /root/kvm-81/qemu/target-i386/op_helper.c:4690
+#10 0x00000000004a6bd2 in __ldb_cmmu (addr=9, mmu_idx=0) at
+/root/kvm-81/qemu/softmmu_template.h:135
+#11 0x00000000004a879b in cpu_x86_exec (env1=<value optimized out>) at
+/root/kvm-81/qemu/cpu-exec.c:628
+#12 0x000000000040ba29 in main (argc=12, argv=0x7fff67f7a398) at
+/root/kvm-81/qemu/vl.c:3816
+
+send_all() invokes unix_write() which by design is not breaking out on
+EAGAIN.
+
+The following command is enough to show the problem:
+
+qemu-system-x86_64 -m 256 -smp 1 -no-kvm \
+    -drivefile=/dev/cciss/c0d0,if=scsi,cache=off,boot=on \
+    -vnc :1 -serial /dev/ttyS0
+
+
+The guest is running RHEL3 with the parameter 'console=ttyS0' added to
+grub.conf; the problem appears to be with qemu, so I would expect it to
+show with any linux guest. This particular host is running RHEL5.2 with
+kvm-81, but I have also seen the problem with Fedora-9 as the host OS.
+
+Yes, the serial port of the server is connected to another system via a
+null modem. If I change the serial argument to '-serial udp::4555' and
+use  'nc -u -l  localhost 4555  > /dev/ttyS0' I see the guest's boot
+output show up on the second system as expected. I'd prefer to be able
+to use the serial port connection directly without nc as a proxy.
+Suggestions?

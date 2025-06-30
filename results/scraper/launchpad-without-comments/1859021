@@ -1,0 +1,32 @@
+qemu-system-aarch64 (tcg):  cval + voff overflow not handled, causes qemu to hang
+
+The Armv8 architecture reference manual states that for any timer set (e.g. CNTP* and CNTV*), the condition for such timer to generate an interrupt (if enabled & unmasked) is:
+
+CVAL <= CNT(P/V)CT
+
+Although this is arguably sloppy coding, I have seen code that is therefore assuming it can set CVAL to a very high value (e.g. UINT64_MAX) and leave the interrupt enabled in CTL, and never get the interrupt.
+
+On latest master commit as the time of writing, there is an integer overflow in target/arm/helper.c gt_recalc_timer affecting the virtual timer when the interrupt is enabled in CTL:
+
+    /* Next transition is when we hit cval */
+    nexttick = gt->cval + offset;
+
+When this overflow happens, I notice that qemu is no longer responsive and that I have to SIGKILL the process:
+    - qemu takes nearly all the cpu time of the cores it is running on (e.g. 50% cpu usage if running on half the cores) and is completely unresponsive
+    - no guest interrupt (reported via -d int) is generated
+
+Here the minimal code example to reproduce the issue:
+
+    mov     x0, #1
+    msr     cntvoff_el2, x0
+    mov     x0, #-1
+    msr     cntv_cval_el0, x0
+    mov     x0, #1
+    msr     cntv_ctl_el0, x0 // interrupt generation enabled, not masked; qemu will start to hang here
+
+Options used:
+-nographic -machine virt,virtualization=on,gic-version=2,accel=tcg -cpu cortex-a57
+-smp 4 -m 1024 -kernel whatever.elf -d unimp,guest_errors,int -semihosting-config enable,target=native
+-serial mon:stdio
+
+Version used: 4.2

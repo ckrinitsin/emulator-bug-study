@@ -1,0 +1,130 @@
+kvm hardware error 0xffffffff with vfio-pci VGA passthrough
+
+Hi,
+
+Using qcow2 format for an ide-hd device is causing "KVM: entry failed, hardware error 0xffffffff". When this error occurs, qemu-monitor shows the guest has stopped. The error did not occur immediately, but at the point that the boot, running from an attached Ubuntu 14.04.1 iso, switched to graphical mode after text-mode startup.
+
+The root-cause was verified by switching only the ide-hd disk to raw format (no OS installed), which allowed the guest to boot normally from the iso. The error and fix are reliably repeatable.
+
+The interesting part is that the ide-hd (with no OS installed) with qcow2 format was not actually being used for boot - the boot was from a Ubuntu iso, with the intention of installing an ubuntu guest on the attached ide-hd device. The guest was using a vfio-pci passthrough GPU connected to an external UHD monitor.
+
+The commands used to create the disk images:
+qemu-img create -f qcow2 /media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img 20G
+qemu-img create -f raw /media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img 20G
+
+The script vm1 was used to launch the guests with "sudo ./vm1", with the only difference between launches being the ide-hd format (raw vs qcow2). With qcow2 this resulted in the terminal below. The corresponding dmesg snippets are attached. There were two dmesg entries each time the error occurred.
+
+The same problem occurred when using the latest packages from the ppa:jacob/virtualisation. However, when using jacob's packages, it was not verified that raw format resolves the error (I am running this on my primary system and purged jacob's ppa when this problem first occured).
+
+A fix would be helpful as the qcow2 format allows snapshots, while raw does not.
+
+----------------------------------System info-----------------------------------------------------------
+Linux v2min 3.18.9-031809-generic #201503080036 SMP Sun Mar 8 00:37:46 UTC 2015 x86_64 x86_64 x86_64 GNU/Linux
+
+/var/log/libvirt/libvirt.d is 0 bytes
+
+Libvirt versions are these:
+
+v2min@v2min:~/QCOW2-Error$ dpkg -l | grep libvirt
+ii  libvirt-bin                         1.2.2-0ubuntu13.1.9        amd64        programs for the libvirt library
+rc  libvirt-glib-1.0-0                  0.1.6-1ubuntu2             amd64        libvirt glib mainloop integration
+ii  libvirt0                            1.2.2-0ubuntu13.1.9        amd64        library for interfacing with different virtualization systems
+ii  python-libvirt                      1.2.2-0ubuntu2             amd64        libvirt Python bindings
+
+
+v2min@v2min:~/QCOW2-Error$ dpkg -l | grep qemu
+ii  ipxe-qemu                           1.0.0+git-20131111.c3d1e78-2ubuntu1.1               all          PXE boot firmware - ROM images for qemu
+ii  qemu-keymaps                        2.0.0+dfsg-2ubuntu1.10                              all          QEMU keyboard maps
+ii  qemu-kvm                            2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU Full virtualization on x86 hardware (transitional package)
+ii  qemu-system-common                  2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU full system emulation binaries (common files)
+ii  qemu-system-x86                     2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU full system emulation binaries (x86)
+ii  qemu-utils                          2.0.0+dfsg-2ubuntu1.10                              amd64        QEMU utilities
+
+Passthrough GPU: Zotac GT 730 2GB.
+Processor: AMD A10-5800K APU
+Primary GPU: Radeon R9-290X
+
+
+------------------------------------------vm1 script-----------------------------------------------------
+#!/bin/bash
+
+configfile=/etc/vfio-pci1.cfg
+
+vfiobind() {
+    dev="$1"
+        vendor=$(cat /sys/bus/pci/devices/$dev/vendor)
+        device=$(cat /sys/bus/pci/devices/$dev/device)
+        if [ -e /sys/bus/pci/devices/$dev/driver ]; then
+                echo $dev > /sys/bus/pci/devices/$dev/driver/unbind
+        fi
+        echo $vendor $device > /sys/bus/pci/drivers/vfio-pci/new_id
+   
+}
+
+modprobe vfio-pci
+
+cat $configfile | while read line;do
+    echo $line | grep ^# >/dev/null 2>&1 && continue
+        vfiobind $line
+done
+
+sudo qemu-system-x86_64 -enable-kvm -M q35 -m 4096 -cpu host \
+-smp 2,sockets=1,cores=2,threads=1 \
+-bios /usr/share/qemu/bios.bin -vga none \
+-usb -device usb-host,hostbus=5,hostaddr=8 \
+-device ioh3420,bus=pcie.0,addr=1c.0,multifunction=on,port=1,chassis=1,id=root.1 \
+-device vfio-pci,host=04:00.0,bus=root.1,addr=00.0,multifunction=on,x-vga=on \
+-device vfio-pci,host=04:00.1,bus=root.1,addr=00.1 \
+-drive file=/media/v2min/Data/VMachines-KVM/KVM-NVidia/kvm-nvidia.img,id=disk,format=qcow2 -device ide-hd,bus=ide.0,drive=disk \
+-drive file=/media/v2min/Data/Shr/Software/OSes/ubuntu-14.04.1-desktop-amd64.iso,id=isocd -device ide-cd,bus=ide.1,drive=isocd \
+-boot menu=on \
+-boot d
+
+exit 0
+
+------------------------------------------------------------gnome-terminal-----------------------------
+v2min@v2min:~$ sudo ./vm1
+[sudo] password for v2min: 
+KVM: entry failed, hardware error 0xffffffff
+RAX=0000000000000005 RBX=0000000000000000 RCX=0000000000000000 RDX=ffffffff81eaf3e8
+RSI=0000000000000000 RDI=0000000000000000 RBP=ffff880179553930 RSP=ffff880179553910
+R8 =ffffffff81eaf3e0 R9 =000000000000ffff R10=0000000000000206 R11=000000000000000f
+R12=ffff880179597b1c R13=0000000000000028 R14=0000000000000000 R15=ffff880179597800
+RIP=ffffffff8104ed58 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 ffffffff 00800000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 ffffffff 00800000
+FS =0000 00007f51d8a96880 ffffffff 00800000
+GS =0000 ffff88017fd00000 ffffffff 00800000
+LDT=0000 0000000000000000 0000ffff 00000000
+TR =0040 ffff88017fd11900 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88017fd0a000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=00007f51d8a99000 CR3=00000001740be000 CR4=000406e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=00 01 48 c7 c0 6a b0 00 00 31 db 0f b7 0c 01 b8 05 00 00 00 <0f> 01 c1 0f 1f 44 00 00 5b 41 5c 41 5d 41 5e 5d c3 89 f0 31 c9 f0 0f b0 0d 9b 06 e6 00 40
+v2min@v2min:~$ sudo ./vm1
+KVM: entry failed, hardware error 0xffffffff
+RAX=0000000000000005 RBX=0000000000000000 RCX=0000000000000000 RDX=ffffffff81eaf3e8
+RSI=0000000000000000 RDI=0000000000000000 RBP=ffff88017957f9e8 RSP=ffff88017957f9c8
+R8 =ffffffff81eaf3e0 R9 =0000000000000000 R10=ffff88017b001d00 R11=0000000000000246
+R12=ffff880179527ac0 R13=000000000000003e R14=0000000000000000 R15=0000000000000001
+RIP=ffffffff8104ed58 RFL=00000046 [---Z-P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 ffffffff 00800000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 ffffffff 00800000
+FS =0000 00007f49153a6740 ffffffff 00800000
+GS =0000 ffff88017fd00000 ffffffff 00800000
+LDT=0000 0000000000000000 0000ffff 00000000
+TR =0040 ffff88017fd11900 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88017fd0a000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=00007f4914e82170 CR3=0000000001c0e000 CR4=000406e0
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000 
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+Code=00 01 48 c7 c0 6a b0 00 00 31 db 0f b7 0c 01 b8 05 00 00 00 <0f> 01 c1 0f 1f 44 00 00 5b 41 5c 41 5d 41 5e 5d c3 89 f0 31 c9 f0 0f b0 0d 9b 06 e6 00 40

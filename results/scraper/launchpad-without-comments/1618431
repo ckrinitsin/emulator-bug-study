@@ -1,0 +1,65 @@
+windows hangs after live migration with virtio
+
+Several of our users reported problems with windows machines hanging
+after live migrations. The common denominator _seems_ to be virtio
+devices.
+I've managed to reproduce this reliably on a windows 10 (+
+virtio-win-0.1.118) guest, always within 1 to 5 migrations, with a
+virtio-scsi hard drive and a virtio-net network device. (When I
+replace the virtio-net device with an e1000 it takes 10 or more
+migrations, and without virtio devices I have not (yet) been able to
+reproduce this problem. I also could not reproduce this with a linux
+guest. Also spice seems to improve the situation, but doesn't solve
+it completely).
+
+I've tested quite a few tags from qemu-git (v2.2.0 through v2.6.1,
+and 2.6.1 with the patches mentioned on qemu-stable by Peter Lieven)
+and the behavior is the same everywhere.
+
+The reproducibility seems to be somewhat dependent on the host
+hardware, which makes investigating this issue that much harder.
+
+Symptoms:
+After the migration the windows graphics stack just hangs.
+Background processes are still running (eg. after installing an ssh
+server I could still login and get a command prompt after the hang was
+triggered... not that I'd know what to do with that on a windows
+machine...) - commands which need no GUI access work, the rest just
+hangs there on the command line, too.
+It's also capable of responding to an NMI sent via the qemu monitor:
+it then seems to "recover" and manages to show the blue sad-face
+screen that something happened, reboots successfully and is usable
+again without restarting the qemu process in between.
+From there whole the process can be repeated.
+
+Here's what our command line usually looks like:
+
+/usr/bin/qemu -daemonize \
+	-enable-kvm \
+	-chardev socket,id=qmp,path=/var/run/qemu-server/101.qmp,server,nowait -mon chardev=qmp,mode=control \
+	-pidfile /var/run/qemu-server/101.pid \
+	-smbios type=1,uuid=07fc916e-24c2-4eef-9827-4ab4026501d4 \
+	-name win10 \
+	-smp 6,sockets=1,cores=6,maxcpus=6 \
+	-nodefaults \
+	-boot menu=on,strict=on,reboot-timeout=1000 \
+	-vga std \
+	-vnc unix:/var/run/qemu-server/101.vnc \
+	-no-hpet \
+	-cpu kvm64,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_reset,hv_vpindex,hv_runtime,hv_relaxed,+lahf_lm,+sep,+kvm_pv_unhalt,+kvm_pv_eoi,enforce \
+	-m 2048 \
+	-device pci-bridge,id=pci.2,chassis_nr=2,bus=pci.0,addr=0x1f \
+	-device pci-bridge,id=pci.1,chassis_nr=1,bus=pci.0,addr=0x1e \
+	-device piix3-usb-uhci,id=uhci,bus=pci.0,addr=0x1.0x2 \
+	-device usb-tablet,id=tablet,bus=uhci.0,port=1 \
+	-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x3 \
+	-iscsi initiator-name=iqn.1993-08.org.debian:01:1ba48d46fb8 \
+	-drive if=none,id=drive-ide0,media=cdrom,aio=threads \
+	-device ide-cd,bus=ide.0,unit=0,drive=drive-ide0,id=ide0,bootindex=200 \
+	-device virtio-scsi-pci,id=scsihw0,bus=pci.0,addr=0x5 \
+	-drive file=/mnt/pve/data1/images/101/vm-101-disk-1.qcow2,if=none,id=drive-scsi0,cache=writeback,discard=on,format=qcow2,aio=threads,detect-zeroes=unmap \
+	-device scsi-hd,bus=scsihw0.0,channel=0,scsi-id=0,lun=0,drive=drive-scsi0,id=scsi0,bootindex=100 \
+	-netdev type=tap,id=net0,ifname=tap101i0,script=/var/lib/qemu-server/pve-bridge,downscript=/var/lib/qemu-server/pve-bridgedown,vhost=on \
+	-device virtio-net-pci,mac=F2:2B:20:37:E6:D7,netdev=net0,bus=pci.0,addr=0x12,id=net0,bootindex=300 \
+	-rtc driftfix=slew,base=localtime \
+	-global kvm-pit.lost_tick_policy=discard

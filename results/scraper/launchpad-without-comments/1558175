@@ -1,0 +1,415 @@
+virtio: vm killed (Guest moved used index)
+
+Hello,
+
+I ran a DPDK application with virtio ports. If I killed and relaunched it, VM is
+killed by qemu with the following message:
+> qemu-system-x86_64: Guest moved used index from 571 to 0
+
+If I ran the same application with e1000 ports, I haven't this issue.
+
+Network topology
+================
+
+I used two VM machines with last qemu-2.5 with two virtio-net netdevs. Both
+netdevs are connected through a VDE switch.
+
+On testnode, I used a Debian 8 (3.16) and virtio-net linux drivers. On DUT, I
+used a Ubuntu 14.04 (3.13) with DPDK (next/16_04) with virtio pmd.
+
++-------------------------------------------------------------+
+|                                                             |
+|  +-------------+                    +-------------------+   |
+|  |             |                    |                   |   |
+|  |   Testnode  |                    |       DUT         |   |
+|  |   Debian 8  |                    |    Ubuntu 14.04   |   |
+|  |             |    +----------+    |                   |   |
+|  |       eth0  +----+   VDE    +----+ eth0  pmd_virtio  |   |
+|  |     virtio  |    +----------+    |        00:04.0    |   |
+|  |             |                    | DE:ED:01:0C:DD:CC |   |
+|  |             |                    |                   |   |
+|  |             |    +----------+    |                   |   |
+|  |       eth1  +----+   VDE    +----+ eth1  pmd_virtio  |   |
+|  |      virtio |    +----------+    |        00:05.0    |   |
+|  |             |                    | DE:ED:02:04:01:60 |   |
+|  |             |                    |                   |   |
+|  +-------------+                    +-------------------+   |
+|     qemu 2.5                             qemu 2.5           |
+|                                                             |
+|                                                             |
+|                                              Hypervisor     |
+|                                              Debian 8       |
+|                                              Kernel 3.16    |
++-------------------------------------------------------------+
+
+Steps
+=====
+
+1. Start a DPDK application using virtio ports
+2. Send traffic over those ports (using ping flood ...)
+3. Kill this DPDK application (sending SIGKILL, making it crash etc...)
+4. Restart this DPDK application with the same configuration
+5. During EAL initialization, if an incoming packet is received on a virtio
+   port, qemu exits (error code 1) with the following message:
+> qemu-system-x86_64: Guest moved used index from 571 to 0
+
+NOTE: This issue is *NOT* seen with e1000 interface
+
+Configuration
+=============
+
+Hypervisor
+-----------
+Debian 8
+Kernel 3.16.0-4-amd64 #1 SMP Debian 3.16.7-ckt11-1+deb8u5
+
+Qemu
+----
+
+qemu 2.5 (vanilla)
+./configure --enable-kvm --enable-vhost-net --enable-vde --target-list="x86_64-softmmu" --enable-debug --extra-cflags="-O0 -g"
+
+> qemu-system-x86_64 -k fr --enable-kvm -m 4G -cpu host -smp \
+  sockets=1,cores=1,threads=2 -serial telnet::46528,server,nowait -serial null \
+  -qmp tcp::47257,server,nowait -monitor telnet::59305,server,nowait  -hda \
+  "/opt/vm/ubuntu-14.04-template.qcow2" -snapshot -vga none -display none \
+  -netdev vde,id=tapdeed01417a99,sock=L.vdesock -device \
+  virtio-net,mac=DE:ED:01:0C:DD:CC,addr=04,netdev=tapdeed01417a99 -netdev \
+  vde,id=tapdeed021a7b37,sock=R.vdesock -device \
+  virtio-net,mac=DE:ED:02:04:01:60,addr=05,netdev=tapdeed021a7b37
+
+On Testnode
+-----------
+
+Configure interface to send continuous traffic to PMD
+> ip link set dev eth0 up
+> ip addr add 1.1.1.1/24 dev eth0
+> ip neigh add 1.1.1.2 lladdr DE:ED:01:0C:DD:CC dev eth0
+> ping -q -f 1.1.1.2
+
+On DUT
+------
+
+Configure and start testpmd (a standard DPDK application)
+
+> modprobe uio
+> modprobe igb_uio
+> mkdir -p /mnt/huge
+> mount -t hugetlbfs nodev /mnt/huge
+> echo 64 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+> dpdk_nic_bind  --bind=igb_uio 0000:00:04.0
+> dpdk_nic_bind  --bind=igb_uio 0000:00:05.0
+> testpmd --huge-dir=/mnt/huge -n 4 -l 0-1 --socket-mem 128 -w 0000:00:04.0 \
+  -w 0000:00:05.0 --log-level 8 -- -i --nb-cores=1 --nb-ports=2\
+  --total-num-mbufs=1025
+EAL: Detected lcore 0 as core 0 on socket 0
+EAL: Detected lcore 1 as core 0 on socket 0
+EAL: Support maximum 255 logical core(s) by configuration.
+EAL: Detected 2 lcore(s)
+EAL: Probing VFIO support...
+EAL: Module /sys/module/vfio_pci not found! error 2 (No such file or directory)
+EAL: VFIO modules not loaded, skipping VFIO support...
+EAL: Setting up physically contiguous memory...
+EAL: Ask a virtual area of 0x4600000 bytes
+EAL: Virtual area found at 0x7fbcbf000000 (size = 0x4600000)
+EAL: Ask a virtual area of 0xc00000 bytes
+EAL: Virtual area found at 0x7fbcbe200000 (size = 0xc00000)
+EAL: Ask a virtual area of 0x400000 bytes
+EAL: Virtual area found at 0x7fbcbdc00000 (size = 0x400000)
+EAL: Ask a virtual area of 0x200000 bytes
+EAL: Virtual area found at 0x7fbcbd800000 (size = 0x200000)
+EAL: Ask a virtual area of 0x200000 bytes
+EAL: Virtual area found at 0x7fbcbd400000 (size = 0x200000)
+EAL: Ask a virtual area of 0x1c00000 bytes
+EAL: Virtual area found at 0x7fbcbb600000 (size = 0x1c00000)
+EAL: Ask a virtual area of 0x600000 bytes
+EAL: Virtual area found at 0x7fbcbae00000 (size = 0x600000)
+EAL: Ask a virtual area of 0x200000 bytes
+EAL: Virtual area found at 0x7fbcbaa00000 (size = 0x200000)
+EAL: Ask a virtual area of 0x200000 bytes
+EAL: Virtual area found at 0x7fbcba600000 (size = 0x200000)
+EAL: Requesting 64 pages of size 2MB from socket 0
+EAL: TSC frequency is ~3192572 KHz
+EAL: WARNING: cpu flags constant_tsc=yes nonstop_tsc=no -> using unreliable clock cycles !
+EAL: Master lcore 0 is ready (tid=c5707900;cpuset=[0])
+EAL: lcore 1 is ready (tid=c3ffd700;cpuset=[1])
+EAL: PCI device 0000:00:04.0 on NUMA socket -1
+EAL:   probe driver: 1af4:1000 rte_virtio_pmd
+EAL:   PCI memory mapped at 0x7fbcc3600000
+PMD: virtio_read_caps(): [40] skipping non VNDR cap id: 11
+PMD: virtio_read_caps(): no modern virtio pci device found.
+PMD: vtpci_init(): trying with legacy virtio pci.
+PMD: virtio_resource_init_by_uio(): PCI Port IO found start=0xc020 with size=0x20
+PMD: virtio_negotiate_features(): guest_features before negotiate = 100cf8020
+PMD: virtio_negotiate_features(): host_features before negotiate = 79bf8064
+PMD: virtio_negotiate_features(): features after negotiate = 8f8020
+PMD: eth_virtio_dev_init(): PORT MAC: DE:ED:01:0C:DD:CC
+PMD: eth_virtio_dev_init(): VIRTIO_NET_F_MQ is not supported
+PMD: virtio_dev_cq_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 2
+PMD: virtio_dev_queue_setup(): vq_size: 64 nb_desc:0
+PMD: virtio_dev_queue_setup(): vring_size: 4612, rounded_vring_size: 8192
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134f35000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbaf35000
+PMD: eth_virtio_dev_init(): config->max_virtqueue_pairs=1
+PMD: eth_virtio_dev_init(): config->status=1
+PMD: eth_virtio_dev_init(): PORT MAC: DE:ED:01:0C:DD:CC
+PMD: eth_virtio_dev_init(): hw->max_rx_queues=1   hw->max_tx_queues=1
+PMD: eth_virtio_dev_init(): port 0 vendorID=0x1af4 deviceID=0x1000
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_cq_start(): VQ: - size=64; free=64; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+EAL: PCI device 0000:00:05.0 on NUMA socket -1
+EAL:   probe driver: 1af4:1000 rte_virtio_pmd
+EAL:   PCI memory mapped at 0x7fbcc3601000
+PMD: virtio_read_caps(): [40] skipping non VNDR cap id: 11
+PMD: virtio_read_caps(): no modern virtio pci device found.
+PMD: vtpci_init(): trying with legacy virtio pci.
+PMD: virtio_resource_init_by_uio(): PCI Port IO found start=0xc040 with size=0x20
+PMD: virtio_negotiate_features(): guest_features before negotiate = 100cf8020
+PMD: virtio_negotiate_features(): host_features before negotiate = 79bf8064
+PMD: virtio_negotiate_features(): features after negotiate = 8f8020
+PMD: eth_virtio_dev_init(): PORT MAC: DE:ED:02:04:01:60
+PMD: eth_virtio_dev_init(): VIRTIO_NET_F_MQ is not supported
+PMD: virtio_dev_cq_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 2
+PMD: virtio_dev_queue_setup(): vq_size: 64 nb_desc:0
+PMD: virtio_dev_queue_setup(): vring_size: 4612, rounded_vring_size: 8192
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134f30000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbaf30000
+PMD: eth_virtio_dev_init(): config->max_virtqueue_pairs=1
+PMD: eth_virtio_dev_init(): config->status=1
+PMD: eth_virtio_dev_init(): PORT MAC: DE:ED:02:04:01:60
+PMD: eth_virtio_dev_init(): hw->max_rx_queues=1   hw->max_tx_queues=1
+PMD: eth_virtio_dev_init(): port 1 vendorID=0x1af4 deviceID=0x1000
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_cq_start(): VQ: - size=64; free=64; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+Interactive-mode selected
+Configuring Port 0 (socket 0)
+PMD: virtio_dev_configure(): configure
+PMD: virtio_dev_tx_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 1
+PMD: virtio_dev_queue_setup(): vq_size: 256 nb_desc:512
+PMD: virtio_dev_queue_setup(): vring_size: 10244, rounded_vring_size: 12288
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134eac000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbaeac000
+PMD: virtio_dev_rx_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 0
+PMD: virtio_dev_queue_setup(): vq_size: 256 nb_desc:128
+PMD: virtio_dev_queue_setup(): vring_size: 10244, rounded_vring_size: 12288
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134ea6000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbaea6000
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 0 is up
+PMD: virtio_dev_rxtx_start():  >>
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_vring_start(): Allocated 256 bufs
+PMD: virtio_dev_rxtx_start(): VQ: - size=256; free=0; used=0; desc_head_idx=32768; avail.idx=256; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_rxtx_start(): VQ: - size=256; free=256; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_start(): nb_queues=1
+PMD: virtio_dev_start(): Notified backend at initialization
+PMD: virtio_dev_start(): VQ: - size=256; free=0; used=0; desc_head_idx=32768; avail.idx=256; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_start(): VQ: - size=256; free=256; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+rte_eth_dev_config_restore: port 0: MAC address array not supported
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf37880 vq = 0x7fbcbaf37880
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf37880 vq = 0x7fbcbaf37880
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 0 is up
+Port 0: DE:ED:01:0C:DD:CC
+Configuring Port 1 (socket 0)
+PMD: virtio_dev_configure(): configure
+PMD: virtio_dev_tx_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 1
+PMD: virtio_dev_queue_setup(): vq_size: 256 nb_desc:512
+PMD: virtio_dev_queue_setup(): vring_size: 10244, rounded_vring_size: 12288
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134ea1000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbaea1000
+PMD: virtio_dev_rx_queue_setup():  >>
+PMD: virtio_dev_queue_setup(): setting up queue: 0
+PMD: virtio_dev_queue_setup(): vq_size: 256 nb_desc:128
+PMD: virtio_dev_queue_setup(): vring_size: 10244, rounded_vring_size: 12288
+PMD: virtio_dev_queue_setup(): vq->vq_ring_mem:      0x134e9c000
+PMD: virtio_dev_queue_setup(): vq->vq_ring_virt_mem: 0x7fbcbae9c000
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 1 is up
+PMD: virtio_dev_rxtx_start():  >>
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_vring_start(): Allocated 256 bufs
+PMD: virtio_dev_rxtx_start(): VQ: - size=256; free=0; used=0; desc_head_idx=32768; avail.idx=256; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_vring_start():  >>
+PMD: virtio_dev_rxtx_start(): VQ: - size=256; free=256; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_start(): nb_queues=1
+PMD: virtio_dev_start(): Notified backend at initialization
+PMD: virtio_dev_start(): VQ: - size=256; free=0; used=0; desc_head_idx=32768; avail.idx=256; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+PMD: virtio_dev_start(): VQ: - size=256; free=256; used=0; desc_head_idx=0; avail.idx=0; used_cons_idx=0; used.idx=0; avail.flags=0x1; used.flags=0x0
+rte_eth_dev_config_restore: port 1: MAC address array not supported
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf325c0 vq = 0x7fbcbaf325c0
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf325c0 vq = 0x7fbcbaf325c0
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 1 is up
+Port 1: DE:ED:02:04:01:60
+Checking link statuses...
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 0 is up
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 1 is up
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 0 is up
+Port 0 Link Up - speed 10000 Mbps - full-duplex
+PMD: virtio_dev_link_update(): Get link status from hw
+PMD: virtio_dev_link_update(): Port 1 is up
+Port 1 Link Up - speed 10000 Mbps - full-duplex
+Done
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf37880 vq = 0x7fbcbaf37880
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+PMD: virtio_send_command(): vq->vq_desc_head_idx = 0, status = 255, vq->hw->cvq = 0x7fbcbaf325c0 vq = 0x7fbcbaf325c0
+PMD: virtio_send_command(): vq->vq_queue_index = 2
+PMD: virtio_send_command(): vq->vq_free_cnt=64
+vq->vq_desc_head_idx=0
+testpmd> start
+  io packet forwarding - CRC stripping disabled - packets/burst=32
+  nb forwarding cores=1 - nb forwarding ports=2
+  RX queues=1 - RX desc=128 - RX free threshold=0
+  RX threshold registers: pthresh=0 hthresh=0 wthresh=0
+  TX queues=1 - TX desc=512 - TX free threshold=0
+  TX threshold registers: pthresh=0 hthresh=0 wthresh=0
+  TX RS bit threshold=0 - TXQ flags=0xf00
+
+...
+[wait a few seconds]
+...
+
+Kill the application
+> kill -9 $(pidof testpmd) (On another shell)
+
+Relaunch the application
+> testpmd --huge-dir=/mnt/huge -n 4 -l 0-1 --socket-mem 128 -w 0000:00:04.0 \
+  -w 0000:00:05.0 --log-level 8 -- -i --nb-cores=1 --nb-ports=2 \
+  --total-num-mbufs=1025
+EAL: Detected lcore 0 as core 0 on socket 0
+EAL: Detected lcore 1 as core 0 on socket 0
+EAL: Support maximum 255 logical core(s) by configuration.
+EAL: Detected 2 lcore(s)
+EAL: Probing VFIO support...
+EAL: Module /sys/module/vfio_pci not found! error 2 (No such file or directory)
+EAL: VFIO modules not loaded, skipping VFIO support...
+EAL: Setting up physically contiguous memory...
+EAL: Ask a virtual area of 0x4400000 bytes
+EAL: Virtual area found at 0x7f86cde00000 (size = 0x4400000)
+EAL: Ask a virtual area of 0x400000 bytes
+EAL: Virtual area found at 0x7f86cd800000 (size = 0x400000)
+EAL: Ask a virtual area of 0x400000 bytes
+EAL: Virtual area found at 0x7f86cd200000 (size = 0x400000)
+EAL: Ask a virtual area of 0x200000 bytes
+EAL: Virtual area found at 0x7f86cce00000 (size = 0x200000)
+EAL: Ask a virtual area of 0xc00000 bytes
+EAL: Virtual area found at 0x7f86cc000000 (size = 0xc00000)
+EAL: Ask a virtual area of 0x1c00000 bytes
+EAL: Virtual area found at 0x7f86ca200000 (size = 0x1c00000)
+EAL: Ask a virtual area of 0x600000 bytes
+EAL: Virtual area found at 0x7f86c9a00000 (size = 0x600000)
+EAL: Ask a virtual area of 0x400000 bytes
+EAL: Virtual area found at 0x7f86c9400000 (size = 0x400000)
+EAL: Requesting 64 pages of size 2MB from socket 0
+...
+
+VM has been killed by qemu with the following error
+> qemu-system-x86_64: Guest moved used index from 570 to 0
+
+Debugging
+---------
+
+With GDB, I have got this backtrace for Qemu
+
+(gdb) bt full
+#0  __GI_exit (status=1) at exit.c:104
+No locals.
+#1  0x00007f13cb53412e in virtqueue_num_heads (vq=0x7f13ce28d4c0, idx=592)
+    at /tmp/qemu/qemu-2.5.0/hw/virtio/virtio.c:320
+        num_heads = 64944
+#2  0x00007f13cb53444e in virtqueue_get_avail_bytes (vq=0x7f13ce28d4c0, in_bytes=0x7fff5c036270, 
+    out_bytes=0x7fff5c036274, max_in_bytes=110, max_out_bytes=0) at /tmp/qemu/qemu-2.5.0/hw/virtio/virtio.c:381
+        idx = 592
+        total_bufs = 0
+        in_total = 0
+        out_total = 0
+#3  0x00007f13cb5344b6 in virtqueue_avail_bytes (vq=0x7f13ce28d4c0, in_bytes=110, out_bytes=0)
+    at /tmp/qemu/qemu-2.5.0/hw/virtio/virtio.c:447
+        in_total = 1543725744
+        out_total = 32767
+#4  0x00007f13cb51ad6b in virtio_net_has_buffers (q=0x7f13ce22cea0, bufsize=110)
+    at /tmp/qemu/qemu-2.5.0/hw/net/virtio-net.c:899
+        n = 0x7f13cda08f18
+#5  0x00007f13cb51b37d in virtio_net_receive (nc=0x7f13cdf96490, 
+    buf=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98)
+    at /tmp/qemu/qemu-2.5.0/hw/net/virtio-net.c:1037
+        n = 0x7f13cda08f18
+        q = 0x7f13ce22cea0
+        vdev = 0x7f13cda08f18
+        __func__ = "virtio_net_receive"
+        mhdr_sg = {{iov_base = 0x7f1365fda43e, iov_len = 2}, {iov_base = 0x0, iov_len = 0} <repeats 1023 times>}
+        mhdr = {hdr = {flags = 0 '\000', gso_type = 0 '\000', hdr_len = 0, gso_size = 0, csum_start = 0, 
+            csum_offset = 0}, num_buffers = 1}
+        mhdr_cnt = 0
+        offset = 98
+        i = 1
+        guest_offset = 12
+        __PRETTY_FUNCTION__ = "virtio_net_receive"
+#6  0x00007f13cb75da86 in nc_sendv_compat (nc=0x7f13cdf96490, iov=0x7fff5c057440, iovcnt=1, flags=0) at net/net.c:717
+        buf = '\000' <repeats 416 times>...
+        buffer = 0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b"
+        offset = 98
+#7  0x00007f13cb75db3e in qemu_deliver_packet_iov (sender=0x7f13cc902eb0, flags=0, iov=0x7fff5c057440, iovcnt=1, 
+    opaque=0x7f13cdf96490) at net/net.c:741
+        nc = 0x7f13cdf96490
+        ret = 0
+#8  0x00007f13cb75fa5f in qemu_net_queue_deliver (queue=0x7f13cdf966b0, sender=0x7f13cc902eb0, flags=0, 
+    data=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98) at net/queue.c:163
+        ret = -1
+        iov = {iov_base = 0x7fff5c057580, iov_len = 98}
+#9  0x00007f13cb75fb7b in qemu_net_queue_send (queue=0x7f13cdf966b0, sender=0x7f13cc902eb0, flags=0, 
+    data=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98, sent_cb=0x0) at net/queue.c:198
+        ret = 139722994604174
+#10 0x00007f13cb75d8d9 in qemu_send_packet_async_with_flags (sender=0x7f13cc902eb0, flags=0, 
+    buf=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98, sent_cb=0x0) at net/net.c:677
+        queue = 0x7f13cdf966b0
+        ret = 0
+#11 0x00007f13cb75d911 in qemu_send_packet_async (sender=0x7f13cc902eb0, 
+    buf=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98, sent_cb=0x0) at net/net.c:684
+No locals.
+#12 0x00007f13cb75d93e in qemu_send_packet (nc=0x7f13cc902eb0, 
+    buf=0x7fff5c057580 "\336\355\001\246\223t\336\355\001\211\371\360\b", size=98) at net/net.c:690
+No locals.
+#13 0x00007f13cb76b49e in vde_to_qemu (opaque=0x7f13cc902eb0) at net/vde.c:47
+        s = 0x7f13cc902eb0
+        buf = "[...]"
+        size = 98
+[...]
+
+According to GDB, there is no available vring
+(gdb) up
+#1  0x00007f13cb53412e in virtqueue_num_heads (vq=0x7f13ce28d4c0, idx=592)
+    at /tmp/qemu/qemu-2.5.0/hw/virtio/virtio.c:320
+320	        exit(1);
+(gdb) p num_heads
+$1 = 64944
+(gdb) p vq->vring.num
+$2 = 256
+(gdb) p idx
+$3 = 592
+(gdb) p vring_avail_idx(vq)
+$5 = 0

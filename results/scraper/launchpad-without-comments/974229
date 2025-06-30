@@ -1,0 +1,49 @@
+qemu-kvm-1.0: segfault using vnc-console => not threadsafe!
+
+after failure using qemu-kvm-0.14.1 I've tried v1.0, but there's a problem if compiled with vnc-thread-support:
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0000000000000000 in ?? ()
+(gdb) bt
+#0  0x0000000000000000 in ?? ()
+#1  0x00007f3ac48ca10a in qemu_iohandler_poll (readfds=0x7fff12379ac0, writefds=0x7fff12379b40, xfds=0x7fff12379bc0, ret=3)
+    at iohandler.c:124
+#2  0x00007f3ac4964387 in main_loop_wait (nonblocking=0) at main-loop.c:463
+#3  0x00007f3ac4958fb1 in main_loop () at /opt/workspace/oneiric64/qemu-kvm-1.0/vl.c:1482
+#4  0x00007f3ac495e1ec in main (argc=68, argv=0x7fff1237a088, envp=0x7fff1237a2b0)
+    at /opt/workspace/oneiric64/qemu-kvm-1.0/vl.c:3523
+(gdb) up
+#1  0x00007f3ac48ca10a in qemu_iohandler_poll (readfds=0x7fff12379ac0, writefds=0x7fff12379b40, xfds=0x7fff12379bc0, ret=3)
+    at iohandler.c:124
+124	                ioh->fd_write(ioh->opaque);
+
+(gdb) print *ioh
+$4 = {fd = 29, fd_read_poll = 0, fd_read = 0x7f3ac49de158 <vnc_client_read>, fd_write = 0, deleted = 0, 
+  opaque = 0x7f3ac7978d50, next = {le_next = 0x7f3ac6add2e0, le_prev = 0x7f3ac52bde90}}
+
+
+ok, how could that happen?
+loooking deeper at the code and backtraces shows, that iohandler.c:124 is called within the main-loop, while iohandler.c:77 is called within the vnc-thread-loop
+
+mmmh, but where the hell is the threadsafe-locking of the ioh-structure????
+
+I didn't found anything...
+
+the resetting in line 77 is called from vnc_client_write_plain(), where following code can be found:
+
+===================
+   if (vs->output.offset == 0) {
+        qemu_set_fd_handler2(vs->csock, NULL, vnc_client_read, NULL, vs);
+    }
+===================
+
+why should the function-ptrs should be zeroed?
+
+further tracing shows, that the vnc-thread sometimes seems to exits normally and a new one is started (I haven't verified that), but this would be a reason for zeroing function-ptrs, which may point to code inside the thread, which will exit...
+
+but why should this be done? and why there's no threadsafe-modification of the structure?
+
+well: disabling vnc-thread at configure-state leads into a normal running machine, but threading would be nice here...
+
+so a quick fix could be, to drop the call above and make the vnc-thread staying for the whole session, but I don't know all mechanisms of vnc-support within kvm.
+but a better solution would be usage of clean locking-mechanisms

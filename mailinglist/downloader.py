@@ -11,7 +11,7 @@ from launchpad import process_launchpad_bug
 from thread import process_thread
 
 start_date = datetime(2015, 4, 1)
-end_date = datetime.today().replace(day=1)
+end_date = datetime(2025, 5, 1)
 
 def months_iterator(start, end):
     current = start

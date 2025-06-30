@@ -1,0 +1,96 @@
+COLO unable to failover to secondary VM
+
+I test COLO feature on my host following docs/COLO-FT.txt in qemu folder, but fail to failover to secondary VM. 
+Is there any mistake in my execution steps?
+
+Execution environment:
+QEMU v2.12.0-rc4
+OS:     Ubuntu 16.04.3 LTS
+Kernel: Linux 4.4.35
+Secondary VM IP: noted as "a.b.c.d"
+
+Execution steps:
+# Primary
+${COLO_PATH}/x86_64-softmmu/qemu-system-x86_64 \
+    -enable-kvm \
+    -m 512M \
+    -smp 2 \
+    -qmp stdio \
+    -vnc :7 \
+    -name primary \
+    -device piix3-usb-uhci \
+    -device usb-tablet \
+    -netdev tap,id=tap0,vhost=off \
+    -device virtio-net-pci,id=net-pci0,netdev=tap0 \
+    -drive if=virtio,id=primary-disk0,driver=quorum,read-pattern=fifo,vote-threshold=1,\
+        children.0.file.filename=${IMG_PATH},\
+        children.0.driver=raw -S
+
+# Secondary
+${COLO_PATH}/x86_64-softmmu/qemu-system-x86_64 \
+    -enable-kvm \
+    -m 512M \
+    -smp 2 \
+    -qmp stdio \
+    -vnc :8 \
+    -name secondary \
+    -device piix3-usb-uhci \
+    -device usb-tablet \
+    -netdev tap,id=tap1,vhost=off \
+    -device virtio-net-pci,id=net-pci0,netdev=tap1 \
+    -drive if=none,id=secondary-disk0,file.filename=${IMG_PATH},driver=raw,node-name=node0 \
+    -drive if=virtio,id=active-disk0,driver=replication,mode=secondary,\
+        file.driver=qcow2,top-id=active-disk0,\
+        file.file.filename=$ACTIVE_DISK,\
+        file.backing.driver=qcow2,\
+        file.backing.file.filename=$HIDDEN_DISK,\
+        file.backing.backing=secondary-disk0 \
+    -incoming tcp:0:8888
+
+# Enter into Secondary:
+{'execute':'qmp_capabilities'}
+{ 'execute': 'nbd-server-start',
+    'arguments': {'addr': {'type': 'inet', 'data': {'host': 'a.b.c.d', 'port': '8889'} } }
+}
+{'execute': 'nbd-server-add', 'arguments': {'device': 'secondary-disk0', 'writable': true } }
+
+# Enter into Primary:
+{'execute':'qmp_capabilities'}
+{'execute': 'human-monitor-command',
+    'arguments': {
+        'command-line': 'drive_add -n buddy driver=replication,mode=primary,file.driver=nbd,file.host=a.b.c.d,file.port=8889,file.export=secondary-disk0,node-name=nbd_client0'
+    }
+}
+{ 'execute':'x-blockdev-change', 'arguments':{'parent': 'primary-disk0', 'node': 'nbd_client0' } }
+{ 'execute': 'migrate-set-capabilities',
+    'arguments': {'capabilities': [ {'capability': 'x-colo', 'state': true } ] } }
+{ 'execute': 'migrate', 'arguments': {'uri': 'tcp:a.b.c.d:8888' } }
+
+# To test failover
+Primary
+{ 'execute': 'x-blockdev-change', 'arguments': {'parent': 'primary-disk0', 'child': 'children.1'}}
+{ 'execute': 'human-monitor-command','arguments': {'command-line': 'drive_del nbd_client0'}}
+
+Secondary
+{ 'execute': 'nbd-server-stop' }
+
+Stop Primary
+Send ^C signal to terminate PVM.
+
+Secondary
+{ "execute": "x-colo-lost-heartbeat" }
+
+
+# Result:
+Primary (Use ^C to terminate)
+qemu-system-x86_64: Can't receive COLO message: Input/output error
+qemu-system-x86_64: terminating on signal 2
+{"timestamp": {"seconds": 1531815575, "microseconds": 997696}, "event": "SHUTDOWN", "data": {"guest":false}}
+
+Secondary
+{ 'execute': 'nbd-server-stop' }
+{"return": {}}
+{ "execute": "x-colo-lost-heartbeat" }
+{"return": {}}
+qemu-system-x86_64: Can't receive COLO message: Input/output error
+Segmentation fault

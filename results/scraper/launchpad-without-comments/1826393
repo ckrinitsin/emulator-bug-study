@@ -1,0 +1,80 @@
+QEMU 3.1.0 stuck waiting for 800ms (5 times slower) in pre-bios phase
+
+Yesterday I have upgraded my laptop from Ubuntu 18.10 to 19.04 and that way got newer QEMU 3.1.0 along vs QEMU 2.12.0 before. I have noticed that everytime I start QEMU to run OSv, QEMU seems to hand noticably longer (~1 second) before showing SeaBIOS output. I have tried all kind of combinations to get rid of that pause and nothing helped.
+
+Here is my start command:
+time qemu-system-x86_64 -m 256M -smp 1 -nographic -nodefaults \
+ -device virtio-blk-pci,id=blk0,bootindex=0,drive=hd0,scsi=off \
+ -drive file=usr.img,if=none,id=hd0,cache=none,aio=thre\
+ -enable-kvm \
+ -cpu host,+x2apic -chardev stdio,mux=on,id=stdio,signal=off \
+ -mon chardev=stdio,mode=readline -device isa-serial,chardev=stdio
+
+It looks like qemu process starts, waits almost a second for something and then print SeaBIOS splashscreen and continues boot:
+
+--> waits here
+SeaBIOS (version 1.12.0-1)
+Booting from Hard Disk..OSv v0.53.0-6-gc8395118
+	disk read (real mode): 27.25ms, (+27.25ms)
+	uncompress lzloader.elf: 46.22ms, (+18.97ms)
+	TLS initialization: 46.79ms, (+0.57ms)
+	.init functions: 47.82ms, (+1.03ms)
+	SMP launched: 48.08ms, (+0.26ms)
+	VFS initialized: 49.25ms, (+1.17ms)
+	Network initialized: 49.48ms, (+0.24ms)
+	pvpanic done: 49.57ms, (+0.08ms)
+	pci enumerated: 52.42ms, (+2.85ms)
+	drivers probe: 52.42ms, (+0.00ms)
+	drivers loaded: 55.33ms, (+2.90ms)
+	ROFS mounted: 56.37ms, (+1.04ms)
+	Total time: 56.37ms, (+0.00ms)
+Found optarg
+dev  etc  hello  libenviron.so	libvdso.so  proc  tmp  tools  usr
+
+real	0m0.935s
+user	0m0.426s
+sys	0m0.490s
+
+With version 2.12.0 I used to see real below 200ms. So it seems qemu slowed down 5 times.
+
+I ran strace -tt against it and I have noticed a pause here:
+...
+07:31:41.848579 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 0
+07:31:41.848604 futex(0x55c4a2ff6308, FUTEX_WAIT_PRIVATE, 0, NULL) = 0
+07:31:41.848649 ioctl(10, KVM_SET_PIT2, 0x7ffdd272d1f0) = 0
+07:31:41.848674 ioctl(9, KVM_CHECK_EXTENSION, KVM_CAP_KVMCLOCK_CTRL) = 1
+07:31:41.848699 ioctl(10, KVM_SET_CLOCK, 0x7ffdd272d230) = 0
+07:31:41.848724 futex(0x55c4a49a9a9c, FUTEX_WAKE_PRIVATE, 2147483647) = 1
+07:31:41.848747 getpid()                = 5162
+07:31:41.848769 tgkill(5162, 5166, SIGUSR1) = 0
+07:31:41.848791 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 0
+07:31:41.848814 futex(0x55c4a49a9a98, FUTEX_WAKE_PRIVATE, 2147483647) = 1
+07:31:41.848837 getpid()                = 5162
+07:31:41.848858 tgkill(5162, 5166, SIGUSR1) = 0
+07:31:41.848889 write(8, "\1\0\0\0\0\0\0\0", 8) = 8
+07:31:41.848919 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 1
+07:31:41.848943 ppoll([{fd=0, events=POLLIN}, {fd=4, events=POLLIN}, {fd=5, events=POLLIN}, {fd=7, events=POLLIN}, 
+{fd=8, events=POLLIN}], 5, {tv_sec=0, tv_nsec=0}, NULL, 8) = 1 ([{fd=8, revents=POLLIN}], left {tv_sec=0, tv_nsec=0
+})
+07:31:41.849003 futex(0x55c4a2fd34c0, FUTEX_WAIT_PRIVATE, 2, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+07:31:41.849031 read(8, "\5\0\0\0\0\0\0\0", 16) = 8
+07:31:41.849064 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 0
+07:31:41.849086 ppoll([{fd=0, events=POLLIN}, {fd=4, events=POLLIN}, {fd=5, events=POLLIN}, {fd=7, events=POLLIN}, 
+{fd=8, events=POLLIN}], 5, {tv_sec=0, tv_nsec=984624000}, NULL, 8) = 1 ([{fd=7, revents=POLLIN}], left {tv_sec=0, t
+v_nsec=190532609})
+
+--> waits for almost 800ms
+
+07:31:42.643272 futex(0x55c4a2fd34c0, FUTEX_WAIT_PRIVATE, 2, NULL) = 0
+07:31:42.643522 read(7, "\1\0\0\0\0\0\0\0", 512) = 8
+07:31:42.643625 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 1
+07:31:42.643646 ppoll([{fd=0, events=POLLIN}, {fd=4, events=POLLIN}, {fd=5, events=POLLIN}, {fd=7, events=POLLIN}, 
+{fd=8, events=POLLIN}], 5, {tv_sec=0, tv_nsec=190066000}, NULL, 8) = 2 ([{fd=4, revents=POLLIN}, {fd=8, revents=POL
+LIN}], left {tv_sec=0, tv_nsec=189909632})
+07:31:42.643836 futex(0x55c4a2fd34c0, FUTEX_WAIT_PRIVATE, 2, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+07:31:42.643859 read(8, "\2\0\0\0\0\0\0\0", 16) = 8
+07:31:42.643880 futex(0x55c4a2fd34c0, FUTEX_WAKE_PRIVATE, 1) = 1
+
+...
+
+when I run same command using qemu 3.0.5 that I still happen to have on the same machine that I built directly from source I see total boot time at around 200ms. It seems like a regression.

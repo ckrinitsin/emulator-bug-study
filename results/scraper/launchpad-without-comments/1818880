@@ -1,0 +1,30 @@
+Deadlock when detaching network interface
+
+[Impact]
+Qemu guests hang indefinitely
+
+[Description]
+When running a Qemu guest with VirtIO network interfaces, detaching an interface that's currently being used can result in a deadlock. The guest instance will hang and become unresponsive to commands, and the only option is to kill -9 the instance.
+The reason for this is a dealock between a monitor and an RCU thread, which will fight over the BQL (qemu_global_mutex) and the critical RCU section locks. The monitor thread will acquire the BQL for detaching the network interface, and fire up a helper thread to deal with detaching the network adapter. That new thread needs to wait on the RCU thread to complete the deletion, but the RCU thread wants the BQL to commit its transactions.
+This bug is already fixed upstream (73c6e4013b4c rcu: completely disable pthread_atfork callbacks as soon as possible) and included for other series (see below), so we don't need to backport it to Bionic onwards.
+
+Upstream commit: https://git.qemu.org/?p=qemu.git;a=commit;h=73c6e4013b4c
+
+$ git describe --contains 73c6e4013b4c
+v2.10.0-rc2~1^2~8
+
+$ rmadison qemu
+===> qemu | 1:2.5+dfsg-5ubuntu10.34 | xenial-updates/universe   | amd64, ...
+     qemu | 1:2.11+dfsg-1ubuntu7    | bionic/universe           | amd64, ...
+     qemu | 1:2.12+dfsg-3ubuntu8    | cosmic/universe           | amd64, ...
+     qemu | 1:3.1+dfsg-2ubuntu2     | disco/universe            | amd64, ...
+
+[Test Case]
+Being a racing condition, this is a tricky bug to reproduce consistently. We've had reports of users running into this with OpenStack deployments and Windows Server guests, and the scenario is usually like this:
+1) Deploy a 16vCPU Windows Server 2012 R2 guest with a virtio network interface
+2) Stress the network interface with e.g. Windows HLK test suite or similar
+3) Repeatedly attach/detach the network adapter that's in use
+It usually takes more than ~4000 attach/detach cycles to trigger the bug.
+
+[Regression Potential]
+Regressions for this might arise from the fact that the fix changes RCU lock code. Since this patch has been upstream and in other series for a while, it's unlikely that it would regressions in RCU code specifically. Other code that makes use of the RCU locks (MMIO and some monitor events) will be thoroughly tested for any regressions with autokpkgtest and scripted Qemu runs.

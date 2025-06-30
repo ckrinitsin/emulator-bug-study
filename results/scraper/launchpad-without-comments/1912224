@@ -1,0 +1,127 @@
+qemu may freeze during drive-mirroring on fragmented FS
+
+
+We have odd behavior in operation where qemu freeze during long
+seconds, We started an thread about that issue here:
+https://lists.gnu.org/archive/html/qemu-devel/2020-11/msg05623.html
+
+It happens at least during openstack nova snapshot (qemu blockdev-mirror)
+or live block migration(which include network copy of disk).
+
+After further troubleshoots, it seems related to FS fragmentation on host.
+
+reproducible at least on:
+Ubuntu 18.04.3/4.18.0-25-generic/qemu-4.0
+Ubuntu 16.04.6/5.10.6/qemu-5.2.0-rc2
+
+# Lets create a dedicated file system on a SSD/Nvme 60GB disk in my case:
+$sudo mkfs.ext4 /dev/sda3
+$sudo mount /dev/sda3 /mnt
+$df -h /mnt
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda3         59G   53M   56G   1% /mnt
+
+#Create a fragmented disk on it using 2MB Chunks (about 30min):
+$sudo python3 create_fragged_disk.py /mnt 2
+Filling up FS by Creating chunks files in:  /mnt/chunks
+We are probably full as expected!!:  [Errno 28] No space left on device
+Creating fragged disk file:  /mnt/disk
+
+$ls -lhs 
+59G -rw-r--r-- 1 root root 59G Jan 15 14:08 /mnt/disk
+
+$ sudo e4defrag -c /mnt/disk
+ Total/best extents                             41971/30
+ Average size per extent                        1466 KB
+ Fragmentation score                            2
+ [0-30 no problem: 31-55 a little bit fragmented: 56- needs defrag]
+ This file (/mnt/disk) does not need defragmentation.
+ Done.
+
+# the tool^^^ says it is not enough fragmented to be able to defrag.
+
+#Inject an image on fragmented disk
+sudo chown ubuntu /mnt/disk
+wget https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img
+qemu-img convert -O raw  bionic-server-cloudimg-amd64.img \
+                         bionic-server-cloudimg-amd64.img.raw
+dd conv=notrunc iflag=fullblock if=bionic-server-cloudimg-amd64.img.raw \
+                of=/mnt/disk bs=1M
+virt-customize -a /mnt/disk --root-password password:xxxx
+
+# logon run console activity ex: ping -i 0.3 127.0.0.1
+$qemu-system-x86_64 -m 2G -enable-kvm  -nographic \
+    -chardev socket,id=test,path=/tmp/qmp-monitor,server,nowait \
+    -mon chardev=test,mode=control \
+    -drive file=/mnt/disk,format=raw,if=none,id=drive-virtio-disk0,cache=none,discard\
+    -device virtio-blk-pci,scsi=off,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on
+
+$sync
+$echo 3 | sudo tee -a /proc/sys/vm/drop_caches
+
+#start drive-mirror via qmp on another SSD/nvme partition
+nc -U /tmp/qmp-monitor
+{"execute":"qmp_capabilities"}
+{"execute":"drive-mirror","arguments":{"device":"drive-virtio-disk0","target":"/home/ubuntu/mirror","sync":"full","format":"qcow2"}}
+^^^ qemu console may start to freeze at this step.
+
+NOTE:
+ - smaller chunk sz and bigger disk size the worst it is.
+   In operation we also have issue on 400GB disk size with average 13MB/extent
+ - Reproducible also on xfs
+
+
+Expected behavior:
+-------------------
+QEMU should remain steady, eventually only have decrease storage Performance
+or mirroring, because of fragmented fs.
+
+Observed behavior:
+-------------------
+Perf of mirroring is still quite good even on fragmented FS,
+but it breaks qemu.
+
+
+######################  create_fragged_disk.py ############
+import sys
+import os
+import tempfile
+import glob
+import errno
+
+MNT_DIR = sys.argv[1]
+CHUNK_SZ_MB = int(sys.argv[2])
+CHUNKS_DIR = MNT_DIR + '/chunks'
+DISK_FILE = MNT_DIR + '/disk'
+
+if not os.path.exists(CHUNKS_DIR):
+    os.makedirs(CHUNKS_DIR)
+
+with open("/dev/urandom", "rb") as f_rand:
+     mb_rand=f_rand.read(1024 * 1024)
+
+print("Filling up FS by Creating chunks files in: ",CHUNKS_DIR)
+try:
+    while True:
+        tp = tempfile.NamedTemporaryFile(dir=CHUNKS_DIR,delete=False)
+        for x in range(CHUNK_SZ_MB):
+            tp.write(mb_rand)
+        os.fsync(tp)
+        tp.close()
+except Exception as ex:
+    print("We are probably full as expected!!: ",ex)
+
+chunks = glob.glob(CHUNKS_DIR + '/*')
+
+print("Creating fragged disk file: ",DISK_FILE)
+with open(DISK_FILE, "w+b") as f_disk:
+    for chunk in chunks:
+        try:
+            os.unlink(chunk)
+            for x in range(CHUNK_SZ_MB):
+                f_disk.write(mb_rand)
+            os.fsync(f_disk)
+        except IOError as ex:
+            if ex.errno != errno.ENOSPC:
+                raise
+###########################################################3

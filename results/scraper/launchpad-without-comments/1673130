@@ -1,0 +1,73 @@
+qemu 2.7.0 receives SIGABRT in qemu_coroutine_enter()
+
+I've been experiencing frequent SIGABRTs (in addition to segfaults in #1671876) lately with qemu 2.7.0 running Ubuntu 16.04 guests. The crash usually happens in qemu_coroutine_enter(). I haven't seen this so far with any other guests or distros.
+
+Here is one stack trace I obtained
+--------------------------------------------------------------------------
+(gdb) bt
+#0  0x00007fd7cc676067 in __GI_raise (sig=sig@entry=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:56
+#1  0x00007fd7cc677448 in __GI_abort () at abort.c:89
+#2  0x0000556aed247b6c in qemu_coroutine_enter (co=0x7fd574300df0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:113
+#3  0x0000556aed247e55 in qemu_co_queue_run_restart (co=0x7fd574300ce0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#4  0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd574300ce0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#5  0x0000556aed247e74 in qemu_co_queue_run_restart (co=0x7fd589111670) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#6  0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd589111670) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#7  0x0000556aed247e74 in qemu_co_queue_run_restart (co=0x7fd57430dba0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#8  0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd57430dba0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#9  0x0000556aed247e74 in qemu_co_queue_run_restart (co=0x7fd589119130) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#10 0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd589119130) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#11 0x0000556aed247e74 in qemu_co_queue_run_restart (co=0x7fd589117410) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#12 0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd589117410) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#13 0x0000556aed247e74 in qemu_co_queue_run_restart (co=0x7fd577f00e00) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:60
+#14 0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd577f00e00) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+#15 0x0000556aed247fa0 in qemu_co_enter_next (queue=queue@entry=0x556aef34e5e0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine-lock.c:106
+#16 0x0000556aed1e6060 in timer_cb (blk=0x556aef34e590, is_write=<optimized out>) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/block/throttle-groups.c:400
+#17 0x0000556aed1a3615 in timerlist_run_timers (timer_list=0x556aef3bad40) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/qemu-timer.c:528
+#18 0x0000556aed1a3679 in timerlistgroup_run_timers (tlg=tlg@entry=0x556af0738758) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/qemu-timer.c:564
+#19 0x0000556aed1a3f47 in aio_dispatch (ctx=ctx@entry=0x556af0738610) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/aio-posix.c:357
+#20 0x0000556aed1a40e8 in aio_poll (ctx=0x556af0738610, blocking=<optimized out>) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/aio-posix.c:479
+#21 0x0000556aed005c79 in iothread_run (opaque=0x556af07383c0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/iothread.c:46
+#22 0x00007fd7cc9f40a4 in start_thread (arg=0x7fd7aafff700) at pthread_create.c:403
+#23 0x00007fd7cc72962d in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:111
+--------------------------------------------------------------------------
+
+The code crashes here
+--------------------------------------------------------------------------
+void qemu_coroutine_enter(Coroutine *co)
+{
+    Coroutine *self = qemu_coroutine_self();
+    CoroutineAction ret;
+
+    trace_qemu_coroutine_enter(self, co, co->entry_arg);
+
+    if (co->caller) {
+        fprintf(stderr, "Co-routine re-entered recursively\n");            
+        abort();  <--- Code aborts here                                               
+    }
+
+    [...]
+}
+--------------------------------------------------------------------------
+
+Debugging further we see:
+--------------------------------------------------------------------------
+(gdb) frame 2
+#2  0x0000556aed247b6c in qemu_coroutine_enter (co=0x7fd574300df0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:113
+113    /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c: No such file or directory.
+(gdb) print *co
+$1 = {entry = 0x7fd793e95a58, entry_arg = 0x1, caller = 0x7fd793e95a38, pool_next = {sle_next = 0x10}, co_queue_wakeup = {sqh_first = 0x7fd6ebbd2000, sqh_last = 0x1000}, co_queue_next = {
+    sqe_next = 0x7fd6ebbd1000}}
+(gdb) print *co->caller
+$2 = {entry = 0x400400000001, entry_arg = 0xc546a20, caller = 0x0, pool_next = {sle_next = 0x0}, co_queue_wakeup = {sqh_first = 0x0, sqh_last = 0xffffea00061f7480}, co_queue_next = {sqe_next = 0x100000000000}}
+(gdb) frame 4
+#4  0x0000556aed2479a9 in qemu_coroutine_enter (co=0x7fd574300ce0) at /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c:119
+119    in /build/pb-qemu-pssKUp/pb-qemu-2.7.0/util/qemu-coroutine.c
+(gdb) print *co
+$3 = {entry = 0xc00000053, entry_arg = 0x7fd500000001, caller = 0x7fd574300d88, pool_next = {sle_next = 0x7fd574300d90}, co_queue_wakeup = {sqh_first = 0x7fd6ebbd1000, sqh_last = 0x7fd574300e00}, 
+  co_queue_next = {sqe_next = 0xc546a20}}
+(gdb) print *co->caller
+$4 = {entry = 0x230095a58, entry_arg = 0x230095a38, caller = 0x187dd2000, pool_next = {sle_next = 0x187dd1000}, co_queue_wakeup = {sqh_first = 0x187dd0000, sqh_last = 0x187dcf000}, co_queue_next = {
+    sqe_next = 0x184970000}}
+--------------------------------------------------------------------------
+
+The question is, why did qemu_coroutine_enter not complain when in earlier calls co->caller was not NULL?

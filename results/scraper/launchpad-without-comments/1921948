@@ -1,0 +1,38 @@
+MTE tags not checked properly for unaligned accesses at EL1
+
+For kernel memory accesses that span across two memory granules, QEMU's MTE implementation only checks the tag of the first granule but not of the second one.
+
+To reproduce this, build the Linux kernel with CONFIG_KASAN_HW_TAGS enabled, apply the patch below, and boot the kernel:
+
+diff --git a/sound/last.c b/sound/last.c
+index f0bb98780e70..04745cb30b74 100644
+--- a/sound/last.c
++++ b/sound/last.c
+@@ -5,12 +5,18 @@
+  */
+ 
+ #include <linux/init.h>
++#include <linux/slab.h>
+ #include <sound/core.h>
+ 
+ static int __init alsa_sound_last_init(void)
+ {
+        struct snd_card *card;
+        int idx, ok = 0;
++
++       char *ptr = kmalloc(128, GFP_KERNEL);
++       pr_err("KASAN report should follow:\n");
++       *(volatile unsigned long *)(ptr + 124);
++       kfree(ptr);
+        
+        printk(KERN_INFO "ALSA device list:\n");
+        for (idx = 0; idx < SNDRV_CARDS; idx++) {
+
+KASAN tags the 128 allocated bytes with the same tag as the returned pointer. The memory granule that follows the 128 allocated bytes has a different tag (with 1/15 probability).
+
+Expected result: a tag fault is detected and a KASAN report is printed when accessing bytes [124, 130).
+Observed result: no tag fault is detected and no KASAN report is printed.
+
+Here are the flags that I use to run QEMU if they matter:
+
+qemu-system-aarch64 -s -machine virt,mte=on -cpu max -m 2G -smp 2 -net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 -net nic -nographic -kernel ./Image -append "console=ttyAMA0 root=/dev/vda earlyprintk=serial" -drive file=./fs.img,format=raw,if=virtio -no-shutdown -no-reboot

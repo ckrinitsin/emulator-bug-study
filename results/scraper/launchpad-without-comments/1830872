@@ -1,0 +1,74 @@
+AARCH64 to ARMv7 mistranslation in TCG
+
+The following guest code:
+
+  https://github.com/tianocore/edk2/blob/3604174718e2afc950c3cc64c64ba5165c8692bd/MdePkg/Library/BaseMemoryLibOptDxe/AArch64/CopyMem.S
+
+implements, in hand-optimized aarch64 assembly, the CopyMem() edk2 (EFI
+Development Kit II) library function. (CopyMem() basically has memmove()
+semantics, to provide a standard C analog here.) The relevant functions
+are InternalMemCopyMem() and __memcpy().
+
+When TCG translates this aarch64 code to x86_64, everything works fine.
+
+When TCG translates this aarch64 code to ARMv7, the destination area of
+the translated CopyMem() function becomes corrupted -- it differs from
+the intended source contents. Namely, in every 4096 byte block, the
+8-byte word at offset 4032 (0xFC0) is zeroed out in the destination,
+instead of receiving the intended source value.
+
+I'm attaching two hexdumps of the same destination area:
+
+- "good.txt" is a hexdump of the destination area when CopyMem() was
+  translated to x86_64,
+
+- "bad.txt" is a hexdump of the destination area when CopyMem() was
+  translated to ARMv7.
+
+In order to assist with the analysis of this issue, I disassembled the
+aarch64 binary with "objdump". Please find the listing in
+"DxeCore.objdump", attached. The InternalMemCopyMem() function starts at
+hex offset 2b2ec. The __memcpy() function starts at hex offset 2b180.
+
+And, I ran the guest on the ARMv7 host with "-d
+in_asm,op,op_opt,op_ind,out_asm". Please find the log in
+"tcg.in_asm.op.op_opt.op_ind.out_asm.log", attached.
+
+The TBs that correspond to (parts of) the InternalMemCopyMem() and
+__memcpy() functions are scattered over the TCG log file, but the offset
+between the "nice" disassembly from "DxeCore.objdump", and the in-RAM
+TBs in the TCG log, can be determined from the fact that there is a
+single prfm instruction in the entire binary. The instruction's offset
+is 0x2b180 in "DxeCore.objdump" -- at the beginning of the __memcpy()
+function --, and its RAM address is 0x472d2180 in the TCG log. Thus the
+difference (= the load address of DxeCore.efi) is 0x472a7000.
+
+QEMU was built at commit a4f667b67149 ("Merge remote-tracking branch
+'remotes/cohuck/tags/s390x-20190521-3' into staging", 2019-05-21).
+
+The reproducer command line is (on an ARMv7 host):
+
+  qemu-system-aarch64 \
+    -display none \
+    -machine virt,accel=tcg \
+    -nodefaults \
+    -nographic \
+    -drive if=pflash,format=raw,file=$prefix/share/qemu/edk2-aarch64-code.fd,readonly \
+    -drive if=pflash,format=raw,file=$prefix/share/qemu/edk2-arm-vars.fd,snapshot=on \
+    -cpu cortex-a57 \
+    -chardev stdio,signal=off,mux=on,id=char0 \
+    -mon chardev=char0,mode=readline \
+    -serial chardev:char0
+
+The apparent symptom is an assertion failure *in the guest*, such as
+
+> ASSERT [DxeCore]
+> /home/lacos/src/upstream/qemu/roms/edk2/MdePkg/Library/BaseLib/String.c(1090):
+> Length < _gPcd_FixedAtBuild_PcdMaximumAsciiStringLength
+
+but that is only a (distant) consequence of the CopyMem()
+mistranslation, and resultant destination area corruption.
+
+Originally reported in the following two mailing list messages:
+- http://<email address hidden>
+- http://<email address hidden>

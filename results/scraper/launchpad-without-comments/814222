@@ -1,0 +1,126 @@
+kvm cannot use vhd files over 127GB
+
+The primary use case for using vhds with KVM is to perform a conversion to a raw image file so that one could move from Hyper-V to Linux-KVM.  See more on this http://blog.allanglesit.com/2011/03/linux-kvm-migrating-hyper-v-vhd-images-to-kvm/
+
+# kvm-img convert -f raw -O vpc /root/file.vhd /root/file.img
+
+The above works great if you have VHDs smaller than 127GB, however if it is larger, then no error is generated during the conversion process, but it appears to just process up to that 127GB barrier and no more.  Also of note.  VHDs can also be run directly using KVM if they are smaller than 127GB.  VHDs can be read and function well using virtualbox as well as hyper-v, so I suspect the problem lies not with the VHD format (since that has a 2TB limitation).  But instead with how qemu-kvm is interpreting them.
+
+BORING VERSION INFO:
+# cat /etc/issue
+Ubuntu 11.04 \n \l
+# uname -rmiv
+2.6.38-8-server #42-Ubuntu SMP Mon Apr 11 03:49:04 UTC 2011 x86_64 x86_64
+# apt-cache policy kvm
+kvm:
+  Installed: 1:84+dfsg-0ubuntu16+0.14.0+noroms+0ubuntu4.1
+  Candidate: 1:84+dfsg-0ubuntu16+0.14.0+noroms+0ubuntu4.1
+  Version table:
+ *** 1:84+dfsg-0ubuntu16+0.14.0+noroms+0ubuntu4.1 0
+        500 http://apt.sonosite.com/ubuntu/ natty-updates/main amd64 Packages
+        500 http://apt.sonosite.com/ubuntu/ natty-security/main amd64 Packages
+        100 /var/lib/dpkg/status
+     1:84+dfsg-0ubuntu16+0.14.0+noroms+0ubuntu4 0
+        500 http://apt.sonosite.com/ubuntu/ natty/main amd64 Packages
+# apt-cache policy libvirt-bin
+libvirt-bin:
+  Installed: 0.8.8-1ubuntu6.2
+  Candidate: 0.8.8-1ubuntu6.2
+  Version table:
+ *** 0.8.8-1ubuntu6.2 0
+        500 http://apt.sonosite.com/ubuntu/ natty-updates/main amd64 Packages
+        500 http://apt.sonosite.com/ubuntu/ natty-security/main amd64 Packages
+        100 /var/lib/dpkg/status
+     0.8.8-1ubuntu6 0
+        500 http://apt.sonosite.com/ubuntu/ natty/main amd64 Packages
+
+qemu-img version 0.14.0
+
+# vboxmanage -v
+4.0.12r72916
+
+
+REPRODUCTION STEPS (requires Windows 7 or Windows 2008 R2 with < 1GB of free space)
+
+##  WINDOWS  MACHINE  ##
+
+Use Computer Management > Disk Management
+-Create 2 VHD files, both dynamically expanding 120GB and 140GB respectively.
+-Do not initialize  or format.
+
+These files will need to be transferred to an Ubuntu KVM machine (pscp is what I used but usb would work as well).
+
+##  UBUNTU KVM MACHINE  ##
+
+# ls *.vhd
+120g-dyn.vhd  140g-dyn.vhd
+# kvm-img info 120g-dyn.vhd 
+image: 120g-dyn.vhd
+file format: vpc
+virtual size: 120G (128847052800 bytes)
+disk size: 244K
+# kvm-img info 140g-dyn.vhd 
+image: 140g-dyn.vhd
+file format: vpc
+virtual size: 127G (136899993600 bytes)
+disk size: 284K
+# kvm-img info 120g-dyn.vhd | grep "virtual size"
+virtual size: 120G (128847052800 bytes)
+# kvm-img info 140g-dyn.vhd | grep "virtual size"
+virtual size: 127G (136899993600 bytes)
+
+Regardless of how big the second vhd is I always get a virtual size of 127G
+
+Now if we use virtualbox to view the vhds we see markedly different results.
+
+# VBoxManage showhdinfo 120g-dyn.vhd
+UUID:                 e63681e0-ff12-4114-85de-7d13562b36db
+Accessible:           yes
+Logical size:         122880 MBytes
+Current size on disk: 0 MBytes
+Type:                 normal (base)
+Storage format:       VHD
+Format variant:       dynamic default
+Location:             /root/120g-dyn.vhd
+# VBoxManage showhdinfo 140g-dyn.vhd 
+UUID:                 94531905-46b4-469f-bb44-7a7d388fb38f
+Accessible:           yes
+Logical size:         143360 MBytes
+Current size on disk: 0 MBytes
+Type:                 normal (base)
+Storage format:       VHD
+Format variant:       dynamic default
+Location:             /root/140g-dyn.vhd
+
+# kvm-img convert -f vpc -O raw 120g-dyn.vhd 120g-dyn.img
+#
+# kvm-img convert -f vpc -O raw 140g-dyn.vhd 140g-dyn.img
+#
+
+# kvm-img info 120g-dyn.img 
+image: 120g-dyn.img
+file format: raw
+virtual size: 120G (128847052800 bytes)
+disk size: 0
+# kvm-img info 120g-dyn.img | grep "virtual size"
+virtual size: 120G (128847052800 bytes)
+# kvm-img info 140g-dyn.img 
+image: 140g-dyn.img
+file format: raw
+virtual size: 127G (136899993600 bytes)
+disk size: 0
+# kvm-img info 140g-dyn.img | grep "virtual size"
+virtual size: 127G (136899993600 bytes)
+
+Notice after the conversion the raw image will the taken on the partial geometry of the vhd, thus rendering that image invalid.
+
+vboxmanage has a clonehd option which allows you to successfully convert vhd to a raw image, which kvm then sees properly.
+
+For giggles I also tested with a 140GB fixed VHD (in the same manner as above) and it displayed the virtual size as correct, so a good work around is to convert your VHDs to fixed, then use kvm-img to convert them.
+
+Keep in mind that these reproduction steps will not have a file systems therefore no valid data, if there were for example NTFS with a text file the problem would still occur but more importantly the guest trying to use it would not be able to open the disk because of it being unable to find the final sector.
+
+So long story short I think we are dealing with 2 issues here.
+
+1) kvm not being able to deal with dynamic VHD files larger than 127GB
+2) kvm-img not generating an error when it "fails" at converting or displaying information on dynamic VHDs larger than 127GB.  The error should be something like "qemu-kvm does not support dynamic VHD files larger that 127GB..."

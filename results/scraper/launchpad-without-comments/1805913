@@ -1,0 +1,21 @@
+readdir() returns NULL (errno=EOVERFLOW) for 32-bit user-static qemu on 64-bit host
+
+This can be simply reproduced by compiling and running the attached C code (readdir-bug.c) under 32-bit user-static qemu, such as qemu-arm-static:
+
+# Setup docker for user-static binfmt
+docker run --rm --privileged multiarch/qemu-user-static:register --reset
+# Compile the code and run (readdir for / is fine, so create a new directory /test).
+docker run -v /path/to/qemu-arm-static:/usr/bin/qemu-arm-static -v /path/to/readdir-bug.c:/tmp/readdir-bug.c -it --rm arm32v7/ubuntu:18.10 bash -c '{ apt update && apt install -y gcc; } >&/dev/null && mkdir -p /test && cd /test && gcc /tmp/readdir-bug.c && ./a.out'
+dir=0xff5b4150
+readdir(dir)=(nil)
+errno=75: Value too large for defined data type
+
+Do remember to replace the /path/to/qemu-arm-static and /path/to/readdir-bug.c to the actual paths of the files.
+
+The root cause is in glibc: https://sourceware.org/git/?p=glibc.git;a=blob;f=sysdeps/unix/sysv/linux/getdents.c;h=6d09a5be7057e2792be9150d3a2c7b293cf6fc34;hb=a5275ba5378c9256d18e582572b4315e8edfcbfb#l87
+
+By C standard, the return type of readdir() is DIR*, in which the inode number and offset are 32-bit integers, therefore, glibc calls getdents64() and check if the inode number and offset fits the 32-bit range, and reports EOVERFLOW if not.
+
+The problem here is for 32-bit user-static qemu running on 64-bit host, getdents64 simply passing through the inode number and offset from underlying getdents64 syscall (from 64-bit kernel), which is very likely to not fit into 32-bit range. On real hardware, the 32-bit kernel creates 32-bit inode numbers, therefore works properly.
+
+The glibc code makes sense to do the check to be conformant with C standard, therefore ideally it should be a fix on qemu side. I admit this is difficult because qemu has to maintain a mapping between underlying 64-bit inode numbers and 32-bit inode numbers, which would severely hurt the performance. I don't expect this could be fix anytime soon (or even there would be a fix), but it would be worthwhile to surface this issue.

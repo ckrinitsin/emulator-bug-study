@@ -1,0 +1,44 @@
+hw/scsi/scsi-disk.c line 2554 allocation overflow
+
+When compiling qemu from git master (at commit 03bf012e523ecdf047ac56b2057950247256064d ) on Linux amd64, with gcc-9 9.2.1 , and using `-march=native -flto`, during linking of most target binaries, compiler does detect an issue with allocation in scsi_disk_new_request_dump and aborts compilation.
+
+
+make[1]: Entering directory '/home/user/qemu/slirp'
+make[1]: Nothing to be done for 'all'.
+make[1]: Leaving directory '/home/user/qemu/slirp'
+nm: stats64.o: no symbols
+  LINK    aarch64-softmmu/qemu-system-aarch64
+In function ‘scsi_disk_new_request_dump’,
+    inlined from ‘scsi_new_request’ at hw/scsi/scsi-disk.c:2580:9,
+    inlined from ‘scsi_new_request’ at hw/scsi/scsi-disk.c:2564:21:
+hw/scsi/scsi-disk.c:2554:19: error: argument 1 value ‘18446744073709551612’ exceeds maximum object size 9223372036854775807 [-Werror=alloc-size-larger-than=]
+hw/scsi/scsi-disk.c: In function ‘scsi_new_request’:
+/usr/include/glib-2.0/glib/gmem.h:78:10: note: in a call to allocation function ‘g_malloc’ declared here
+   78 | gpointer g_malloc         (gsize  n_bytes) G_GNUC_MALLOC G_GNUC_ALLOC_SIZE(1);
+      |          ^
+lto1: all warnings being treated as errors
+lto-wrapper: fatal error: c++ returned 1 exit status
+compilation terminated.
+/usr/bin/ld: error: lto-wrapper failed
+collect2: error: ld returned 1 exit status
+
+
+
+same happens for most other targets: alpha-softmmu/qemu-system-alpha arm-softmmu/qemu-system-arm hppa-softmmu/qemu-system-hppa i386-softmmu/qemu-system-i386 lm32-softmmu/qemu-system-lm32 mips-softmmu/qemu-system-mips mips64-softmmu/qemu-system-mips64 mips64el-softmmu/qemu-system-mips64el mipsel-softmmu/qemu-system-mipsel ppc-softmmu/qemu-system-ppc ppc64-softmmu/qemu-system-ppc64 riscv32-softmmu/qemu-system-riscv32 riscv64-softmmu/qemu-system-riscv64 s390x-softmmu/qemu-system-s390x sh4-softmmu/qemu-system-sh4 sh4eb-softmmu/qemu-system-sh4eb sparc-softmmu/qemu-system-sparc sparc64-softmmu/qemu-system-sparc64 x86_64-softmmu/qemu-system-x86_64 xtensa-softmmu/qemu-system-xtensa xtensaeb-softmmu/qemu-system-xtensaeb
+
+Notice -softmmu being a common factor here.
+
+
+
+The size of the allocation for the temporary buffer for dumping using snprintf is determined based on the size of the buffer via call to scsi_cdb_length. I believe the heavy inlining and constant propagation makes scsi_cdb_length return -1, so len = -1. Then allocation size is 5*len + 1, or -4. Which overflows to 2^64 - 4 or so.
+
+The case of len==-1 from scsi_cdb_length happens if the (buf[0] >> 5) is not 0, 1, 2, 4 or 5.
+
+However, I can't find out how gcc figures out that buf[0] is not one of these variables. To me looking at this function, compiler should not know anything about buf[0].
+
+I tried following the chain of calls back, including devirtualize alloc_req, and I found scsi_device_alloc_req calling these alloc_req callbacks, but it is itself called from scsi_req_new, which is called in  get_scsi_requests , just after buf is filled from QEMUFile using qemu_get_buffer, which ultimately goes even further into read paths, which there might be many AFAIK.
+
+
+
+
+glib2 version 2.62.1-1

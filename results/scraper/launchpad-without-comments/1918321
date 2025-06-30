@@ -1,0 +1,83 @@
+[OSS-Fuzz] Issue 31875 megasas: Null-ptr dereference in megasas_finish_dcmd
+
+Hello,
+
+== QTest Reproducer ==
+/* 
+ * cat << EOF | ./qemu-system-i386 -display none -machine accel=qtest, -m \
+ * 512M -machine q35 -nodefaults -device megasas -device \
+ * scsi-cd,drive=null0 -blockdev \
+ * driver=null-co,read-zeroes=on,node-name=null0 -qtest stdio
+ * outl 0xcf8 0x80000801
+ * outl 0xcfc 0x05000000
+ * outl 0xcf8 0x80000816
+ * outl 0xcfc 0x19000000
+ * write 0x1e1ed300 0x1 0x01
+ * write 0x1e1ed307 0x1 0x01
+ * write 0x1e1ed316 0x1 0x01
+ * write 0x1e1ed328 0x1 0x01
+ * write 0x1e1ed32f 0x1 0x01
+ * outl 0x1940 0x1e1ed300
+ * outl 0x19c0 0x00
+ * EOF
+ */
+static void null_deref_megasas_finish_dcmd(void)
+{
+    QTestState *s = qtest_init(
+        "-display none , -m 512M -machine q35 -nodefaults -device megasas -device "
+        "scsi-cd,drive=null0 -blockdev driver=null-co,read-zeroes=on,node-name=null0 ");
+    qtest_outl(s, 0xcf8, 0x80000801);
+    qtest_outl(s, 0xcfc, 0x05000000);
+    qtest_outl(s, 0xcf8, 0x80000816);
+    qtest_outl(s, 0xcfc, 0x19000000);
+    qtest_bufwrite(s, 0x1e1ed300, "\x01", 0x1);
+    qtest_bufwrite(s, 0x1e1ed307, "\x01", 0x1);
+    qtest_bufwrite(s, 0x1e1ed316, "\x01", 0x1);
+    qtest_bufwrite(s, 0x1e1ed328, "\x01", 0x1);
+    qtest_bufwrite(s, 0x1e1ed32f, "\x01", 0x1);
+    qtest_outl(s, 0x1940, 0x1e1ed300);
+    qtest_outl(s, 0x19c0, 0x00);
+    qtest_quit(s);
+}
+int main(int argc, char **argv)
+{
+    const char *arch = qtest_get_arch();
+
+    g_test_init(&argc, &argv, NULL);
+
+    if (strcmp(arch, "i386") == 0) {
+        qtest_add_func("fuzz/null_deref_megasas_finish_dcmd",
+                       null_deref_megasas_finish_dcmd);
+    }
+
+    return g_test_run();
+}
+
+== Stack Trace ==
+../hw/scsi/megasas.c:1884:21: runtime error: member access within null pointer of type 'union mfi_frame'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior ../hw/scsi/megasas.c:1884:21 in
+../hw/scsi/megasas.c:1884:21: runtime error: member access within null pointer of type 'struct mfi_frame_header'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior ../hw/scsi/megasas.c:1884:21 in
+AddressSanitizer:DEADLYSIGNAL
+=================================================================
+==314546==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000003 (pc 0x55b1b4f4de73 bp 0x7ffcfc5a8bb0 sp 0x7ffcfc5a8900 T0)
+==314546==The signal is caused by a WRITE memory access.
+==314546==Hint: address points to the zero page.
+#0 0x55b1b4f4de73 in megasas_command_complete build/../hw/scsi/megasas.c:1884:40
+#1 0x55b1b5613914 in scsi_req_complete build/../hw/scsi/scsi-bus.c:1515:5
+#2 0x55b1b5448aeb in scsi_dma_complete_noio build/../hw/scsi/scsi-disk.c:345:9
+#3 0x55b1b5446fc7 in scsi_dma_complete build/../hw/scsi/scsi-disk.c:366:5
+#4 0x55b1b4fffc56 in dma_complete build/../softmmu/dma-helpers.c:121:9
+#5 0x55b1b4fffc56 in dma_blk_cb build/../softmmu/dma-helpers.c:139:9
+#6 0x55b1b6856016 in blk_aio_complete build/../block/block-backend.c:1412:9
+#7 0x55b1b6f48b06 in aio_bh_poll build/../util/async.c:164:13
+#8 0x55b1b6f08cec in aio_dispatch build/../util/aio-posix.c:381:5
+#9 0x55b1b6f4d59c in aio_ctx_dispatch build/../util/async.c:306:5
+#10 0x7fd88c098baa in g_main_context_dispatch (/usr/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x51baa)
+#11 0x55b1b6f59a3c in glib_pollfds_poll build/../util/main-loop.c:232:9
+#12 0x55b1b6f59a3c in os_host_main_loop_wait build/../util/main-loop.c:255:5
+#13 0x55b1b6f59a3c in main_loop_wait build/../util/main-loop.c:531:11
+#14 0x55b1b61a78a9 in qemu_main_loop build/../softmmu/runstate.c:725:9
+#15 0x55b1b4c751e5 in main build/../softmmu/main.c:50:5
+#16 0x7fd88aec6d09 in __libc_start_main csu/../csu/libc-start.c:308:16
+#17 0x55b1b4bc8bb9 in _start (system-i386+0x2b5fbb9)

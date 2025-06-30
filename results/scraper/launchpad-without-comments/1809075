@@ -1,0 +1,31 @@
+Concurrency bug on keyboard events: capslock LED messing up keycode streams causes character misses at guest kernel
+
+Whenever capslock is pressed on host, both capslock keycode(0x3a 0xba) and capslock LED keycode(0xfa 0xfa) would be sent to the ps2 keycode stream. 
+
+However, capslock LED is handled by another thread, confirmed by tracing `ps2_write_keyboard` with gdb. The keycode of casplock LED might divide 
+
+For example, I sent AaBb but got ABa. I was using vncdotool, so it equals sending `capslock a capslock a capslock b capslock b`. In ps2_queue, I was expecting `3a fa fa ba 1e 9e 3a fa fa ba 1e 9e 3a fa fa ba 30 b0 3a fa fa ba 30 b0`. But actually once in a while, it might not receive such streams. In one case I got `3a fa fa ba 1e 9e 3a ba 1e fa fa 9e 3a ba 30 b0 3a ba 30 b0 fa fa`
+
+In this specific example, `a` was lost because LED keycode 'jumps in' its keycode. Kernel event device receives below streams
+```
+# /dev/input/event receives    what is sent from ps2_queue
+# I use cap_1 to show capslock key down
+cap_1   led     caps_0,        # 0x3a 0xfa 0xfa 0xba
+a_1     a_0                    # 0x1e 0x9e
+caps_1  caps_0                 # 0x3a 0xba
+led                            # 0x1e 0xfa 0xfa 0x1e (we lost `a` here)
+caps_1  caps_0                 # 0x3a 0xba
+b_1     led     b_0            # 0x30 0xfa 0xfa 0xb0 
+caps_1  caps_0                 # 0x3a 0xba
+led     b_1     b_0            # 0xfa 0xfa 0x30 0xb0
+```
+
+I made sure kernel receives the correct key stream as the qemu ps2_queue sends using /proc, ftrace and dynamic_debug. I explained the details in this [post](https://medium.com/@alapha23/quick-peek-into-kernel-land-keyboard-events-handling-with-ftrace-and-dynamic-debug-24a790056d5a)
+
+So it seems to be a concurrency issue. 
+
+A hacky path on my mind is to skip all `0xfa` in ps2_queue. But I'm not sure if capslock LED is the only stink bug to our ps2 keycode queue as I've seen other keycodes handled by `ps2_write_keyboard` sent to ps2 queue. 
+
+Another solution might be a memory barrier or a lock. Making key down and key up atomic will prevent another thread modifying the ps2 queue unwantedly.  
+
+What do you think?

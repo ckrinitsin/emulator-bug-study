@@ -1,0 +1,38 @@
+TI Stellaris lm3s811evb (ARM Cortex-M3) : Systick interrupt not working
+
+I've tried to create a small project that uses the CMSIS as base library.
+The problem is that the SysTick_interrupt_handler() doesn't get executed when the systick event is detected in QEMU. Furthermore, it seems asif QEMU gets stuck in an endless loop. QEMU doesn't respond to Ctrl-C on the command line and the GDB session also stalls. 'kill -9' is the only way to stop QEMU.
+
+It seems asif the initialisation of the NVIC works fine. I've traced the function calls in QEMU as follows:
+stellaris.c: stellaris_init() - Perform generic armv7 init: armv7m_init()
+   armv7m.c: armv7m_init() - Create and init the nvic:
+                               nvic = qdev_create(NULL, "armv7m_nvic");
+                               env->nvic = nvic;
+                               qdev_init_nofail(nvic);
+                           - Configure the programmable interrupt controller:
+                               Call: arm_pic_init_cpu() 
+                                        qemu_allocate_irqs(arm_pic_cpu_handler)
+                           - Initialise 64 interrupt structures.
+
+The following call sequence is observed when the systick event occur:
+armv7m_nvic.c: systick_timer_tick(): set pending interrupt
+armv7m_nvic.c: armv7m_nvic_set_pending() for irq:15
+  arm_gic.c: gic_set_pending_private(): GIC_SET_PENDING(15,)
+    arm_gic.c: gic_update() - Raise IRQ with qemu_set_irq()
+       irq.c: eqmu_set_irq() - Call the irq->handler 
+                               -- I assume the irq handler is 'arm_pic_cpu_handler()',
+                                  since that was passed as the parameter when
+                                  qemu_allocate_irqs() was called in ...
+          arm_pic.c: arm_pic_cpu_handler() - After evaluation, call cpu_interrupt()
+             exec.c: cpu_interrupt() is called.     
+
+The tools that were used during the testing of this project:
+  GCC: Codesourcery ARM eabi 2010q3
+  QEMU: Checked out on 31/12/2010 - Last commit: 0fcec41eec0432c77645b4a407d3a3e030c4abc4
+The project files are attached, for reproducing of the errors.
+   Note: The CMSIS wants to perform byte accesses to the NVIC. For the Cortex-M3, unaligned 8 bit and 16 bit accesses are allowed. The current QEMU implementation doesn't yet cater for it. As a work around, updated versions of
+arm_gic.c armv7m_nvic.h armv7m_nvic.c is also included.
+
+Launch project with: go_gdb.sh
+Attach debugger with: arm-none-eabi-gdbtui --command=gdbCommands_tui
+(s = step, n = next, c = continue, Ctrl-C = stop, print <variable> to look at variable contents)

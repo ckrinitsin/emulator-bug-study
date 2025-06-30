@@ -1,0 +1,51 @@
+AMD CPUID leaf 0x8000'0008 reported number of cores  inconsistent with ACPI.MADT
+
+Setup:
+CPU: AMD EPYC-v2 or host's EPYC cpu
+Linux 64-bit fedora host; Kernel version 5.5.15-200.fc31
+qemu version: self build
+git-head: f3bac27cc1e303e1860cc55b9b6889ba39dee587
+config: Configured with: '../configure' '--target-list=x86_64-softmmu,mips64el-softmmu,mips64-softmmu,mipsel-softmmu,mips-softmmu,i386-softmmu,aarch64-softmmu,arm-softmmu' '--prefix=/opt/qemu-master'
+
+Cmdline: 
+qemu-system-x86_64 -kernel /home/peppelt/code/l4/internal/.build-x86_64/bin/amd64_gen/bootstrap -append "" -initrd "./fiasco/.build-x86_64/fiasco , ... " -serial stdio -nographic -monitor none -nographic -monitor none -cpu EPYC-v2 -m 4G -smp 4 
+
+Issue:
+We are developing an microkernel operating system called L4Re. We recently got an AMD EPYC server for testing and we couldn't execute SMP tests of our system when running Linux + qemu + VM w/ L4Re.
+In fact, the kernel did not recognize any APs at all. On AMD CPUs the kernel checks for the number of cores reported in CPUID leaf 0x8000_0008.ECX[NC] or [ApicIdSize].  [0][1]
+
+The physical machine reports for leaf 0x8000_0008:  EAX: 0x3030 EBX: 0x18cf757 ECX: 0x703f EDX: 0x1000
+The lower four bits of ECX are the [NC] field and all set.
+
+When querying inside qemu with -enable-kvm -cpu host -smp 4 (basically as replacement and addition to the above cmdline) the CPUID leaf shows: EAX: 0x3024, EBX: 0x1001000, ECX: 0x0, EDX: 0x0
+Note, ECX is zero. Indicating that this is no SMP capabale CPU.
+
+I'm debugging it using my local machine and the QEMU provided EPYC-v2 CPU model and it is reproducible there as well and reports:  EAX: 0x3028, EBX: 0x0, ECX: 0x0, EDX: 0x0
+
+I checked other AMD based CPU models (phenom, opteron_g3/g5) and they behave the same. [2] shows the CPUID 0x8000'0008 handling in the QEMU source.
+I believe that behavior here is wrong as ECX[NC] should report the number of cores per processor, as stated in the AMD manual [2] p.584. In my understanding -smp 4 should then lead to ECX[NC] = 0x3.
+
+The following table shows my findings with the -smp option:
+Option | Qemu guest observed ECX value
+-smp 4 | 0x0
+-smp 4,cores=4  | 0x3
+-smp 4,cores=2,thread=2 | 0x3
+-smp 4,cores=4,threads=2 | QEMU boot error: topology false.
+
+Now, I'm asking myself how the terminology of the AMD manual maps to QEMU's -smp option.
+Obviously, nr_cores and nr_threads correspond to the cores and threads options on the cmdline and cores * threads <= 4 (in this example), but what corresponds the X in -smp X to?
+
+Querying 0x8000'0008 on the physical processor results in different reports than quering QEMU's model as does it with -enable-kvm -cpu host.
+
+Furthermore, the ACPI.MADT shows 4 local APICs to be present while the CPU leave reports a single core processor.
+
+This leads me to the conclusion that CPUID 0x8000'0008.ECX reports the wrong number.
+
+
+Please let me know, if you need more information from my side.
+
+
+[0] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/kernel_thread-ia32.cpp#L109
+[1] https://github.com/kernkonzept/fiasco/blob/522ccc5f29ab120213cf02d71328e2b879cbbd19/src/kern/ia32/cpu-ia32.cpp#L1120
+[2] https://github.com/qemu/qemu/blob/f2a8261110c32c4dccd84e774d8dd7a0524e00fb/target/i386/cpu.c#L5835
+[3] https://www.amd.com/system/files/TechDocs/24594.pdf

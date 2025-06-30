@@ -1,0 +1,58 @@
+AUD_set_volume_out takes SWVoiceOut as parameter, but controls HWVoiceOut
+
+There was a change in https://github.com/qemu/qemu/commit/571a8c522e0095239598347ac0add93337c1e0bf#diff-230ab01fa7fb1668a1e9183241115cb0R1852-R1853 (audio/audio.c) which breaks audio output on devices which have multiple software voices on the same hardware voice.
+
+When multiple software voices use the same hardware voice, then setting a volume / mute for any of the software voices, will affect all other software voices, too.
+
+I'm not sure if such a use-case exists in QEMU; however, it does exist in my fork.
+It's also easy to see that this is a bug in the QEMU audio subsystem.
+
+The API (and broken function) for this is:
+
+```
+    void AUD_set_volume_out (SWVoiceOut *sw, int mute, uint8_t lvol, uint8_t rvol)
+```
+
+So this is supposed to modify the SWVoiceOut.
+
+However, if the backend supports `pcm_ops->volume_out` this does not work as expected. It's always as if you had called:
+
+```
+    void AUD_set_volume_out (HWVoiceOut *hw, int mute, uint8_t lvol, uint8_t rvol)
+```
+
+*(Note how this modifies the hardware voice)*
+
+
+In my specific use case, I have 2 outputs (digital and analog audio on AC97), and I want to mute the digital audio output, but I still need to keep the voice activated for timing.
+However, if I mute the digital audio SWVoiceOut, it will also affect the other SWVoiceOut (for analog audio) on the same HWVoiceOut.
+
+---
+
+Old code - if the hardware supports volume changes, it will receive the software voice which should be modified, so changes can be restricted to that one voice:
+
+```
+        HWVoiceOut *hw = sw->hw;
+        [...]
+        if (hw->pcm_ops->ctl_out) {
+            hw->pcm_ops->ctl_out (hw, VOICE_VOLUME, sw);
+        }
+```
+
+New code - the hardware backend will have no way to differentiate software voices; so any change will affect all voices. The volume which was set last on any sw voice will set a global volume / mute for all voices on the hardware backend:
+
+```
+        HWVoiceOut *hw = sw->hw;
+        [...]
+        if (hw->pcm_ops->volume_out) {
+            hw->pcm_ops->volume_out(hw, &sw->vol);
+        }
+```
+
+The old interface was already broken with some (all?) backends, because they ignored the software voice, but at least the design made sense.
+However, the new design is fundamentally broken because it doesn't even tell the backend which voice is supposed to be modified.
+
+---
+
+Bug was introduced in cecc1e79bf9ad9a0e2d3ce513d4f71792a0985f6
+The affected code was touched since then, but still remains in 49ee11555262a256afec592dfed7c5902d5eefd2

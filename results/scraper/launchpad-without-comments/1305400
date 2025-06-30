@@ -1,0 +1,99 @@
+qmp-version of memsave makes a zero filled dump
+
+calling the memsave function through hmp and qmp makes a different results. it happened because hmp_memsave calls synchronization of cpu, but qmp_marshal_input_memsave does not. so virDomainMemoryPeek (libvirt api) does not work correctly
+
+1) hmp:
+void hmp_memsave(Monitor *mon, const QDict *qdict)
+{
+    uint32_t size = qdict_get_int(qdict, "size");
+    const char *filename = qdict_get_str(qdict, "filename");
+    uint64_t addr = qdict_get_int(qdict, "val");
+    Error *errp = NULL;
+
+    qmp_memsave(addr, size, filename, true, <<<< monitor_get_cpu_index() >>>, &errp);
+    hmp_handle_error(mon, &errp);
+}
+int monitor_get_cpu_index(void)
+{
+    CPUState *cpu = ENV_GET_CPU(<<< mon_get_cpu >>>());
+    return cpu->cpu_index;
+}
+static CPUArchState *mon_get_cpu(void)
+{
+    if (!cur_mon->mon_cpu) {
+        monitor_set_cpu(0);
+    }
+    <<< cpu_synchronize_state(cur_mon->mon_cpu); >>>
+    return cur_mon->mon_cpu->env_ptr;
+}
+
+2) qmp
+int qmp_marshal_input_memsave(Monitor *mon, const QDict *qdict, QObject **ret)
+{
+    Error *local_err = NULL;
+    Error **errp = &local_err;
+    QDict *args = (QDict *)qdict;
+    QmpInputVisitor *mi;
+    QapiDeallocVisitor *md;
+    Visitor *v;
+    int64_t val;
+    int64_t size;
+    char * filename = NULL;
+    bool has_cpu_index = false;
+    int64_t cpu_index;
+
+    mi = qmp_input_visitor_new_strict(QOBJECT(args));
+    v = qmp_input_get_visitor(mi);
+    visit_type_int(v, &val, "val", errp);
+    visit_type_int(v, &size, "size", errp);
+    visit_type_str(v, &filename, "filename", errp);
+    visit_start_optional(v, &has_cpu_index, "cpu-index", errp);
+    if (has_cpu_index) {
+        visit_type_int(v, &cpu_index, "cpu-index", errp);
+    }
+    visit_end_optional(v, errp);
+    qmp_input_visitor_cleanup(mi);
+
+    if (error_is_set(errp)) {
+        goto out;
+    }
+    <<< qmp_memsave(val, size, filename, has_cpu_index, cpu_index, errp); >>>
+
+out:
+    md = qapi_dealloc_visitor_new();
+    v = qapi_dealloc_get_visitor(md);
+    visit_type_int(v, &val, "val", NULL);
+    visit_type_int(v, &size, "size", NULL);
+    visit_type_str(v, &filename, "filename", NULL);
+    visit_start_optional(v, &has_cpu_index, "cpu-index", NULL);
+    if (has_cpu_index) {
+        visit_type_int(v, &cpu_index, "cpu-index", NULL);
+    }
+    visit_end_optional(v, NULL);
+    qapi_dealloc_visitor_cleanup(md);
+
+    if (local_err) {
+        qerror_report_err(local_err);
+        error_free(local_err);
+        return -1;
+    }
+    return 0;
+}
+
+how to reproduce:
+
+1) run qemu as it makes a libvirtd
+./qemu-system-x86_64 -name gentoo -machine pc-i440fx-1.7,accel=kvm,usb=off -m 1024 -realtime mlock=off -smp 1,sockets=1,cores=1,threads=1 -uuid 135b3e47-43ca-bc68-e23b-354a2f62a023 -no-user-config -nodefaults -chardev socket,id=charmonitor,path=./gentoo.monitor,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -rtc base=utc -no-shutdown -boot menu=off,strict=on -kernel ./bzImage -append root="/dev/vda2 vga=38f" -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -drive file=./gentoo.img,if=none,id=drive-virtio-disk0,format=raw -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x4,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 -drive file=./install-amd64-minimal-20140320.iso,if=none,id=drive-ide0-1-0,readonly=on,format=raw -device ide-cd,bus=ide.1,unit=0,drive=drive-ide0-1-0,id=ide0-1-0,bootindex=2 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -vnc 127.0.0.1:0 -device qxl-vga,id=video0,ram_size=67108864,vram_size=67108864,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5 -vnc 127.0.0.1:2 -monitor stdio
+
+2) attach to qemu through qmp-shell (taken from qemu sources)
+python ./qmp-shell ./gentoo.monitor
+
+3) make some commands in sequence
+(qmp-shell) memsave memsave val=-2130706432 size=100 filename=./test01
+(stdio monitor) memsave 0xffffffff81000000 100 ./test02
+(qmp-shell) memsave memsave val=-2130706432 size=100 filename=./test03
+
+result:
+test01 - zero filled
+test02 - right
+test03 - right

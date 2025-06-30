@@ -1,0 +1,149 @@
+[Regression]Powerpc kvm guest unable to start with hugepage backed memory
+
+Current upstream qemu master does not boot a powerpc kvm guest backed by hugepage.
+
+HW: Power9 (DD2.3)
+Host Kernel: 5.6.0-rc5
+Guest Kernel: 5.6.0-rc5
+Qemu: ba29883206d92a29ad5a466e679ccfc2ee6132ef
+
+Steps to reproduce:
+1. Allocate enough hugepage to boot a KVM guest
+# cat /proc/meminfo |grep ^HugePages
+HugePages_Total:    5000
+HugePages_Free:     5000
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+
+2. Define and boot a guest
+/usr/bin/virt-install --connect=qemu:///system --hvm --accelerate --name 'vm1' --machine pseries --memory=8192,hugepages=yes --vcpu=8,maxvcpus=8,sockets=1,cores=8,threads=1 --import --nographics --serial pty --memballoon model=virtio --controller type=scsi,model=virtio-scsi --disk path=/home/kvmci/tests/data/avocado-vt/images/f31-ppc64le.qcow2,bus=scsi,size=10,format=qcow2 --network=bridge=virbr0,model=virtio,mac=52:54:00:5f:82:83 --mac=52:54:00:5f:82:83 --boot emulator=/home/sath/qemu/ppc64-softmmu/qemu-system-ppc64,kernel=/home/kvmci/linux/vmlinux,kernel_args="root=/dev/sda5 rw console=tty0 console=ttyS0,115200 init=/sbin/init initcall_debug selinux=0" --noautoconsole
+
+Starting install...
+ERROR    internal error: qemu unexpectedly closed the monitor: qemu-system-ppc64: util/qemu-thread-posix.c:76: qemu_mutex_lock_impl: Assertion `mutex->initialized' failed.
+qemu-system-ppc64: util/qemu-thread-posix.c:76: qemu_mutex_lock_impl: Assertion `mutex->initialized' failed.
+
+ -----------NOK
+
+
+Bisected the issue to below commit.
+
+037fb5eb3941c80a2b7c36a843e47207ddb004d4 is the first bad commit
+commit 037fb5eb3941c80a2b7c36a843e47207ddb004d4
+Author: bauerchen <email address hidden>
+Date:   Tue Feb 11 17:10:35 2020 +0800
+
+    mem-prealloc: optimize large guest startup
+    
+    [desc]:
+        Large memory VM starts slowly when using -mem-prealloc, and
+        there are some areas to optimize in current method;
+    
+        1、mmap will be used to alloc threads stack during create page
+        clearing threads, and it will attempt mm->mmap_sem for write
+        lock, but clearing threads have hold read lock, this competition
+        will cause threads createion very slow;
+    
+        2、methods of calcuating pages for per threads is not well;if we use
+        64 threads to split 160 hugepage,63 threads clear 2page,1 thread
+        clear 34 page,so the entire speed is very slow;
+    
+        to solve the first problem,we add a mutex in thread function,and
+        start all threads when all threads finished createion;
+        and the second problem, we spread remainder to other threads,in
+        situation that 160 hugepage and 64 threads, there are 32 threads
+        clear 3 pages,and 32 threads clear 2 pages.
+    
+    [test]:
+        320G 84c VM start time can be reduced to 10s
+        680G 84c VM start time can be reduced to 18s
+    
+    Signed-off-by: bauerchen <email address hidden>
+    Reviewed-by: Pan Rui <email address hidden>
+    Reviewed-by: Ivan Ren <email address hidden>
+    [Simplify computation of the number of pages per thread. - Paolo]
+    Signed-off-by: Paolo Bonzini <email address hidden>
+
+ util/oslib-posix.c | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+
+
+bisect log:
+
+# git bisect log
+git bisect start
+# good: [52901abf94477b400cf88c1f70bb305e690ba2de] Update version for v4.2.0-rc5 release
+git bisect good 52901abf94477b400cf88c1f70bb305e690ba2de
+# bad: [ba29883206d92a29ad5a466e679ccfc2ee6132ef] Merge remote-tracking branch 'remotes/borntraeger/tags/s390x-20200310' into staging
+git bisect bad ba29883206d92a29ad5a466e679ccfc2ee6132ef
+# good: [d1ebbc9d16297b54b153ee33abe05eb4f1df0c66] target/arm/kvm: trivial: Clean up header documentation
+git bisect good d1ebbc9d16297b54b153ee33abe05eb4f1df0c66
+# good: [87b74e8b6edd287ea2160caa0ebea725fa8f1ca1] target/arm: Vectorize USHL and SSHL
+git bisect good 87b74e8b6edd287ea2160caa0ebea725fa8f1ca1
+# bad: [e0175b71638cf4398903c0d25f93fe62e0606389] Merge remote-tracking branch 'remotes/pmaydell/tags/pull-target-arm-20200228' into staging
+git bisect bad e0175b71638cf4398903c0d25f93fe62e0606389
+# bad: [ca6155c0f2bd39b4b4162533be401c98bd960820] Merge tag '<email address hidden>' of https://github.com/patchew-project/qemu into HEAD
+git bisect bad ca6155c0f2bd39b4b4162533be401c98bd960820
+# good: [ab74e543112957696f7c79b0c33ecebd18b52af5] ppc/spapr: use memdev for RAM
+git bisect good ab74e543112957696f7c79b0c33ecebd18b52af5
+# good: [cb06fdad05f3e546a4e20f1f3c0127f9ae53de1a] fuzz: support for fork-based fuzzing.
+git bisect good cb06fdad05f3e546a4e20f1f3c0127f9ae53de1a
+# bad: [037fb5eb3941c80a2b7c36a843e47207ddb004d4] mem-prealloc: optimize large guest startup
+git bisect bad 037fb5eb3941c80a2b7c36a843e47207ddb004d4
+# good: [88e2b97aa3e369a454c9d8360afddc348070c708] Merge remote-tracking branch 'remotes/dgilbert-gitlab/tags/pull-virtiofs-20200221' into staging
+git bisect good 88e2b97aa3e369a454c9d8360afddc348070c708
+# good: [b1db8c63169f2139af9f26c884e5e2abd27dd290] fuzz: add virtio-net fuzz target
+git bisect good b1db8c63169f2139af9f26c884e5e2abd27dd290
+# good: [e5c59355ae9f724777c61c859292ec9db2c8c2ab] fuzz: add documentation to docs/devel/
+git bisect good e5c59355ae9f724777c61c859292ec9db2c8c2ab
+# good: [920d557e5ae58671d335acbcfba3f9a97a02911c] memory: batch allocate ioeventfds[] in address_space_update_ioeventfds()
+git bisect good 920d557e5ae58671d335acbcfba3f9a97a02911c
+# first bad commit: [037fb5eb3941c80a2b7c36a843e47207ddb004d4] mem-prealloc: optimize large guest startup
+
+
+
+
+Qemu cmdline:
+```
+/home/sath/qemu/ppc64-softmmu/qemu-system-ppc64 \
+-name guest=vm1,debug-threads=on \
+-S \
+-object secret,id=masterKey0,format=raw,file=/var/lib/libvirt/qemu/domain-9-vm1/master-key.aes \
+-machine pseries-5.0,accel=kvm,usb=off,dump-guest-core=off \
+-m 8192 \
+-mem-prealloc \
+-mem-path /dev/hugepages/libvirt/qemu/9-vm1 \
+-overcommit mem-lock=off \
+-smp 8,sockets=1,cores=8,threads=1 \
+-uuid e5875dd8-0d1c-422f-ae46-9a0b88919902 \
+-display none \
+-no-user-config \
+-nodefaults \
+-chardev socket,id=charmonitor,fd=36,server,nowait \
+-mon chardev=charmonitor,id=monitor,mode=control \
+-rtc base=utc \
+-no-shutdown \
+-boot strict=on \
+-kernel /home/kvmci/linux/vmlinux \
+-append 'root=/dev/sda5 rw console=tty0 console=ttyS0,115200 init=/sbin/init initcall_debug selinux=0' \
+-device qemu-xhci,p2=15,p3=15,id=usb,bus=pci.0,addr=0x3 \
+-device virtio-scsi-pci,id=scsi0,bus=pci.0,addr=0x2 \
+-device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x4 \
+-drive file=/home/kvmci/tests/data/avocado-vt/images/f31-ppc64le.qcow2,format=qcow2,if=none,id=drive-scsi0-0-0-0 \
+-device scsi-hd,bus=scsi0.0,channel=0,scsi-id=0,lun=0,device_id=drive-scsi0-0-0-0,drive=drive-scsi0-0-0-0,id=scsi0-0-0-0,bootindex=1 \
+-netdev tap,fd=38,id=hostnet0,vhost=on,vhostfd=39 \
+-device virtio-net-pci,netdev=hostnet0,id=net0,mac=52:54:00:5f:82:83,bus=pci.0,addr=0x1 \
+-chardev pty,id=charserial0 \
+-device spapr-vty,chardev=charserial0,id=serial0,reg=0x30000000 \
+-chardev socket,id=charchannel0,fd=40,server,nowait \
+-device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=org.qemu.guest_agent.0 \
+-device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x5 \
+-msg timestamp=on
+2020-03-11 08:11:46.639+0000: 494632: info : libvirt version: 5.6.0, package: 5.fc31 (Fedora Project, 2019-11-11-20:24:40, )
+2020-03-11 08:11:46.639+0000: 494632: info : hostname: ltcmihawk50.aus.stglabs.ibm.com
+2020-03-11 08:11:46.639+0000: 494632: info : virObjectUnref:349 : OBJECT_UNREF: obj=0x7fff3c0f6fb0
+char device redirected to /dev/pts/2 (label charserial0)
+qemu-system-ppc64: util/qemu-thread-posix.c:76: qemu_mutex_lock_impl: Assertion `mutex->initialized' failed.
+qemu-system-ppc64: util/qemu-thread-posix.c:76: qemu_mutex_lock_impl: Assertion `mutex->initialized' failed.
+2020-03-11 08:11:47.195+0000: shutting down, reason=failed
+```

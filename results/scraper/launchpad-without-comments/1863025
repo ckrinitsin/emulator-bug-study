@@ -1,0 +1,46 @@
+Use-after-free after flush in TCG accelerator
+
+I believe I found a UAF in TCG that can lead to a guest VM escape. The security 
+list informed me "This can not be treated as a security issue." and to post it 
+here. I am looking at the 4.2.0 source code. The issue requires a race and I 
+will try to describe it in terms of three concurrent threads.
+
+I am looking 
+at the 4.2.0 source code. The issue requires a race and I will try to describe 
+it in terms of three concurrent threads.
+
+Thread A:
+
+A1. qemu_tcg_cpu_thread_fn runs work loop
+A2. qemu_wait_io_event => qemu_wait_io_event_common => process_queued_cpu_work
+A3. start_exclusive critical section entered
+A4. do_tb_flush is called, TB memory freed/re-allocated
+A5. end_exclusive exits critical section
+
+Thread B:
+
+B1. qemu_tcg_cpu_thread_fn runs work loop
+B2. tcg_cpu_exec => cpu_exec => tb_find => tb_gen_code
+B3. tcg_tb_alloc obtains a new TB
+
+Thread C:
+
+C1. qemu_tcg_cpu_thread_fn runs work loop
+C2. cpu_exec_step_atomic executes
+C3. TB obtained with tb_lookup__cpu_state or tb_gen_code
+C4. start_exclusive critical section entered
+C5. cpu_tb_exec executes the TB code
+C6. end_exclusive exits critical section
+
+Consider the following sequence of events:
+  B2 => B3 => C3 (same TB as B2) => A3 => A4 (TB freed) => A5 => B2 => 
+  B3 (re-allocates TB from B2) => C4 => C5 (freed/reused TB now executing) => C6
+
+In short, because thread C uses the TB in the critical section, there is no 
+guarantee that the pointer has not been "freed" (rather the memory is marked as 
+re-usable) and therefore a use-after-free occurs.
+
+Since the TCG generated code can be in the same memory as the TB data structure,
+it is possible for an attacker to overwrite the UAF pointer with code generated
+from TCG. This can overwrite key pointer values and could lead to code 
+execution on the host outside of the TCG sandbox.

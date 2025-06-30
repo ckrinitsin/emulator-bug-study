@@ -1,0 +1,51 @@
+Incorrect feature negotiation for vhost-vdpa netdevice
+
+QEMU cmdline:
+=============
+./x86_64-softmmu/qemu-system-x86_64 -machine accel=kvm -m 2G -hda  /gautam/centos75_1.qcow2 -name gautam,process=gautam -enable-kvm -netdev vhost-vdpa,id=mynet0,vhostdev=/dev/vhost-vdpa-0 -device virtio-net-pci,netdev=mynet0,mac=02:AA:BB:DD:00:20,disable-modern=off,page-per-vq=on -cpu host --nographic
+
+Host OS:
+========
+Linux kernel 5.11 running on x86 host
+
+Guest OS:
+==========
+CentOS 7.5
+
+Root cause analysis:
+=====================
+
+For vhost-vdpa netdevice, the feature negotiation results in sending the superset of features received from device in call to get_features vdpa ops callback.
+
+During the feature-negotiation phase, the acknowledged feature bits are initialized with backend_features  and then checked for supported feature bits in vhost_ack_features():
+
+void vhost_net_ack_features(struct vhost_net *net, uint64_t features)
+{
+  net->dev.acked_features = net->dev.backend_features;
+  vhost_ack_features(&net->dev, vhost_net_get_feature_bits(net), features);
+}
+
+ 
+The vhost_ack_features() function just builds up on the dev.acked_features and never trims it down:
+
+void vhost_ack_features(struct vhost_dev *hdev, const int *feature_bits, uint64_t features)
+{     const int *bit = feature_bits;
+
+      while (*bit != VHOST_INVALID_FEATURE_BIT) {
+           uint64_t bit_mask = (1ULL << *bit);      
+
+            if (features & bit_mask)
+                 hdev->acked_features |= bit_mask;
+
+            bit++;
+       }
+}
+
+Because of this hdev->acked_features is always minimally equal to the value of device features and this is the value that is passed to the device in set_features callback:
+
+static int vhost_dev_set_features(struct vhost_dev *dev, bool enable_log)
+{
+       uint64_t *features = dev->acked_features;
+       .....
+       r = dev->vhost_ops->*vhost_set_features*(dev, features);
+}

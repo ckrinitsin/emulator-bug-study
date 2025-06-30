@@ -1,0 +1,36 @@
+QEMU memfd_create fallback mechanism change for security drivers
+
+And, when libvirt starts using apparmor, and creating apparmor profiles for every virtual machine created in the compute nodes, mitaka qemu (2.5 - and upstream also) uses a fallback mechanism for creating shared memory for live-migrations. This fall back mechanism, on kernels 3.13 - that don't have memfd_create() system-call, try to create files on /tmp/ directory and fails.. causing live-migration not to work.
+
+Trusty with kernel 3.13 + Mitaka with qemu 2.5 + apparmor capability = can't live migrate.
+
+From qemu 2.5, logic is on :
+
+void *qemu_memfd_alloc(const char *name, size_t size, unsigned int seals, int *fd)
+{
+    if (memfd_create)... ### only works with HWE kernels
+
+    else ### 3.13 kernels, gets blocked by apparmor
+       tmpdir = g_get_tmp_dir
+       ...
+       mfd = mkstemp(fname)
+}
+
+And you can see the errors:
+
+From the host trying to send the virtual machine:
+
+2016-08-15 16:36:26.160 1974 ERROR nova.virt.libvirt.driver [req-0cac612b-8d53-4610-b773-d07ad6bacb91 691a581cfa7046278380ce82b1c38ddd 133ebc3585c041aebaead8c062cd6511 - - -] [instance: 2afa1131-bc8c-43d2-9c4a-962c1bf7723e] Migration operation has aborted
+2016-08-15 16:36:26.248 1974 ERROR nova.virt.libvirt.driver [req-0cac612b-8d53-4610-b773-d07ad6bacb91 691a581cfa7046278380ce82b1c38ddd 133ebc3585c041aebaead8c062cd6511 - - -] [instance: 2afa1131-bc8c-43d2-9c4a-962c1bf7723e] Live Migration failure: internal error: unable to execute QEMU command 'migrate': Migration disabled: failed to allocate shared memory
+
+From the host trying to receive the virtual machine:
+
+Aug 15 16:36:19 tkcompute01 kernel: [ 1194.356794] type=1400 audit(1471289779.791:72): apparmor="STATUS" operation="profile_load" profile="unconfined" name="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" pid=12565 comm="apparmor_parser"
+Aug 15 16:36:19 tkcompute01 kernel: [ 1194.357048] type=1400 audit(1471289779.791:73): apparmor="STATUS" operation="profile_load" profile="unconfined" name="qemu_bridge_helper" pid=12565 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.877027] type=1400 audit(1471289780.311:74): apparmor="STATUS" operation="profile_replace" profile="unconfined" name="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" pid=12613 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.904407] type=1400 audit(1471289780.343:75): apparmor="STATUS" operation="profile_replace" profile="unconfined" name="qemu_bridge_helper" pid=12613 comm="apparmor_parser"
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.973064] type=1400 audit(1471289780.407:76): apparmor="DENIED" operation="mknod" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/tmp/memfd-tNpKSj" pid=12625 comm="qemu-system-x86" requested_mask="c" denied_mask="c" fsuid=107 ouid=107
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.979871] type=1400 audit(1471289780.411:77): apparmor="DENIED" operation="open" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/tmp/" pid=12625 comm="qemu-system-x86" requested_mask="r" denied_mask="r" fsuid=107 ouid=0
+Aug 15 16:36:20 tkcompute01 kernel: [ 1194.979881] type=1400 audit(1471289780.411:78): apparmor="DENIED" operation="open" profile="libvirt-2afa1131-bc8c-43d2-9c4a-962c1bf7723e" name="/var/tmp/" pid=12625 comm="qemu-system-x86" requested_mask="r" denied_mask="r" fsuid=107 ouid=0
+
+When leaving libvirt without apparmor capabilities (thus not confining virtual machines on compute nodes, the live migration works as expected, so, clearly, apparmor is stepping into the live migration). I'm sure that virtual machines have to be confined and that this isn't the desired behaviour...

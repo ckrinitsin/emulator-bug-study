@@ -1,0 +1,40 @@
+qemu 2.12.0 crash during install windows 10 with vga
+
+Same issue as https://www.qubes-os.org/doc/windows-vm/ , it's not easy to reproduced.
+cpu_physical_memory_snapshot_get_dirty: Assertion `start + length <= snap->end’ failed
+
+Qemu version is 2.12.0. 
+(gdb) bt
+#0  0x00007f504ed6fc37 in raise () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f504ed73028 in abort () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f504ed68bf6 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007f504ed68ca2 in __assert_fail () from /lib/x86_64-linux-gnu/libc.so.6
+#4  0x00005585bbdc9641 in cpu_physical_memory_snapshot_get_dirty (snap=snap@entry=0x5585bfdc2ff0, start=<optimized out>, length=<optimized out>)
+    at /qemu-2.12/exec.c:1264
+#5  0x00005585bbe2b4de in memory_region_snapshot_get_dirty (mr=mr@entry=0x5585c06e3d10, snap=snap@entry=0x5585bfdc2ff0, addr=<optimized out>,
+    size=<optimized out>) at /qemu-2.12/memory.c:1997
+#6  0x00005585bbe552a4 in vga_draw_graphic (full_update=0, s=0x5585c06e3d00) at /qemu-2.12/hw/display/vga.c:1671
+#7  vga_update_display (opaque=0x5585c06e3d00) at /qemu-2.12/hw/display/vga.c:1767
+#8  0x00005585bc0d9a8f in qemu_spice_display_refresh (ssd=0x5585c06e3930) at /qemu-2.12/ui/spice-display.c:478
+#9  0x00005585bc0ced72 in dpy_refresh (s=0x5585c081b2a0) at /qemu-2.12/ui/console.c:1629
+#10 gui_update (opaque=0x5585c081b2a0) at /qemu-2.12/ui/console.c:203
+#11 0x00005585bc1d333c in timerlist_run_timers (timer_list=0x5585bee1f950) at /qemu-2.12/util/qemu-timer.c:536
+#12 0x00005585bc1d35a3 in qemu_clock_run_timers (type=QEMU_CLOCK_REALTIME) at /qemu-2.12/util/qemu-timer.c:547
+#13 qemu_clock_run_all_timers () at /qemu-2.12/util/qemu-timer.c:674
+#14 0x00005585bc1d3aa4 in main_loop_wait (nonblocking=<optimized out>) at /qemu-2.12/util/main-loop.c:528
+#15 0x00005585bbdc2f8a in main_loop () at /qemu-2.12/vl.c:1973
+#16 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /qemu-2.12/vl.c:4804 
+
+(gdb) frame 5
+(gdb) p/x *snap
+$1 = {start = 0x1000c0000, end = 0x1000c0000, dirty = 0x5585bfdc3000}
+
+Here the snap->start is identical to snap->end , I think something is wrong. 
+In function vga_draw_graphic, the snap is allocated from region_start/region_end.
+        snap = memory_region_snapshot_and_clear_dirty(&s->vram, region_start,
+                                                      region_end - region_start,
+                                                      DIRTY_MEMORY_VGA);
+Is that possible for region_start== region_end ? 
+
+Commandline:
+/usr/bin/kvm -name guest=win10-2,debug-threads=on -S -object secret,id=masterKey0,format=raw,file=/run/lib/libvirt/qemu/domain-51-win10-2/master-key.aes -machine pc-i440fx-2.12,accel=kvm,usb=off,system=windows,dump-guest-core=off -cpu qemu64,hv_time,hv_relaxed,hv_spinlocks=0x2000 -m size=4194304k,slots=10,maxmem=34359738368k -realtime mlock=off -smp 2,maxcpus=24,sockets=24,cores=1,threads=1 -numa node,nodeid=0,cpus=0-23,mem=4096 -uuid cb871760-e684-4926-8f0b-270f7ff35539 -no-user-config -nodefaults -chardev socket,id=charmonitor,path=/run/lib/libvirt/qemu/domain-51-win10-2/monitor.sock,server,nowait -mon chardev=charmonitor,id=monitor,mode=control -chardev socket,id=charmonitor_cas,path=/run/lib/libvirt/qemu/domain-51-win10-2/monitor.sock.cas,server,nowait -mon chardev=charmonitor_cas,id=monitor_cas,mode=control -rtc base=localtime,clock=vm,driftfix=slew -no-hpet -no-shutdown -global PIIX4_PM.disable_s3=1 -global PIIX4_PM.disable_s4=1 -boot strict=on -device piix3-usb-uhci,id=usb,bus=pci.0,addr=0x1.0x2 -device usb-ehci,id=usb1,bus=pci.0,addr=0x4 -device nec-usb-xhci,id=usb2,bus=pci.0,addr=0x5 -device virtio-scsi-pci,id=scsi1,bus=pci.0,addr=0x6 -device virtio-serial-pci,id=virtio-serial0,bus=pci.0,addr=0x7 -device usb-hub,id=hub0,bus=usb.0,port=1 -drive file=/vms/images/win10-2,format=qcow2,if=none,id=drive-virtio-disk0,cache=directsync,aio=native -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x8,pci_hotpluggable=on,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1 -drive file=/vms/isos/virtio-win10.vfd,format=raw,if=none,id=drive-fdc0-0-0,readonly=on,cache=directsync,aio=native -global isa-fdc.driveA=drive-fdc0-0-0 -global isa-fdc.bootindexA=4 -drive file=/vms/nfs/windows_msdn_iso/cn_windows_10_multi-edition_version_1709_updated_sept_2017_x64_dvd_100090804.iso,format=raw,if=none,id=drive-ide0-0-0,readonly=on -device ide-cd,bus=ide.0,unit=0,drive=drive-ide0-0-0,id=ide0-0-0,bootindex=2 -netdev tap,fd=62,id=hostnet0,vhost=on,vhostfd=63 -device virtio-net-pci,pci_hotpluggable=on,netdev=hostnet0,id=net0,mac=0c:da:41:1d:11:5b,bus=pci.0,addr=0x3,bootindex=3 -chardev pty,id=charserial0 -device isa-serial,chardev=charserial0,id=serial0 -chardev socket,id=charchannel0,path=/var/lib/libvirt/qemu/win10-2.agent,server,nowait -device virtserialport,bus=virtio-serial0.0,nr=1,chardev=charchannel0,id=channel0,name=org.qemu.guest_agent.0 -device usb-tablet,id=input0,bus=usb.0,port=2 -vnc 0.0.0.0:0 -spice port=5901,tls-port=5902,addr=0.0.0.0,disable-ticketing,x509-dir=/etc/pki/libvirt-spice,seamless-migration=on -device qxl-vga,id=video0,ram_size=67108864,vram_size=16777216,vram64_size_mb=0,vgamem_mb=16,bus=pci.0,addr=0x2 -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x9 -msg timestamp=on

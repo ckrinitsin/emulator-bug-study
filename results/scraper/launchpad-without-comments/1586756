@@ -1,0 +1,52 @@
+"-serial unix:" option of qemu-system-arm is broken in qemu 2.6.0
+
+I found a bug of "-serial unix:PATH_TO_SOCKET" in qemu 2.6.0 (qemu 2.5.1 works fine).
+Occasionally, a part of the output of qemu disappears in the bug.
+
+It looks like following commit is the cause:
+
+char: ensure all clients are in non-blocking mode (Author: Daniel P. Berrange <email address hidden>)
+http://git.qemu.org/?p=qemu.git;a=commitdiff;h=64c800f808748522727847b9cdc73412f22dffb9
+
+In this commit, UNIX socket is set to non-blocking mode, but qemu_chr_fe_write function doesn't handle EAGAIN.
+You should fix code like that:
+
+---
+diff --git a/qemu-char.c b/qemu-char.c
+index b597ee1..0361d78 100644
+--- a/qemu-char.c
++++ b/qemu-char.c
+@@ -270,6 +270,7 @@ static int qemu_chr_fe_write_buffer(CharDriverState *s, const uint8_t *buf, int
+ int qemu_chr_fe_write(CharDriverState *s, const uint8_t *buf, int len)
+ {
+     int ret;
++    int offset = 0;
+ 
+     if (s->replay && replay_mode == REPLAY_MODE_PLAY) {
+         int offset;
+@@ -280,7 +281,21 @@ int qemu_chr_fe_write(CharDriverState *s, const uint8_t *buf, int len)
+     }
+ 
+     qemu_mutex_lock(&s->chr_write_lock);
+-    ret = s->chr_write(s, buf, len);
++
++    while (offset < len) {
++    retry:
++        ret = s->chr_write(s, buf, len);
++        if (ret < 0 && errno == EAGAIN) {
++            g_usleep(100);
++            goto retry;
++        }
++
++        if (ret <= 0) {
++            break;
++        }
++
++        offset += ret;
++    }
+ 
+     if (ret > 0) {
+         qemu_chr_fe_write_log(s, buf, ret);
+---
+
+Or please do "git revert 64c800f808748522727847b9cdc73412f22dffb9".
