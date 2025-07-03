@@ -16,11 +16,13 @@ args = parser.parse_args()
 
 positive_categories = ['semantic', 'TCG', 'assembly', 'architecture', 'mistranslation', 'register', 'user-level']
 architectures = ['x86', 'arm', 'risc-v', 'i386', 'ppc']
-negative_categories = ['boot', 'network', 'KVM', 'vnc', 'graphic', 'device', 'socket', 'debug', 'files', 'PID', 'permissions', 'performance', 'kernel', 'peripherals', 'VMM', 'hypervisor', 'virtual', 'other']
+negative_categories = ['boot', 'network', 'kvm', 'vnc', 'graphic', 'device', 'socket', 'debug', 'files', 'PID', 'permissions', 'performance', 'kernel', 'peripherals', 'VMM', 'hypervisor', 'virtual', 'other']
 categories = positive_categories + negative_categories + architectures
 
 def list_files_recursive(directory, basename = False):
     result = []
+    if not path.isdir(directory):
+        return result
     for entry in listdir(directory):
         full_path = path.join(directory, entry)
         if path.isdir(full_path):
@@ -132,8 +134,8 @@ def main():
             text = file.read()
 
         if args.deepseek:
-            response = chat(args.deepseek, [{'role': 'user', 'content': preambel + "\n" + text,}])
-            category = sub(r'[^a-zA-Z]', '', response['message']['content'].split()[-1])
+            response = chat(args.deepseek, [{'role': 'user', 'content': text + "\n" + preambel,}])
+            category = sub(r'[^a-zA-Z]', '', response['message']['content'].split()[-1]).lower()
             if not category in categories:
                 category = "manual-review"
             output(text, category, [], [], path.basename(bug), response['message']['content'])
