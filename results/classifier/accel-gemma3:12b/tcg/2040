@@ -1,0 +1,25 @@
+
+x86 TCG incorrectly truncates physical addresses to 32 bits when PAE is enabled
+Description of problem:
+Originally observed as 32-bit Windows failing to boot on systems with RAM above 4G when using TCG (but working fine under KVM).  Windows kernel debugger showed the kernel allocating a block of memory but somehow failing to create a page table mapping for it.
+
+Bisection in QEMU produced the first bad commit as 4a1e9d4 ("target/i386: Use atomic operations for pte updates"), which changed the PTE accessing code from using e.g. `x86_ldq_phys()` to using `probe_access_full()` and `ldq_p()`.
+
+Further deconstruction of the changes in this commit found that at some point during the boot, the value obtained from `ldq_p()` was completely different to the value obtained from `x86_ldq_phys()`.  Debugging revealed that the underlying host addresses used by each method were exactly 4G apart, with the new method (`ldq_p()`) accessing a host location 4G below the correct address.
+
+Inspection of the code revealed one place where addresses are truncated to 32 bits, which would cause this 4G offset: in `get_physical_address()` we have the code:
+
+```
+    if (!(env->hflags & HF_LMA_MASK)) {
+        /* Without long mode we can only address 32bits in real mode */
+        out->paddr = (uint32_t)out->paddr;
+    }
+```
+
+This looks wrong, since PAE allows for physical addresses above 4G to be accessed without long mode.  (This is the whole point of PAE.)
+
+A quick experiment shows that commenting out the above block of code fixes the symptom and allows Windows 10 to boot with RAM above 4G.
+
+I suspect that the test should be checking for PAE being enabled rather than long mode being enabled.  (Enabling PAE is part of setting up the CPU for long mode, so it is impossible to be in long mode without PAE already enabled.)
+Steps to reproduce:
+Run the command given above.

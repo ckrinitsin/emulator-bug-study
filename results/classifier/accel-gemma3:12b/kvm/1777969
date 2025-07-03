@@ -1,0 +1,67 @@
+
+Crash with UEFI, q35, AHCI, and <= SystemRescueCD 4.3.0
+
+I am getting a crash when booting <= SystemRescueCD 4.3.0 in UEFI mode with q35 machine and from a AHCI device with qemu 2.11.1 and 2.12.0.  The crash doesn't occur if I compile with --enable-trace-backends=simple or if I use virtio-scsi.  The original crash was noticed on Gentoo with hardened gcc 6.4.0 and an Intel CPU, the test system to reproduce the crash is on Gentoo with non-hardened gcc 5.4.0 and an Intel CPU.
+
+OVMF version is from Gentoo: edk2-ovmf-2017_p20180211-bin.tar.xz
+
+Here is the commands I have run on qemu 2.12.0 to reproduce the issue although it also crashes with accel=kvm removed:
+./configure --target-list="x86_64-softmmu"
+make
+qemu-system-x86_64 -nodefaults -machine q35,accel=kvm -cpu qemu64 -drive if=pflash,format=raw,unit=0,file=/usr/share/edk2-ovmf/OVMF_CODE.fd,readonly=on -drive if=pflash,format=raw,unit=1,file=OVMF_VARS.fd -m 512 -drive file=systemrescuecd-x86-4.3.0.iso,if=none,id=cdrom-sysresc,readonly=on -device ide-cd,bus=ide.0,unit=0,drive=cdrom-sysresc,bootindex=5 -device VGA -display gtk
+
+Valgrind says "Bad permissions for mapped region at address 0x4C022FE0" for the crash.
+
+Here is a backtrace from gdb:
+Program received signal SIGSEGV, Segmentation fault.
+0x00007f42dcbc5833 in malloc () from /lib64/libc.so.6
+(gdb) bt
+#0  0x00007f42dcbc5833 in malloc () from /lib64/libc.so.6
+#1  0x00007f42e10117d9 in g_malloc () from /usr/lib64/libglib-2.0.so.0
+#2  0x000055a3ff9def8f in qemu_aio_get (aiocb_info=aiocb_info@entry=0x55a4001b39a0 <thread_pool_aiocb_info>, bs=bs@entry=0x0, cb=cb@entry=0x55a3ff9dfe20 <thread_pool_co_cb>, opaque=opaque@entry=0x7f42961e30b0) at util/aiocb.c:33
+#3  0x000055a3ff9e0249 in thread_pool_submit_aio (pool=pool@entry=0x55a400c038d0, func=func@entry=0x55a3ff956620 <aio_worker>, arg=arg@entry=0x55a400bd30b0, cb=cb@entry=0x55a3ff9dfe20 <thread_pool_co_cb>, 
+    opaque=opaque@entry=0x7f42961e30b0) at util/thread-pool.c:251
+#4  0x000055a3ff9e0423 in thread_pool_submit_co (pool=0x55a400c038d0, func=func@entry=0x55a3ff956620 <aio_worker>, arg=arg@entry=0x55a400bd30b0) at util/thread-pool.c:289
+#5  0x000055a3ff956b50 in paio_submit_co (bs=0x55a400bff180, fd=<optimized out>, offset=362702848, qiov=<optimized out>, bytes=2048, type=1) at block/file-posix.c:1536
+#6  0x000055a3ff95c82a in bdrv_driver_preadv (bs=bs@entry=0x55a400bff180, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=0) at block/io.c:924
+#7  0x000055a3ff960154 in bdrv_aligned_preadv (child=child@entry=0x55a400c03a20, req=req@entry=0x7f42961e32e0, offset=offset@entry=362702848, bytes=bytes@entry=2048, align=align@entry=1, qiov=qiov@entry=0x7f42961e3650, flags=0)
+    at block/io.c:1228
+#8  0x000055a3ff960434 in bdrv_co_preadv (child=0x55a400c03a20, offset=362702848, bytes=2048, qiov=0x7f42961e3650, flags=0) at block/io.c:1324
+#9  0x000055a3ff95c82a in bdrv_driver_preadv (bs=bs@entry=0x55a400bf8e50, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=0) at block/io.c:924
+#10 0x000055a3ff960154 in bdrv_aligned_preadv (child=child@entry=0x55a400be92c0, req=req@entry=0x7f42961e3510, offset=offset@entry=362702848, bytes=bytes@entry=2048, align=align@entry=512, qiov=qiov@entry=0x7f42961e3650, flags=0)
+    at block/io.c:1228
+#11 0x000055a3ff960434 in bdrv_co_preadv (child=0x55a400be92c0, offset=offset@entry=362702848, bytes=bytes@entry=2048, qiov=qiov@entry=0x7f42961e3650, flags=flags@entry=0) at block/io.c:1324
+#12 0x000055a3ff94f4ce in blk_co_preadv (blk=0x55a400bf8ba0, offset=362702848, bytes=2048, qiov=0x7f42961e3650, flags=0) at block/block-backend.c:1158
+#13 0x000055a3ff94f5ac in blk_read_entry (opaque=0x7f42961e3670) at block/block-backend.c:1206
+#14 0x000055a3ff94e000 in blk_prw (blk=0x55a400bf8ba0, offset=362702848, buf=<optimized out>, bytes=bytes@entry=2048, co_entry=co_entry@entry=0x55a3ff94f590 <blk_read_entry>, flags=flags@entry=0) at block/block-backend.c:1243
+#15 0x000055a3ff94f076 in blk_pread (blk=<optimized out>, offset=<optimized out>, buf=<optimized out>, count=count@entry=2048) at block/block-backend.c:1409
+#16 0x000055a3ff7d8b93 in cd_read_sector_sync (s=0x55a401a0faa0) at hw/ide/atapi.c:124
+#17 ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:269
+#18 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#19 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#20 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#21 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#22 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#23 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#24 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#25 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#26 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#27 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#28 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#29 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#30 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#31 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#32 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#33 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#34 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#35 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#36 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#37 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#38 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#39 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#40 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#41 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#42 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#43 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285
+#44 0x000055a3ff7dde0e in ahci_start_transfer (dma=0x55a401a0f9f0) at hw/ide/ahci.c:1325
+#45 0x000055a3ff7d870c in ide_atapi_cmd_reply_end (s=0x55a401a0faa0) at hw/ide/atapi.c:285

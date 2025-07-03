@@ -1,0 +1,38 @@
+
+Slow graphics output under aarch64 hvf (no dirty bitmap tracking)
+Description of problem:
+When using a display adapter such as `bochs-display` (which, yes, I realize is not the ideal choice for an aarch64 guest, but it works fine under TCG and KVM, so bear with me) under `hvf` acceleration on an M1 Mac, display output is slow enough to be measured in seconds-per-frame.
+
+The issue seems to stem from each write to the framebuffer memory resulting in a data abort, while the expected behavior is that only one such write results in a data abort exception, which is handled by marking the region dirty and then subsequent writes do not yield exceptions until the display management in QEMU resets the dirty flag. Instead, every pixel drawn causes the VM to trap, and performance is degraded.
+Steps to reproduce:
+1. Start an aarch64 HVF guest with the `bochs-display` display adapter.
+2. Observe performance characteristics.
+3.
+Additional information:
+I reported this issue on IRC around a year ago, and was provided with a patch by @agraf which I have confirmed works. That patch was shared on the `qemu-devel` mailing list in February, 2022, with a response from @pm215: https://lists.gnu.org/archive/html/qemu-devel/2022-02/msg00609.html
+
+As a quick summary, the patch takes this snippet from the i386 HVF target:
+
+https://gitlab.com/qemu-project/qemu/-/blob/master/target/i386/hvf/hvf.c#L132-138
+
+And applies a variation of it to the ARM target when handling a data abort exception, before this assert:
+
+https://gitlab.com/qemu-project/qemu/-/blob/master/target/arm/hvf/hvf.c#L1381
+
+Something to the effect of:
+
+```c
+        if (iswrite) {
+            uint64_t gpa = hvf_exit->exception.physical_address;
+            hvf_slot *slot = hvf_find_overlap_slot(gpa, 1);
+
+            if (slot && slot->flags & HVF_SLOT_LOG) {
+                memory_region_set_dirty(slot->region, 0, slot->size);
+                hv_vm_protect(slot->start, slot->size, HV_MEMORY_READ |
+                              HV_MEMORY_WRITE | HV_MEMORY_EXEC);
+                break;
+            }
+        }
+```
+
+I am reporting this issue now as I updated my git checkout with the release of QEMU 8.0.0 and was surprised to find that the patch had never made it upstream and the issue persists.

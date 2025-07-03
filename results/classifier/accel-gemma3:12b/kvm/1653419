@@ -1,0 +1,73 @@
+
+SVM emulation fails due to EIP and FLAG register update optimization
+
+SVM emulation support has a bug due to which causes KVM emulation error when qemu-kvm is run over KVM installed on top of QEmu in software mode. 
+
+Steps to reproduce
+====================
+1. Run KVM inside QEmu(software mode with SVM emulation support). Make sure kvm_amd is running.
+2. Run any guest OS on top of the KVM using qemu-kvm.
+3. Following KVM emulation error is thrown immediately.
+
+KVM internal error. Suberror: 1
+emulation failure
+EAX=ffffffff EBX=4000004b ECX=00000000 EDX=000f5ea0
+ESI=00000000 EDI=00000000 EBP=00000000 ESP=00006fd0
+EIP=40000000 EFL=00000086 [--S--P-] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+CS =0008 00000000 ffffffff 00c09b00 DPL=0 CS32 [-RA]
+SS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+FS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+GS =0010 00000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+LDT=0000 00000000 0000ffff 00008200 DPL=0 LDT
+TR =0000 00000000 0000ffff 00008b00 DPL=0 TSS32-busy
+GDT=     000f7180 00000037
+IDT=     000f71be 00000000
+CR0=00000011 CR2=00000000 CR3=00000000 CR4=00000000
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000000
+Code=00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 <00> 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+
+Reason for the error
+====================
+Due to performance reasons, EIP and FLAG registers are not updated after executing every guest instructions. There are optimizations done to update these registers intelligently, for eg: EIP is updated at the end of translation block. This means EIP remains the address of the first instruction in the TB throughout the execution.
+
+In case of a VMEXIT because of a page fault happened after executing an instruction in the middle of the TB, the VMCB is updated with the wrong guest EIP and jumps to the address where host has left off. On the subsequent VMRUN by the host QEmu start executing some of the instructions that has already been executed. This can cause wrong execution flow. 
+
+Following is the instruction execution trace of the above scenario.
+
+0x00000000000f368f: callq 0xeecc4
+vmexit(00000060, 0000000000000000, 0000000000000000, 00000000000eecc4)!
+vmsave! 00000000b72e9000
+vmload! 00000000b72e9000
+vmrun! 00000000b72e9000
+0x00000000000eecc4: push %rbx
+0x00000000000eecc5: xor %ecx,%ecx
+0x00000000000eecc7: mov (%rax,%rcx,1),%bl
+0x00000000000eecca: cmp (%rdx,%rcx,1),%bl
+vmexit(0000004e, 0000000000000000, 00000000000f5ea0, 00000000000eecc4)!
+
+Page fault happens at 0x00000000000eecca which triggers a VMEXIT. vmcb->save->rip is updated with 0x00000000000eecc4 instead of 0x00000000000eecca.
+
+vmsave! 00000000b72e9000
+vmload! 00000000b72e9000
+vmrun! 00000000b72e9000
+0x00000000000eecc4: push %rbx
+0x00000000000eecc5: xor %ecx,%ecx
+0x00000000000eecc7: mov (%rax,%rcx,1),%bl
+0x00000000000eecca: cmp (%rdx,%rcx,1),%bl
+0x00000000000eeccd: je 0xeecdc
+0x00000000000eeccf: setl %al
+0x00000000000eecd2: movzbl %al,%eax
+0x00000000000eecd5: neg %eax
+0x00000000000eecd7: or $0x1,%eax
+0x00000000000eecda: jmp 0xeece3
+0x00000000000eece3: pop %rbx
+0x00000000000eece4: retq
+vmexit(0000004e, 0000000000000000, 0000000040000000, 0000000040000000)!
+
+The subsequent VMRUN again starts executing from 0x00000000000eecc4 which causes %rbx being pushed to the stack for the second time. The retq instruction picks wrong return address and jumps to an illegal location.
+
+Similar issue is there with updating FLAG register as well.

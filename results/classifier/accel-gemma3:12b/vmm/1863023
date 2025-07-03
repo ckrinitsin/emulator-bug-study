@@ -1,0 +1,39 @@
+
+Deadlock in QXL
+
+This is on qemu 4.2.0 OSX host, running fresh Windows 7 with SPICE guest tools just installed.
+
+Command line: `qemu-system-x86_64 -qmp tcp:localhost:4444,server,nowait -smp cpus=2 -boot order=d -m 2048 -soundhw hda -drive file=hda.img,if=ide,media=disk -spice port=5930,addr=127.0.0.1,disable-ticketing,image-compression=off,playback-compression=off,streaming-video=off -vga qxl -device rtl8139,netdev=net0 -netdev user,id=net0`
+
+After the Windows logo, the screen is black. I dump the two vCPU threads:
+
+```
+* thread #16
+  * frame #0: 0x00007fff523b8ce6 libsystem_kernel.dylib`__psynch_cvwait + 10
+    frame #1: 0x00007fff52467185 libsystem_pthread.dylib`_pthread_cond_wait + 701
+    frame #2: 0x0000000110bf88bd qemu-system-x86_64`qemu_cond_wait_impl(cond=0x000000011121e8d0, mutex=0x000000011120ba48, file="cpus-common.c", line=144) at qemu-thread-posix.c:173:11 [opt]
+    frame #3: 0x0000000110926a59 qemu-system-x86_64`do_run_on_cpu(cpu=<unavailable>, func=<unavailable>, data=<unavailable>, mutex=0x000000011120ba48) at cpus-common.c:144:9 [opt]
+    frame #4: 0x000000011080c50a qemu-system-x86_64`memory_region_snapshot_and_clear_dirty at memory.c:2595:5 [opt]
+    frame #5: 0x000000011080c4d7 qemu-system-x86_64`memory_region_snapshot_and_clear_dirty(mr=<unavailable>, addr=0, size=2359296, client=<unavailable>) at memory.c:2107 [opt]
+    frame #6: 0x0000000110849fe1 qemu-system-x86_64`vga_update_display [inlined] vga_draw_graphic(s=<unavailable>, full_update=0) at vga.c:1661:16 [opt]
+    frame #7: 0x000000011084996a qemu-system-x86_64`vga_update_display(opaque=<unavailable>) at vga.c:1785 [opt]
+    frame #8: 0x00000001109b261d qemu-system-x86_64`qxl_hard_reset(d=0x00007f84f8730000, loadvm=0) at qxl.c:1285:5 [opt]
+    frame #9: 0x000000011080ac97 qemu-system-x86_64`memory_region_write_accessor(mr=0x00007f84f8741fb0, addr=5, value=<unavailable>, size=1, shift=<unavailable>, mask=<unavailable>, attrs=MemTxAttrs @ 0x000070000786d890) at memory.c:483:5 [opt]
+    frame #10: 0x000000011080ab31 qemu-system-x86_64`memory_region_dispatch_write [inlined] access_with_adjusted_size(addr=<unavailable>, value=0x00000000015c6100, size=<unavailable>, access_size_min=<unavailable>, access_size_max=<unavailable>, access_fn=<unavailable>, mr=<unavailable>, attrs=<unavailable>) at memory.c:544:18 [opt]
+    frame #11: 0x000000011080aafd qemu-system-x86_64`memory_region_dispatch_write(mr=<unavailable>, addr=<unavailable>, data=22831360, op=32644, attrs=MemTxAttrs @ 0x000070000786d8c0) at memory.c:1475 [opt]
+    frame #12: 0x00000001107b080d qemu-system-x86_64`address_space_stb(as=<unavailable>, addr=<unavailable>, val=22831360, attrs=MemTxAttrs @ r12, result=0x0000000000000000) at memory_ldst.inc.c:378:13 [opt]
+    frame #13: 0x0000000118570230
+
+* thread #18
+  * frame #0: 0x00007fff523b8ce6 libsystem_kernel.dylib`__psynch_cvwait + 10
+    frame #1: 0x00007fff52467185 libsystem_pthread.dylib`_pthread_cond_wait + 701
+    frame #2: 0x0000000110bf88bd qemu-system-x86_64`qemu_cond_wait_impl(cond=0x000000011121e860, mutex=0x000000011121e818, file="cpus-common.c", line=196) at qemu-thread-posix.c:173:11 [opt]
+    frame #3: 0x0000000110926c44 qemu-system-x86_64`start_exclusive at cpus-common.c:196:9 [opt]
+    frame #4: 0x0000000110837c35 qemu-system-x86_64`cpu_exec_step_atomic(cpu=0x00007f8518290000) at cpu-exec.c:265:9 [opt]
+    frame #5: 0x00000001107fcf95 qemu-system-x86_64`qemu_tcg_cpu_thread_fn(arg=0x00007f8518290000) at cpus.c:1799:17 [opt]
+    frame #6: 0x0000000110bf911e qemu-system-x86_64`qemu_thread_start(args=<unavailable>) at qemu-thread-posix.c:519:9 [opt]
+    frame #7: 0x00007fff52466e65 libsystem_pthread.dylib`_pthread_start + 148
+    frame #8: 0x00007fff5246283b libsystem_pthread.dylib`thread_start + 15
+```
+
+Seems like thread #16 had a STB to QXL MMIO registers which caused it to call `qxl_hard_reset` and eventually made its way to `do_run_on_cpu` which waits for `qemu_work_cond`. The only way `qemu_work_cond` is set is if one of the two vCPU executes the queued work at the end of the TCG execution. Thread #16 is stuck waiting, so what about thread #18? Thread #18 is waiting for `exclusive_cond` which is set once all the other CPUs are done running (but thread #16 is waiting still). So classic deadlock.

@@ -1,0 +1,64 @@
+
+RISC-V: Unable to unwind the stack upon signals
+
+Consider the following program:
+
+===============================================================
+#include <stdio.h>
+#include <stdlib.h>
+
+#define NOINLINE __attribute__ ((noinline))
+
+void NOINLINE abort_me(void) { abort(); /* trigger SIGABRT */ }
+
+void NOINLINE level1(void) { abort_me(); }
+
+void NOINLINE level2(void) { level1(); }
+
+void NOINLINE level3(void) { level2(); }
+
+void NOINLINE level4(void) { level3();}
+
+int main(void) {
+	level4();
+	return 0;
+}
+===============================================================
+
+$ riscv64-linux-gnu-gcc -march=rv64imafdc -O0 -g c.c
+$ qemu-riscv64 -g 31337 ./c &
+$ riscv64-unknown-linux-gnu-gdb -q -ex 'target remote localhost:31337' -ex 'b abort_me' -ex c -ex bt ./c
+Reading symbols from c...
+Remote debugging using localhost:31337
+Reading symbols from /home/lewurm/riscv/sysroot/lib/ld-linux-riscv64-lp64d.so.1...
+0x0000004000804f30 in _start () from /home/lewurm/riscv/sysroot/lib/ld-linux-riscv64-lp64d.so.1
+Breakpoint 1 at 0x4000000632: file c.c, line 7.
+Continuing.
+
+Breakpoint 1, abort_me () at c.c:7
+7               abort(); /* trigger SIGABRT */
+#0  abort_me () at c.c:7
+#1  0x0000004000000642 in level1 () at c.c:11
+#2  0x0000004000000658 in level2 () at c.c:15
+#3  0x000000400000066e in level3 () at c.c:19
+#4  0x0000004000000684 in level4 () at c.c:23
+#5  0x000000400000069a in main () at c.c:27
+===============================================================
+
+So far so good, I get a proper backtrace as expected. If I let the signal trigger however, gdb is not able to unwind the stack:
+
+(gdb) c
+Continuing.
+
+Program received signal SIGABRT, Aborted.
+0x0000004000858074 in ?? ()
+(gdb) bt
+#0  0x0000004000858074 in ?? ()
+
+
+
+I get the same behaviour for SIGSEGV and SIGILL, I didn't try other signals. Apparently this scenario works on real hardware (see linked gdb issue below), and presumably it would work with system qemu (I haven't tested that yet though). So my guess is that qemu does something differently around signal handling than the linux kernel.
+
+
+Full reproducer: https://gist.github.com/lewurm/befb9ddf5894bad9628b1df77258598b
+RISC-V GDB issue: https://github.com/riscv/riscv-binutils-gdb/issues/223

@@ -1,0 +1,52 @@
+
+SVE first-faulting gather loads return incorrect data
+Description of problem:
+The results of `ldff1(b|h|w|d)` seem to be incorrect when `<Zt> == <Zm>`. The first element is duplicated throughout the vector while the FFR indicates that all elements were successfully loaded. This happens since https://gitlab.com/qemu-project/qemu/-/commit/50de9b78cec06e6d16e92a114a505779359ca532, and still happens on the latest master.
+Steps to reproduce:
+1. This assembly sequence loads data with an `ldff1d` instruction (and also loads the ffr). Note that with `ldff1d`, `<Zt> == <Zm>`.
+
+asmtest.s
+```
+    .type asmtest, @function
+    .balign 16
+    .global asmtest
+asmtest:
+    setffr
+    ptrue   p0.d
+    index   z1.d, #0, #1
+    ldff1d  z1.d, p0/z, [x0, z1.d, LSL #3]
+    rdffr   p1.b
+    st1d    {z1.d}, p0, [x1]
+    str     p1, [x2]
+    ret
+```
+
+This harness for convenience intialises some data and checks the element at index 1, which should be 1.
+
+test.c
+```
+#include <arm_sve.h>
+#include <stdio.h>
+
+void asmtest(int64_t const * data, svint64_t * loaded, svbool_t * ffr);
+
+int main() {
+    const int64_t data[] = {42,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
+                          11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+                          22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+    svint64_t loaded;
+    svbool_t ffr;
+
+    asmtest(data, &loaded, &ffr);
+
+    // Check value of element at index 1
+    svuint64_t lanes = svindex_u64(0, 1);
+    svbool_t lane = svcmpeq_n_u64(svptrue_b64(), lanes, 1);
+    printf("%ld\n", svaddv_s64(lane, loaded));
+}
+```
+
+2. ```clang-15 -fuse-ld=lld -march=armv8-a+sve2 -target aarch64-unknown-linux-gnu -static *.c *.s -o svldffgathertest```
+3. ```qemu-aarch64 svldffgathertest``` - the value printed should be 1, but it can be seen that all values in the loaded vector are 42.
+Additional information:
+The above code was successfully tested on real SVE hardware. Normal gathers work fine in QEMU, as does a non-gather first-fault load.

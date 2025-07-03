@@ -1,0 +1,132 @@
+
+qemu-system-i386 registers clobbered after gdb set due to k_gs_base bug in gdbstub
+
+Due to a bug in /target/i386/gdbstub.c, setting registers in gdb causes the ones following k_gs_base to get clobbered.  
+
+I'm using qemu version 4.2.50 on an msys64 and start qemu's i386 with a gdb server.
+
+$ qemu-system-i386 -version
+QEMU emulator version 4.2.50 (v4.2.0-363-gdd5b0f9549-dirty)
+Copyright (c) 2003-2019 Fabrice Bellard and the QEMU Project developers
+
+$ qemu-system-i386 -gdb tcp::29096 -S
+C:\msys64\usr\local\qemu-system-i386.exe: invalid accelerator kvm
+C:\msys64\usr\local\qemu-system-i386.exe: falling back to tcg
+
+
+I start a gdb client, connect to the server, display the register state, set k_gs_base, display the register state again, and notice an issue. (Setting other registers also clobbers the ones after k_gs_base).
+
+$ gdb -q
+(gdb) target remote :29096
+...
+(gdb) info regs
+...
+gs_base        0x0      0
+k_gs_base      0x0      0
+cr0            0x60000010       [ CD NW ET ]
+cr2            0x0      0
+...
+(gdb) set $k_gs_base = 0x41414141
+(gdb) info regs
+...
+gs_base        0x0      0
+k_gs_base      0x0      0
+cr0            0x41414151       [ CD WP ET PE ]
+cr2            0x60000010       1610612752
+...
+
+
+In the gdbstub code, I notice that the read and write functions are not symmetric for IDX_SEG_REGS + 8, which corresponds to k_gs_base.
+
+$ cat /usr/local/src/qemu-4.2.0/target/i386/gdbstub.c
+...
+int x86_cpu_gdb_read_register(CPUState *cs, uint8_t *mem_buf, int n)
+{
+...
+        case IDX_SEG_REGS + 8:
+#ifdef TARGET_X86_64
+            if ((env->hflags & HF_CS64_MASK) || GDB_FORCE_64) {
+                return gdb_get_reg64(mem_buf, env->kernelgsbase);
+            }
+            return gdb_get_reg32(mem_buf, env->kernelgsbase);
+#else
+            return gdb_get_reg32(mem_buf, 0);
+#endif
+...
+}
+...
+int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
+{
+...
+#ifdef TARGET_X86_64
+        case IDX_SEG_REGS + 8:
+            if (env->hflags & HF_CS64_MASK) {
+                env->kernelgsbase = ldq_p(mem_buf);
+                return 8;
+            }
+            env->kernelgsbase = ldl_p(mem_buf);
+            return 4;
+#endif
+...
+}
+...
+
+
+I change the write function, rebuild, and verify that the issue is resolved.
+
+$ cat /usr/local/src/qemu-4.2.0/target/i386/gdbstub.c
+int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
+{
+...
+        case IDX_SEG_REGS + 8:
+#ifdef TARGET_X86_64
+            if (env->hflags & HF_CS64_MASK) {
+                env->kernelgsbase = ldq_p(mem_buf);
+                return 8;
+            }
+            env->kernelgsbase = ldl_p(mem_buf);
+            return 4;
+#else
+            return 4;
+#endif
+...
+}
+...
+
+$ make
+...
+$ make install
+...
+
+$ qemu-system-i386 -gdb tcp::29096 -S
+
+$ gdb -q
+(gdb) target remote :29096
+...
+(gdb) info regs
+...
+gs_base        0x0      0
+k_gs_base      0x0      0
+cr0            0x60000010       [ CD NW ET ]
+cr2            0x0      0
+...
+(gdb) set $k_gs_base = 0x41414141
+(gdb) info regs
+...
+gs_base        0x0      0
+k_gs_base      0x0      0
+cr0            0x60000010       [ CD NW ET ]
+cr2            0x0      0
+...
+
+
+I'll submit the patch below.
+
+$ diff gdbstub.c gdbstub.c.bkp
+353d352
+<         case IDX_SEG_REGS + 8:
+354a354
+>         case IDX_SEG_REGS + 8:
+362,363d361
+< #else
+<             return 4;

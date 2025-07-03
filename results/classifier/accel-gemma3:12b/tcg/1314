@@ -1,0 +1,41 @@
+
+68k: issues with fremx and fmodx
+Description of problem:
+Some of the mac68k folks have been testing my MacOS branch at https://github.com/mcayland/qemu/tree/q800.upstream2-vm and noticed problems with the values of some of the MacOS _Pack5 transcendental functions. This is easily visible when calling the `sin()` and `cos()` functions whereby some angle ranges use the values from the wrong section of the waveform and/or return values with the incorrect sign.
+
+SolraBizna was kind enough to write a 68K MacOS test program to generate a sine table (including dumping the hex values of the FP registers) that could be run on real hardware for comparison with QEMU. Using this it was discovered that the issue is related to the implementation of the `fremx` and `fmodx` instructions which can be found in [`floatx80_modrem()`](https://gitlab.com/qemu-project/qemu/-/blob/master/fpu/softfloat.c#L2601).
+
+I have taken the output of the test program run on a real 68040 Mac and used it to create a test harness at https://github.com/mcayland/qemu/commits/68k-fmodrem-bug [(diff from git master)](https://github.com/mcayland/qemu/commit/4afd6b7c3cad89df943ec43395f95dad7f368338.diff) which iterates over 100 points of the sine table and uses the registers to indicate any failures according to the following comment:
+
+```
+    /*
+     * The test program below hangs when it completes and the exit
+     * condition can be determined using the monitor via "info
+     * registers" command as follows:
+     *
+     *     D7 is the test number (0-99)
+     *     D6 is the error code
+     *         0 = no error
+     *         1 = frem result incorrect
+     *         2 = frem fpsr result incorrect
+     *         3 = fmod result incorrect
+     *         4 = fmod fpsr result incorrect
+     *     D2 is the actual result of the long comparison
+     *     D1 is the expected result of the long comparison
+     *
+     * A successful termination of the test program is when D7 == 100
+     * and D6 == 0.
+     */
+```
+
+This enables the majority of debugging to be done directly using `info registers` in the monitor rather than manually stepping through the example code using the gdbstub.
+
+Based upon my local testing on `qemu-system-m68k` there are 2 main differences between QEMU and the output from a real 68040:
+
+- Differences in precision
+
+The very first `fremx` result comparison fails here returning `0x3ffe0000 0xc90fdaa2 0x2168c23c 0x........` instead of `0x3ffe0000 0xc90fdaa2 0x2168c238 0x........`. Fortunately the difference in precision is small, and while it may not be possible to fix this, at least it gives a measure of how QEMU's emulation compares to a real 68040.
+
+- Incorrect setting of the quotient byte
+
+Bits 16-23 of the FPSR are supposed to contain the sign and 7 LSBs of the quotient for `fremx` and `fmodx` instructions, which is used in _Pack5 to generate an offset into a lookup table for the transcendental functions. It appears that the main cause of the incorrect `sin()` and `cos()` functions is due to the quotient byte being set incorrectly by `fremx`, causing MacOS to jump to the wrong segment of the lookup table for certain angle ranges.

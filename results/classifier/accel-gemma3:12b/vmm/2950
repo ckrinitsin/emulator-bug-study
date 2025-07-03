@@ -1,0 +1,66 @@
+
+QEMU 10 breaks Incus' NVME handling
+Description of problem:
+Incus is an open-source container and VM manager.
+For VMs we naturally use QEMU where we basically:
+ - Use QMP as much as possible to put together the VM prior to starting emulation
+ - Put the static pre-start stuff in a config file + use readconfig
+ - Keep the command line to a bare minimum
+
+This isn't particularly relevant to this issue except for the first point which is our use of QMP for most device handling. That means qemu is spawned without any disk or network attached. We have a `virtio-scsi` controller in the base config file but that's it.
+
+When doing NVME, we hotplug a new drive and a new nvme device pointing to that drive.
+This means that our setup has a 1:1 mapping between NVME controllers on the PCIe bus and drives.
+
+This worked great up until QEMU 10. With QEMU 10, I believe this commit https://gitlab.com/qemu-project/qemu/-/commit/cd59f50ab017183805a0dd82f5e85159ecc355ce by @birkelund now effectively causes the creation of a `nvme-subsys` device when we add a `nvme` device without a pre-existing subsystem.
+
+As `nvme-subsys` doesn't support hotplugging, this immediately breaks all our VMs that rely on NVME.
+
+```
+stgraber@dakara:~$ incus start test-nvme
+Error: Failed setting up device via monitor: Failed adding block device for disk device "root": Failed adding device: Device 'nvme-subsys' does not support hotplugging
+Try `incus info --show-log test-nvme` for more info
+```
+
+As you can see, QEMU returns `Device 'nvme-subsys' does not support hotplugging`.
+
+On the QMP front, we did:
+```
+stgraber@dakara:~$ sudo cat /var/log/incus/test-nvme/qemu.qmp.log
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"qom-get","arguments":{"path":"/machine","property":"type"}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": "pc-q35-10.0-machine"}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"query-cpus-fast"}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": [{"thread-id": 3885061, "props": {"core-id": 0, "thread-id": 0, "node-id": 0, "socket-id": 0}, "qom-path": "/machine/unattached/device[0]", "cpu-index": 0, "target": "x86_64"}]}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"netdev_add","arguments":{"fds":"/dev/net/tun.0:/dev/net/tun.1","id":"incus_eth0","type":"tap","vhost":true,"vhostfds":"/dev/vhost-net.0:/dev/vhost-net.1"}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": {}}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"device_add","arguments":{"addr":"00.0","bootindex":1,"bus":"qemu_pcie4","driver":"virtio-net-pci","id":"dev-incus_eth0","mac":"10:66:6a:30:97:66","mq":true,"netdev":"incus_eth0","vectors":6}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": {}}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"blockdev-add","arguments":{"aio":"native","cache":{"direct":true,"no-flush":false},"discard":"unmap","driver":"host_device","filename":"/dev/fdset/0","locking":"off","node-name":"incus_root","read-only":false}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": {}}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"device_add","arguments":{"addr":"00.0","bootindex":0,"bus":"qemu_pcie5","drive":"incus_root","driver":"nvme","id":"dev-incus_root","serial":"incus_root"}}
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"blockdev-del","arguments":{"node-name":"incus_root"}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": {}}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"query-fdsets"}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": [{"fds": [{"fd": 49, "opaque": "rdwr:incus_root"}], "fdset-id": 0}]}
+
+[2025-05-06T11:42:30-04:00] QUERY: {"execute":"remove-fd","arguments":{"fdset-id":0}}
+[2025-05-06T11:42:30-04:00] REPLY: {"return": {}}
+```
+Additional information:
+My limited understanding of NVME concepts is that NVME controllers are tied to a subsystem, then drives are tied to namespaces which themselves are tied to subsystems.
+
+So in a world where we need to deal with QEMU not supporting hotplugging subsystems, we would be able to create a single subsystem with a single controller and then hot plug/remove drives+namespaces into that.
+
+I've not actually tested this because to us it's not really an option.
+We have users that for better or for worse currently rely on the current behavior of having each drive have its own controller, and so on the Linux side expect to see one PCIe device per drive and then one `/dev/nvmeXn1` device per drive.
+
+Changing this to be multiple namespaces on controller 0 would break anyone who ever hardcoded /dev/nvmeXn1 on their system and may also lead to different performance characteristics due to now using a single controller. Multiple controllers would still be an option of course, but they'd be tied to the same subsystem and namespaces so effectively now having the guest do NVME multipath.
+
+
+Anyway, let me know if I'm missing a way to get QEMU 10 to behave as we did in releases prior, where I can start a VM with 0 NVME controllers, then add a couple of drives, each showing up as their own controller with the drive as namespace 1 on that.

@@ -1,0 +1,88 @@
+
+virtio-pci: the number of irq routes keeps increasing and qemu abort
+Description of problem:
+
+Steps to reproduce:
+1. Start a virtual machine and add a virtio-scsi controller for vm, E.g:
+
+   `<controller type='scsi' model='virtio-scsi' index='1'/>`
+2. write rand value and rand address in port IO address space of virtio-scsi device in the guest, E.g:
+
+   ```
+   int main(){
+       iopl(3);
+       srand(10001);
+       unsigned port_base = 0xc000;
+       unsigned port_space_size = 32;
+       time_t now;
+       struct tm *tm_struct;
+       int i;
+   
+       for (i=0;i<100000000;i++){
+           outb(rand()&0xff,port_base+rand()%port_space_size);
+           outw(rand()&0xffff,port_base+rand()%port_space_size);
+           outl(rand(),port_base+rand()%port_space_size);
+       }
+       return 0;
+   }
+   ```
+
+   or write some special value:
+
+   ```
+   int main(){
+       iopl(3);
+       srand(10001);
+       unsigned port_base = 0xc000;
+       unsigned port_space_size = 32;
+       int i;
+   
+       for (i=0;i<100000000;i++){
+           outw(13170, port_base + 18); // DRIVER
+           outw(16, port_base + 20);    // config_vector = 16
+           outw(34244, port_base + 18); // DRIVE OK
+           outw(29, port_base + 20);    // config_vector = 65535
+           outw(5817, port_base + 18);  // not DRIVE OK
+           usleep(1000);
+       }
+       return 0;
+   }
+   ```
+3. the number of irq routes will keep increasing and qemu process on the host will abort
+Additional information:
+stack infomation after qemu process aborts:
+
+```
+#0  0x00007f3cd38500ff in  () at /usr/lib64/libc.so.6
+#1  0x00007f3cd3803d06 in raise () at /usr/lib64/libc.so.6
+#2  0x00007f3cd37ef1f7 in abort () at /usr/lib64/libc.so.6
+#3  0x0000563055c54d68 in kvm_irqchip_commit_routes (s=0x563058b24bc0) at ../accel/kvm/kvm-all.c:1872
+#4  kvm_irqchip_commit_routes (s=0x563058b24bc0) at ../accel/kvm/kvm-all.c:1855
+#5  0x0000563055a1c242 in kvm_irqchip_commit_route_changes (c=0x7f3ccaffc040) at /Images/syg/code/openEuler/qemu/include/sysemu/kvm.h:470
+#6  kvm_virtio_pci_vq_vector_use (vector=18, proxy=0x563059b7f320) at ../hw/virtio/virtio-pci.c:875
+#7  kvm_virtio_pci_vector_use_one (proxy=proxy@entry=0x563059b7f320, queue_no=queue_no@entry=17) at ../hw/virtio/virtio-pci.c:948
+#8  0x0000563055a1d718 in kvm_virtio_pci_vector_vq_use (nvqs=18, proxy=0x563059b7f320) at ../hw/virtio/virtio-pci.c:1010
+#9  virtio_pci_set_guest_notifiers (d=0x563059b7f320, nvqs=18, assign=<optimized out>) at ../hw/virtio/virtio-pci.c:1373
+#10 0x00005630559cb5f9 in virtio_scsi_dataplane_start (vdev=0x563059b876f0) at ../hw/scsi/virtio-scsi-dataplane.c:116
+#11 0x0000563055a194f2 in virtio_bus_start_ioeventfd (bus=bus@entry=0x563059b87670) at ../hw/virtio/virtio-bus.c:236
+#12 0x0000563055a1c9f2 in virtio_pci_start_ioeventfd (proxy=0x563059b7f320) at ../hw/virtio/virtio-pci.c:375
+#13 virtio_ioport_write (val=34244, addr=18, opaque=0x563059b7f320) at ../hw/virtio/virtio-pci.c:471
+#14 virtio_pci_config_write (opaque=0x563059b7f320, addr=18, val=<optimized out>, size=<optimized out>) at ../hw/virtio/virtio-pci.c:617
+#15 0x0000563055bfb3af in memory_region_write_accessor (mr=mr@entry=0x563059b7fd50, addr=18, value=value@entry=0x7f3ccaffc2c8, size=size@entry=2, shift=<optimized out>, mask=mask@entry=65535, attrs=...)
+    at ../system/memory.c:497
+#16 0x0000563055bfc05e in access_with_adjusted_size (addr=addr@entry=18, value=value@entry=0x7f3ccaffc2c8, size=size@entry=2, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=
+    0x563055bfb330 <memory_region_write_accessor>, mr=0x563059b7fd50, attrs=...) at ../system/memory.c:573
+#17 0x0000563055bfd074 in memory_region_dispatch_write (mr=0x563059b7fd50, addr=18, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ../system/memory.c:1528
+#18 0x0000563055c040f4 in flatview_write_continue
+    (fv=fv@entry=0x7f3aa40198b0, addr=addr@entry=49170, attrs=attrs@entry=..., ptr=ptr@entry=0x7f3cd0002000, len=len@entry=2, addr1=<optimized out>, l=<optimized out>, mr=<optimized out>)
+    at /Images/syg/code/openEuler/qemu/include/qemu/host-utils.h:238
+#19 0x0000563055c043e0 in flatview_write (fv=0x7f3aa40198b0, addr=addr@entry=49170, attrs=attrs@entry=..., buf=buf@entry=0x7f3cd0002000, len=len@entry=2) at ../system/physmem.c:2799
+#20 0x0000563055c07c48 in address_space_write (len=2, buf=0x7f3cd0002000, attrs=..., addr=49170, as=0x563056cc8fe0 <address_space_io>) at ../system/physmem.c:2906
+#21 address_space_rw (as=0x563056cc8fe0 <address_space_io>, addr=addr@entry=49170, attrs=attrs@entry=..., buf=0x7f3cd0002000, len=len@entry=2, is_write=is_write@entry=true) at ../system/physmem.c:2916
+#22 0x0000563055c58663 in kvm_handle_io (count=1, size=2, direction=<optimized out>, data=<optimized out>, attrs=..., port=49170) at ../accel/kvm/kvm-all.c:2670
+#23 kvm_cpu_exec (cpu=cpu@entry=0x563058ee2a40) at ../accel/kvm/kvm-all.c:2943
+#24 0x0000563055c59965 in kvm_vcpu_thread_fn (arg=0x563058ee2a40) at ../accel/kvm/kvm-accel-ops.c:51
+#25 0x0000563055ddb9df in qemu_thread_start (args=0x563058eecaa0) at ../util/qemu-thread-posix.c:541
+#26 0x00007f3cd384e51a in  () at /usr/lib64/libc.so.6
+#27 0x00007f3cd38d0e00 in  () at /usr/lib64/libc.so.6
+```

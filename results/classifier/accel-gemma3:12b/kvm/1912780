@@ -1,0 +1,79 @@
+
+QEMU: Null Pointer Failure in fdctrl_read() in hw/block/fdc.c
+
+[via qemu-security list]
+
+This is Gaoning Pan from Zhejiang University & Ant Security Light-Year Lab.
+I found a Null Pointer issue locates in fdctrl_read() in  hw/block/fdc.c.
+This flaw allows a malicious guest user or process in a denial of service condition.
+
+This issus was discovered in the latest Qemu-5.2.0. When using floppy device, there are several
+choices to get specific drive in get_drv(), depending on fdctrl->cur_drv. But not all drives are
+initialized properly, leaving fdctrl->drives[0]->blk as NULL. So when the drive was used in
+blk_pread(cur_drv->blk, fd_offset(cur_drv), fdctrl->fifo, BDRV_SECTOR_SIZE) at line 1918,
+null pointer access triggers, thus denial of service.My reproduced environment is as follows:
+
+    Host: ubuntu 18.04
+    Guest: ubuntu 18.04
+
+My boot command is as follows:
+
+  qemu-system-x86_64 -enable-kvm -boot c -m 2G -drive format=qcow2,file=./ubuntu.img \
+   -nic user,hostfwd=tcp:0.0.0.0:5555-:22 -device floppy,unit=1,drive=mydrive \
+   -drive id=mydrive,file=null-co://,size=2M,format=raw,if=none -display none
+
+ASAN output is as follows:
+=================================================================
+==14688==ERROR: AddressSanitizer: SEGV on unknown address 0x00000000034c (pc 0x5636eee9bbaf bp 0x7ff2a53fdea0 sp 0x7ff2a53fde90 T3)
+==14688==The signal is caused by a WRITE memory access.
+==14688==Hint: address points to the zero page.
+    #0 0x5636eee9bbae in blk_inc_in_flight ../block/block-backend.c:1356
+    #1 0x5636eee9b766 in blk_prw ../block/block-backend.c:1328
+    #2 0x5636eee9cd76 in blk_pread ../block/block-backend.c:1491
+    #3 0x5636ee1adf24 in fdctrl_read_data ../hw/block/fdc.c:1918
+    #4 0x5636ee1a6654 in fdctrl_read ../hw/block/fdc.c:935
+    #5 0x5636eebb84c8 in portio_read ../softmmu/ioport.c:179
+    #6 0x5636ee9848c5 in memory_region_read_accessor ../softmmu/memory.c:442
+    #7 0x5636ee9855c2 in access_with_adjusted_size ../softmmu/memory.c:552
+    #8 0x5636ee98f0b7 in memory_region_dispatch_read1 ../softmmu/memory.c:1420
+    #9 0x5636ee98f311 in memory_region_dispatch_read ../softmmu/memory.c:1449
+    #10 0x5636ee8ff64a in flatview_read_continue ../softmmu/physmem.c:2822
+    #11 0x5636ee8ff9e5 in flatview_read ../softmmu/physmem.c:2862
+    #12 0x5636ee8ffb83 in address_space_read_full ../softmmu/physmem.c:2875
+    #13 0x5636ee8ffdeb in address_space_rw ../softmmu/physmem.c:2903
+    #14 0x5636eea6a924 in kvm_handle_io ../accel/kvm/kvm-all.c:2285
+    #15 0x5636eea6c5e3 in kvm_cpu_exec ../accel/kvm/kvm-all.c:2531
+    #16 0x5636eeca492b in kvm_vcpu_thread_fn ../accel/kvm/kvm-cpus.c:49
+    #17 0x5636ef1bc296 in qemu_thread_start ../util/qemu-thread-posix.c:521
+    #18 0x7ff337c736da in start_thread (/lib/x86_64-linux-gnu/libpthread.so.0+0x76da)
+    #19 0x7ff33799ca3e in __clone (/lib/x86_64-linux-gnu/libc.so.6+0x121a3e)
+
+AddressSanitizer can not provide additional info.
+SUMMARY: AddressSanitizer: SEGV ../block/block-backend.c:1356 in blk_inc_in_flight
+Thread T3 created by T0 here:
+    #0 0x7ff33c580d2f in __interceptor_pthread_create (/usr/lib/x86_64-linux-gnu/libasan.so.4+0x37d2f)
+    #1 0x5636ef1bc673 in qemu_thread_create ../util/qemu-thread-posix.c:558
+    #2 0x5636eeca4ce7 in kvm_start_vcpu_thread ../accel/kvm/kvm-cpus.c:73
+    #3 0x5636ee9aa965 in qemu_init_vcpu ../softmmu/cpus.c:622
+    #4 0x5636ee82a9b4 in x86_cpu_realizefn ../target/i386/cpu.c:6731
+    #5 0x5636eed002f4 in device_set_realized ../hw/core/qdev.c:886
+    #6 0x5636eecc59bc in property_set_bool ../qom/object.c:2251
+    #7 0x5636eecc0c28 in object_property_set ../qom/object.c:1398
+    #8 0x5636eecb6fb9 in object_property_set_qobject ../qom/qom-qobject.c:28
+    #9 0x5636eecc1175 in object_property_set_bool ../qom/object.c:1465
+    #10 0x5636eecfc286 in qdev_realize ../hw/core/qdev.c:399
+    #11 0x5636ee739b34 in x86_cpu_new ../hw/i386/x86.c:111
+    #12 0x5636ee739d6d in x86_cpus_init ../hw/i386/x86.c:138
+    #13 0x5636ee6f843e in pc_init1 ../hw/i386/pc_piix.c:159
+    #14 0x5636ee6fab1e in pc_init_v5_2 ../hw/i386/pc_piix.c:438
+    #15 0x5636ee1cb4a7 in machine_run_board_init ../hw/core/machine.c:1134
+    #16 0x5636ee9c323d in qemu_init ../softmmu/vl.c:4369
+    #17 0x5636edd92c71 in main ../softmmu/main.c:49
+    #18 0x7ff33789cb96 in __libc_start_main (/lib/x86_64-linux-gnu/libc.so.6+0x21b96)
+
+==14688==ABORTING
+
+Reproducer is attached.
+
+Best regards.
+Gaoning Pan of Zhejiang University & Ant Security Light-Year Lab

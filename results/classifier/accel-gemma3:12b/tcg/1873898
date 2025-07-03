@@ -1,0 +1,39 @@
+
+arm linux-user: bkpt insn doesn't cause SIGTRAP
+
+QEMU's 32-bit arm linux-user mode doesn't correctly turn guest BKPT insns into SIGTRAP signals. Test case:
+
+===begin bkpt.c===
+/* test bkpt insn */
+
+#include <stdlib.h>
+#include <stdio.h>
+
+int main(void)
+{
+    printf("breakpoint\n");
+#ifdef __aarch64__
+    __asm__ volatile("brk 0x42\n");
+#else
+    __asm__ volatile("bkpt 0x42\n");
+#endif
+    printf("done\n");
+    return 0;
+}
+===endit===
+
+Compile with
+$ arm-linux-gnueabihf-gcc -g -Wall -o bkpt-aa32 bkpt.c
+$ aarch64-linux-gnu-gcc -g -Wall -o bkpt-aa64 bkpt.c
+
+Contrast aarch64 which delivers the SIGTRAP and arm which doesn't:
+
+$ qemu-aarch64 bkpt-aa64
+breakpoint
+qemu: uncaught target signal 5 (Trace/breakpoint trap) - core dumped
+Trace/breakpoint trap (core dumped)
+$ qemu-arm bkpt-aa32
+breakpoint
+done
+
+This is because in linux-user/arm/cpu-loop.c we incorrectly treat EXCP_BKPT similarly to EXCP_SWI, which means that we actually perform a syscall (which one depends on what happens to be in r7...). This code has been like this (more or less) since commit 06c949e62a098f in 2006 which added BKPT in the first place. This is probably because at the time the same code path was used to handle both Linux syscalls and semihosting calls, and (on M profile) BKPT does imply a semihosting call. But these days we've moved handling of semihosting out to an entirely different codepath, so we can fix this bug by simply removing this handling of EXCP_BKPT and instead making it deliver a SIGTRAP like EXCP_DEBUG (as we do already on aarch64).

@@ -1,0 +1,68 @@
+
+Malformed audio and video output stuttering after upgrade to QEMU 3.0
+
+My host is an x86_64 Arch Linux OS with a recompiled 4.18.10 hardened kernel, running a few KVM guests with varying OSes and configurations managed through a Libvirt stack.
+
+Among these guests I have two Windows 10 VMs with VGA passthrough and PulseAudio-backed virtual audio devices.
+
+After upgrading to QEMU 3.0.0, both of the Win10 guests started showing corrupted audio output in the form of unnatural reproduction speed and occasional but consistently misplaced audio fragments originating from what seems to be a circular buffer wrapping over itself (misbehaviour detected by starting some games with known OSTs and dialogues: soundtracks sound accelerated and past dialogue lines start replaying middle-sentence until the next line starts playing).
+
+In addition, the video output of the malfunctioning VMs regularly stutters roughly twice a second for a fraction of a second (sync'ed with the suspected buffer wrapping and especially pronounced during not-pre-rendered cutscenes), toghether with mouse freezes that look like actual input misses more than simple lack of screen refreshes.
+
+
+The issue was succesfully reproduced without the managing stack, directly with the following command line, on the most capable Windows guest:
+
+ QEMU_AUDIO_DRV=pa
+ QEMU_PA_SERVER=127.0.0.1
+ /usr/bin/qemu-system-x86_64 -name guest=win10_gms,debug-threads=on \
+ -machine pc-i440fx-3.0,accel=kvm,usb=off,vmport=off,dump-guest-core=off \                                                                                                                                           
+ -cpu host,hv_time,hv_relaxed,hv_vapic,hv_spinlocks=0x1fff,hv_vendor_id=123456789abc,kvm=off \          
+ -drive file=/usr/share/ovmf/x64/OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on \       
+ -drive file=/var/lib/libvirt/qemu/nvram/win10_gms_VARS.fd,if=pflash,format=raw,unit=1 \
+ -m 5120 \                                                                              
+ -realtime mlock=off \
+ -smp 3,sockets=1,cores=3,threads=1 \
+ -uuid 39b56ee2-6bae-4009-9108-7be26d5d63ac \
+ -display none \                             
+ -no-user-config \
+ -nodefaults \    
+ -rtc base=localtime,driftfix=slew \                                                                                                                                                                                 
+ -global kvm-pit.lost_tick_policy=delay \                                                                  
+ -no-hpet \                              
+ -no-shutdown \
+ -global PIIX4_PM.disable_s3=1 \
+ -global PIIX4_PM.disable_s4=1 \
+ -boot strict=on \              
+ -device ich9-usb-ehci1,id=usb,bus=pci.0,addr=0x4.0x7 \
+ -device ich9-usb-uhci1,masterbus=usb.0,firstport=0,bus=pci.0,multifunction=on,addr=0x4 \
+ -device ich9-usb-uhci2,masterbus=usb.0,firstport=2,bus=pci.0,addr=0x4.0x1 \             
+ -device ich9-usb-uhci3,masterbus=usb.0,firstport=4,bus=pci.0,addr=0x4.0x2 \
+ -device ahci,id=sata0,bus=pci.0,addr=0x9 \                                 
+ -drive file=/dev/vms/win10_gaming,format=raw,if=none,id=drive-virtio-disk0,cache=none,aio=native \
+ -device virtio-blk-pci,scsi=off,bus=pci.0,addr=0x5,drive=drive-virtio-disk0,id=virtio-disk0,bootindex=1,write-cache=on \
+ -drive file=/dev/sr0,format=raw,if=none,id=drive-sata0-0-0,media=cdrom,readonly=on \                                    
+ -device ide-cd,bus=sata0.0,drive=drive-sata0-0-0,id=sata0-0-0 \                     
+ -device intel-hda,id=sound0,bus=pci.0,addr=0x3 \                                                                                                                                                                    
+ -device hda-duplex,id=sound0-codec0,bus=sound0.0,cad=0 \                                             
+ -device usb-host,hostbus=2,hostaddr=3,id=hostdev0,bus=usb.0,port=1 \
+ -device vfio-pci,host=01:00.0,id=hostdev1,bus=pci.0,addr=0x6 \      
+ -device vfio-pci,host=01:00.1,id=hostdev2,bus=pci.0,addr=0x7 \
+ -device virtio-balloon-pci,id=balloon0,bus=pci.0,addr=0x8 \   
+ -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+ -msg timestamp=on
+
+
+By "purposedly misconfiguring" the codepaths and replacing "pc-i440fx-3.0" with "pc-i440fx-2.11" (basically reverting the config changes I needed to do in order to update the domain definitions), the stuttering seems to disappear (or at least becomes negligible) and the audio output, despite becoming incredibly distorted, is consistent in every other way, with in-order dialogues and (perceived) correct tempo.
+
+
+In order to exclude eventual misconfigurations in the host's audio processing pipeline, I proceeded to update the domain definition's codepath of another guest running Ubuntu 18.04 with a completely different hardware configuration (no video card passthrough and no PulseAudio backconnection, just a plain emulated VirtIO display and Spice audio device).
+
+The audio issue presented itself again in the form of slightly sped up audio playback from Internet videos interleaved with occasional "quenches" of playing speed.
+Stutters are difficult to detect because of the poor refresh rate of the emulated VGA adapter, but I wouldn't be surprised to find them here too (actually, I *think* I sensed them, but I'm not sure enough to assess their existence).
+
+Once again, by reverting to the old 2.11 directive everything is back to normal.
+
+
+
+Given the fact that no official upgrade directives regarding required sampling rate, period or sheduling adjustments were stated or handed-out to administrators, I decided to report this behaviour as a bug.
+I hope this is the appropriate channel and that I didn't annoy anyone (this is my first proper bug report, please forgive me for any innaccuracy).

@@ -1,0 +1,49 @@
+
+segfault mremap 4096
+
+a qemu-hosted process segfaults when the program calls mremap to shrink the size of a buffer to 4096 that was allocated with mmap. See below for a C program to reproduce this issue.  I was able to compile this program for both i386 and 32-bit arm, and use qemu-i386 and qemu-arm to reproduce the segfault.  If I run the i386 program natively on my x86_64 system, no segfault occurs.  Also note that if I change the mremap size to something else such as 12288, no segfault occurs.  I also confirmed using qemu's -singlestep debug option that the segfault occurs during the mremap syscall.
+
+If you save the source below to mremapbug.c, the following should reproduce the issue given you have gcc-multilib:
+
+gcc -m32 mremapbug.c
+# works
+./a.out
+# segfault
+qemu-i386 a.out
+
+If you can also compile to arm, the same thing happens when running "qemu-arm a.out".  I also tried compiling natively and running "qemu-x86_64 a.out" but no segfault in that case, not sure if it's because it is 64-bits or if it was because it was my native target.
+
+
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <stdio.h>
+#include <sys/mman.h>
+
+int main(int argc, char *argv[])
+{
+  const size_t initial_size = 8192;
+
+  printf("calling mmap, size=%llu\n", (unsigned long long)initial_size);
+  void *mmap_ptr = mmap(NULL, initial_size,
+                   PROT_READ | PROT_WRITE ,
+                   MAP_PRIVATE | MAP_ANONYMOUS,
+                   -1, 0);
+  printf("mmap returned  : %p\n", mmap_ptr);
+  if (mmap_ptr == MAP_FAILED) {
+    perror("mmap");
+    exit(1);
+  }
+
+  const size_t new_size = 4096;
+  printf("calling mremap, size=%llu\n", (unsigned long long)new_size);
+  void *remap_ptr = mremap(mmap_ptr, initial_size, new_size, 0);
+  printf("mremap returned: %p\n", remap_ptr);
+  if (remap_ptr != mmap_ptr) {
+    perror("mreamap");
+    exit(1);
+  }
+  printf("Success: pointers match\n");
+}
+
+
+This issue was found while I was pushing code that calls "mremap" to the Zig compiler repository, it's CI testing uses qemu-i386 and qemu-arm to run tests for non-native hosts.  I've filed an issue in that repository as well with details on how to reproduce this issue with the Zig compiler as well: https://github.com/ziglang/zig/issues/5245
