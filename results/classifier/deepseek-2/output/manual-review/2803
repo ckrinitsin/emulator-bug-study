@@ -1,0 +1,109 @@
+
+Assert failure in virtio-net device in address_space_lduw_le_cached
+Description of problem:
+Issue was found by fuzzing. Assert 
+
+```
+qemu/include/exec/memory_ldst_cached.h.inc:30: uint16_t address_space_lduw_le_cached(MemoryRegionCache *, hwaddr, MemTxAttrs, MemTxResult *): Assertion `addr < cache->len && 2 <= cache->len - addr' failed.
+```
+can be triggered with some qtest commands. This is pretty similar to [issue_302](https://gitlab.com/qemu-project/qemu/-/issues/302) and [issue_781](https://gitlab.com/qemu-project/qemu/-/issues/781), but kinda different. In [issue_781](https://gitlab.com/qemu-project/qemu/-/issues/781) there is a comment, that issue was `Possibly fixed by commit 10d35e58 ("virtio-pci: fix queue_enable write").`, but unfortunately it is not - we can still trigger this assert with other set of command-line arguments and qtest commands.
+Steps to reproduce:
+Command:
+
+```
+cat << EOF | ./qemu-system-x86_64 -display none -machine accel=qtest, -m 512M -M q35 -nodefaults -device virtio-net,netdev=net0,packed=on -netdev user,id=net0 -qtest stdio
+outl 0xcf8 0x80000810
+outl 0xcfc 0xc000
+outl 0xcf8 0x80000820
+outl 0xcfc 0xe0004000
+outl 0xcf8 0x80000804
+outw 0xcfc 0x7
+write 0xe0004008 0x1 0x01
+write 0xe000400c 0x1 0x04
+outl 0xc00b 0x01000000
+outl 0xc006 0x38380000
+outl 0xc001 0x00
+outl 0xc00f 0x04000100
+write 0x3839003 0x1 0x01
+EOF
+```
+
+Results in 
+
+```
+[I 0.000000] OPENED
+[R +0.028638] outl 0xcf8 0x80000810
+[S +0.028692] OK
+OK
+[R +0.028705] outl 0xcfc 0xc000
+[S +0.028729] OK
+OK
+[R +0.028738] outl 0xcf8 0x80000820
+[S +0.028748] OK
+OK
+[R +0.028763] outl 0xcfc 0xe0004000
+[S +0.028784] OK
+OK
+[R +0.028800] outl 0xcf8 0x80000804
+[S +0.029483] OK
+OK
+[R +0.029509] outw 0xcfc 0x7
+[S +0.029820] OK
+OK
+[R +0.029833] write 0xe0004008 0x1 0x01
+[S +0.029846] OK
+OK
+[R +0.029853] write 0xe000400c 0x1 0x04
+[S +0.029882] OK
+OK
+[R +0.029894] outl 0xc00b 0x01000000
+[S +0.029909] OK
+OK
+[R +0.029923] outl 0xc006 0x38380000
+[S +0.029938] OK
+OK
+[R +0.029944] outl 0xc001 0x00
+[S +0.029953] OK
+OK
+[R +0.029959] outl 0xc00f 0x04000100
+[S +0.030073] OK
+OK
+[R +0.030091] write 0x3839003 0x1 0x01
+[S +0.030106] OK
+OK
+qemu-system-x86_64: /home/artemiin/Work/original_qemu/include/exec/memory_ldst_cached.h.inc:30: uint16_t address_space_lduw_le_cached(MemoryRegionCache *, hwaddr, MemTxAttrs, MemTxResult *): Assertion `addr < cache->len && 2 <= cache->len - addr' failed.
+```
+Additional information:
+There is a stack trace from libFuzzer output:
+
+```
+#0 0x5555561bcfc1 in __sanitizer_print_stack_trace (qemu/build/qemu-fuzz-x86_64+0xc68fc1) (BuildId: 97b846e788f9dda2a285e5ea004d922c4886a315)
+<some_asert_calls>
+#6 0x7ffff48d4471 in abort stdlib/abort.c:79:7
+#7 0x7ffff48d4394 in __assert_fail_base assert/assert.c:92:3
+#8 0x7ffff48e2eb1 in __assert_fail assert/assert.c:101:3
+#9 0x555557043c41 in address_space_lduw_le_cached qemu/include/exec/memory_ldst_cached.h.inc:30:5
+#10 0x555557043c41 in lduw_le_phys_cached qemu/include/exec/memory_ldst_phys.h.inc:67:12
+#11 0x555557043c41 in virtio_lduw_phys_cached qemu/include/hw/virtio/virtio-access.h:166:12
+#12 0x555557030a78 in vring_avail_ring qemu/build/../hw/virtio/virtio.c:389:12
+#13 0x555557030a78 in virtqueue_get_head qemu/build/../hw/virtio/virtio.c:1043:13
+#14 0x555557030a78 in virtqueue_split_pop qemu/build/../hw/virtio/virtio.c:1540:10
+#15 0x555557030a78 in virtqueue_pop qemu/build/../hw/virtio/virtio.c:1790:16
+#16 0x555556f9aaf9 in virtio_net_flush_tx qemu/build/../hw/net/virtio-net.c:2746:16
+#17 0x555556f9a4dc in virtio_net_tx_bh qemu/build/../hw/net/virtio-net.c:2953:11
+#18 0x5555577152e2 in aio_bh_call qemu/build/../util/async.c:171:5
+#19 0x555557715830 in aio_bh_poll qemu/build/../util/async.c:218:13
+#20 0x5555576ce2d7 in aio_dispatch qemu/build/../util/aio-posix.c:423:5
+#21 0x555557717918 in aio_ctx_dispatch qemu/build/../util/async.c:360:5
+#22 0x7ffff69837a8 in g_main_context_dispatch (/lib/x86_64-linux-gnu/libglib-2.0.so.0+0x547a8) (BuildId: 9f90bd7bbfcf84a1f1c5a6102f70e6264837b9d4)
+#23 0x5555577187cd in glib_pollfds_poll qemu/build/../util/main-loop.c:287:9
+#24 0x5555577187cd in os_host_main_loop_wait qemu/build/../util/main-loop.c:310:5
+#25 0x5555577187cd in main_loop_wait qemu/build/../util/main-loop.c:589:11
+#26 0x5555571ce309 in flush_events qemu/build/../tests/qtest/fuzz/fuzz.c:50:9
+#27 0x5555571d662b in generic_fuzz qemu/build/../tests/qtest/fuzz/generic_fuzz.c:669:13
+#28 0x5555571ce7de in LLVMFuzzerTestOneInput qemu/build/../tests/qtest/fuzz/fuzz.c:158:5
+<fuzzer_init_calls>
+#35 0x5555560e2510 in _start (qemu/build/qemu-fuzz-x86_64+0xb8e510) (BuildId: 97b846e788f9dda2a285e5ea004d922c4886a315
+```
+
+FYI @mstredhat

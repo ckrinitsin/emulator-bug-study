@@ -1,0 +1,67 @@
+
+openbsd 7.5 crashes with QEMU since "virtio-pci: Add lookup subregion of VirtIOPCIRegion MR"
+Description of problem:
+Attempt to boot OpenBSD 7.5 in QEMU current git HEAD fdf250e5a37830615e324017cb3a503e84b3712c.
+
+It immediately aborts with
+
+```
+Thread 6 (Thread 0x7fe06d2006c0 (LWP 2797401) "CPU 0/KVM"):
+#0  __pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0) at pthread_kill.c:44
+#1  0x00007fe0764476d3 in __pthread_kill_internal (threadid=<optimized out>, signo=6) at pthread_kill.c:78
+#2  0x00007fe0763eec4e in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+#3  0x00007fe0763d6902 in __GI_abort () at abort.c:79
+#4  0x00007fe0763d681e in __assert_fail_base (fmt=0x7fe076562b98 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=assertion@entry=0x55a00b998b4d "mrs.mr", file=file@entry=0x55a00b998b33 "../hw/virtio/virtio-pci.c", line=line@entry=620, function=function@entry=0x55a00bb596b0 <__PRETTY_FUNCTION__.13> "virtio_address_space_lookup") at assert.c:94
+#5  0x00007fe0763e6d87 in __assert_fail (assertion=assertion@entry=0x55a00b998b4d "mrs.mr", file=file@entry=0x55a00b998b33 "../hw/virtio/virtio-pci.c", line=line@entry=620, function=function@entry=0x55a00bb596b0 <__PRETTY_FUNCTION__.13> "virtio_address_space_lookup") at assert.c:103
+#6  0x000055a00b49d368 in virtio_address_space_lookup (proxy=proxy@entry=0x55a0213a59d0, off=off@entry=0x7fe06d1f3370, len=len@entry=1) at ../hw/virtio/virtio-pci.c:620
+#7  0x000055a00b4a127f in virtio_address_space_write (proxy=0x55a0213a59d0, addr=<optimized out>, buf=0x55a0213b32c8 "", len=1) at ../hw/virtio/virtio-pci.c:654
+#8  virtio_write_config (pci_dev=<optimized out>, address=<optimized out>, val=<optimized out>, len=<optimized out>) at ../hw/virtio/virtio-pci.c:790
+#9  0x000055a00b6edc30 in memory_region_write_accessor (mr=0x55a01fa1b470, addr=4194520, value=<optimized out>, size=1, shift=<optimized out>, mask=<optimized out>, attrs=...) at ../system/memory.c:497
+#10 0x000055a00b6ed4be in access_with_adjusted_size (addr=addr@entry=4194520, value=0x7fe06d1f34c8, size=size@entry=1, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=0x55a00b6edbb0 <memory_region_write_accessor>, mr=<optimized out>, attrs=...) at ../system/memory.c:573
+#11 0x000055a00b6ed7fa in memory_region_dispatch_write (mr=mr@entry=0x55a01fa1b470, addr=addr@entry=4194520, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ../system/memory.c:1560
+#12 0x000055a00b6f593f in flatview_write_continue_step (attrs=attrs@entry=..., buf=buf@entry=0x7fe07988e028 "", mr_addr=4194520, l=l@entry=0x7fe06d1f3590, mr=0x55a01fa1b470, len=1) at ../system/physmem.c:2786
+#13 0x000055a00b6f6058 in flatview_write_continue (fv=0x7fdf505079f0, addr=2956984536, attrs=..., ptr=0xb04000d8, len=1, mr_addr=<optimized out>, l=<optimized out>, mr=<optimized out>) at .--Type <RET> for more, q to quit, c to continue without paging--
+./system/physmem.c:2816
+#14 flatview_write (fv=0x7fdf505079f0, addr=addr@entry=2956984536, attrs=attrs@entry=..., buf=buf@entry=0x7fe07988e028, len=len@entry=1) at ../system/physmem.c:2847
+#15 0x000055a00b6f97a1 in address_space_write (as=0x55a00ca34600 <address_space_memory>, addr=2956984536, attrs=..., buf=0x7fe07988e028, len=1) at ../system/physmem.c:2967
+#16 address_space_rw (as=0x55a00ca34600 <address_space_memory>, addr=2956984536, attrs=attrs@entry=..., buf=buf@entry=0x7fe07988e028, len=1, is_write=<optimized out>) at ../system/physmem.c:2977
+#17 0x000055a00b75c256 in kvm_cpu_exec (cpu=cpu@entry=0x55a01f9cb690) at ../accel/kvm/kvm-all.c:3184
+#18 0x000055a00b75da25 in kvm_vcpu_thread_fn (arg=arg@entry=0x55a01f9cb690) at ../accel/kvm/kvm-accel-ops.c:50
+#19 0x000055a00b94daa8 in qemu_thread_start (args=0x55a01f9d2140) at ../util/qemu-thread-posix.c:541
+#20 0x00007fe0764456d7 in start_thread (arg=<optimized out>) at pthread_create.c:447
+#21 0x00007fe0764c9414 in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:100
+
+```
+
+Git bisect points to
+
+```
+commit ffa8a3e3b2e6ff017113b98d500d6a9e05b1560a (HEAD)
+Author: Gao Shiyuan <gaoshiyuan@baidu.com>
+Date:   Tue Sep 3 20:03:04 2024 +0800
+
+    virtio-pci: Add lookup subregion of VirtIOPCIRegion MR
+    
+    Now virtio_address_space_lookup only lookup common/isr/device/notify
+    MR and exclude their subregions.
+    
+    When VHOST_USER_PROTOCOL_F_HOST_NOTIFIER enable, the notify MR has
+    host-notifier subregions and we need use host-notifier MR to
+    notify the hardware accelerator directly instead of eventfd notify.
+    
+    Further more, maybe common/isr/device MR also has subregions in
+    the future, so need memory_region_find for each MR incluing
+    their subregions.
+    
+    Add lookup subregion of VirtIOPCIRegion MR instead of only lookup container MR.
+    
+    Fixes: a93c8d8 ("virtio-pci: Replace modern_as with direct access to modern_bar")
+    Co-developed-by: Zuo Boqun <zuoboqun@baidu.com>
+    Signed-off-by: Gao Shiyuan <gaoshiyuan@baidu.com>
+    Signed-off-by: Zuo Boqun <zuoboqun@baidu.com>
+    Message-Id: <20240903120304.97833-1-gaoshiyuan@baidu.com>
+    Reviewed-by: Michael S. Tsirkin <mst@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+```
+
+cc @mstredhat

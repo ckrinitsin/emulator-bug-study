@@ -1,0 +1,96 @@
+
+Arm64 kernel run with qemu-system-aarch64 crashes handling program using SVE and Streaming SVE modes
+Description of problem:
+The userspace program shown, which switches between SVE/SME states, crashes the kernel on task switch when running under qemu-system-aarch64. This does not reproduce on an Arm Fast Model, but I can't be sure that that is not a timing difference.
+
+The kernel appears to have no space allocated to save SVE state for this process, but also believes that it should save the state, where it then faults.
+Steps to reproduce:
+1. Compile the following program:
+```
+#include <sys/prctl.h>
+
+int main() {
+  asm volatile("msr  s0_3_c4_c7_3, xzr" /*smstart*/);
+  prctl(PR_SVE_SET_VL, 8 * 4);
+  asm volatile("msr  s0_3_c4_c7_3, xzr" /*smstart*/);
+  while (1) {} // Wait to be preempted?
+  return 0;
+}
+```
+With:
+```
+$ aarch64-unknown-linux-gnu-gcc main.c -o main.o -g -O3 -march=armv8.6-a+sve
+```
+Compiler version does not matter I don't think, but in case:
+```
+$ aarch64-unknown-linux-gnu-gcc --version
+aarch64-unknown-linux-gnu-gcc (crosstool-NG 1.25.0.85_61c4cca) 10.4.0
+```
+It is a 10.4.0 built with CrossToolNG.
+
+2. Boot Linux and run the program in the emulated environment. I've found looping it to be more consistent:
+```
+$ while true; do ./main.o; done
+```
+Though sometimes it will crash after only one run.
+Additional information:
+Here is the output from the kernel:
+```
+$ /mnt/virt_root/sme_crash/main.o
+[  190.813392] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000000
+[  190.818912] Mem abort info:
+[  190.819255]   ESR = 0x0000000096000046
+[  190.819727]   EC = 0x25: DABT (current EL), IL = 32 bits
+[  190.820391]   SET = 0, FnV = 0
+[  190.820757]   EA = 0, S1PTW = 0
+[  190.821145]   FSC = 0x06: level 2 translation fault
+[  190.821635] Data abort info:
+[  190.821978]   ISV = 0, ISS = 0x00000046, ISS2 = 0x00000000
+[  190.822490]   CM = 0, WnR = 1, TnD = 0, TagAccess = 0
+[  190.822991]   GCS = 0, Overlay = 0, DirtyBit = 0, Xs = 0
+[  190.823645] user pgtable: 4k pages, 48-bit VAs, pgdp=00000000475f1000
+[  190.824269] [0000000000000000] pgd=0800000047645003, p4d=0800000047645003, pud=0800000047641003, pmd=0000000000000000
+[  190.826225] Internal error: Oops: 0000000096000046 [#1] PREEMPT SMP
+[  190.826996] Modules linked in:
+[  190.827748] CPU: 0 PID: 198 Comm: main.o Not tainted 6.4.0-01761-g6aeadf7896bf #1
+[  190.828638] Hardware name: linux,dummy-virt (DT)
+[  190.829304] pstate: 234000c5 (nzCv daIF +PAN -UAO +TCO +DIT -SSBS BTYPE=--)
+[  190.830115] pc : sve_save_state+0x4/0xf0
+[  190.831378] lr : fpsimd_save+0x184/0x1f0
+[  190.831848] sp : ffff80008047bc70
+[  190.832223] x29: ffff80008047bc70 x28: ffff0000036c49c0 x27: 0000000000000000
+[  190.833182] x26: ffff0000036c4f58 x25: ffff0000036c49c0 x24: ffff0000036c5868
+[  190.834045] x23: 0000000000000020 x22: ffff24441ea31000 x21: 0000000000000001
+[  190.834894] x20: ffff00003fdc50b0 x19: ffffdbbc213940b0 x18: 0000000000000000
+[  190.835759] x17: ffff24441ea31000 x16: ffff800080000000 x15: 0000000000000000
+[  190.836593] x14: 000000000000026c x13: 0000000000000001 x12: 0000000000000020
+[  190.837436] x11: 0000000000000000 x10: 0000000000000001 x9 : 0000000000000800
+[  190.838323] x8 : ffff00003fdcffc0 x7 : ffff00003fdcff40 x6 : 0000000002da9c8c
+[  190.839149] x5 : 0000000000000001 x4 : 0000000000000000 x3 : 0000000000000000
+[  190.839976] x2 : 0000000000000001 x1 : ffff0000036c56a0 x0 : 0000000000000440
+[  190.840936] Call trace:
+[  190.841406]  sve_save_state+0x4/0xf0
+[  190.841993]  fpsimd_thread_switch+0x24/0xd4
+[  190.842572]  __switch_to+0x20/0x1d4
+[  190.843043]  __schedule+0x2a0/0xa7c
+[  190.843488]  schedule+0x5c/0xc4
+[  190.843912]  do_notify_resume+0x1a4/0x474
+[  190.844410]  el0_interrupt+0xc4/0xd4
+[  190.844855]  __el0_irq_handler_common+0x18/0x24
+[  190.845350]  el0t_64_irq_handler+0x10/0x1c
+[  190.845824]  el0t_64_irq+0x190/0x194
+[  190.846661] Code: 54000040 d51b4408 d65f03c0 d503245f (e5bb5800)
+[  190.847545] ---[ end trace 0000000000000000 ]---
+[  190.848125] note: main.o[198] exited with irqs disabled
+```
+
+I have looked the kernel functions in the backtrace and it seems to be loading memory fine, so it's not obviously a code generation problem. The pointer loaded prior to the crash is definitely a nullptr.
+
+Removing any of the lines (`while (1) {}` aside) from the example seems to avoid the issue but again, could be timing.
+
+An important point here is that the kernel syscall ABI states that streaming mode will be exited on
+a syscall. I have observed that this does happen as expected. This is why the test case does a syscall, then immediately goes back to streaming mode. And it is perhaps where the confusion starts.
+
+I have confirmed that SME is supported by the emulated CPU and other SME programs do run correctly.
+
+I initially thought this was to do with having many cores, but it reproduces on a single core also.

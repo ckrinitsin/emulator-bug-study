@@ -1,0 +1,76 @@
+
+4.1.0: qcow2 corruption on savevm/quit/loadvm cycle
+
+I'm seeing massive corruption of qcow2 images with qemu 4.1.0 and git master as of 7f21573c822805a8e6be379d9bcf3ad9effef3dc after a few savevm/quit/loadvm cycles. I've narrowed it down to the following reproducer (further notes below):
+
+# qemu-img check debian.qcow2
+No errors were found on the image.
+251601/327680 = 76.78% allocated, 1.63% fragmented, 0.00% compressed clusters
+Image end offset: 18340446208
+# bin/qemu/bin/qemu-system-x86_64 -machine pc-q35-4.0.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=debian.qcow2,id=d -S
+qemu-system-x86_64: warning: dbind: Couldn't register with accessibility bus: Did not receive a reply. Possible causes include: the remote application did not send a reply, the message bus security policy blocked the reply, the reply timeout expired, or the network connection was broken.
+QEMU 4.1.50 monitor - type 'help' for more information
+(qemu) loadvm foo
+(qemu) c
+(qemu) qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+qcow2_free_clusters failed: Invalid argument
+quit
+[m@nargothrond:~] qemu-img check debian.qcow2
+Leaked cluster 85179 refcount=2 reference=1
+Leaked cluster 85180 refcount=2 reference=1
+ERROR cluster 266150 refcount=0 reference=2
+[...]
+ERROR OFLAG_COPIED data cluster: l2_entry=422840000 refcount=1
+
+9493 errors were found on the image.
+Data may be corrupted, or further writes to the image may corrupt it.
+
+2 leaked clusters were found on the image.
+This means waste of disk space, but no harm to data.
+259266/327680 = 79.12% allocated, 1.67% fragmented, 0.00% compressed clusters
+Image end offset: 18340446208
+
+This is on a x86_64 Linux 5.3.1 Gentoo host with qemu-system-x86_64 and accel=kvm. The compiler is gcc-9.2.0 with the rest of the system similarly current.
+
+Reproduced with qemu-4.1.0 from distribution package as well as vanilla git checkout of tag v4.1.0 and commit 7f21573c822805a8e6be379d9bcf3ad9effef3dc (today's master). Does not happen with qemu compiled from vanilla checkout of tag v4.0.0. Build sequence:
+
+./configure --prefix=$HOME/bin/qemu-bisect --target-list=x86_64-softmmu --disable-werror --disable-docs
+[...]
+CFLAGS            -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2 -g
+[...] (can provide full configure output if helpful)
+make -j8 install
+
+The kind of guest OS does not matter: seen with Debian testing 64bit, Windows 7 x86/x64 BIOS and Windows 7 x64 EFI.
+
+The virtual storage controller does not seem to matter: seen with VirtIO SCSI, emulated SCSI and emulated SATA AHCI.
+
+Caching modes (none, directsync, writeback), aio mode (threads, native) or discard (ignore, unmap) or detect-zeroes (off, unmap) does not influence occurence either.
+
+Having more RAM in the guest seems to increase odds of corruption: With 512MB to the Debian guest problem hardly occurs at all, with 4GB RAM it happens almost instantly.
+
+An automated reproducer works as follows:
+
+- the guest *does* mount its root fs and swap with option discard and my testing leaves me with the impression that file deletion rather than reading is causing the issue
+
+- foo is a snapshot of the running Debian VM which is already running command
+
+# while true ; do dd if=/dev/zero of=foo bs=10240k count=400 ; done
+
+to produce some I/O to the disk (4GB file with 4GB of RAM).
+
+- on the host a loop continuously resumes and saves the guest state and quits qemu inbetween:
+
+# while true ; do (echo loadvm foo ; echo c ; sleep 10 ; echo stop ; echo savevm foo ; echo quit ) | bin/qemu-bisect/bin/qemu-system-x86_64 -machine pc-q35-3.1,accel=kvm -m 4096 -chardev stdio,id=charmonitor -mon chardev=charmonitor -drive file=debian.qcow2,id=d -S -display none ; done
+
+- quitting qemu inbetween saves and loads seems to be necessary for the problem to occur. Just continusouly in one session saving and loading guest state does not trigger it.
+
+- For me, after about 2 to 6 iterations of above loop the image is corrupted.
+
+- corruption manifests with other messages from qemu as well, e.g.:
+
+(qemu) loadvm foo
+Error: Device 'd' does not have the requested snapshot 'foo'
+
+Using above reproducer I have to the be best of my ability bisected the introduction of the problem to commit 69f47505ee66afaa513305de0c1895a224e52c45 (block: avoid recursive block_status call if possible). qemu compiled from the commit before does not exhibit the issue, from that commit on it does and reverting the commit off of current master makes it disappear.

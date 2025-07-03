@@ -1,0 +1,71 @@
+
+X86-64 flags handling broken
+
+The current qemu sources cause improper handling of flags on x86-64.
+This bug seems to have shown up a few weeks ago.
+
+A plain install of Debian GNU/Linux makes user processes catch
+spurious signals.  The kernel seems to run stably, though.
+
+The ADX feature works very poorly.  It might be related; at least it
+allows for reproducibly provoking invalid behaviour.
+
+Here is a test case:
+
+================================================================
+qemumain.c
+#include <stdio.h>
+long adx();
+int
+main ()
+{
+  printf ("%lx\n", adx (0xffbeef, 17));
+  return 0;
+}
+================================================================
+qemuadx.s:
+        .globl  adx
+adx:    xor     %rax, %rax
+1:      dec     %rdi
+        jnz     1b
+        .byte 0xf3, 0x48, 0x0f, 0x38, 0xf6, 0xc0        # adox  %rax, %rax
+        .byte 0x66, 0x48, 0x0f, 0x38, 0xf6, 0xc0        # adcx  %rax, %rax
+        ret
+================================================================
+
+Compile and execute:
+$ gcc -m64 qemumain.c qemuadx.s
+$ a.out
+ffffff8000378cd8
+
+Expected output is simply "0".  The garbage value varies between qemu
+compiles and guest systems.
+
+Note that one needs a recent GNU assembler in order to handle adox and
+adcx.  For convenience I have supplied them as byte sequences.
+
+Exaplanation and feeble analysis:
+
+The 0xffbeef argument is a loop count.  It is necessary to loop for a
+while in order to trigger this bug.  If the loop count is decreased,
+the bug will seen intermittently; the lower the count, the less
+frequent the invalid behaviour.
+
+It seems like a reasonable assumption that this bug is related to
+flags handling at context switch.  Presumably, qemu keeps flags state
+in some internal format, then recomputes then when needing to form the
+eflags register, as needed for example for context switching.
+
+I haven't tried to reproduce this bug using qemu-x86_64 and SYSROOT,
+but I strongly suspect that to be impossible.  I use
+qemu-system-x86_64 and the guest Debian GNU/Linux x86_64 (version
+6.0.6) .
+
+The bug happens also with the guest FreeBSD x86_64 version 9.1.  (The
+iteration count for triggering the problem 50% of the runs is not the
+same when using the kernel Linux and FreeBSD's kernel, presumably due
+to different ticks.)
+
+The bug happens much more frequently for a loaded system; in fact, the
+loop count can be radically decreased if two instances of the trigger
+program are run in parallel.

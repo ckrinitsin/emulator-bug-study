@@ -1,0 +1,371 @@
+
+guest migration 100% cpu freeze bug
+
+# Investigate migration cpu hog(100%) bug
+
+I have some issues when migrating from qemu 2.6.2 to qemu 2.11.1.
+The hypervisors are running kernel 4.9.92 on debian stretch with libvirt v4.0.0.
+Linux, libvirt and qemu are all custom compiled.
+
+I migrated around 21.000 vms from qemu 2.6.2 to qemu 2.11.1 and every once in a while a vm is stuck at 100% cpu after the migration from 2.6.2 to 2.11.1. This happend with about 50-60 vms so far.
+
+I attached gdb to a vcpu thread of one stuck vm, and a bt showed the following info:
+#0  0x00007f4f19949dd7 in ioctl () at ../sysdeps/unix/syscall-template.S:84
+#1  0x0000557c9edede47 in kvm_vcpu_ioctl (cpu=cpu@entry=0x557ca1058840, type=type@entry=0xae80) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:2050
+#2  0x0000557c9ededfb6 in kvm_cpu_exec (cpu=cpu@entry=0x557ca1058840) at /home/dbosschieter/src/qemu-pkg/src/accel/kvm/kvm-all.c:1887
+#3  0x0000557c9edcab44 in qemu_kvm_cpu_thread_fn (arg=0x557ca1058840) at /home/dbosschieter/src/qemu-pkg/src/cpus.c:1128
+#4  0x00007f4f19c0f494 in start_thread (arg=0x7f4f053f3700) at pthread_create.c:333
+#5  0x00007f4f19951acf in clone () at ../sysdeps/unix/sysv/linux/x86_64/clone.S:97
+
+The ioctl call is a ioctl(18, KVM_RUN and it looks like it is looping inside the vm itself.
+
+I saved the state of the VM (with `virsh save`) after I found it was hanging on its vcpu threads. Then I restored this vm on a test environment running the same kernel, QEMU and libvirt version). After the restore the VM still was haning at 100% cpu usage on all the vcpus.
+I tried to use the perf kvm guest option to trace the guest vm with a copy of the kernel, modules and kallsyms files from inside the guest vm and I got the following trace:
+
+$ perf kvm --guest --guestkallsyms=kallsyms --guestmodules=modules record -g -p 14471 -o perf.data
+$ perf kvm --guest --guestkallsyms=kallsyms --guestmodules=modules report -i perf.data --stdio > analyze
+
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 105K of event 'cycles'
+# Event count (approx.): 67588147605
+#
+# Children      Self  Command  Shared Object            Symbol                                      Parent symbol
+# ........  ........  .......  .......................  ..........................................  .............
+#
+    28.79%    28.79%  :16028   [guest.kernel.kallsyms]  [g] fuse_get_root_inode                     [other]
+    23.48%    23.48%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_init          [other]
+     7.32%     7.32%  :16029   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration                 [other]
+     4.82%     4.82%  :16029   [guest.kernel.kallsyms]  [g] posix_cpu_clock_get                     [other]
+     4.20%     4.20%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_timer_expire_entry    [other]
+     3.87%     3.87%  :16029   [guest.kernel.kallsyms]  [g] kvm_init_debugfs                        [other]
+     3.66%     3.66%  :16029   [guest.kernel.kallsyms]  [g] fat_msg                                 [other]
+     3.11%     3.11%  :16029   [guest.kernel.kallsyms]  [g] match_token                             [other]
+     3.07%     3.07%  :16029   [guest.kernel.kallsyms]  [g] load_balance                            [other]
+     1.87%     1.87%  :16029   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot                 [other]
+     1.69%     1.69%  :16031   [guest.kernel.kallsyms]  [g] kvm_init_debugfs                        [other]
+     1.59%     1.59%  :16029   [guest.kernel.kallsyms]  [g] sys_kcmp                                [other]
+     1.19%     1.19%  :16031   [guest.kernel.kallsyms]  [g] save_paranoid                           [other]
+     0.82%     0.82%  :16031   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot                 [other]
+     0.69%     0.69%  :16031   [guest.kernel.kallsyms]  [g] kvm_cpu_notify                          [other]
+     0.54%     0.54%  :16031   [guest.kernel.kallsyms]  [g] rcu_process_callbacks                   [other]
+     0.46%     0.46%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_start         [other]
+     0.43%     0.43%  :16031   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth                    [other]
+     0.42%     0.42%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_expire_entry  [other]
+     0.37%     0.37%  :16029   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range                  [other]
+     0.35%     0.35%  :16031   [guest.kernel.kallsyms]  [g] sys_kcmp                                [other]
+     0.35%     0.35%  :16031   [guest.kernel.kallsyms]  [g] console_unlock                          [other]
+     0.34%     0.34%  :16029   [guest.kernel.kallsyms]  [g] __fat_fs_error                          [other]
+     0.31%     0.31%  :16031   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration                 [other]
+     0.24%     0.24%  :16031   [guest.kernel.kallsyms]  [g] paravirt_write_msr                      [other]
+     0.24%     0.24%  :16029   [guest.kernel.kallsyms]  [g] parse_no_kvmclock                       [other]
+     0.24%     0.24%  :16029   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state              [other]
+     0.21%     0.21%  :16030   [guest.kernel.kallsyms]  [g] ptrace_request                          [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] print_stack_trace                       [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] build_sched_domains                     [other]
+     0.20%     0.20%  :16031   [guest.kernel.kallsyms]  [g] __synchronize_srcu                      [other]
+     0.17%     0.17%  :16031   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep                        [other]
+     0.16%     0.16%  :16031   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range                  [other]
+     0.16%     0.16%  :16031   [guest.kernel.kallsyms]  [g] irq_node_proc_show                      [other]
+     0.15%     0.15%  :16031   [guest.kernel.kallsyms]  [g] __srcu_read_lock                        [other]
+     0.15%     0.15%  :16031   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart                [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] parse_no_kvmclock                       [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] __irq_domain_add                        [other]
+     0.11%     0.11%  :16031   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4                 [other]
+     0.10%     0.10%  :16031   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state              [other]
+     0.09%     0.09%  :16031   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev                   [other]
+     0.09%     0.09%  :16029   [guest.kernel.kallsyms]  [g] __sched_setscheduler                    [other]
+     0.09%     0.09%  :16031   [guest.kernel.kallsyms]  [g] process_srcu                            [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] avc_compute_av                          [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] arch_remove_reservations                [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] __switch_to_xtra                        [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] __create_irqs                           [other]
+     0.08%     0.08%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit      [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] posix_clock_read                        [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] posix_clock_poll                        [other]
+     0.07%     0.07%  :16031   [guest.kernel.kallsyms]  [g] native_cpu_up                           [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] do_nmi                                  [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs                 [other]
+     0.06%     0.06%  :16031   [guest.kernel.kallsyms]  [g] fat_msg                                 [other]
+     0.05%     0.05%  :16031   [guest.kernel.kallsyms]  [g] check_tsc_warp                          [other]
+     0.04%     0.04%  :16031   [guest.kernel.kallsyms]  [g] tick_handle_oneshot_broadcast           [other]
+     0.03%     0.03%  :16031   [guest.kernel.kallsyms]  [g] set_cpu_itimer                          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] arp_ignore                              [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] store_powersave_bias_gov_sys            [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] cleanup_srcu_struct                     [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask                    [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] alarm_timer_nsleep                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] time_cpufreq_notifier                   [other]
+     0.02%     0.02%  :16030   [guest.kernel.kallsyms]  [g] ftrace_raw_output_itimer_state          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] tick_check_new_device                   [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] init_timer_key                          [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] tick_setup_device                       [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] clockevents_register_device             [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] __srcu_read_unlock                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt                      [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] init_srcu_struct                        [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show                  [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] rcu_jiffies_till_stall_check            [other]
+     0.02%     0.02%  :16031   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run                    [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry     [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] avc_denied.isra.0                       [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] __fat_fs_error                          [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] wakeme_after_rcu                        [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] prof_cpu_mask_proc_write                [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] srcu_barrier                            [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_get_device                         [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] irq_domain_add_simple                   [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] synchronize_srcu_expedited              [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] sysfs_show_current_tick_dev             [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_is_oneshot_available               [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_check_replacement                  [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] clockevents_notify                      [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] show_stack                              [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] debug_kfree                             [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] tick_do_broadcast.constprop.6           [other]
+     0.01%     0.01%  :16031   [guest.kernel.kallsyms]  [g] sock_rps_save_rxhash.isra.28.part.29    [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] store_ignore_nice_load.isra.3           [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] perf_trace_itimer_expire                [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] hrtick_start                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] parse_probe_arg                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] wakeup_softirqd                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tick_install_replacement                [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] detach_if_pending                       [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] default_affinity_show                   [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tick_do_periodic_broadcast              [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq               [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tasklet_kill                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] update_rq_clock                         [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] tasklet_init                            [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] arch_local_irq_enable                   [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] irq_affinity_proc_show                  [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] store_sampling_down_factor.isra.4       [other]
+     0.00%     0.00%  :16031   [guest.kernel.kallsyms]  [g] amd_get_subcaches                       [other]
+
+Also tried a `virsh restore` with the `--bypass-cache` option and ran a perf trace. Noticable is the different trace. See output below:
+
+# perf trace without filesystem cache:
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1M of event 'cycles'
+# Event count (approx.): 798928823821
+#
+# Children      Self  Command  Shared Object            Symbol
+# ........  ........  .......  .......................  ..........................................
+#
+    25.32%    25.32%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_init
+     9.55%     9.55%  :34334   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     5.83%     5.83%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_timer_expire_entry
+     5.60%     5.60%  :34334   [guest.kernel.kallsyms]  [g] posix_cpu_clock_get
+     4.37%     4.37%  :34334   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     4.30%     4.30%  :34334   [guest.kernel.kallsyms]  [g] fat_msg
+     3.63%     3.63%  :34334   [guest.kernel.kallsyms]  [g] match_token
+     3.44%     3.44%  :34334   [guest.kernel.kallsyms]  [g] load_balance
+     3.28%     3.28%  :34333   [guest.kernel.kallsyms]  [g] save_paranoid
+     2.25%     2.25%  :34334   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     2.19%     2.19%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_expire_entry
+     1.89%     1.89%  :34334   [guest.kernel.kallsyms]  [g] sys_kcmp
+     1.73%     1.73%  :34336   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     1.58%     1.58%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_hrtimer_start
+     1.26%     1.26%  :34336   [guest.kernel.kallsyms]  [g] save_paranoid
+     1.09%     1.09%  :34333   [guest.kernel.kallsyms]  [g] kvm_init_debugfs
+     1.01%     1.01%  :34333   [unknown]                [u] 0x0000000000434c1b
+     0.94%     0.94%  :34336   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth
+     0.88%     0.88%  :34333   [guest.kernel.kallsyms]  [g] avc_denied.isra.0
+     0.87%     0.87%  :34336   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     0.73%     0.73%  :34333   [guest.kernel.kallsyms]  [g] kvm_pv_guest_cpu_reboot
+     0.68%     0.68%  :34336   [guest.kernel.kallsyms]  [g] kvm_cpu_notify
+     0.65%     0.65%  :34336   [guest.kernel.kallsyms]  [g] rcu_process_callbacks
+     0.57%     0.57%  :34333   [guest.kernel.kallsyms]  [g] paravirt_write_msr
+     0.56%     0.56%  :34333   [guest.kernel.kallsyms]  [g] avc_compute_av
+     0.40%     0.40%  :34334   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.39%     0.39%  :34334   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.39%     0.39%  :34335   [guest.kernel.kallsyms]  [g] ptrace_request
+     0.38%     0.38%  :34336   [guest.kernel.kallsyms]  [g] sys_kcmp
+     0.34%     0.34%  :34333   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart
+     0.32%     0.32%  :34336   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     0.31%     0.31%  :34336   [guest.kernel.kallsyms]  [g] console_unlock
+     0.30%     0.30%  :34334   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.29%     0.29%  :34334   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.27%     0.27%  :34333   [guest.kernel.kallsyms]  [g] do_sysfs_unregistration
+     0.27%     0.27%  :34333   [guest.kernel.kallsyms]  [g] check_tsc_warp
+     0.26%     0.26%  :34333   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run
+     0.26%     0.26%  :34336   [guest.kernel.kallsyms]  [g] paravirt_write_msr
+     0.26%     0.26%  :34333   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.25%     0.25%  :34333   [guest.kernel.kallsyms]  [g] sys_kcmp
+     0.22%     0.22%  :34336   [guest.kernel.kallsyms]  [g] build_sched_domains
+     0.22%     0.22%  :34333   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep
+     0.22%     0.22%  :34333   [guest.kernel.kallsyms]  [g] print_stack_trace
+     0.21%     0.21%  :34336   [guest.kernel.kallsyms]  [g] irq_node_proc_show
+     0.19%     0.19%  :34336   [guest.kernel.kallsyms]  [g] print_stack_trace
+     0.19%     0.19%  :34336   [guest.kernel.kallsyms]  [g] __srcu_read_lock
+     0.18%     0.18%  :34336   [guest.kernel.kallsyms]  [g] __synchronize_srcu
+     0.17%     0.17%  :34333   [guest.kernel.kallsyms]  [g] __create_irqs
+     0.17%     0.17%  :34336   [guest.kernel.kallsyms]  [g] do_cpu_nanosleep
+     0.17%     0.17%  :34336   [guest.kernel.kallsyms]  [g] amd_get_mmconfig_range
+     0.15%     0.15%  :34336   [guest.kernel.kallsyms]  [g] posix_cpu_nsleep_restart
+     0.14%     0.14%  :34333   [guest.kernel.kallsyms]  [g] rcu_process_callbacks
+     0.14%     0.14%  :34333   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs
+     0.13%     0.13%  :34336   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.11%     0.11%  :34333   [guest.kernel.kallsyms]  [g] tasklet_init
+     0.11%     0.11%  :34336   [guest.kernel.kallsyms]  [g] process_srcu
+     0.11%     0.11%  :34336   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.11%     0.11%  :34333   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] __switch_to_xtra
+     0.10%     0.10%  :34334   [guest.kernel.kallsyms]  [g] __sched_setscheduler
+     0.10%     0.10%  :34333   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] sysfs_unbind_tick_dev
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] print_tickdevice.isra.4
+     0.10%     0.10%  :34336   [guest.kernel.kallsyms]  [g] posix_clock_read
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] parse_no_kvmclock
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] posix_clock_poll
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] __irq_domain_add
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] avc_compute_av
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] posix_clock_read
+     0.09%     0.09%  :34333   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt
+     0.09%     0.09%  :34336   [guest.kernel.kallsyms]  [g] __create_irqs
+     0.08%     0.08%  :34336   [guest.kernel.kallsyms]  [g] posix_clock_poll
+     0.08%     0.08%  :34336   [guest.kernel.kallsyms]  [g] rcu_try_advance_all_cbs
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] arch_remove_reservations
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] native_cpu_up
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] native_cpu_up
+     0.07%     0.07%  :34336   [guest.kernel.kallsyms]  [g] check_tsc_warp
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] kvm_save_sched_clock_state
+     0.07%     0.07%  :34333   [guest.kernel.kallsyms]  [g] do_nmi
+     0.06%     0.06%  :34336   [guest.kernel.kallsyms]  [g] do_nmi
+     0.06%     0.06%  :34335   [guest.kernel.kallsyms]  [g] ftrace_raw_output_itimer_state
+     0.05%     0.05%  :34336   [guest.kernel.kallsyms]  [g] fat_msg
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] store_powersave_bias_gov_sys
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] tick_handle_oneshot_broadcast
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] set_cpu_itimer
+     0.04%     0.04%  :34336   [guest.kernel.kallsyms]  [g] cleanup_srcu_struct
+     0.03%     0.03%  :34336   [guest.kernel.kallsyms]  [g] __srcu_read_unlock
+     0.03%     0.03%  :34336   [guest.kernel.kallsyms]  [g] time_cpufreq_notifier
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] alarm_timer_nsleep
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] ksoftirqd_should_run
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] tg_set_cfs_bandwidth
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] create_prof_cpu_mask
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] fat_msg
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] tick_check_new_device
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] __switch_to_xtra
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] tick_setup_device
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] init_timer_key
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] rcu_jiffies_till_stall_check
+     0.02%     0.02%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_exit
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] arp_ignore
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] clockevents_register_device
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] hpet_rtc_interrupt
+     0.02%     0.02%  :34336   [guest.kernel.kallsyms]  [g] init_srcu_struct
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] irq_node_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_check_replacement
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] avc_denied.isra.0
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_get_device
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] irq_affinity_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] sysfs_show_current_tick_dev
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] __fat_fs_error
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_is_oneshot_available
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] irq_domain_add_simple
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] irq_spurious_proc_show
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] tick_do_broadcast.constprop.6
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] sock_rps_save_rxhash.isra.28.part.29
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] prof_cpu_mask_proc_write
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] perf_trace_itimer_expire
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] srcu_barrier
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] store_ignore_nice_load.isra.3
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] wakeme_after_rcu
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_irq_handler_entry
+     0.01%     0.01%  :34333   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] debug_kfree
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] clockevents_notify
+     0.01%     0.01%  :34336   [guest.kernel.kallsyms]  [g] parse_probe_arg
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] hrtick_start
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] detach_if_pending
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tasklet_init
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] show_stack
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] wakeup_softirqd
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] arch_local_irq_enable
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tasklet_kill
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] default_affinity_show
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] ftrace_raw_output_softirq
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] store_sampling_down_factor.isra.4
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] synchronize_srcu_expedited
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] update_rq_clock
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_do_periodic_broadcast
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_install_replacement
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] amd_get_subcaches
+     0.00%     0.00%  :34334   [guest.kernel.kallsyms]  [g] amd_get_subcaches
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] tick_handle_periodic
+     0.00%     0.00%  :34336   [guest.kernel.kallsyms]  [g] __page_cache_alloc
+
+I am not sure how correct the symbol mapping of perf is, so I don't know if this is usable at all.
+
+I have dumped info registers with the `qemu-monitor-command` command after the  migration problematic VM and this gave the following output:
+
+RAX=0000000000001975 RBX=ffff8802342fc000 RCX=000000000000beac RDX=000000000000beaa
+RSI=000000000000beac RDI=ffff8802342fc000 RBP=ffff880233d3fb18 RSP=ffff880233d3fb18
+R8 =0000000000000286 R9 =ffff8800a71eee40 R10=ffff8800a71eeed4 R11=000000000000000a
+R12=ffff8802342fc000 R13=ffffffff81cdf010 R14=ffff880233d3fb58 R15=ffff88003672b200
+RIP=ffffffff817360b7 RFL=00000002 [-------] CPL=0 II=0 A20=1 SMM=0 HLT=0
+ES =0000 0000000000000000 000fffff 00000000
+CS =0010 0000000000000000 ffffffff 00a09b00 DPL=0 CS64 [-RA]
+SS =0018 0000000000000000 ffffffff 00c09300 DPL=0 DS   [-WA]
+DS =0000 0000000000000000 000fffff 00000000
+FS =0000 0000000000000000 000fffff 00000000
+GS =0000 ffff88023fc00000 000fffff 00000000
+LDT=0000 0000000000000000 000fffff 00000000
+TR =0040 ffff88023fc04440 00002087 00008b00 DPL=0 TSS64-busy
+GDT=     ffff88023fc0c000 0000007f
+IDT=     ffffffffff576000 00000fff
+CR0=8005003b CR2=0000000000408950 CR3=0000000232098000 CR4=00000670
+DR0=0000000000000000 DR1=0000000000000000 DR2=0000000000000000 DR3=0000000000000000
+DR6=00000000ffff0ff0 DR7=0000000000000400
+EFER=0000000000000d01
+FCW=037f FSW=0000 [ST=0] FTW=00 MXCSR=00001fa0
+FPR0=0000000000000000 0000 FPR1=0000000000000000 0000
+FPR2=0000000000000000 0000 FPR3=0000000000000000 0000
+FPR4=0000000000000000 0000 FPR5=0000000000000000 0000
+FPR6=0000000000000000 0000 FPR7=0000000000000000 0000
+XMM00=ffffffffff0000ff0000000000000000 XMM01=0000010101000000ffffffffffffffff
+XMM02=00007fe302de17006776615f64616f6c XMM03=00000000000000000000000000000000
+XMM04=00000000000000000000000000000000 XMM05=00000000000000000000000000ff0000
+XMM06=5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b XMM07=20202020202020202020202020202020
+XMM08=00000000000000000000000000000000 XMM09=00000000000000000000000000000000
+XMM10=00000000000000000000000000000000 XMM11=00000000000000000000000000000000
+XMM12=00ff000000ff0000000000000000ff00 XMM13=00000000000000000000000000000000
+XMM14=00000000000000000000000000000000 XMM15=00000000000000000000000000000000
+
+And I looped this for a minute to check were the RIP is changing to:
+136 RIP=0000000000434c1b
+173 RIP=ffffffff8105144a
+  2 RIP=ffffffff810521ff
+  1 RIP=ffffffff81070816
+
+
+I tried to reproduce this with some manual actions prior to migrating between qemu 2.6.2 and 2.11.1 on our testing environment using similar hardware (56 core model name: Intel(R) Xeon(R) Gold 6126 CPU @ 2.60GHz)
+And I was not able to reproduce this, i tried the following:
+- restore without filesystem caches (see new perf traces below)
+- create vm with same kernel as stuck vm
+- restore paused detach net device and virtio block device (detach doesn't work)
+- try to do a lot of network and disk io while migrating
+- ecrypt fs actions during migration
+- migrate 4000 times between 2.6.2 -> 2.11 using loop
+- add extra timer calls inside guest for migrate loop (done using cyclictest)
+- try with guest kernel 3.13.0-145-generic, same kernel vm was running with this issue
+- try host clock/timer calls on 2.11.1 host prior and during migration bound on first cpu core (cyclictest -a 0 -c 1 -d 200 -H -l 1 -t 2)
+
+I asked the vm owner what he is doing on his vm, and he told me that he is using 80% of his mem around 14G of the 16G, the vm is running a tomcat 7 server and a libreoffice deamon the vm has a load of 1.0 and runs Ubuntu 14.04 with kernel 3.13.0-145.
+
+The other vms were running centos 6, centos 7, debian 7, debian 8, ubuntu 13.10, ubuntu 14.04, ubuntu 12.04 the majority of these vms are running linux kernel 3.*.
+
+The thing is I am actually out of ideas for reproducing this, and I am not sure how to pinpoint this issue, I would like some help and possible some extra tips on debugging.

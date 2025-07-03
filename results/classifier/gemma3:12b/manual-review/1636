@@ -1,0 +1,103 @@
+
+RISCV: Interrupt not cleared correctly (supervisor external IRQ)
+Description of problem:
+
+Steps to reproduce:
+1. Set mie -> 0
+2. Assert all interrupt sources which can be taken in M-mode (i.e. set mei, msi, mti, sei, ssi, sti)
+3. I'm using the imsic for the external interrupts and the clint for timer interrupts.
+4. Once all IRQs are pending set mie -> 0xFFFF
+5. IRQs are taken one by one, all M-level IRQs are cleared without issues.
+6. The issue occurs when trying to clear the S-external IRQ, when writing stopei to clear the IRQ mip is not updated correctly.
+
+I believe I have located the issue in target/riscv/cpu.c:1314 
+
+**Old code:**
+```
+riscv_cpu_update_mip(cpu, 1 << irq,
+     BOOL_TO_MASK(level | env->software_seip));
+```
+**Changed code:**
+```
+riscv_cpu_update_mip(cpu, 1 << irq,
+     BOOL_TO_MASK(level));
+```
+
+When we reach the next code snippet (cpu_helper.c:628) we enter cpu_interrupt instead of cpu_reset_interrupt and thus end up in an infinite loop since the imsic message from that point on will be 0. It looks weird to me to use env->software_seip and not env->external_seip, in any case I changed it to BOOL_TO_MASK(level) and I now see the behavior I expect from my test program. 
+
+```c
+    env->mip = (env->mip & ~mask) | (value & mask);
+
+    if (env->mip | vsgein | vstip) {
+        cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
+
+```
+Additional information:
+Log when getting the error.
+```
+TRACE: [src/hart_ctrl.c:35] STARTING CPU 0
+DEBUG: [src/trap_handling.c: 938] Setting up trap handlers
+TRACE: [src/page_tables.c:341] Setting up page tables between 0x80000000 -> 0x81c00000
+TRACE: [src/page_tables.c:355] Setting up page tables for UART 0x10000000
+TRACE: [src/page_tables.c:365] Setting up page tables for CLINT 0x2000000
+DEBUG: [src/page_tables.c: 383] Mapping IMISIC 0x24000000
+DEBUG: [src/page_tables.c: 383] Mapping IMISIC 0x28000000
+DEBUG: [src/page_tables.c: 383] Mapping IMISIC 0x28001000
+DEBUG: [src/util_fn.c: 339] Setting satp: 0x8000100000081017 
+DEBUG: [src/util_fn.c: 342] Setting hgatp: 0x8000000000081014 
+TRACE: [src/main.c:40] Asserting M-level interrupts simultaneously
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause machine external interrupt
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause machine software interrupt
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause machine timer interrupt
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause supervisor external interrupt
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause supervisor software interrupt
+DEBUG: [src/irq_trigger.c: 121] Setting inteded cause to: Cause supervisor timer interrupt
+riscv_cpu_do_interrupt: hart:0, async:1, cause:000000000000000b, epc:0x0000000080004d80, tval:0x0000000000000000, desc=m_external
+DEBUG: [src/trap_handling.c: 315] mtvec_mei
+DEBUG: [src/trap_handling.c:  65] Cause to check is currently Cause machine external interrupt
+DEBUG: [src/trap_handling.c:  76] Cause machine external interrupt exception: MEPC = 0x80004d80, MTVAL = 0x0
+DEBUG: [src/aia_ctrl.c: 352] Popped IMSIC message = 1
+riscv_cpu_do_interrupt: hart:0, async:1, cause:0000000000000003, epc:0x0000000080004d80, tval:0x0000000000000000, desc=m_software
+DEBUG: [src/trap_handling.c:  65] Cause to check is currently Cause machine software interrupt
+DEBUG: [src/trap_handling.c:  76] Cause machine software interrupt exception: MEPC = 0x80004d80, MTVAL = 0x0
+riscv_cpu_do_interrupt: hart:0, async:1, cause:0000000000000007, epc:0x0000000080004d80, tval:0x0000000000000000, desc=m_timer
+DEBUG: [src/trap_handling.c:  65] Cause to check is currently Cause machine timer interrupt
+DEBUG: [src/trap_handling.c:  76] Cause machine timer interrupt exception: MEPC = 0x80004d80, MTVAL = 0x0
+riscv_cpu_do_interrupt: hart:0, async:1, cause:0000000000000009, epc:0x0000000080004d80, tval:0x0000000000000000, desc=s_external
+DEBUG: [src/trap_handling.c: 296] mtvec_sei
+DEBUG: [src/trap_handling.c:  65] Cause to check is currently Cause supervisor external interrupt
+DEBUG: [src/trap_handling.c:  76] Cause supervisor external interrupt exception: MEPC = 0x80004d80, MTVAL = 0x0
+mip
+    ssip (1)   =  1
+    vssip(2)   =  0
+    msip (3)   =  0
+    stip (5)   =  1
+    vstip(6)   =  0
+    mtip (7)   =  0
+    seip (9)   =  1
+    vseip(10)  =  0
+    meip (11)  =  0
+    sgeip(12)  =  0
+DEBUG: [src/aia_ctrl.c: 339] Writing stopei -> 0
+DEBUG: [src/aia_ctrl.c: 344] stopei = 0x0000000000000000 
+DEBUG: [src/aia_ctrl.c: 352] Popped IMSIC message = 1
+mip
+    ssip (1)   =  1
+    vssip(2)   =  0
+    msip (3)   =  0
+    stip (5)   =  1
+    vstip(6)   =  0
+    mtip (7)   =  0
+    seip (9)   =  1
+    vseip(10)  =  0
+    meip (11)  =  0
+    sgeip(12)  =  0
+riscv_cpu_do_interrupt: hart:0, async:1, cause:0000000000000009, epc:0x0000000080004d80, tval:0x0000000000000000, desc=s_external
+DEBUG: [src/trap_handling.c: 296] mtvec_sei
+DEBUG: [src/trap_handling.c:  65] Cause to check is currently Cause supervisor software interrupt
+DEBUG: [src/trap_handling.c:  76] Cause supervisor external interrupt exception: MEPC = 0x80004d80, MTVAL = 0x0
+ERROR: [src/trap_handling.c:121] The following assert failed: masked_cause == cause2check
+masked_cause = 9

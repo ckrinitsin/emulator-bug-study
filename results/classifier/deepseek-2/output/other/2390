@@ -1,0 +1,64 @@
+
+linux-user: Qemu handles `getsockopt` with NULL `optval` incorrectly
+Description of problem:
+In short call to `getsockopt(_, SOL_TCP, TCP_KEEPIDLE, NULL, _)` behaves differently on RISC-V Qemu than on x64 Linux. 
+On Linux syscall returns 0, but on Qemu it fails with `"Bad address"`.
+Apparently Qemu `getsockopt` implementation is more conservative about NULL `optval` argument than kernel implementation. However man permits passing NULL [link](https://man7.org/linux/man-pages/man2/setsockopt.2.html):
+
+>  For getsockopt(), optlen is a value-result argument, initially
+       containing the size of the buffer pointed to by optval, and
+       modified on return to indicate the actual size of the value
+       returned.  **If no option value is to be supplied** or returned,
+       **optval may be NULL.**"
+
+For me it sounds like accepting NULL without error (and x64 confirms that interpretation).
+Steps to reproduce:
+1. Use below toy program `getsockopt.c` and compile it without optimizations like:
+```
+    gcc -Wall -W -std=gnu11 -pedantic  getsockopt.c -o getsockopt
+```
+
+```
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdio.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+
+static void fail_on_error(int error, const char *msg) {
+    if (error < 0) {
+        perror(msg);
+        exit(errno);
+    }
+}
+
+int main(int argc, char **argv) {
+     int socketfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+     fail_on_error(socketfd, "socket error");
+     uint8_t *option_value = NULL;
+     int32_t len = 0;
+     int32_t *option_len = &len;
+     socklen_t opt_len = (socklen_t)*option_len;
+     int status = getsockopt(socketfd, SOL_TCP, TCP_KEEPIDLE, option_value, &opt_len);
+     fail_on_error(status, "getsockopt error");
+     return 0;
+}
+```
+
+
+2. Run program on Qemu and compare output with output from x64 build. In my case it looks like:
+```
+root@57646f544f3a:/runtime/programs# ./getsockopt-x64
+root@57646f544f3a:/runtime/programs# ./getsockopt-riscv
+getsockopt error: Bad address
+```
+Additional information:
+I don't think issue is platform specific assuming Qemu `getsockopt` implementation that is actually running is here:
+[link](https://github.com/qemu/qemu/blob/master/linux-user/syscall.c#L2522)
+
+Looking at sources, I'm not sure why Qemu can't simply forward everything to kernel space 
+instead doing extra sanity checks together with `optval` dereference attempt that eventually fails in one of `put_user*_` function: [link](https://github.com/qemu/qemu/blob/master/linux-user/syscall.c#L2753) 
+
+Anyway, I think that interpretation of man quote is rather straightforward and Qemu `getsockopt` implementation should follow it.

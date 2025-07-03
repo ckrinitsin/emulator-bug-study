@@ -1,0 +1,63 @@
+
+qemu stalls when taking LUKS encrypted snapshot
+Description of problem:
+We have been dealing with an issue recently, where qemu occasionally stalls when taking LUKS encrypted snapshots. We were able to take several core dumps (one example below) when the issue was happening and, upon analyzing those, we found out that the issue is that the function [qcrypto_pbkdf2_count_iters](https://github.com/qemu/qemu/blob/master/crypto/pbkdf.c#L88) reaches an iteration number high enough that the algorithm takes a long time to finish.
+
+Upon investigation, we were able to see that this is happening because [start_ms and end_ms](https://github.com/qemu/qemu/blob/master/crypto/pbkdf.c#L115) have the same value, giving a delta of zero, causing the number of iterations to always increase.
+
+Here are the important parts of the coredump:
+
+```
+(gdb) bt
+#0  0x00007fb00aba5489 in _gcry_sha256_transform_amd64_avx2 () at ../../cipher/sha256-avx2-bmi2-amd64.S:346
+#1  0x00007fb00aba3000 in sha256_final (context=0x55ab875d5028) at ../../cipher/sha256.c:591
+#2  0x00007fb00ab19dea in md_final (a=0x55ab82e1bf50) at ../../cipher/md.c:800
+#3  0x00007fb00ab19f89 in md_final (a=a@entry=0x55ab82e1bf50) at ../../cipher/md.c:1003
+#4  _gcry_md_ctl (hd=hd@entry=0x55ab82e1bf50, buflen=0, buffer=0x0, cmd=5) at ../../cipher/md.c:1012
+#5  0x00007fb00ab1a4d0 in _gcry_md_ctl (buflen=0, buffer=0x0, cmd=5, hd=0x55ab82e1bf50) at ../../cipher/md.c:1106
+#6  _gcry_md_read (hd=0x55ab82e1bf50, algo=algo@entry=0) at ../../cipher/md.c:1110
+#7  0x00007fb00ab1d9ef in _gcry_kdf_pkdf2 (passphrase=passphrase@entry=0x55ab8177f040, passphraselen=passphraselen@entry=64, hashalgo=hashalgo@entry=8, salt=salt@entry=0x55ab8397a1d4, saltlen=saltlen@entry=32, 
+    iterations=iterations@entry=32768000000, keysize=20, keybuffer=0x55ab817693c0) at ../../cipher/kdf.c:213
+#8  0x00007fb00ab1de3c in _gcry_kdf_pkdf2 (keybuffer=0x55ab817693c0, keysize=20, iterations=32768000000, saltlen=32, salt=0x55ab8397a1d4, hashalgo=8, passphraselen=64, passphrase=0x55ab8177f040) at ../../cipher/kdf.c:144
+#9  _gcry_kdf_derive (passphrase=0x55ab8177f040, passphraselen=64, algo=34, subalgo=8, salt=0x55ab8397a1d4, saltlen=32, iterations=32768000000, keysize=20, keybuffer=0x55ab817693c0) at ../../cipher/kdf.c:286
+#10 0x00007fb00ab02299 in gcry_kdf_derive (passphrase=passphrase@entry=0x55ab8177f040, passphraselen=passphraselen@entry=64, algo=algo@entry=34, hashalgo=hashalgo@entry=8, salt=salt@entry=0x55ab8397a1d4, saltlen=saltlen@entry=32, 
+    iterations=32768000000, keysize=20, keybuffer=0x55ab817693c0) at ../../src/visibility.c:1337
+#11 0x000055ab7f80ff83 in qcrypto_pbkdf2 (hash=hash@entry=QCRYPTO_HASH_ALG_SHA256, key=key@entry=0x55ab8177f040 "\b@\327\061\177F\f\345\200Bw#", nkey=nkey@entry=64, 
+    salt=salt@entry=0x55ab8397a1d4 "\"ͧ\322+\201!\375\177\020\037\252Hg$\271\021\340\343T\021OKָ\234m\304\066g\024\276", nsalt=nsalt@entry=32, iterations=iterations@entry=32768000000, 
+    out=0x55ab817693c0 "C[\210\003\332\017b\350\f\257\377UP\257\262\275\033\v\034(", nout=20, errp=0x7fa7565e5df8) at ./crypto/pbkdf-gcrypt.c:75
+#12 0x000055ab7f80fe66 in qcrypto_pbkdf2_count_iters (hash=hash@entry=QCRYPTO_HASH_ALG_SHA256, key=key@entry=0x55ab8177f040 "\b@\327\061\177F\f\345\200Bw#", nkey=64, 
+    salt=salt@entry=0x55ab8397a1d4 "\"ͧ\322+\201!\375\177\020\037\252Hg$\271\021\340\343T\021OKָ\234m\304\066g\024\276", nsalt=nsalt@entry=32, nout=nout@entry=20, errp=0x7fa7565e5df8) at ./crypto/pbkdf.c:80
+#13 0x000055ab7f812930 in qcrypto_block_luks_create (block=0x55ab82944540, options=<optimized out>, optprefix=<optimized out>, initfunc=0x55ab7f7abad0 <qcow2_crypto_hdr_init_func>, writefunc=0x55ab7f7ac040 <qcow2_crypto_hdr_write_func>, 
+    opaque=0x55ab83a32290, errp=0x55ab823873d0) at ./crypto/block-luks.c:1362
+#14 0x000055ab7f810d80 in qcrypto_block_create (options=options@entry=0x55ab818e1f40, optprefix=optprefix@entry=0x55ab7f99912b "encrypt.", initfunc=initfunc@entry=0x55ab7f7abad0 <qcow2_crypto_hdr_init_func>, 
+    writefunc=writefunc@entry=0x55ab7f7ac040 <qcow2_crypto_hdr_write_func>, opaque=opaque@entry=0x55ab83a32290, errp=errp@entry=0x55ab823873d0) at ./crypto/block.c:106
+#15 0x000055ab7f7b0f79 in qcow2_set_up_encryption (errp=0x55ab823873d0, cryptoopts=0x55ab818e1f40, bs=0x55ab83a32290) at ./block/qcow2.c:2996
+#16 qcow2_co_create (create_options=<optimized out>, errp=0x55ab823873d0) at ./block/qcow2.c:3529
+#17 0x000055ab7f7e2fca in blockdev_create_run (job=0x55ab82387350, errp=0x55ab823873d0) at ./block/create.c:46
+#18 0x000055ab7f79cf6f in job_co_entry (opaque=0x55ab82387350) at ./job.c:878
+#19 0x000055ab7f87e09c in coroutine_trampoline (i0=<optimized out>, i1=<optimized out>) at ./util/coroutine-ucontext.c:115
+#20 0x00007fb009a14680 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#21 0x00007ffd40716530 in ?? ()
+#22 0x0000000000000000 in ?? ()
+(gdb) frame 12
+#12 0x000055ab7f80fe66 in qcrypto_pbkdf2_count_iters (hash=hash@entry=QCRYPTO_HASH_ALG_SHA256, key=key@entry=0x55ab8177f040 "\b@\327\061\177F\f\345\200Bw#", nkey=64, 
+    salt=salt@entry=0x55ab8397a1d4 "\"ͧ\322+\201!\375\177\020\037\252Hg$\271\021\340\343T\021OKָ\234m\304\066g\024\276", nsalt=nsalt@entry=32, nout=nout@entry=20, errp=0x7fa7565e5df8) at ./crypto/pbkdf.c:80
+80	        if (qcrypto_pbkdf2(hash,
+(gdb) info locals
+ret = 18446744073709551615
+out = 0x55ab817693c0 "C[\210\003\332\017b\350\f\257\377UP\257\262\275\033\v\034("
+iterations = 32768000000
+delta_ms = <optimized out>
+start_ms = 35357141
+end_ms = 35357141
+```
+
+We did some investigation on the getrusage system call, which is [used to calculate start_ms and end_ms](https://github.com/qemu/qemu/blob/master/crypto/pbkdf.c#L72) and found some patches which indicate that it might not be that accurate:
+
+https://github.com/torvalds/linux/commit/3dc167ba5729ddd2d8e3fa1841653792c295d3f1
+
+https://lore.kernel.org/lkml/20221226031010.4079885-1-maxing.lan@bytedance.com/t/#m1c7f2fdc0ea742776a70fd1aa2a2e414c437f534
+
+So far we have only seen this with Windows guests, but it might be a red herring. It happens maybe once a month and we were unable to get a reproducer.
+
+I'm open to proposing a fix for this, but how could we measure this without relying on getrusage which is causing us trouble? Any other suggestions or tips on this?

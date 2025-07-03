@@ -1,0 +1,97 @@
+
+elf-linux-user: segfault caused by invalid loaddr extracted by the ELF loader
+Description of problem:
+Emulating ELF binaries as emitted by Zig may lead to segfault in QEMU, which typically looks like this
+
+```
+$ qemu-x86_64 simple
+fish: Job 1, 'qemu-x86_64 simple' terminated by signal SIGSEGV (Address boundary error)
+```
+Steps to reproduce:
+1. Obtain latest Zig nightly
+2. Compile simple static C program using Zig's ELF linker:
+
+```
+$ echo "int main() { return 0 };" > simple.c
+$ zig build-exe simple.c -lc -target x86_64-linux-musl -fno-lld --image-base 0x1000000
+$ qemu-x86_64 simple
+fish: Job 1, 'qemu-x86_64 simple' terminated by signal SIGSEGV (Address boundary error)
+```
+Additional information:
+Note that running `simple` directly it's correctly mmaped and executed by the kernel:
+
+```
+$ ./simple
+$ echo $status
+0
+``` 
+
+The reason this happens is because of an assumption QEMU's ELF loader makes on the virtual addresses and offsets of `PT_LOAD` segments, namely:
+
+```
+vaddr2 - vaddr1 >= off2 - off1
+```
+
+Typically, to the best of my knowledge, this is conformed to by the linkers in the large, but it is not required at all. Here's a one-line tweak to QEMU's loader that fixes the segfault:
+
+```diff
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index f21e2e0c3d..eabb4fed03 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -3211,7 +3211,7 @@ static void load_elf_image(const char *image_name, int image_fd,
+     for (i = 0; i < ehdr->e_phnum; ++i) {
+         struct elf_phdr *eppnt = phdr + i;
+         if (eppnt->p_type == PT_LOAD) {
+-            abi_ulong a = eppnt->p_vaddr - eppnt->p_offset;
++            abi_ulong a = eppnt->p_vaddr & ~(eppnt->p_align - 1);
+             if (a < loaddr) {
+                 loaddr = a;
+             }
+```
+
+The reason why this breaks for ELF binaries emitted by Zig is that while virtual addresses are allocated sequentially or pre-allocated, file offsets are allocated on a best-effort basis wherever there is enough space in the file to fit a given section/segment so that we can move the contents in file while preserving the allocated virtual addresses on a whim. To provide a more concrete example, here's the load segment layout for `simple` as emitted by Zig:
+
+```
+$ readelf -l simple
+
+Elf file type is EXEC (Executable file)
+Entry point 0x1002000
+There are 7 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  PHDR           0x0000000000000040 0x0000000001000040 0x0000000001000040
+                 0x0000000000000188 0x0000000000000188  R      0x8
+  LOAD           0x0000000000000000 0x0000000001000000 0x0000000001000000
+                 0x00000000000001c8 0x00000000000001c8  R      0x1000
+  LOAD           0x0000000000021000 0x0000000001001000 0x0000000001001000
+                 0x0000000000000078 0x0000000000000078  R      0x1000
+  LOAD           0x0000000000022000 0x0000000001002000 0x0000000001002000
+                 0x000000000000065a 0x000000000000065a  R E    0x1000
+  LOAD           0x0000000000023000 0x0000000001003000 0x0000000001003000
+                 0x0000000000000060 0x0000000000000278  RW     0x1000
+  GNU_EH_FRAME   0x0000000000021064 0x0000000001001064 0x0000000001001064
+                 0x0000000000000014 0x0000000000000014  R      0x4
+  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000000000000 0x0000000000000000  RW     0x1
+
+ Section to Segment mapping:
+  Segment Sections...
+   00
+   01
+   02     .rodata.str1.1 .rodata .eh_frame .eh_frame_hdr
+   03     .text .init .fini
+   04     .data .got .bss
+   05     .eh_frame_hdr
+   06
+```
+
+As you can see, initially `loaddr := 0x1000000 - 0x0 = 0x1000000`. However, upon iterating over the second load segment, we already get
+
+```
+a := 0x1001000 - 0x21000 = 0xfe000
+```
+
+and since `a < loaddr`, we incorrectly set `loaddr := 0xfe000`.

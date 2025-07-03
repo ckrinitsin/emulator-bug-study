@@ -1,0 +1,37 @@
+
+Executing LD1SB + MTE on Arm64 fails an assert
+Description of problem:
+I'm getting 
+```
+qemu-system-aarch64: ../tcg/tcg-op-gvec.c:91: simd_desc: Assertion `data == sextract32(data, 0, (32 - ((0 + 8) + 2)))' failed.
+```
+This is caused by the upper bits of `data` being set to 1, which violates the condition.
+Steps to reproduce:
+1. build QEMU with assertions enabled (e.g., `configure --enable-debug-tcg`).
+2. have a `LD1SB f{z25.d}, p3/z, [x14, x9]` (binary a5894dd9) instruction in the executed code.
+3. enable mte
+4. Let QEMU execute the ld1sb instruction.
+Additional information:
+![image](/uploads/8b2a68b986b94549da1abf4e076c5171/image.png){width=699 height=141}
+
+This issue happens because for ld1sb, nregs=0 in `sve.decode`:
+```
+# SVE contiguous load (scalar plus scalar)
+LD_zprr         1010010 .... ..... 010 ... ..... .....    @rprr_load_dt nreg=0 
+```
+As a result, in do_mem_zpa is called with n_reg=0, which becomes mte_n inside do_mem_zpa.
+Since mte_n==0, and mte_active, then 
+```c
+desc = FIELD_DP32(desc, MTEDESC, SIZEM1, (mte_n << msz) - 1);
+```
+sets (0) - 1 == -1 to the field, which also sets the upper bits of `desc`.
+The `desc` with upper bits set to 1 is used to call:
+```c
+desc = simd_desc(vsz, vsz, zt | desc);
+```
+Inside `simd_desc`, the last parameter is named `data` and it fails the assertion:
+```c
+tcg_debug_assert(data == sextract32(data, 0, SIMD_DATA_BITS))
+```
+
+#

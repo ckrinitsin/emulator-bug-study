@@ -1,0 +1,45 @@
+
+FEAT_RME: NS EL1/0 Address Translation from EL3 fails
+Description of problem:
+I'm playing around with the QEMU RME Stack (TF-A, TF-RMM, Linux/KVM) for a research project.  
+For this I want to access some virtual normal world memory address from within EL3.
+To translate the address to the physical address I use the `AT` instructions (e.g., `ats1e2r`).  
+If the NW memory is initially mapped in the GPT as `GPT_GPI_ANY`, this works fine, however, if the NW memory is mapped as `GPT_GPI_NS` the address translation fails with the error `0b100101`/GPT on PTW.  
+However, EL3/Root World should be able to access memory from all PAS, and therefore, if I understand the ARM documentation correctly, should also be able to execute a PTW for an address marked NS in the GPT.
+Steps to reproduce:
+1. Setup GPT with some memory marked as `GPT_GPI_NS`
+2. Forward some NW virtual address from the kernel to EL3
+3. Execute a PTW on this address via the `AT` instructions.
+Additional information:
+I also took a look into the QEMU source code and potentially found the issue.  
+When executing a PTW we execute `target/arm/ptw.c:granule_protection_check`.  
+The function extracts the target page's GPI (`ptw.c:440'):  
+```c 
+ switch (gpi) {
+    case 0b0000: /* no access */
+        break;
+    case 0b1111: /* all access */
+        return true;
+    case 0b1000:
+    case 0b1001:
+    case 0b1010:
+    case 0b1011:
+        if (pspace == (gpi & 3)) {
+            return true;
+        }
+        break;
+    default:
+        goto fault_walk; /* reserved */
+    }
+```
+The if statement checks if the current `pstate` (previously set to `ptw->in_space`) is the same security state as the one contained in the GPI.  
+If this is not the case, we generate a GPF.  
+However, I think the code misses the fact, that EL3/Root world can access memory from each PAS, meaning that the if statement should be something like
+```c
+if (pspace == (gpi & 3) || (pspace == ARMSS_Root)) {
+            return true;
+}
+```
+Additionally, as both Secure and Realm World can also access Normal World memory, similar checks should also be added in such cases.  
+ 
+I have a patch prepared for this, however, I first want to check in if I'm in line with the Arm ARM or if I'm missing something and EL3 is indeed not supposed to execute PTWs for NS memory.

@@ -1,0 +1,95 @@
+
+SME FMOPA outer product instruction gives incorrect result
+Description of problem:
+The SME outer product instructions operate on tiles of elements. In the
+below example we are performing an outer product of a vector of 1.0
+by itself. This naturally should produce a matrix filled with 1.0
+values, however if we read the values of the tile and printf them we
+instead observe 0.0 values.
+
+Without digging into the underlying QEMU code this appears to be a bug
+in how elements are set based on the tile number, since the same code
+using za0.s rather than za1.s correctly reports all 1.0 values as output
+as expected.
+
+main.c
+```
+#include <stdio.h>
+
+void foo(float *dst);
+
+int main() {
+  float dst[16];
+  foo(dst);
+
+  // This should print:
+  // >>> 1.000000  1.000000  1.000000  1.000000
+  // >>> 1.000000  1.000000  1.000000  1.000000
+  // >>> 1.000000  1.000000  1.000000  1.000000
+  // >>> 1.000000  1.000000  1.000000  1.000000
+  for (int i=0; i<4; ++i) {
+    printf(">>> ");
+    for (int j=0; j<4; ++j) {
+      printf("%lf  ", (double)dst[i * 4 + j]);
+    }
+    printf("\n");
+  }
+}
+```
+
+foo.S
+```
+.global foo
+foo:
+  stp x29, x30, [sp, -80]!
+  mov x29, sp
+  stp d8, d9, [sp, 16]
+  stp d10, d11, [sp, 32]
+  stp d12, d13, [sp, 48]
+  stp d14, d15, [sp, 64]
+
+  smstart
+
+  ptrue p0.s, vl4
+  fmov z0.s, #1.0
+
+  // An outer product of a vector of 1.0 by itself should be a matrix of 1.0.
+  // Note that we are using tile 1 here (za1.s) rather than tile 0.
+  zero {za}
+  fmopa za1.s, p0/m, p0/m, z0.s, z0.s
+
+  // Read the first 4x4 sub-matrix of elements from tile 1:
+  // Note that za1h should be interchangable here.
+  mov w12, #0
+  mova z0.s, p0/m, za1v.s[w12, #0]
+  mova z1.s, p0/m, za1v.s[w12, #1]
+  mova z2.s, p0/m, za1v.s[w12, #2]
+  mova z3.s, p0/m, za1v.s[w12, #3]
+
+  // And store them to the input pointer (dst in the C code):
+  st1w {z0.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z1.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z2.s}, p0, [x0]
+  add x0, x0, #16
+  st1w {z3.s}, p0, [x0]
+
+  smstop
+
+  ldp d8, d9, [sp, 16]
+  ldp d10, d11, [sp, 32]
+  ldp d12, d13, [sp, 48]
+  ldp d14, d15, [sp, 64]
+  ldp x29, x30, [sp], 80
+  ret
+```
+Steps to reproduce:
+```
+$ clang -target aarch64-linux-gnu -march=armv9-a+sme test.c -O1 -static
+$ ~/qemu/build/qemu-aarch64 ./a.out
+>>> 0.000000  0.000000  0.000000  0.000000
+>>> 0.000000  0.000000  0.000000  0.000000
+>>> 0.000000  0.000000  0.000000  0.000000
+>>> 0.000000  0.000000  0.000000  0.000000
+```

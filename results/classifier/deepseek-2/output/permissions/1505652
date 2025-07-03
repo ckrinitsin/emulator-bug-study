@@ -1,0 +1,53 @@
+
+An IO error happen when qemu  snapshot-create
+
+My qemu version is 1.7.1,but when I try to make live snapshot by libvirt,the libvirt sometimes report an error :qemuMonitorJSONCheckError:377 : internal error: unable to execute QEMU command 'transaction': An IO error has occurred.
+
+Here is the command being snpshot create by virsh:
+virsh  snapshot-create snapshot-test.vm   snapshot.xml  --no-metadata  --disk-only --reuse-external
+the snapshot.xml:
+<domainsnapshot>
+  <description>test</description>
+  <disks>
+    <disk name='vda' snapshot="external">
+      <source dev='/home/disk/sbd8' file='/home/disk/sdb8'  type="block"/>
+    </disk>
+  </disks>
+</domainsnapshot>
+
+
+I have read the qemu code about the snapshot create, and I find the qemu when call the function handle_aiocb_rw_linear():
+static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
+{
+    ssize_t offset = 0;
+    ssize_t len;
+
+    while (offset < aiocb->aio_nbytes) {
+        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+            len = pwrite(aiocb->aio_fildes,
+                         (const char *)buf + offset,
+                         aiocb->aio_nbytes - offset,
+                         aiocb->aio_offset + offset);
+        } else {
+            len = pread(aiocb->aio_fildes,
+                        buf + offset,
+                        aiocb->aio_nbytes - offset,
+                        aiocb->aio_offset + offset);
+        }
+        if (len == -1 && errno == EINTR) {
+            continue;
+        } else if (len == -1) {
+            offset = -errno;
+            break;
+        } else if (len == 0) {
+            break;
+        }
+        offset += len;
+    }
+
+    return offset;
+}
+
+The function pwrite happen error,the errono is 1,and the  error describe:"pwrite  failed, Operation not permitted (1, EPERM) because the process does not have the appropriate privileges to use the pwrite system call".
+The qemu call stack about is:
+external_snapshot_prepare()->bdrv_flush()->...->paio_submit->...->handle_aiocb_rw_linear.

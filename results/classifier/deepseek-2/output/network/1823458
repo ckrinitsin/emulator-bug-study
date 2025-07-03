@@ -1,0 +1,42 @@
+
+race condition between vhost_net_stop and CHR_EVENT_CLOSED on shutdown crashes qemu
+
+[impact]
+
+on shutdown of a guest, there is a race condition that results in qemu crashing instead of normally shutting down.  The bt looks similar to this (depending on the specific version of qemu, of course; this is taken from 2.5 version of qemu):
+
+(gdb) bt
+#0  __GI___pthread_mutex_lock (mutex=0x0) at ../nptl/pthread_mutex_lock.c:66
+#1  0x00005636c0bc4389 in qemu_mutex_lock (mutex=mutex@entry=0x0) at /build/qemu-7I4i1R/qemu-2.5+dfsg/util/qemu-thread-posix.c:73
+#2  0x00005636c0988130 in qemu_chr_fe_write_all (s=s@entry=0x0, buf=buf@entry=0x7ffe65c086a0 "\v", len=len@entry=20) at /build/qemu-7I4i1R/qemu-2.5+dfsg/qemu-char.c:205
+#3  0x00005636c08f3483 in vhost_user_write (msg=msg@entry=0x7ffe65c086a0, fds=fds@entry=0x0, fd_num=fd_num@entry=0, dev=0x5636c1bf6b70, dev=0x5636c1bf6b70)
+    at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost-user.c:195
+#4  0x00005636c08f411c in vhost_user_get_vring_base (dev=0x5636c1bf6b70, ring=0x7ffe65c087e0) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost-user.c:364
+#5  0x00005636c08efff0 in vhost_virtqueue_stop (dev=dev@entry=0x5636c1bf6b70, vdev=vdev@entry=0x5636c2853338, vq=0x5636c1bf6d00, idx=1) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost.c:895
+#6  0x00005636c08f2944 in vhost_dev_stop (hdev=hdev@entry=0x5636c1bf6b70, vdev=vdev@entry=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/vhost.c:1262
+#7  0x00005636c08db2a8 in vhost_net_stop_one (net=0x5636c1bf6b70, dev=dev@entry=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/vhost_net.c:293
+#8  0x00005636c08dbe5b in vhost_net_stop (dev=dev@entry=0x5636c2853338, ncs=0x5636c209d110, total_queues=total_queues@entry=1) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/vhost_net.c:371
+#9  0x00005636c08d7745 in virtio_net_vhost_status (status=7 '\a', n=0x5636c2853338) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/virtio-net.c:150
+#10 virtio_net_set_status (vdev=<optimized out>, status=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/net/virtio-net.c:162
+#11 0x00005636c08ec42c in virtio_set_status (vdev=0x5636c2853338, val=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/hw/virtio/virtio.c:624
+#12 0x00005636c098fed2 in vm_state_notify (running=running@entry=0, state=state@entry=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1605
+#13 0x00005636c089172a in do_vm_stop (state=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/cpus.c:724
+#14 vm_stop (state=RUN_STATE_SHUTDOWN) at /build/qemu-7I4i1R/qemu-2.5+dfsg/cpus.c:1407
+#15 0x00005636c085d240 in main_loop_should_exit () at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1883
+#16 main_loop () at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:1931
+#17 main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at /build/qemu-7I4i1R/qemu-2.5+dfsg/vl.c:4683
+
+
+[test case]
+
+unfortunately since this is a race condition, it's very hard to arbitrarily reproduce; it depends very much on the overall configuration of the guest as well as how exactly it's shut down - specifically, its vhost user net must be closed from the host side at a specific time during qemu shutdown.
+
+I have someone with such a setup who has reported to me their setup is able to reproduce this reliably, but the config is too complex for me to reproduce so I have relied on their reproduction and testing to debug and craft the patch for this.
+
+[regression potential]
+
+the change adds flags to prevent repeated calls to both vhost_net_stop() and vhost_net_cleanup() (really, prevents repeated calls to vhost_dev_cleanup()).  Any regression would be seen when stopping and/or cleaning up a vhost net.  Regressions might include failure to hot-remove a vhost net from a guest, or failure to cleanup (i.e. mem leak), or crashes during cleanup or stopping a vhost net.
+
+[other info]
+
+this was originally seen in the 2.5 version of qemu - specifically, the UCA version in trusty-mitaka (which uses the xenial qemu codebase).  However, this appears to still apply upstream, and I am sending a patch to the qemu list to patch upstream as well.

@@ -1,0 +1,74 @@
+
+qemu-system-ppc: Floating point instructions do not properly generate the SPE/Embedded Floating-Point Unavailable interrupt
+
+When emulating certain floating point instructions or vector instructions on PowerPC machines, QEMU does not properly generate the SPE/Embedded Floating-Point Unavailable interrupt.
+
+As described in the Signal Processing Engine (SPE) Programming Environments Manual, Rev. 0, available at https://www.nxp.com/docs/en/reference-manual/SPEPEM.pdf:
+
+> An SPE/embedded floating-point unavailable exception occurs on an attempt to execute any of the
+> following instructions and MSR[SPV] is not set:
+> * SPE instruction (except brinc)
+> * An embedded scalar double-precision instruction
+> * A vector single-precision floating-point instructions
+> It is not used by embedded scalar single-precision floating-point instructions
+
+This behavior was partially reported in Bug #1611394, however the issue is larger than what is described in that bug. As mentioned in that bug, some single-precision instructions generate the exception (while they should not), which is incorrect but does not typically produce an incorrect output. What is more of an issue is that several double-precision and vector instructions do not generate the exception (while they should), and this break support for lazy FPU/vector context switching in Linux (for example).
+
+The upper 32-bit of the double-precision/vector registers (which are in fact hidden in the general purpose registers) is not properly saved/restored, and this causes arithmetic errors. This was observed very frequently on a commercial project that does a lot of double-precision computations. The application works perfectly fine on an MPC8548 CPU, but fails often with QEMU.
+
+The issue can be reproduced using the attached Linux program "spe-bug.c". This program properly prints the number 42 (as the result of some very simple double-precision computation) on real PowerPC hardware, but prints an incorrect result (typically 0) on QEMU.
+
+This issue was first discovered in an older version of QEMU, but is also reproduced in the latest:
+
+# git rev-parse HEAD
+7adfbea8fd1efce36019a0c2f198ca73be9d3f18
+# ppc-softmmu/qemu-system-ppc --version
+QEMU emulator version 5.0.91 (v5.1.0-rc1-28-g7adfbea8fd-dirty)
+Copyright (c) 2003-2020 Fabrice Bellard and the QEMU Project developers
+
+Upon further analysis a total of 39 instructions are misbehaving:
+
+efsabs: raised: 1, expected: 0
+efsnabs: raised: 1, expected: 0
+efsneg: raised: 1, expected: 0
+efdcfs: raised: 0, expected: 1
+efdcfsf: raised: 0, expected: 1
+efdcfsi: raised: 0, expected: 1
+efdcfuf: raised: 0, expected: 1
+efdcfui: raised: 0, expected: 1
+efdctsf: raised: 0, expected: 1
+efdctsi: raised: 0, expected: 1
+efdctsiz: raised: 0, expected: 1
+efdctuf: raised: 0, expected: 1
+efdctui: raised: 0, expected: 1
+efdctuiz: raised: 0, expected: 1
+efscfd: raised: 0, expected: 1
+evfscfsf: raised: 0, expected: 1
+evfscfsi: raised: 0, expected: 1
+evfscfuf: raised: 0, expected: 1
+evfscfui: raised: 0, expected: 1
+evfsctsf: raised: 0, expected: 1
+evfsctsi: raised: 0, expected: 1
+evfsctsiz: raised: 0, expected: 1
+evfsctuf: raised: 0, expected: 1
+evfsctui: raised: 0, expected: 1
+evfsctuiz: raised: 0, expected: 1
+brinc: raised: 0, expected: 1
+efsadd: raised: 1, expected: 0
+efsdiv: raised: 1, expected: 0
+efsmul: raised: 1, expected: 0
+efssub: raised: 1, expected: 0
+evsplatfi: raised: 0, expected: 1
+evsplati: raised: 0, expected: 1
+efscmpeq: raised: 1, expected: 0
+efscmpgt: raised: 1, expected: 0
+efscmplt: raised: 1, expected: 0
+efststeq: raised: 1, expected: 0
+efststgt: raised: 1, expected: 0
+efststlt: raised: 1, expected: 0
+evsel: raised: 0, expected: 1
+
+When "raised" is 0 and "expected" is 1, this means that the SPE/Embedded Floating-Point Unavailable interrupt was not generated while it should have.
+When "raised" is 1 and "expected" is 0, this means that the SPE/Embedded Floating-Point Unavailable interrupt was generated while it should not have (Bug #1611394).
+
+A comprehensive program testing all the instructions listed in the Signal Processing Engine (SPE) Programming Environments Manual, Rev. 0 is posted in the comments of this ticket, and can be used to reproduce the issue, and validate the future fix.

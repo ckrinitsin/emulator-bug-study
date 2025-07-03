@@ -1,0 +1,238 @@
+
+QEMU crashes during guest OS boot if virtserialport is present
+Description of problem:
+QEMU will load the firmware (`OVMF_CODE.fd`) and run the boot manager (`BootDisk.qcow2`) just fine, then shortly after control is passed to the OS installer (`InstallDisk.raw`) it will crash.
+
+This only happens if a `virtioserialport` is present: dropping that single device from the configuration will allow the installer to run, even if the `virtio-serial-pci` device is still present. The exact value of the `name` attribute doesn't seem to make a difference either, I'm just using the standard one for qemu-ga here.
+
+Note that `InstallDisk.raw` is attached using `virtio-blk-pci`, so it's this specific virtio device triggering the crash, not the use of virtio devices in general.
+Additional information:
+The crash happens 100% of the time.
+
+Running a bisect between 8.2 (known to work) and 9.0 (known to crash) has identified the commit 2ce6cff94df2650c460f809e5ad263f1d22507c0 as the culpit:
+
+```
+commit 2ce6cff94df2650c460f809e5ad263f1d22507c0
+Author: Cindy Lu <lulu@redhat.com>
+Date:   Fri Apr 12 14:26:55 2024 +0800
+
+    virtio-pci: fix use of a released vector
+
+    During the booting process of the non-standard image, the behavior of the
+    called function in qemu is as follows:
+
+    1. vhost_net_stop() was triggered by guest image. This will call the function
+    virtio_pci_set_guest_notifiers() with assgin= false,
+    virtio_pci_set_guest_notifiers(） will release the irqfd for vector 0
+
+    2. virtio_reset() was triggered, this will set configure vector to VIRTIO_NO_VECTOR
+
+    3.vhost_net_start() was called (at this time, the configure vector is
+    still VIRTIO_NO_VECTOR) and then call virtio_pci_set_guest_notifiers() with
+    assgin=true, so the irqfd for vector 0 is still not "init" during this process
+
+    4. The system continues to boot and sets the vector back to 0. After that
+    msix_fire_vector_notifier() was triggered to unmask the vector 0 and  meet the crash
+
+    To fix the issue, we need to support changing the vector after VIRTIO_CONFIG_S_DRIVER_OK is set.
+
+    (gdb) bt
+    0  __pthread_kill_implementation (threadid=<optimized out>, signo=signo@entry=6, no_tid=no_tid@entry=0)
+        at pthread_kill.c:44
+    1  0x00007fc87148ec53 in __pthread_kill_internal (signo=6, threadid=<optimized out>) at pthread_kill.c:78
+    2  0x00007fc87143e956 in __GI_raise (sig=sig@entry=6) at ../sysdeps/posix/raise.c:26
+    3  0x00007fc8714287f4 in __GI_abort () at abort.c:79
+    4  0x00007fc87142871b in __assert_fail_base
+        (fmt=0x7fc8715bbde0 "%s%s%s:%u: %s%sAssertion `%s' failed.\n%n", assertion=0x5606413efd53 "ret == 0", file=0x5606413ef87d "../accel/kvm/kvm-all.c", line=1837, function=<optimized out>) at assert.c:92
+    5  0x00007fc871437536 in __GI___assert_fail
+        (assertion=0x5606413efd53 "ret == 0", file=0x5606413ef87d "../accel/kvm/kvm-all.c", line=1837, function=0x5606413f06f0 <__PRETTY_FUNCTION__.19> "kvm_irqchip_commit_routes") at assert.c:101
+    6  0x0000560640f884b5 in kvm_irqchip_commit_routes (s=0x560642cae1f0) at ../accel/kvm/kvm-all.c:1837
+    7  0x0000560640c98f8e in virtio_pci_one_vector_unmask
+        (proxy=0x560643c65f00, queue_no=4294967295, vector=0, msg=..., n=0x560643c6e4c8)
+        at ../hw/virtio/virtio-pci.c:1005
+    8  0x0000560640c99201 in virtio_pci_vector_unmask (dev=0x560643c65f00, vector=0, msg=...)
+        at ../hw/virtio/virtio-pci.c:1070
+    9  0x0000560640bc402e in msix_fire_vector_notifier (dev=0x560643c65f00, vector=0, is_masked=false)
+        at ../hw/pci/msix.c:120
+    10 0x0000560640bc40f1 in msix_handle_mask_update (dev=0x560643c65f00, vector=0, was_masked=true)
+        at ../hw/pci/msix.c:140
+    11 0x0000560640bc4503 in msix_table_mmio_write (opaque=0x560643c65f00, addr=12, val=0, size=4)
+        at ../hw/pci/msix.c:231
+    12 0x0000560640f26d83 in memory_region_write_accessor
+        (mr=0x560643c66540, addr=12, value=0x7fc86b7bc628, size=4, shift=0, mask=4294967295, attrs=...)
+        at ../system/memory.c:497
+    13 0x0000560640f270a6 in access_with_adjusted_size
+
+         (addr=12, value=0x7fc86b7bc628, size=4, access_size_min=1, access_size_max=4, access_fn=0x560640f26c8d <memory_region_write_accessor>, mr=0x560643c66540, attrs=...) at ../system/memory.c:573
+    14 0x0000560640f2a2b5 in memory_region_dispatch_write (mr=0x560643c66540, addr=12, data=0, op=MO_32, attrs=...)
+        at ../system/memory.c:1521
+    15 0x0000560640f37bac in flatview_write_continue
+        (fv=0x7fc65805e0b0, addr=4273803276, attrs=..., ptr=0x7fc871e9c028, len=4, addr1=12, l=4, mr=0x560643c66540)
+        at ../system/physmem.c:2714
+    16 0x0000560640f37d0f in flatview_write
+        (fv=0x7fc65805e0b0, addr=4273803276, attrs=..., buf=0x7fc871e9c028, len=4) at ../system/physmem.c:2756
+    17 0x0000560640f380bf in address_space_write
+        (as=0x560642161ae0 <address_space_memory>, addr=4273803276, attrs=..., buf=0x7fc871e9c028, len=4)
+        at ../system/physmem.c:2863
+    18 0x0000560640f3812c in address_space_rw
+        (as=0x560642161ae0 <address_space_memory>, addr=4273803276, attrs=..., buf=0x7fc871e9c028, len=4, is_write=true) at ../system/physmem.c:2873
+    --Type <RET> for more, q to quit, c to continue without paging--
+    19 0x0000560640f8aa55 in kvm_cpu_exec (cpu=0x560642f205e0) at ../accel/kvm/kvm-all.c:2915
+    20 0x0000560640f8d731 in kvm_vcpu_thread_fn (arg=0x560642f205e0) at ../accel/kvm/kvm-accel-ops.c:51
+    21 0x00005606411949f4 in qemu_thread_start (args=0x560642f292b0) at ../util/qemu-thread-posix.c:541
+    22 0x00007fc87148cdcd in start_thread (arg=<optimized out>) at pthread_create.c:442
+    23 0x00007fc871512630 in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:81
+    (gdb)
+
+    MST: coding style and typo fixups
+
+    Fixes: f9a09ca3ea ("vhost: add support for configure interrupt")
+    Cc: qemu-stable@nongnu.org
+    Signed-off-by: Cindy Lu <lulu@redhat.com>
+    Message-ID: <2321ade5f601367efe7380c04e3f61379c59b48f.1713173550.git.mst@redhat.com>
+    Cc: Lei Yang <leiyang@redhat.com>
+    Cc: Jason Wang <jasowang@redhat.com>
+    Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+    Tested-by: Cindy Lu <lulu@redhat.com>
+```
+
+Considering that it touches virtio-pci, the results seem plausible.
+
+This commit was also backported to stable as part of the 8.2.3 release, and indeed I have verified that that version suffers from the crash while 8.2.2 didn't.
+
+Reverting the commit makes the crash go away, but obviously the change was made for a reason so we probably need a follow-up fix rather than a plain revert.
+
+Crash and stack trace:
+
+```
+Thread 10 "qemu-system-x86" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fffe56006c0 (LWP 323938)]
+kvm_virtio_pci_vq_vector_use (vector=0, proxy=0x555558e04690) at ../hw/virtio/virtio-pci.c:817
+817	    if (irqfd->users == 0) {
+(gdb) t a a bt
+
+Thread 33 (Thread 0x7fffe6a006c0 (LWP 323987) "qemu-system-x86"):
+#0  0x00007ffff4ae1169 in __futex_abstimed_wait_common64 (private=0, cancel=true, abstime=0x7fffe69fb010, op=393, expected=0, futex_word=0x555557ad4370) at futex-internal.c:57
+#1  __futex_abstimed_wait_common (futex_word=futex_word@entry=0x555557ad4370, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7fffe69fb010, private=private@entry=0, cancel=cancel@entry=true) at futex-internal.c:87
+#2  0x00007ffff4ae11ef in __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x555557ad4370, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7fffe69fb010, private=private@entry=0) at futex-internal.c:139
+#3  0x00007ffff4ae3e72 in __pthread_cond_wait_common (abstime=0x7fffe69fb010, clockid=0, mutex=0x7fffe69faf90, cond=0x555557ad4348) at pthread_cond_wait.c:503
+#4  ___pthread_cond_timedwait64 (cond=cond@entry=0x555557ad4348, mutex=mutex@entry=0x555557ad42e0, abstime=abstime@entry=0x7fffe69fb010) at pthread_cond_wait.c:643
+#5  0x0000555555efc651 in qemu_cond_timedwait_ts (cond=cond@entry=0x555557ad4348, mutex=mutex@entry=0x555557ad42e0, ts=ts@entry=0x7fffe69fb010, file=file@entry=0x55555616c035 "../util/thread-pool.c", line=line@entry=91) at ../util/qemu-thread-posix.c:239
+#6  0x0000555555efd2f8 in qemu_cond_timedwait_impl (cond=0x555557ad4348, mutex=0x555557ad42e0, ms=<optimized out>, file=0x55555616c035 "../util/thread-pool.c", line=91) at ../util/qemu-thread-posix.c:253
+#7  0x0000555555f129bc in worker_thread (opaque=opaque@entry=0x555557ad42d0) at ../util/thread-pool.c:91
+#8  0x0000555555efc4c8 in qemu_thread_start (args=0x555557aef190) at ../util/qemu-thread-posix.c:541
+#9  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#10 0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 32 (Thread 0x7fffece006c0 (LWP 323986) "qemu-system-x86"):
+#0  0x00007ffff4ae1169 in __futex_abstimed_wait_common64 (private=0, cancel=true, abstime=0x7fffecdfb010, op=393, expected=0, futex_word=0x555557ad4374) at futex-internal.c:57
+#1  __futex_abstimed_wait_common (futex_word=futex_word@entry=0x555557ad4374, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7fffecdfb010, private=private@entry=0, cancel=cancel@entry=true) at futex-internal.c:87
+#2  0x00007ffff4ae11ef in __GI___futex_abstimed_wait_cancelable64 (futex_word=futex_word@entry=0x555557ad4374, expected=expected@entry=0, clockid=clockid@entry=0, abstime=abstime@entry=0x7fffecdfb010, private=private@entry=0) at futex-internal.c:139
+#3  0x00007ffff4ae3e72 in __pthread_cond_wait_common (abstime=0x7fffecdfb010, clockid=0, mutex=0x7fffecdfaf90, cond=0x555557ad4348) at pthread_cond_wait.c:503
+#4  ___pthread_cond_timedwait64 (cond=cond@entry=0x555557ad4348, mutex=mutex@entry=0x555557ad42e0, abstime=abstime@entry=0x7fffecdfb010) at pthread_cond_wait.c:643
+#5  0x0000555555efc651 in qemu_cond_timedwait_ts (cond=cond@entry=0x555557ad4348, mutex=mutex@entry=0x555557ad42e0, ts=ts@entry=0x7fffecdfb010, file=file@entry=0x55555616c035 "../util/thread-pool.c", line=line@entry=91) at ../util/qemu-thread-posix.c:239
+#6  0x0000555555efd2f8 in qemu_cond_timedwait_impl (cond=0x555557ad4348, mutex=0x555557ad42e0, ms=<optimized out>, file=0x55555616c035 "../util/thread-pool.c", line=91) at ../util/qemu-thread-posix.c:253
+#7  0x0000555555f129bc in worker_thread (opaque=opaque@entry=0x555557ad42d0) at ../util/thread-pool.c:91
+#8  0x0000555555efc4c8 in qemu_thread_start (args=0x555557aee7b0) at ../util/qemu-thread-posix.c:541
+#9  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#10 0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x7fffe56006c0 (LWP 323938) "qemu-system-x86"):
+#0  kvm_virtio_pci_vq_vector_use (vector=0, proxy=0x555558e04690) at ../hw/virtio/virtio-pci.c:817
+#1  kvm_virtio_pci_vector_use_one (proxy=0x555558e04690, queue_no=5) at ../hw/virtio/virtio-pci.c:893
+#2  0x0000555555cde680 in memory_region_write_accessor (mr=0x555558e05230, addr=26, value=<optimized out>, size=2, shift=<optimized out>, mask=<optimized out>, attrs=...) at ../system/memory.c:497
+#3  0x0000555555cddf26 in access_with_adjusted_size (addr=addr@entry=26, value=value@entry=0x7fffe55fae78, size=size@entry=2, access_size_min=<optimized out>, access_size_max=<optimized out>, access_fn=0x555555cde600 <memory_region_write_accessor>, mr=<optimized out>, attrs=...) at ../system/memory.c:573
+#4  0x0000555555cde271 in memory_region_dispatch_write (mr=mr@entry=0x555558e05230, addr=addr@entry=26, data=<optimized out>, op=<optimized out>, attrs=attrs@entry=...) at ../system/memory.c:1528
+#5  0x0000555555ce623f in flatview_write_continue_step (attrs=attrs@entry=..., buf=buf@entry=0x7fffeef80028 "", mr_addr=26, l=l@entry=0x7fffe55faf90, mr=0x555558e05230, len=2) at ../system/physmem.c:2757
+#6  0x0000555555ce6918 in flatview_write_continue (mr=<optimized out>, l=<optimized out>, mr_addr=<optimized out>, len=2, ptr=0x8100401a, attrs=..., addr=2164277274, fv=0x7fff343ec810) at ../system/physmem.c:2787
+#7  flatview_write (fv=0x7fff343ec810, addr=addr@entry=2164277274, attrs=attrs@entry=..., buf=buf@entry=0x7fffeef80028, len=len@entry=2) at ../system/physmem.c:2818
+#8  0x0000555555ce9e61 in address_space_write (len=2, buf=0x7fffeef80028, attrs=..., addr=2164277274, as=0x555556e03d40 <address_space_memory>) at ../system/physmem.c:2938
+#9  address_space_rw (as=0x555556e03d40 <address_space_memory>, addr=2164277274, attrs=attrs@entry=..., buf=buf@entry=0x7fffeef80028, len=2, is_write=<optimized out>) at ../system/physmem.c:2948
+#10 0x0000555555d45118 in kvm_cpu_exec (cpu=cpu@entry=0x555557cde8b0) at ../accel/kvm/kvm-all.c:3031
+#11 0x0000555555d46845 in kvm_vcpu_thread_fn (arg=arg@entry=0x555557cde8b0) at ../accel/kvm/kvm-accel-ops.c:50
+#12 0x0000555555efc4c8 in qemu_thread_start (args=0x555557c5a370) at ../util/qemu-thread-posix.c:541
+#13 0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#14 0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7fffe60006c0 (LWP 323937) "qemu-system-x86"):
+#0  futex_wait (private=0, expected=2, futex_word=0x555556deffe0 <bql>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x555556deffe0 <bql>, private=0) at lowlevellock.c:49
+#2  0x00007ffff4ae7e41 in lll_mutex_lock_optimized (mutex=0x555556deffe0 <bql>) at pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x555556deffe0 <bql>) at pthread_mutex_lock.c:93
+#4  0x0000555555efc8c3 in qemu_mutex_lock_impl (mutex=0x555556deffe0 <bql>, file=0x5555560e97ca "../system/physmem.c", line=2689) at ../util/qemu-thread-posix.c:94
+#5  0x0000555555ad6082 in bql_lock_impl (file=file@entry=0x5555560e97ca "../system/physmem.c", line=line@entry=2689) at ../system/cpus.c:536
+#6  0x0000555555ce632f in prepare_mmio_access (mr=0x55555874c4b0) at ../system/physmem.c:2689
+#7  flatview_write_continue_step (attrs=..., attrs@entry=..., buf=buf@entry=0x7fffeef83028 "", mr_addr=536, l=l@entry=0x7fffe5ffaf90, mr=0x55555874c4b0, len=4) at ../system/physmem.c:2738
+#8  0x0000555555ce6918 in flatview_write_continue (mr=<optimized out>, l=<optimized out>, mr_addr=<optimized out>, len=4, ptr=0x81084218, attrs=..., addr=2164802072, fv=0x7fff343ec810) at ../system/physmem.c:2787
+#9  flatview_write (fv=0x7fff343ec810, addr=addr@entry=2164802072, attrs=attrs@entry=..., buf=buf@entry=0x7fffeef83028, len=len@entry=4) at ../system/physmem.c:2818
+#10 0x0000555555ce9e61 in address_space_write (len=4, buf=0x7fffeef83028, attrs=..., addr=2164802072, as=0x555556e03d40 <address_space_memory>) at ../system/physmem.c:2938
+#11 address_space_rw (as=0x555556e03d40 <address_space_memory>, addr=2164802072, attrs=attrs@entry=..., buf=buf@entry=0x7fffeef83028, len=4, is_write=<optimized out>) at ../system/physmem.c:2948
+#12 0x0000555555d45118 in kvm_cpu_exec (cpu=cpu@entry=0x555557dbdcd0) at ../accel/kvm/kvm-all.c:3031
+#13 0x0000555555d46845 in kvm_vcpu_thread_fn (arg=arg@entry=0x555557dbdcd0) at ../accel/kvm/kvm-accel-ops.c:50
+#14 0x0000555555efc4c8 in qemu_thread_start (args=0x555557c0b4a0) at ../util/qemu-thread-posix.c:541
+#15 0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#16 0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x7fffe74006c0 (LWP 323934) "dconf worker"):
+#0  0x00007ffff4b5de3d in __GI___poll (fds=0x7fffc8000b90, nfds=1, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007ffff6e38f04 in g_main_context_poll_unlocked (priority=2147483647, n_fds=1, fds=0x7fffc8000b90, timeout=<optimized out>, context=0x555557adfef0) at ../glib/gmain.c:4653
+#2  g_main_context_iterate_unlocked.isra.0 (context=context@entry=0x555557adfef0, block=block@entry=1, dispatch=dispatch@entry=1, self=<optimized out>) at ../glib/gmain.c:4344
+#3  0x00007ffff6ddbad3 in g_main_context_iteration (context=context@entry=0x555557adfef0, may_block=may_block@entry=1) at ../glib/gmain.c:4414
+#4  0x00007ffff7fb16b5 in dconf_gdbus_worker_thread (user_data=0x555557adfef0) at ../gdbus/dconf-gdbus-thread.c:82
+#5  0x00007ffff6e0e573 in g_thread_proxy (data=0x555557ae00d0) at ../glib/gthread.c:831
+#6  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#7  0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x7fffe7e006c0 (LWP 323933) "gdbus"):
+#0  0x00007ffff4b5de3d in __GI___poll (fds=0x7fffd0000b90, nfds=3, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007ffff6e38f04 in g_main_context_poll_unlocked (priority=2147483647, n_fds=3, fds=0x7fffd0000b90, timeout=<optimized out>, context=0x7fffd4005a90) at ../glib/gmain.c:4653
+#2  g_main_context_iterate_unlocked.isra.0 (context=0x7fffd4005a90, block=block@entry=1, dispatch=dispatch@entry=1, self=<optimized out>) at ../glib/gmain.c:4344
+#3  0x00007ffff6ddf447 in g_main_loop_run (loop=0x7fffd4005b80) at ../glib/gmain.c:4551
+#4  0x00007ffff7048bc2 in gdbus_shared_thread_func (user_data=0x7fffd4005a60) at ../gio/gdbusprivate.c:284
+#5  0x00007ffff6e0e573 in g_thread_proxy (data=0x7fffd4005bc0) at ../glib/gthread.c:831
+#6  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#7  0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7fffed8006c0 (LWP 323931) "gmain"):
+#0  0x00007ffff4b5de3d in __GI___poll (fds=0x555557acd200, nfds=1, timeout=-1) at ../sysdeps/unix/sysv/linux/poll.c:29
+#1  0x00007ffff6e38f04 in g_main_context_poll_unlocked (priority=2147483647, n_fds=1, fds=0x555557acd200, timeout=<optimized out>, context=0x555557accfd0) at ../glib/gmain.c:4653
+#2  g_main_context_iterate_unlocked.isra.0 (context=context@entry=0x555557accfd0, block=block@entry=1, dispatch=dispatch@entry=1, self=<optimized out>) at ../glib/gmain.c:4344
+#3  0x00007ffff6ddbad3 in g_main_context_iteration (context=0x555557accfd0, may_block=may_block@entry=1) at ../glib/gmain.c:4414
+#4  0x00007ffff6ddbb29 in glib_worker_main (data=<optimized out>) at ../glib/gmain.c:6574
+#5  0x00007ffff6e0e573 in g_thread_proxy (data=0x555557ac1140) at ../glib/gthread.c:831
+#6  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#7  0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7fffee2006c0 (LWP 323930) "pool-spawner"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007ffff6e35b7d in g_cond_wait (cond=0x555557ac5f28, mutex=0x555557ac5f20) at ../glib/gthread-posix.c:1552
+#2  0x00007ffff6da922b in g_async_queue_pop_intern_unlocked (queue=0x555557ac5f20, wait=1, end_time=-1) at ../glib/gasyncqueue.c:425
+#3  0x00007ffff6e123e3 in g_thread_pool_spawn_thread (data=<optimized out>) at ../glib/gthreadpool.c:311
+#4  0x00007ffff6e0e573 in g_thread_proxy (data=0x555557ac7800) at ../glib/gthread.c:831
+#5  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#6  0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x7fffeec006c0 (LWP 323929) "qemu-system-x86"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000555555efd7ca in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /home/abologna/src/upstream/qemu/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0x555556e182e8 <rcu_call_ready_event>) at ../util/qemu-thread-posix.c:464
+#3  0x0000555555f07216 in call_rcu_thread (opaque=opaque@entry=0x0) at ../util/rcu.c:278
+#4  0x0000555555efc4c8 in qemu_thread_start (args=0x555556ea0ed0) at ../util/qemu-thread-posix.c:541
+#5  0x00007ffff4ae4897 in start_thread (arg=<optimized out>) at pthread_create.c:444
+#6  0x00007ffff4b6ba5c in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7fffef0864c0 (LWP 323692) "qemu-system-x86"):
+#0  futex_wait (private=0, expected=2, futex_word=0x555556deffe0 <bql>) at ../sysdeps/nptl/futex-internal.h:146
+#1  __GI___lll_lock_wait (futex=futex@entry=0x555556deffe0 <bql>, private=0) at lowlevellock.c:49
+#2  0x00007ffff4ae7e41 in lll_mutex_lock_optimized (mutex=0x555556deffe0 <bql>) at pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x555556deffe0 <bql>) at pthread_mutex_lock.c:93
+#4  0x0000555555efc8c3 in qemu_mutex_lock_impl (mutex=0x555556deffe0 <bql>, file=0x55555616b7ef "../util/main-loop.c", line=308) at ../util/qemu-thread-posix.c:94
+#5  0x0000555555ad6082 in bql_lock_impl (file=file@entry=0x55555616b7ef "../util/main-loop.c", line=line@entry=308) at ../system/cpus.c:536
+#6  0x0000555555f109a6 in os_host_main_loop_wait (timeout=6299288) at ../util/main-loop.c:308
+#7  main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:589
+#8  0x0000555555ae0ce9 in qemu_main_loop () at ../system/runstate.c:795
+#9  0x0000555555d50f66 in qemu_default_main () at ../system/main.c:37
+#10 0x00007ffff4a7e14a in __libc_start_call_main (main=main@entry=0x555555897b80 <main>, argc=argc@entry=29, argv=argv@entry=0x7fffffffe0e8) at ../sysdeps/nptl/libc_start_call_main.h:58
+#11 0x00007ffff4a7e20b in __libc_start_main_impl (main=0x555555897b80 <main>, argc=29, argv=0x7fffffffe0e8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7fffffffe0d8) at ../csu/libc-start.c:360
+#12 0x00005555558998a5 in _start ()
+```

@@ -1,0 +1,47 @@
+<think>
+Okay, I'm trying to figure out why the kernel is panicking when I run QEMU with the given setup. Let me go through this step by step.
+
+First, I see that after running QEMU, there's a panic message about "Kernel panic - not syncing: panic_on_warn set ...". This suggests that some condition triggered a warning, and since panic_on_warn is enabled, it caused a crash.
+
+Looking at the steps to reproduce, the user sets up NUMA emulation with two nodes but doesn't specify which CPUs or memory go where. They just use `numa=fake=2`. The build configuration includes `NUMA_EMU` and `CMDLINE_BOOL`, setting the command line parameters to "numa=fake=2 panic_on_warn=1".
+
+When running QEMU without explicit NUMA configuration, it's possible that the kernel isn't handling the fake NUMA setup correctly. The error might be related to how the CPUs are being assigned to the nodes or how memory is being allocated.
+
+In the additional information section, the user mentions that when they explicitly define the NUMA setup using QEMU options like `-numa node,cpus=0-1,nodeid=0`, it works fine. This indicates that without explicit configuration, something goes wrong.
+
+I remember that in the kernel, there's a function called `set_cpu_sibling_map` which is involved in setting up CPU topology information for each node. The backtrace shows this function being called when the panic occurs. So perhaps during the setup of fake NUMA nodes, the sibling map isn't being correctly initialized, leading to an inconsistency that triggers a warning and then a panic.
+
+The kernel might be checking if the topology is sane after setting up the CPU siblings. If it's not, `topology_sane.isra.0` returns false, causing the warning, which then leads to a panic because of `panic_on_warn`.
+
+So why does this happen only when using the default NUMA setup and not with explicit configuration? Maybe when explicitly defining each node's CPUs, the kernel can properly set up the sibling maps. But without explicit definitions, it might be assigning all CPUs to one node or causing some overlap, leading to an inconsistent topology.
+
+I should check how `numa=fake=2` is interpreted by QEMU and the kernel. Does it create two nodes with equal CPU and memory distribution automatically? Or does it require more specific configuration?
+
+In the user's host machine, they have two NUMA nodes (0 and 1) with a lot of CPUs each. But in their test setup, they're running a QEMU VM which might not be utilizing all those CPUs. The default fake=2 might create two nodes but perhaps isn't assigning any specific CPUs to them, leading the kernel to handle it incorrectly.
+
+Maybe the problem is that without explicit CPU assignments, the kernel's `set_cpu_sibling_map` function doesn't have enough information and ends up in a bad state, causing the topology check to fail. When that happens with `panic_on_warn`, it crashes.
+
+To fix this, perhaps using the explicit NUMA configuration as shown in the additional steps is necessary. Alternatively, adjusting how fake=2 works might help, but I'm not sure if that's feasible without more kernel knowledge.
+
+Another angle: since the panic occurs during the secondary CPU initialization (as seen from `start_secondary` and `secondary_startup_64_no_verify` in the backtrace), maybe some APs (Asynchronous Processors) are not being handled correctly when the topology is fake.
+
+In summary, the issue likely stems from the kernel's NUMA emulation setup without explicit configuration causing an inconsistent CPU topology, which triggers a warning that leads to a panic because `panic_on_warn` is enabled. Using explicit node definitions seems to bypass this problem by providing clear instructions on how CPUs and memory should be distributed.
+</think>
+
+The kernel panic occurs due to an inconsistent CPU topology during fake NUMA setup when running QEMU without explicit configuration. The issue arises because the default `numa=fake=2` doesn't assign specific CPUs to nodes, leading the kernel's topology checks to fail. This triggers a warning that causes a panic since `panic_on_warn` is set.
+
+**Solution:** Use explicit NUMA node definitions in QEMU to properly configure CPU assignments and avoid the inconsistency causing the panic.
+
+---
+
+To resolve this issue, ensure that each NUMA node is explicitly assigned CPUs using QEMU's `-numa` option. This provides clear instructions for the kernel, preventing topology inconsistencies and allowing the system to boot successfully without triggering a panic.
+
+**Answer:**
+
+The problem arises because the default fake NUMA configuration doesn't assign specific CPUs to nodes, leading to an inconsistent CPU topology that triggers a warning and subsequent panic. To fix this, explicitly define each node's CPUs in QEMU as shown below:
+
+```bash
+./qemu-system-x86_64 -m 4G -smp 2 -numa node,cpus=0-1,nodeid=0 -numa node,cpus=2-3,nodeid=1 ...
+```
+
+This explicit configuration ensures the kernel correctly initializes CPU siblings, allowing the system to boot without panic.

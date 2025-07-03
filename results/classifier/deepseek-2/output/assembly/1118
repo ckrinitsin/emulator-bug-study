@@ -1,0 +1,76 @@
+
+[AVR] Interrupt skips to incorrect handler when raised after skipping instruction
+Description of problem:
+If interrupt is raised after instruction that can skip following instruction (for example `CPSE`), and skip condition is active, instead of correct vector, one after it is executed. 
+
+This can happen only if CPSE instruction is at the end of translation block. Usually it is somewhere inside block and very rare arrangement of code is required to get into that error.
+Steps to reproduce:
+Real world scenario is waiting in busy loop for `std::atomic<bool>` set by interrupt, in bigger application, with optimized code and rare chance of code arrangement. Effect usually is landing in `__bad_interrupt` and reset, but can also be executing other interrupt handler.
+
+Synthetic example is:
+
+1. There must be instruction that can skip following instruction (for example `CPSE`), with always-active condition for skip
+2. It must be placed in way, that it will be at the end of translation block.
+
+	Example (addresses matter):
+```
+     ff8:	81 e0       	ldi	r24, 0x01	; 1
+     ffa:	88 13       	cpse	r24, r24
+     ffc:	01 c0       	rjmp	.+2      	; 0x1000
+     ffe:	80 e0       	ldi	r24, 0x00	; 0
+    1000:	00 00       	nop
+```
+
+3. It should be busy-looped to raise chances of encountering that code
+4. Any external interrupt should be generated
+	- the simplest is UART RX on stdin raised by key presses
+
+Fully working example attached, with ELF file, annotated C code, ASM dump, and Makefile that allows compiling and running this scenario (but I don't guarantee that self-compiling would always generate this error - it can move code a bit). 
+
+(please adjust paths to GCC and QEMU in Makefile before using)
+
+[avr-irq-fail.zip](/uploads/b702104098a31754d544d6ae6e60e074/avr-irq-fail.zip)
+
+Running by command:
+
+    ./qemu-system-avr -machine arduino-uno -nographic -monitor null -serial stdio -bios fail.elf
+
+And then press any key until error happens.
+
+It is largely machine independent, I originally encountered that on custom Atmega644 machine.
+Additional information:
+Annotated execution log output of `in_asm`, real-world example:
+
+```
+----------------
+IN: _ZNKSt6atomicIbEcvbEv
+0x00000ff4:  MOVW      r31:r30, r25:r24
+0x00000ff6:  LDDZ      r25, Z+0
+0x00000ff8:  LDI       r24, 1
+0x00000ffa:  CPSE      r25, r1            // <-------------------- it must looks like that, with CPSE at the end
+
+----------------
+IN: _ZNKSt6atomicIbEcvbEv
+0x00000ffc:  RJMP      .+2
+
+----------------
+IN: _ZNKSt6atomicIbEcvbEv
+0x00001000:  RET
+...
+```
+and then:
+```
+// <-------------------- INT 20 raised
+...
+----------------
+IN:
+0x00000050:  JMP       0x1002  // <-- correct vector loaded...
+
+----------------
+IN:
+0x00000054:  JMP       0x1012  // <-- ...but skipping to one after that...
+
+----------------
+IN: __vector_21     // <-- ...and executing incorrect handler
+...
+```

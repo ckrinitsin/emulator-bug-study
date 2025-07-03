@@ -1,0 +1,57 @@
+
+Qemu with -accel whpx doesn't set WRMSR permissions, which blocks nested virtualization
+Description of problem:
+This bug blocks https://gitlab.com/qemu-project/qemu/-/issues/628
+
+Qemu doesn't set the host's Hyper-V permissions for WRMSR command to allow using SVM or VMX. Unset permissions lead to `unchecked MSR access error: WRMSR to 0xc0000080` inside Linux VM when trying to launch nested VM on real AMD cpu. Intel users do not see guest VMX feature at all. Please see **Additional info** section to understand how Hyper-V permissions for nested virtualization work in Windows.
+Steps to reproduce:
+1. Turn on VT-x (for Intel) or AMD-V virtualization in your real hardware BIOS/EFI. This was tested only on AMD cpu and Qemu 9, Intel \*may\* behave differently.
+ 2. Install any distro in qemu disk c:\\linux_disk.qcow2 with MSR enabled in kernel, for example, Ubuntu 22.04 LTS.
+ 3. Run qemu using `qemu-system-x86_64.exe -m 2048 -machine q35 -accel whpx -cpu Opteron_G5,check,+svm -hda c:\linux_disk.qcow2`
+
+    To check if your distro has MSR mod enabled, run `grep -i msr /boot/config-$(uname -r)` and it should return `CONFIG_X86_MSR=m` or `CONFIG_X86_MSR=y`. If not, recompile and reinstall your kernel.
+ 4. Run `sudo modprobe msr` and then `sudo rdmsr 0xc0000080 #EFER`. You should see `d01` on modern AMD models. \[Untested\] For intel, run `sudo modprobe msr`, then `sudo rdmsr 0x3A`. You should see `5` or `0x5` or `0x100005`. d01 for AMD and 5 for Intel in output are necessary to enable nested VM. If RDMSR returns non-zero value, it means that qemu developers implemented this part of functionality and your Hyper-V on Windows is not broken.
+ 5. Run `cat /proc/cpuinfo | grep -c svm` on AMD cpu, which should output a positive digit.
+ 6. Run `sudo dmesg | grep kvm` and note:
+
+    `[1.924036] kvm_amd: Nested Virtualization enabled`
+
+    `[1.924038] kvm_amd: Nested Paging disabled`\
+    `[1.924040] kvm_amd: PMU virtualization is disabled`
+ 7. This, in theory, is sufficient for KVM-acclelerated qemu to start a nested VM.
+ 8. Run `xhost si:localuser:root` to prevent `gtk initialization failed` error
+ 9. Run `sudo qemu-system-x86_64 -accel kvm`. A black window with "Guest has not initialized the display (yet)." appears.
+10. Run `sudo dmesg` and note qemu crash starting with `unchecked MSR access error: WRMSR`
+
+    \* Steps 1-4 are only required for diagnostics, and KVM works (in native Windows Hyper-V manager) without the necessarity to enter these commands in usual usage scenarios. If you run <span dir="">`cat /proc/cpuinfo | grep -c vmx` on Intel cpu</span> on Step 5, you may get zero. See Step 5 of Additional Info to understand why.
+
+    \
+    Microsoft released useful info about how to look into Hyper-V MSR access problems:\
+    WRMSR research in Hyper-V - https://msrc.microsoft.com/blog/2018/12/first-steps-in-hyper-v-research/
+Additional information:
+By default, Hyper-V manager in Windows does not allow nested virtualization.\
+To see what happens, do the following:
+
+ 1. Open Hyper-V manager built in the host Windows and create default Ubuntu 22.04 LTS suggested. Upon installation, shut down the VM. Note the name of the VM ("Ubuntu 22.04 LTS" by default).
+ 2. Open Powershell console in the host and run `Set-VMProcessor -VMName "Ubuntu 22.04 LTS" -ExposeVirtualizationExtensions $false`
+ 3. Launch guest Ubuntu 22.04 LTS, open its terminal and run `sudo dmesg | grep kvm`. No output.
+ 4. Run `sudo rdmsr 0xc0000080 #EFER` that outputs d01, which means that Hyper-V manager allows this **ring 0 level** operation.
+ 5. Run `cat /proc/cpuinfo | grep -c svm` for AMD or `cat /proc/cpuinfo | grep -c vmx`  for Intel. Note that output is `0`.
+ 6. Shut the VM down.
+ 7. Now, Open Powershell console and `run Set-VMProcessor -VMName "Ubuntu 22.04 LTS" -ExposeVirtualizationExtensions $true`
+ 8. Launch Ubuntu 22.04 LTS, open its terminal and run `sudo dmesg | grep kvm`. Output:
+
+    `[2.369144] kvm: Nested Virtualization enabled`
+
+    `[2.369146] SVM: kvm: Nested Paging enabled`
+
+    `[2.369148] SVM: kvm: Hyper-V enlightened NPT TLB flush enabled`
+
+    `[2.369149] SVM: kvm: Hyper-V Direct TLB flush enabled`
+
+    `[2.369153] SVM: Virtual VMLOAD VMSAVE supported`
+ 9. Run `cat /proc/cpuinfo | grep -c svm` for AMD or `cat /proc/cpuinfo | grep -c vmx`  for Intel. Note that output is `1` or other positive digit, depending on the number of cpus you've assigned to the VM.
+10. Run `xhost si:localuser:root` to prevent `gtk initialization failed` error
+11. Run `sudo qemu-system-x86_64 -accel kvm` and it successfully boots into qemu BIOS.
+12. Running `sudo qemu-system-x86_64 -accel kvm` calls WRMSR in background, so if you see\
+    booted qemu BIOS in KVM, wrmsr was successfully called.

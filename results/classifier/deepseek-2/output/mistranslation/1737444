@@ -1,0 +1,94 @@
+
+gccgo setcontext conftest crashes qemu-sh4
+
+While testing gccgo on sh4 to add SH platform definitions to libgo, I discovered that the following conftest program which is part of the libgo configure script crashes on qemu-sh4:
+
+(sid-sh4-sbuild)root@z6:/# cat setcontext.c
+#include <pthread.h>                                                                                                                                                                                                                                                           
+#include <stdlib.h>                                                                                                                                                                                                                                                            
+#include <ucontext.h>                                                                                                                                                                                                                                                          
+#include <unistd.h>                                                                                                                                                                                                                                                            
+
+__thread int tls;
+
+static char stack[10 * 1024 * 1024];
+static ucontext_t c;
+
+/* Called via makecontext/setcontext.  */
+
+static void
+cfn (void)
+{
+  exit (tls);
+}
+
+/* Called via pthread_create.  */
+
+static void *
+tfn (void *dummy)
+{
+  /* The thread should still see this value after calling
+     setcontext.  */
+  tls = 0;
+
+  setcontext (&c);
+
+  /* The call to setcontext should not return.  */
+  abort ();
+}
+
+int
+main ()
+{
+  pthread_t tid;
+
+  /* The thread should not see this value.  */
+  tls = 1;
+
+  if (getcontext (&c) < 0)
+    abort ();
+
+  c.uc_stack.ss_sp = stack;
+#ifdef MAKECONTEXT_STACK_TOP                                                                                                                                                                                                                                                   
+  c.uc_stack.ss_sp += sizeof stack;
+#endif                                                                                                                                                                                                                                                                         
+  c.uc_stack.ss_flags = 0;
+  c.uc_stack.ss_size = sizeof stack;
+  c.uc_link = NULL;
+  makecontext (&c, cfn, 0);
+
+  if (pthread_create (&tid, NULL, tfn, NULL) != 0)
+    abort ();
+
+  if (pthread_join (tid, NULL) != 0)
+    abort ();
+
+  /* The thread should have called exit.  */
+  abort ();
+}
+
+(sid-sh4-sbuild)root@z6:/# gcc -o setcontext -lpthread setcontext.c
+(sid-sh4-sbuild)root@z6:/# ./setcontext 
+Unhandled trap: 0x180
+pc=0x7f69235e sr=0x00000000 pr=0x00400710 fpscr=0x00080000
+spc=0x00000000 ssr=0x00000000 gbr=0x7f658478 vbr=0x00000000
+sgr=0x00000000 dbr=0x00000000 delayed_pc=0x7f692320 fpul=0x00000000
+r0=0x00e11158 r1=0x00000000 r2=0x00000001 r3=0x7ffff2e0
+r4=0x00e11068 r5=0x7ffff314 r6=0x7ffff31c r7=0x00000000
+r8=0x004007b0 r9=0x00000000 r10=0x00000000 r11=0x00000000
+r12=0x7f79ac54 r13=0x00000000 r14=0x7ffff288 r15=0x7ffff288
+r16=0x00000000 r17=0x00000000 r18=0x00000000 r19=0x00000000
+r20=0x00000000 r21=0x00000000 r22=0x00000000 r23=0x00000000
+(sid-sh4-sbuild)root@z6:/#
+
+The same code works fine on my Renesas SH7785LCR evaluation board:
+
+root@tirpitz:~> uname -a
+Linux tirpitz 3.16.7-ckt7 #8 PREEMPT Fri Oct 21 18:47:41 CEST 2016 sh4a GNU/Linux
+root@tirpitz:~> gcc -o setcontext setcontext.c  -lpthread
+root@tirpitz:~> ./setcontext 
+root@tirpitz:~> echo $?
+0
+root@tirpitz:~>
+
+Due to this bug, it is not possible to compile gcc-7 with the Go frontend enabled on qemu-sh4.

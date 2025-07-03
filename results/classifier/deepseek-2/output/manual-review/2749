@@ -1,0 +1,80 @@
+
+TSAN/RaceHunter data race on bh->flags in aio_compute_bh_timeout
+Description of problem:
+Switching the TSAN build for `test-aio-multithread` unit test reveals the data race on `bh->flags` in `aio_compute_bh_timeout`.
+
+The same data race can be found in the list of warnings in #851 and #1496.
+
+I investigated the data race and I can reproduce the same race with our tool RaceHunter on the test `tests/unit/test-thread-pool.c` where two accesses may happen simultaneously. It is not false alarm, because RaceHunter introduces the delay and catches both accesses exactly at the same time, not just predicting the race due to missing happens-before as TSAN does.
+
+```
+WARNING: SMC RaceHunter: Data race found:
+  read access from thread 0 [handle=0]  at pc=0x55b851f660b9, addr=7b1000000168 (4 bytes)
+    #0 aio_compute_bh_timeout util/async.c:259:18
+    #1 aio_compute_timeout util/async.c:282:15
+    #2 aio_poll util/aio-posix.c:628:26 (test-thread-pool+0xa4223f)
+    #3 test_submit_aio tests/unit/test-thread-pool.c:70:9
+    #4 main tests/unit/test-thread-pool.c
+
+  Previous atomic write access from thread 4 [handle=4]  at pc=0x55b851f65e24, addr=7b1000000168 (4 bytes)
+    #0 aio_bh_enqueue util/async.c:81:17
+    #1 qemu_bh_schedule util/async.c:235:5
+    #2 worker_thread util/thread-pool.c:118:9
+    #3 qemu_thread_start util/qemu-thread-posix.c:543:9
+```
+
+Both are accesses to `flags` in `BHList` (`bh->flags`)
+The write access in `aio_bh_enqueue` is protected by atomic operation `qatomic_fetch_or` while second read access is not atomic and not protected by locks.
+
+The read access in `aio_compute_bh_timeout` seems to rely on RCU mechanism `QSLIST_FOREACH_RCU(bh, head, next)`, but in this case the writer should also use RCU protected assign.
+Steps to reproduce:
+1. configure --enable-tsan --cc=clang --cxx=clang++ --enable-trace-backends=ust --enable-fdt=system --disable-slirp
+2. make check-unit test-aio-multithread
+3. See the warning in the log
+```
+WARNING: ThreadSanitizer: data race (pid=3514443)
+  Atomic write of size 4 at 0x7b1000000168 by thread T17:
+    #0 aio_bh_enqueue /home/mordan/qemu/build/../util/async.c:81:17 (test-thread-pool+0xa5e933)
+    #1 qemu_bh_schedule /home/mordan/qemu/build/../util/async.c:235:5 (test-thread-pool+0xa5e933)
+    #2 worker_thread /home/mordan/qemu/build/../util/thread-pool.c:118:9 (test-thread-pool+0xa66153)
+    #3 qemu_thread_start /home/mordan/qemu/build/../util/qemu-thread-posix.c:543:9 (test-thread-pool+0xa496c0)
+
+  Previous read of size 4 at 0x7b1000000168 by main thread:
+    #0 aio_compute_bh_timeout /home/mordan/qemu/build/../util/async.c:259:18 (test-thread-pool+0xa5ebc8)
+    #1 aio_compute_timeout /home/mordan/qemu/build/../util/async.c:282:15 (test-thread-pool+0xa5ebc8)
+    #2 aio_poll /home/mordan/qemu/build/../util/aio-posix.c:628:26 (test-thread-pool+0xa42d4f)
+    #3 do_test_cancel /home/mordan/qemu/build/../tests/unit/test-thread-pool.c:199:9 (test-thread-pool+0x50f0e8)
+    #4 test_cancel_async /home/mordan/qemu/build/../tests/unit/test-thread-pool.c:230:5 (test-thread-pool+0x50ec01)
+    #5 <null> <null> (libglib-2.0.so.0+0x7daed) (BuildId: e845b8fd2f396872c036976626389ffc4f50c9c5)
+    #6 __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16 (libc.so.6+0x29d8f) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+  As if synchronized via sleep:
+    #0 nanosleep out/lib/clangrt-x86_64-unknown-linux-gnu/./out/lib/clangrt-x86_64-unknown-linux-gnu/./toolchain/llvm-project/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp:365:3 (test-thread-pool+0x34507d)
+    #1 g_usleep <null> (libglib-2.0.so.0+0x7ff76) (BuildId: e845b8fd2f396872c036976626389ffc4f50c9c5)
+    #2 worker_thread /home/mordan/qemu/build/../util/thread-pool.c:111:15 (test-thread-pool+0xa66115)
+    #3 qemu_thread_start /home/mordan/qemu/build/../util/qemu-thread-posix.c:543:9 (test-thread-pool+0xa496c0)
+
+  Location is heap block of size 56 at 0x7b1000000140 allocated by main thread:
+    #0 malloc out/lib/clangrt-x86_64-unknown-linux-gnu/./out/lib/clangrt-x86_64-unknown-linux-gnu/./toolchain/llvm-project/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp:667:5 (test-thread-pool+0x346151)
+    #1 g_malloc <null> (libglib-2.0.so.0+0x5e738) (BuildId: e845b8fd2f396872c036976626389ffc4f50c9c5)
+    #2 thread_pool_init_one /home/mordan/qemu/build/../util/thread-pool.c:333:27 (test-thread-pool+0xa655c8)
+    #3 thread_pool_new /home/mordan/qemu/build/../util/thread-pool.c:348:5 (test-thread-pool+0xa655c8)
+    #4 aio_get_thread_pool /home/mordan/qemu/build/../util/async.c:441:28 (test-thread-pool+0xa5ed54)
+    #5 thread_pool_submit_aio /home/mordan/qemu/build/../util/thread-pool.c:246:24 (test-thread-pool+0xa64f0d)
+    #6 thread_pool_submit /home/mordan/qemu/build/../util/thread-pool.c:295:5 (test-thread-pool+0xa65362)
+    #7 test_submit /home/mordan/qemu/build/../tests/unit/test-thread-pool.c:49:5 (test-thread-pool+0x50e53f)
+    #8 <null> <null> (libglib-2.0.so.0+0x7daed) (BuildId: e845b8fd2f396872c036976626389ffc4f50c9c5)
+    #9 __libc_start_call_main csu/../sysdeps/nptl/libc_start_call_main.h:58:16 (libc.so.6+0x29d8f) (BuildId: 490fef8403240c91833978d494d39e537409b92e)
+
+  Thread T17 'worker' (tid=3514461, running) created by thread T16 at:
+    #0 pthread_create out/lib/clangrt-x86_64-unknown-linux-gnu/./out/lib/clangrt-x86_64-unknown-linux-gnu/./toolchain/llvm-project/compiler-rt/lib/tsan/rtl/tsan_interceptors_posix.cpp:1022:3 (test-thread-pool+0x34793d)
+    #1 qemu_thread_create /home/mordan/qemu/build/../util/qemu-thread-posix.c:583:11 (test-thread-pool+0xa49550)
+    #2 do_spawn_thread /home/mordan/qemu/build/../util/thread-pool.c:146:5 (test-thread-pool+0xa65f5e)
+    #3 worker_thread /home/mordan/qemu/build/../util/thread-pool.c:83:5 (test-thread-pool+0xa65f5e)
+    #4 qemu_thread_start /home/mordan/qemu/build/../util/qemu-thread-posix.c:543:9 (test-thread-pool+0xa496c0)
+
+SUMMARY: ThreadSanitizer: data race /home/mordan/qemu/build/../util/async.c:81:17 in aio_bh_enqueue
+```
+
+
+@hreitz, @kmwolf, @bonzini Are there any other synchronization that was intended to ensure that the accesses do not happen simultaneously?
