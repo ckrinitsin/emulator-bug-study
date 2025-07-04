@@ -1,10 +1,11 @@
 from argparse import ArgumentParser
-from os import path, listdir
+from os import path, listdir, makedirs
 
 parser = ArgumentParser()
 
 parser.add_argument('-b', '--bugs', required = True)
 parser.add_argument('-d', '--search_directory', required = True)
+parser.add_argument('-o', '--output')
 
 args = parser.parse_args()
 
@@ -27,6 +28,14 @@ def output_csv(dictionary, full_path):
         for key, value in dictionary.items():
             file.write(f"{key}, {value}\n")
 
+def duplicate_bug(file_path, category):
+    output_path = path.join(args.output, category)
+    makedirs(output_path, exist_ok = True)
+    with open(file_path, "r") as file:
+        text = file.read()
+    with open(path.join(output_path, path.basename(file_path)), "w") as file:
+        file.write(text)
+
 def main():
     result = {}
     mistranslation_bugs = list_files_recursive(args.bugs, True)
@@ -36,6 +45,8 @@ def main():
         for bug in bugs:
             if mistranslation_bug == path.basename(bug):
                 category = path.basename(path.dirname(bug))
+                if args.output:
+                    duplicate_bug(bug, category)
                 if category in result:
                     result[category] += 1
                 else:
