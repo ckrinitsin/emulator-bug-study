@@ -1,0 +1,100 @@
+
+
+gluster partial reads refusal conflicts with qcow2
+
+there is an inconsistency in how qemu creates qcow2 files, which causes an error in the gluster (and possibly other block drivers)
+
+the problem is that the gluster backend expects the filesize to be 512 byte aligned, which is not the case anymore since 2.7.0 when using the file backend for qcow2 files with a backing file
+
+the error is then
+Could not open 'gluster://gluster01/gv0/bar2.qcow2': Could not read L1 table: Input/output error
+
+steps to reproduce:
+
+ * create a.qcow2
+ * create b.qcow2 with a.qcow2 as base via filesystem (without gluster)
+   b.qcow2 filesize is not a multiple of 512 bytes
+ * move both files to a gluster share
+ * access to b.qcow2 via gluster block driver fails
+
+example: 
+
+have a gluster server at 'gluster01' with a volume 'gv0' (gluster versions tested: 3.7.15,3.8.5,3.8.5)
+
+root@pc:~# mount -t glusterfs gluster01:/gv0 /mnt/gluster
+root@pc:~# qemu-img create -f qcow2 gluster://gluster01/gv0/foo.qcow2 100M
+Formatting 'gluster://gluster01/gv0/foo.qcow2', fmt=qcow2 size=104857600 encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
+root@pc:~# qemu-img info /mnt/gluster/foo.qcow2 
+image: /mnt/gluster/foo.qcow2
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 193K
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+root@pc:~# qemu-img info gluster://gluster01/gv0/foo.qcow2
+image: gluster://gluster01/gv0/foo.qcow2
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 193K
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+root@pc:~# qemu-img create -f qcow2 -b foo.qcow2 gluster://gluster01/gv0/bar.qcow2
+Formatting 'gluster://gluster01/gv0/bar.qcow2', fmt=qcow2 size=104857600 backing_file=foo.qcow2 encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
+root@pc:~# qemu-img info /mnt/gluster/bar.qcow2
+image: /mnt/gluster/bar.qcow2
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 193K
+cluster_size: 65536
+backing file: foo.qcow2 (actual path: /mnt/gluster/foo.qcow2)
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+root@pc:~# qemu-img info gluster://gluster01/gv0/bar.qcow2
+image: gluster://gluster01/gv0/bar.qcow2
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 193K
+cluster_size: 65536
+backing file: foo.qcow2 (actual path: gluster://gluster01/gv0/foo.qcow2)
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+root@pc:~# qemu-img create -f qcow2 -b foo.qcow2 /mnt/gluster/bar2.qcow2
+Formatting '/mnt/gluster/bar2.qcow2', fmt=qcow2 size=104857600 backing_file=foo.qcow2 encryption=off cluster_size=65536 lazy_refcounts=off refcount_bits=16
+root@pc:~# qemu-img info /mnt/gluster/bar2.qcow2
+image: /mnt/gluster/bar2.qcow2
+file format: qcow2
+virtual size: 100M (104857600 bytes)
+disk size: 193K
+cluster_size: 65536
+backing file: foo.qcow2 (actual path: /mnt/gluster/foo.qcow2)
+Format specific information:
+    compat: 1.1
+    lazy refcounts: false
+    refcount bits: 16
+    corrupt: false
+root@pc:~# qemu-img info gluster://gluster01/gv0/bar2.qcow2
+qemu-img: Could not open 'gluster://gluster01/gv0/bar2.qcow2': Could not read L1 table: Input/output error
+root@pc:~# ls -l /mnt/gluster/
+total 578
+-rw-r--r-- 1 root root 196616 Nov 25 09:07 bar2.qcow2
+-rw------- 1 root root 197120 Nov 25 09:07 bar.qcow2
+-rw------- 1 root root 197120 Nov 25 09:06 foo.qcow2
+drwxr-xr-x 6 root root     46 Nov 24 16:51 images
+
+here you can see that the file created with directory path is not 512 byte aligned, while the one created through the gluster api is
+
+also, when creating a qcow2 with the nfs block driver, the filesize is also a multiple of 512, but reading a non aligned file with nfs works however

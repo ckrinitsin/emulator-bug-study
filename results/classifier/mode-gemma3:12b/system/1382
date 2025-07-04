@@ -1,0 +1,42 @@
+
+
+x86-64 In long mode the Selector Error Code has an improperly encoded Selector Index when dealing with IDT descriptor indexes
+Description of problem:
+When in long mode an IDT descriptor is 16 bytes in size. When an exception is raised where an index to an IDT descriptor entry needs to be encoded in an error code's selector index field it appears that QEMU's software emulation improperly encodes the IDT descriptor index as if each entry is 8 bytes rather than 16. The effect is that the descriptor index is encoded with a value that is double what it should be.
+  
+As an example if I have a *Segment Not Present* (#NP) exception handler (which has a selector error code pushed on the stack) that is raised when I try to generate a software interrupt 0x97 that is marked not present in its IDT descriptor entry - I expect that QEMU would properly encode the value 0x97 in the Selector Index of the Selector Error Code pushed on the stack. Instead, the value stored is actually 0x12E. 0x12E is double the expected value 0x97.
+
+You can observe this errant value in the output of QEMU when using the `-d int` option. I have cut out the unnecessary state information as I'm focussed on the `v=` and `e=`.
+
+     0: v=97 e=0000 i=1 cpl=0 IP=0008:0000000000008a0a pc=0000000000008a0a SP=0010:0000000000007c00      
+     1: v=0b e=0972 i=0 cpl=0 IP=0008:0000000000008a0a pc=0000000000008a0a SP=0010:0000000000007c00 
+
+When I used `int 0x97` to generate the software interrupt it properly shows that `v=97` had occurred in the output above. Because 0x97 was marked not present exception 0x0b (Not Present) was raised as you can see in the second line. The problem is that `e=0972` is a Selector Error Code where *Bits 3..16* contain the value 0x12E instead of 0x97. **It isn't just the display value in QEMU's debug output that is wrong**, as the **Selector Error Code pushed on the interrupt stack is the same erroneous value**. 
+
+This issue doesn't occur if you run QEMU with the `-enable-kvm` option; in BOCHS; or on real hardware. The value in those environments contains a Selector Error Code of 0x4ba. *Bits 3..16* of 0x4ba contains the descriptor index 0x97 as expected. See additional information for more details.
+Steps to reproduce:
+1. Put processor in long mode. 64-bit mode will suffice.
+2. Load an IDT with:
+   - A valid Segment Not Present (#NP) 0x0B Exception Handler. Handler doesn't really need to do anything.
+   - At least one interrupt handler marked *Not Present* higher than 0x00. Interrupt 0x97 as an example.
+3. Raise the interrupt with something like `int 0x097` for this example.
+Additional information:
+In order to test this problem out in other environments like real hardware and virtual machines I wrote a test program on a floppy disk image that can be run on machines and virtual machines that support legacy boot from floppy media (or emulated floppy media). The test program code can be found [in my Github repository](https://github.com/mpetch/SelectorErrorCodeTest). A pre-built [disk image](https://github.com/mpetch/SelectorErrorCodeTest/blob/main/disk.img) is also available.
+
+When the disk image is executed with QEMU using `qemu-system-x86_64 -fda disk.img` the result (with incorrect encoding) can be seen here:
+
+![image](/uploads/02c99f4915956c02c387ba27df693a62/image.png)
+
+When QEMU is run with `qemu-system-x86_64 -fda disk.img -enable-kvm` the result (with correct encoding) can be seen here:
+
+![image](/uploads/9ce7c10fef355e71ac2fdf0e3cb5c80e/image.png)
+
+Correct results are also obtained in BOCHS and real hardware.
+
+---
+The [Intel Software Development Manual Volume 3A](https://www.intel.ca/content/www/ca/en/architecture-and-technology/64-ia-32-architectures-software-developer-vol-3a-part-1-manual.html) documents the error code as:
+
+![image](/uploads/a469d4b3d649e1e20a4b1993d73df05c/image.png)
+
+---
+#

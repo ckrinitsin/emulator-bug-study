@@ -1,0 +1,50 @@
+
+
+Using qemu >=2.2.1 to convert raw->VHD (fixed) adds extra padding to the result file, which Microsoft Azure rejects as invalid
+
+Starting with a raw disk image, using "qemu-img convert" to convert from raw to VHD results in the output VHD file's virtual size being aligned to the nearest 516096 bytes (16 heads x 63 sectors per head x 512 bytes per sector), instead of preserving the input file's size as the output VHD's virtual disk size.
+
+Microsoft Azure requires that disk images (VHDs) submitted for upload have virtual sizes aligned to a megabyte boundary. (Ex. 4096MB, 4097MB, 4098MB, etc. are OK, 4096.5MB is rejected with an error.) This is reflected in Microsoft's documentation: https://azure.microsoft.com/en-us/documentation/articles/virtual-machines-linux-create-upload-vhd-generic/
+
+This is reproducible with the following set of commands (including the Azure command line tools from https://github.com/Azure/azure-xplat-cli). For the following example, I used qemu version 2.2.1:
+
+$ dd if=/dev/zero of=source-disk.img bs=1M count=4096
+
+$ stat source-disk.img 
+  File: ‘source-disk.img’
+  Size: 4294967296      Blocks: 798656     IO Block: 4096   regular file
+Device: fc01h/64513d    Inode: 13247963    Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/  smkent)   Gid: ( 1000/  smkent)
+Access: 2015-08-18 09:48:02.613988480 -0700
+Modify: 2015-08-18 09:48:02.825985646 -0700
+Change: 2015-08-18 09:48:02.825985646 -0700
+ Birth: -
+
+$ qemu-img convert -f raw -o subformat=fixed -O vpc source-disk.img dest-disk.vhd
+
+$ stat dest-disk.vhd 
+  File: ‘dest-disk.vhd’
+  Size: 4296499712      Blocks: 535216     IO Block: 4096   regular file
+Device: fc01h/64513d    Inode: 13247964    Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/  smkent)   Gid: ( 1000/  smkent)
+Access: 2015-08-18 09:50:22.252077624 -0700
+Modify: 2015-08-18 09:49:24.424868868 -0700
+Change: 2015-08-18 09:49:24.424868868 -0700
+ Birth: -
+
+$ azure vm image create testimage1 dest-disk.vhd -o linux -l "West US"
+info:    Executing command vm image create
++ Retrieving storage accounts                                                  
+info:    VHD size : 4097 MB
+info:    Uploading 4195800.5 KB
+Requested:100.0% Completed:100.0% Running:   0 Time: 1m 0s Speed:  6744 KB/s 
+info:    https://[redacted].blob.core.windows.net/vm-images/dest-disk.vhd was uploaded successfully
+error:   The VHD https://[redacted].blob.core.windows.net/vm-images/dest-disk.vhd has an unsupported virtual size of 4296499200 bytes.  The size must be a whole number (in MBs).
+info:    Error information has been recorded to /home/smkent/.azure/azure.err
+error:   vm image create command failed
+
+I also ran the above commands using qemu 2.4.0, which resulted in the same error as the conversion behavior is the same.
+
+However, qemu 2.1.1 and earlier (including qemu 2.0.0 installed by Ubuntu 14.04) does not pad the virtual disk size during conversion. Using qemu-img convert from qemu versions <=2.1.1 results in a VHD that is exactly the size of the raw input file plus 512 bytes (for the VHD footer). Those qemu versions do not attempt to realign the disk. As a result, Azure accepts VHD files created using those versions of qemu-img convert for upload.
+
+Is there a reason why newer qemu realigns the converted VHD file? It would be useful if an option were added to disable this feature, as current versions of qemu cannot be used to create VHD files for Azure using Microsoft's official instructions.

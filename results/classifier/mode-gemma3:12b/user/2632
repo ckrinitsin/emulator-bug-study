@@ -1,0 +1,85 @@
+
+
+tcg optimization breaking memory access ordering
+Description of problem:
+The following code creates register dependency between 2 loads, which forces the first load to finish before the second:
+```
+movz	w0, #0x2
+str	w0, [x1]
+ldr	w2, [x1]
+eor	w3, w2, w2
+ldr	w4, [x5, w3, sxtw]
+```
+
+While translating it to tcg IR, it keeps this dependency correctly.
+But after running tcg optimizations, it optimized the tcg sequence for `eor	w3, w2, w2` at `0000000000000144` to `mov_i64 x3,$0x0`. which then removes the dependency between the loads.
+
+It results in incorrect behavior on the host on a multiple threaded program
+Steps to reproduce:
+1.
+2.
+3.
+Additional information:
+```
+OP:
+ ld_i32 loc0,env,$0xfffffffffffffff0
+ brcond_i32 loc0,$0x0,lt,$L0
+ st8_i32 $0x0,env,$0xfffffffffffffff4
+
+ ---- 0000000000000134 0000000000000000 0000000000000000
+ add_i64 x28,x28,$0x2
+
+ ---- 0000000000000138 0000000000000000 0000000000000000
+ mov_i64 x0,$0x2
+
+ ---- 000000000000013c 0000000000000000 0000000000001c00
+ mov_i64 loc3,x1
+ mov_i64 loc4,loc3
+ qemu_st_a64_i64 x0,loc4,w16+un+leul,2
+
+ ---- 0000000000000140 0000000000000000 0000000000001c10
+ mov_i64 loc5,x1
+ mov_i64 loc6,loc5
+ qemu_ld_a64_i64 x2,loc6,w16+un+leul,2
+
+ ---- 0000000000000144 0000000000000000 0000000000000000
+ and_i64 loc7,x2,$0xffffffff
+ xor_i64 x3,x2,loc7
+ and_i64 x3,x3,$0xffffffff
+
+ ---- 0000000000000148 0000000000000000 0000000000001c20
+ mov_i64 loc9,x5
+ mov_i64 loc10,x3
+ ext32s_i64 loc10,loc10
+ add_i64 loc9,loc9,loc10
+ mov_i64 loc11,loc9
+ qemu_ld_a64_i64 x4,loc11,w16+un+leul,2
+ st8_i32 $0x1,env,$0xfffffffffffffff4
+```
+
+
+```
+OP after optimization and liveness analysis:
+ ld_i32 tmp0,env,$0xfffffffffffffff0      pref=0xffffffff
+ brcond_i32 tmp0,$0x0,lt,$L0              dead: 0
+ st8_i32 $0x0,env,$0xfffffffffffffff4     dead: 0
+
+ ---- 0000000000000134 0000000000000000 0000000000000000
+ add_i64 x28,x28,$0x2                     sync: 0  dead: 0 1  pref=0xffffffff
+
+ ---- 0000000000000138 0000000000000000 0000000000000000
+ mov_i64 x0,$0x2                          sync: 0  dead: 0  pref=0xffffffff
+
+ ---- 000000000000013c 0000000000000000 0000000000001c00
+ qemu_st_a64_i64 $0x2,x1,w16+un+leul,2    dead: 0
+
+ ---- 0000000000000140 0000000000000000 0000000000001c10
+ qemu_ld_a64_i64 x2,x1,w16+un+leul,2      sync: 0  dead: 0 1  pref=0xffffffff
+
+ ---- 0000000000000144 0000000000000000 0000000000000000
+ mov_i64 x3,$0x0                          sync: 0  dead: 0 1  pref=0xffffffff
+
+ ---- 0000000000000148 0000000000000000 0000000000001c20
+ qemu_ld_a64_i64 x4,x5,w16+un+leul,2      sync: 0  dead: 0 1  pref=0xffffffff
+ st8_i32 $0x1,env,$0xfffffffffffffff4     dead: 0
+```

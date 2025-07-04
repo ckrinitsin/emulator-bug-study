@@ -1,0 +1,43 @@
+
+
+x86-64 MTTCG Does not update page table entries atomically
+
+It seems like the qemu tcg code for x86-64 doesn't write the access and dirty flags of the page table entries atomically. Instead, they first read the entry, see if they need to set the page table entry, and then overwrite the entry. So if you have two threads running at the same time, one accessing the virtual address over and over again, and the other modifying the page table entry, it is possible that after the second thread modifies the page table entry, qemu overwrites the value with the old page table entry value, with the access/dirty flags set.
+
+Here's a unit test that reproduces this behavior:
+
+https://github.com/mvanotti/kvm-unit-tests/commit/09f9722807271226a714b04f25174776454b19cd
+
+You can run it with:
+
+```
+/usr/bin/qemu-system-x86_64 --no-reboot -nodefaults \
+-device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 \
+-vnc none -serial stdio -device pci-testdev \
+-smp 4 -machine q35 --accel tcg,thread=multi \
+-kernel x86/mmu-race.flat # -initrd /tmp/tmp.avvPpezMFf
+```
+
+Expected output (failure):
+
+```
+kvm-unit-tests$ make && /usr/bin/qemu-system-x86_64 --no-reboot -nodefaults -device pc-testdev -device isa-debug-exit,iobase=0xf4,iosize=0x4 -vnc none -serial stdio -device pci-testdev -smp 4 -machine q35 --accel tcg,thread=multi  -kernel x86/mmu-race.flat # -initrd /tmp/tmp.avvPpezMFf
+enabling apic
+enabling apic
+enabling apic
+enabling apic
+paging enabled
+cr0 = 80010011
+cr3 = 627000
+cr4 = 20
+found 4 cpus
+PASS: Need more than 1 CPU
+Detected overwritten PTE:
+        want: 0x000000000062e007
+        got:  0x000000000062d027
+FAIL: PTE not overwritten
+PASS: All Reads were zero
+SUMMARY: 3 tests, 1 unexpected failures
+```
+
+This bug has allows user-to-root privilege escalation inside the guest VM: if the user is able overwrite an entry that belongs to a second-to-last level page table, and is able to allocate the referenced page, then the user would be in control of a last-level page table, being able to map any memory they want. This is not uncommon in situations where memory is being decomitted.

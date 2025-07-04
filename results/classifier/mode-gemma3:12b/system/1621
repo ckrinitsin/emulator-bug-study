@@ -1,0 +1,108 @@
+
+
+QCOW2 image grows over 110% of its virtual size
+Description of problem:
+Follow-up of https://github.com/oVirt/vdsm/issues/371
+
+As oVirt divides a iSCSI LUN into a LVM device and each VM disk is a Logical Volume, the qcow2 images are inside a LV.
+This works fine, and oVirt allows the LV to grow to 110% of its virtual size.
+
+Now we have like 1 time each month the issue that a VM tries to grow over its 110% limit, which should never happen.
+Steps to reproduce:
+1. When it happend in production, I copied the LV via dd to some file.
+2. I copied the file to a new LV on a test machine, and created a VM for it
+3. Start the VM
+4. Issue reoccurs directly
+Additional information:
+So I started some gdb'ing on the pid, and this it what seems to happen:
+```
+#16 0x0000563c60921f25 in qcow2_add_task (bs=bs@entry=0x563c62bb8090, pool=pool@entry=0x0, func=func@entry=0x563c60924860 <qcow2_co_pwritev_task_entry>, subcluster_type=subcluster_type@entry=QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN, host_offset=17718824960, offset=offset@entry=15192346624, bytes=1310720, qiov=0x7f84c4003a70, qiov_offset=0, l2meta=0x7f84c401c600)
+    at ../block/qcow2.c:2249
+        local_task = {task = {pool = 0x0, func = 0x563c60924860 <qcow2_co_pwritev_task_entry>, ret = 0}, bs = 0x563c62bb8090, subcluster_type = QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN, host_offset = 17718824960, offset = 15192346624, bytes = 1310720, qiov = 0x7f84c4003a70, qiov_offset = 0, l2meta = 0x7f84c401c600}
+        task = 0x7f82bafffb00
+#17 0x0000563c609225b7 in qcow2_co_pwritev_part (bs=0x563c62bb8090, offset=15192346624, bytes=1310720, qiov=0x7f84c4003a70, qiov_offset=0, flags=<optimized out>) at ../block/qcow2.c:2645
+        s = 0x563c62bbf990
+        offset_in_cluster = <optimized out>
+        ret = <optimized out>
+        cur_bytes = 1310720
+        host_offset = 17718824960
+        l2meta = 0x7f84c401c600
+        aio = 0x0
+#18 0x0000563c6090395b in bdrv_driver_pwritev (bs=bs@entry=0x563c62bb8090, offset=offset@entry=15192346624, bytes=bytes@entry=1310720, qiov=qiov@entry=0x7f84c4003a70, qiov_offset=qiov_offset@entry=0, flags=flags@entry=0) at ../block/io.c:1248
+        drv = 0x563c6125fb20 <bdrv_qcow2>
+        sector_num = <optimized out>
+        nb_sectors = <optimized out>
+        local_qiov = {iov = 0x563c6125fb20 <bdrv_qcow2>, niov = 8192, {{nalloc = 4096, local_iov = {iov_base = 0x563c62bb8090, iov_len = 0}}, {__pad = "\000\020\000\000\000\000\000\000\220\200\273b", size = 0}}}
+        ret = <optimized out>
+        __PRETTY_FUNCTION__ = "bdrv_driver_pwritev"
+#19 0x0000563c60905872 in bdrv_aligned_pwritev (child=0x563c647f3c10, req=0x7f82bafffe30, offset=15192346624, bytes=1310720, align=<optimized out>, qiov=0x7f84c4003a70, qiov_offset=0, flags=0) at ../block/io.c:2122
+        bs = 0x563c62bb8090
+        drv = 0x563c6125fb20 <bdrv_qcow2>
+        ret = <optimized out>
+        bytes_remaining = 1310720
+        max_transfer = <optimized out>
+        __PRETTY_FUNCTION__ = "bdrv_aligned_pwritev"
+#20 0x0000563c6090622b in bdrv_co_pwritev_part (child=0x563c647f3c10, offset=<optimized out>, offset@entry=15192346624, bytes=<optimized out>, bytes@entry=1310720, qiov=<optimized out>, qiov@entry=0x7f84c4003a70, qiov_offset=<optimized out>, qiov_offset@entry=0, flags=flags@entry=0) at ../block/io.c:2310
+        bs = <optimized out>
+        req = {bs = 0x563c62bb8090, offset = 15192346624, bytes = 1310720, type = BDRV_TRACKED_WRITE, serialising = false, overlap_offset = 15192346624, overlap_bytes = 1310720, list = {le_next = 0x7f829c6c8e30, le_prev = 0x7f82a3fffe60}, co = 0x7f84c4004210, wait_queue = {entries = {sqh_first = 0x0, sqh_last = 0x7f82bafffe78}}, waiting_for = 0x0}
+        align = <optimized out>
+        pad = {buf = 0x0, buf_len = 0, tail_buf = 0x0, head = 0, tail = 0, merge_reads = false, local_qiov = {iov = 0x0, niov = 0, {{nalloc = 0, local_iov = {iov_base = 0x0, iov_len = 0}}, {__pad = '\000' <repeats 11 times>, size = 0}}}}
+        ret = <optimized out>
+        padded = false
+        __PRETTY_FUNCTION__ = "bdrv_co_pwritev_part"
+#21 0x0000563c608f71e0 in blk_co_do_pwritev_part (blk=0x563c648183c0, offset=15192346624, bytes=1310720, qiov=0x7f84c4003a70, qiov_offset=qiov_offset@entry=0, flags=0) at ../block/block-backend.c:1289
+        ret = <optimized out>
+        bs = 0x563c62bb8090
+```
+
+There is a write from the VM with size 1310720 on offset 15192346624.
+A host offset is calculated for this, but this offset is 17718824960 !!
+The image/LV is only 17716740096, and 17716740096 < 17718824960 -> ENOSPC error is triggered.
+
+The code for calculating the host offset seems to be untouched for the last years.
+But it seems like for some reason it takes some offset way beyond the virtual size boundaries.
+
+The qemu-img output:
+```
+# qemu-img info /dev/mapper/test-xxxxx 
+image: /dev/mapper/test-xxxxx
+file format: qcow2
+virtual size: 15 GiB (16106127360 bytes)
+disk size: 0 B
+cluster_size: 65536
+Format specific information:
+    compat: 1.1
+    compression type: zlib
+    lazy refcounts: false
+    bitmaps:
+        [0]:
+            flags:
+                [0]: in-use
+                [1]: auto
+            name: 428fae80-3892-4083-9107-51fb76a7f06b
+            granularity: 65536
+        [1]:
+            flags:
+                [0]: in-use
+                [1]: auto
+            name: 51ccd1fc-08a4-485d-8c04-0eb750665e05
+            granularity: 65536
+        [2]:
+            flags:
+                [0]: in-use
+                [1]: auto
+            name: 19796bed-56a5-44c1-a7f2-dae633e65c87
+            granularity: 65536
+        [3]:
+            flags:
+                [0]: in-use
+                [1]: auto
+            name: 13056186-e65e-448e-a3c3-019ab25d3a27
+            granularity: 65536
+    refcount bits: 16
+    corrupt: false
+    extended l2: false
+```
+
+Also attaching the map where you can see there are plenty of zero blocks, but still it tries to allocate a new block for some reason.
+[map.txt](/uploads/0890cf718f77c0ad2e562165eb350d13/map.txt)
