@@ -1,0 +1,98 @@
+
+
+x86_64: strange translation of "vpgatherqq"
+Description of problem:
+The translate of instruction "vpgatherqq" is confusing.
+
+It happens when register xmm4 is in the middle, like "vpgatherqq %xmmi,0x0(,%xmm4,1),%xmmj".
+Steps to reproduce:
+1. Make a simple embedded assembly code named test.c:
+```
+int main()
+{
+    asm("vpgatherqq %xmm6,0x123(,%xmm2,4),%xmm7");
+    asm("vpgatherqq %xmm6,0x123(,%xmm3,4),%xmm7");
+    asm("vpgatherqq %xmm6,0x123(,%xmm4,4),%xmm7");
+    asm("vpgatherqq %xmm6,0x123(,%xmm5,4),%xmm7");
+    return 0;
+}
+```
+and compile it:
+```
+gcc -o test test.c -static
+```
+
+2. Run it with QEMU, print the micro ops:
+```
+qemu-x86_64 -d op -D a.out test
+```
+We can get output like this (only contain vpgatherqq):
+```
+ ---- 000000000040174d 0000000000000000
+ mov_i64 loc2,$0x123
+ add_i64 loc14,env,$0x3d0      #This is xmm2
+ add_i64 loc16,env,$0x4d0
+ add_i64 loc18,env,$0x510
+ call vpgatherqq_xmm,$0x0,$0,env,loc18,loc16,loc14,loc2,$0x2
+ mov_vec v128,e8,tmp20,v128$0x0
+ st_vec v128,e8,tmp20,env,$0x4e0
+ mov_vec v128,e8,tmp22,v128$0x0
+ st_vec v128,e8,tmp22,env,$0x520
+
+ ---- 0000000000401757 0000000000000000
+ mov_i64 loc2,$0x123
+ add_i64 loc23,env,$0x410      #This is xmm3
+ add_i64 loc25,env,$0x4d0
+ add_i64 loc26,env,$0x510
+ call vpgatherqq_xmm,$0x0,$0,env,loc26,loc25,loc23,loc2,$0x2
+ mov_vec v128,e8,tmp27,v128$0x0
+ st_vec v128,e8,tmp27,env,$0x4e0
+ mov_vec v128,e8,tmp28,v128$0x0
+ st_vec v128,e8,tmp28,env,$0x520
+
+ ---- 0000000000401761 0000000000000000
+ mov_i64 loc2,$0x123
+ add_i64 loc29,env,$0x310      #This is xmm4 ???
+ add_i64 loc31,env,$0x4d0
+ add_i64 loc32,env,$0x510
+ call vpgatherqq_xmm,$0x0,$0,env,loc32,loc31,loc29,loc2,$0x2
+ mov_vec v128,e8,tmp33,v128$0x0
+ st_vec v128,e8,tmp33,env,$0x4e0
+ mov_vec v128,e8,tmp34,v128$0x0
+ st_vec v128,e8,tmp34,env,$0x520
+
+ ---- 000000000040176b 0000000000000000
+ mov_i64 loc2,$0x123
+ add_i64 loc35,env,$0x490      #This is xmm5
+ add_i64 loc37,env,$0x4d0
+ add_i64 loc38,env,$0x510
+ call vpgatherqq_xmm,$0x0,$0,env,loc38,loc37,loc35,loc2,$0x2
+ mov_vec v128,e8,tmp39,v128$0x0
+ st_vec v128,e8,tmp39,env,$0x4e0
+ mov_vec v128,e8,tmp40,v128$0x0
+ st_vec v128,e8,tmp40,env,$0x520
+```
+3.
+
+Since the register xmms are continuous within the structure CPUArchState, the offset of xmm2, xmm3, xmm4, xmm5 should be a arithmetic sequence.
+
+From the output, we can infer that the common difference should be 0x40 and the offset of xmm4 should be 0x450 but not 0x310.
+
+I used GDB to track it, the location where the change occurred is:
+
+target/i386/tcg/translate.c, gen_lea_modrm_0(), line 2215:
+```
+        if (rm == 4) {
+            int code = x86_ldub_code(env, s);
+            scale = (code >> 6) & 3;
+            index = ((code >> 3) & 7) | REX_X(s);
+            if (index == 4) {
+                index = -1;  /* no index */
+            }
+            base = (code & 7) | REX_B(s);
+            havesib = 1;
+        }
+```
+This code turned 4 into -1, and -1 do explain the offset 0x310 (xmm0 has offset 0x350).
+Additional information:
+Monitoring the function "helper_vpgatherqq_xmm" can draw similar conclusions: it used wrong value but not xmm4.

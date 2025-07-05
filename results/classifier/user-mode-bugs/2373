@@ -1,0 +1,97 @@
+
+
+A bug in AArch64 FMOPA/FMOPS (widening) instruction
+Description of problem:
+fmopa computes the multiplication of two matrices in the source registers and accumulates the result to the destination register. A source register’s element size is 16 bits, while a destination register’s element size is 64 bits in the case of widening variant of this instruction. Before the matrix multiplication is performed, each element should be converted to a 64-bit floating point. FPCR flags are considered when converting floating point values. Especially, when the FZ (or FZ16) flag is set, denormalized values are converted into zero. When the floating point size is 16 bits, FZ16 should be considered; otherwise, FZ flag should be used.
+
+However, the current implementation only considers FZ flag, not FZ16 flag, so it computes the wrong value.
+Steps to reproduce:
+1. Write `test.c`.
+```
+#include <stdio.h>
+
+char i_P2[4] = { 0xff, 0xff, 0xff, 0xff };
+char i_P5[4] = { 0xff, 0xff, 0xff, 0xff };
+char i_Z0[32] = { // Set only the first element as non-zero
+    0xff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+};
+char i_Z16[32] = { // Set only the first element as non-zero
+    0xff, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+};
+char i_ZA3H[128] = { 0x0, };
+uint64_t i_fpcr = 0x0001000000; // FZ = 1;
+char o_ZA3H[128];
+
+void __attribute__ ((noinline)) show_state() {
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 16; j++) {
+            printf("%02x ", o_ZA3H[16*i+j]);
+        }
+        printf("\n");
+    }
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        ".arch armv9.3-a+sme\n"
+        "smstart\n"
+        "adrp x29, i_P2\n"
+        "add x29, x29, :lo12:i_P2\n"
+        "ldr p2, [x29]\n"
+        "adrp x29, i_P5\n"
+        "add x29, x29, :lo12:i_P5\n"
+        "ldr p5, [x29]\n"
+        "adrp x29, i_Z0\n"
+        "add x29, x29, :lo12:i_Z0\n"
+        "ldr z0, [x29]\n"
+        "adrp x29, i_Z16\n"
+        "add x29, x29, :lo12:i_Z16\n"
+        "ldr z16, [x29]\n"
+        "adrp x29, i_ZA3H\n"
+        "add x29, x29, :lo12:i_ZA3H\n"
+        "mov x15, 0\n"
+        "ld1w {za3h.s[w15, 0]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "ld1w {za3h.s[w15, 1]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "mov x15, 2\n"
+        "ld1w {za3h.s[w15, 0]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "ld1w {za3h.s[w15, 1]}, p2, [x29]\n"
+        "adrp x29, i_fpcr\n"
+        "add x29, x29, :lo12:i_fpcr\n"
+        "ldr x29, [x29]\n"
+        "msr fpcr, x29\n"
+        ".inst 0x81a0aa03\n" // fmopa   za3.s, p2/m, p5/m, z16.h, z0.h
+        "adrp x29, o_ZA3H\n"
+        "add x29, x29, :lo12:o_ZA3H\n"
+        "mov x15, 0\n"
+        "st1w {za3h.s[w15, 0]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "st1w {za3h.s[w15, 1]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "mov x15, 2\n"
+        "st1w {za3h.s[w15, 0]}, p2, [x29]\n"
+        "add x29, x29, 32\n"
+        "st1w {za3h.s[w15, 1]}, p2, [x29]\n"
+        ".arch armv8-a\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+    return 0;
+}
+```
+2. Compile `test.bin` using this command: `aarch64-linux-gnu-gcc-12 -O2 -no-pie ./test.c -o ./test.bin`.
+3. Run QEMU using this command: `qemu-aarch64 -L /usr/aarch64-linux-gnu/ -cpu max,sme256=on ./test.bin`.
+4. The program, runs on top of the buggy QEMU, prints only zero bytes. It should print `00 01 7e 2f + 00 .. (rest of bytes) .. 00` after the bug is fixed.
+Additional information:
+

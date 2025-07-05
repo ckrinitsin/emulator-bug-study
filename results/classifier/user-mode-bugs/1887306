@@ -1,0 +1,57 @@
+
+
+qemu-user deadlocks when forked in a multithreaded process
+
+The following program (also attached) deadlocks when run under QEMU user on Linux. 
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#define NUM_THREADS 100
+#define NUM_FORKS 10
+
+pthread_barrier_t barrier;
+
+void *t(void *arg) {
+    for (int i = 0; i < NUM_FORKS; i++) {
+        pid_t pid = fork();
+        if (pid < 0)
+            abort();
+        if (!pid)
+            _exit(0);
+        if (waitpid(pid, NULL, 0) < 0)
+            abort();
+    }
+    //pthread_barrier_wait(&barrier);
+    return NULL;
+}
+
+int main(void) {
+    pthread_barrier_init(&barrier, NULL, NUM_THREADS);
+    pthread_t ts[NUM_THREADS];
+    for (size_t i = 0; i < NUM_THREADS; i++) {
+        if (pthread_create(&ts[i], NULL, t, NULL))
+            abort();
+    }
+    for (size_t i = 0; i < NUM_THREADS; i++) {
+        pthread_join(ts[i], NULL);
+    }
+    printf("Done: %d\n", getpid());
+    return 0;
+}
+
+To reproduce:
+$ gcc test.c -pthread
+$ while qemu-x86_64 ./a.out; do :; done
+
+(Be careful, Ctrl-C/SIGINT doesn't kill the deadlocked child).
+
+Larger values of NUM_THREADS/NUM_FORKS lead to more often deadlocks. With the values above it often deadlocks on the first try on my machine. When it deadlocks, there is a child qemu process with two threads which is waited upon by one of the worker threads of the parent.
+
+I tried to avoid the deadlock by serializing fork() with a mutex, but it didn't help. However, ensuring that no thread exits until all forks are done (by adding a barrier to t()) does seem to help, at least, the program above could run for a half an hour until I terminated it.
+
+Tested on QEMU 5.0.0, 4.2.0 and 2.11.1, with x86_64 and AArch64 linux-user targets.
