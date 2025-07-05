@@ -1,0 +1,96 @@
+
+
+Error in user-mode calculation of ELF aux vector's AT_PHDR
+
+
+I have an (admittedly strange) statically-linked ELF binary for Linux that runs just fine on top of the Linux kernel in QEMU full-system emulation, but crashes before main in user-mode emulation. Specifically, it crashes when initializing thread-local storage in glibc's _dl_aux_init, because it reads out a strange value from the AT_PHDR entry of the ELF aux vector.
+
+The binary has these program headers:
+
+  Program Headers:
+    Type           Offset   VirtAddr   PhysAddr   FileSiz MemSiz  Flg Align
+    EXIDX          0x065874 0x00075874 0x00075874 0x00570 0x00570 R   0x4
+    PHDR           0x0a3000 0x00900000 0x00900000 0x00160 0x00160 R   0x1000
+    LOAD           0x0a3000 0x00900000 0x00900000 0x00160 0x00160 R   0x1000
+    LOAD           0x000000 0x00010000 0x00010000 0x65de8 0x65de8 R E 0x10000
+    LOAD           0x066b7c 0x00086b7c 0x00086b7c 0x02384 0x02384 RW  0x10000
+    NOTE           0x000114 0x00010114 0x00010114 0x00044 0x00044 R   0x4
+    TLS            0x066b7c 0x00086b7c 0x00086b7c 0x00010 0x00030 R   0x4
+    GNU_STACK      0x000000 0x00000000 0x00000000 0x00000 0x00000 RW  0x8
+    GNU_RELRO      0x066b7c 0x00086b7c 0x00086b7c 0x00484 0x00484 R   0x1
+    LOAD           0x07e000 0x00089000 0x00089000 0x03f44 0x03f44 R E 0x1000
+    LOAD           0x098000 0x00030000 0x00030000 0x01000 0x01000 RW  0x1000
+
+If I build the Linux kernel with the following patch to the very end of create_elf_tables in fs/binfmt_elf.c
+
+  /* Put the elf_info on the stack in the right place.  */
+  elf_addr_t *my_auxv = (elf_addr_t *) mm->saved_auxv;
+  int i;
+  for (i = 0; i < 15; i++) {
+    printk("0x%x = 0x%x", my_auxv[2*i], my_auxv[(2*i)+ 1]);
+  }
+  if (copy_to_user(sp, mm->saved_auxv, ei_index * sizeof(elf_addr_t)))
+      return -EFAULT;
+  return 0;
+
+and run it like this:
+
+  qemu-system-arm \
+    -M versatilepb \
+    -nographic \
+    -dtb ./dts/versatile-pb.dtb \
+    -kernel zImage \
+    -M versatilepb \
+    -m 128M \
+    -append "earlyprintk=vga,keep" \
+    -initrd initramfs
+
+after I've built the kernel initramfs like this (where "init" is the binary in question):
+
+  make ARCH=arm versatile_defconfig
+  make ARCH=arm CROSS_COMPILE=arm-linux-gnueabi- all -j10
+  cp "$1" arch/arm/boot/init
+  cd arch/arm/boot
+  echo init | cpio -o --format=newc > initramfs
+
+then I get the following output. This is the kernel's view of the aux vector for this binary:
+
+  0x10 = 0x1d7
+  0x6 = 0x1000
+  0x11 = 0x64
+  0x3 = 0x900000
+  0x4 = 0x20
+  0x5 = 0xb
+  0x7 = 0x0
+  0x8 = 0x0
+  0x9 = 0x101b8
+  0xb = 0x0
+  0xc = 0x0
+  0xd = 0x0
+  0xe = 0x0
+  0x17 = 0x0
+  0x19 = 0xbec62fb5
+
+However, if I run "qemu-arm -g 12345 binary" and use GDB to peek at the aux vector at the beginning of __libc_start_init (for example, using this Python GDB API script: https://gist.github.com/langston-barrett/5573d64ae0c9953e2fa0fe26847a5e1e), then I see the following values:
+
+  AT_PHDR = 0xae000
+  AT_PHENT = 0x20
+  AT_PHNUM = 0xb
+  AT_PAGESZ = 0x1000
+  AT_BASE = 0x0
+  AT_FLAGS = 0x0
+  AT_ENTRY = 0x10230
+  AT_UID = 0x3e9
+  AT_EUID = 0x3e9
+  AT_GID = 0x3e9
+  AT_EGID = 0x3e9
+  AT_HWCAP = 0x1fb8d7
+  AT_CLKTCK = 0x64
+  AT_RANDOM = -0x103c0
+  AT_HWCAP2 = 0x1f
+  AT_NULL = 0x0
+
+The crucial difference is in AT_PHDR (0x3), which is indeed the virtual address of the PHDR segment when the kernel calculates it, but is not when QEMU calculates it.
+
+qemu-arm --version
+qemu-arm version 2.11.1(Debian 1:2.11+dfsg-1ubuntu7.26)

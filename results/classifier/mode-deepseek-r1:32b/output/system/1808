@@ -1,0 +1,73 @@
+
+
+qemu-system-i386: Crash in tcg_handle_interrupt on fpu_raise_exception call
+Description of problem:
+While I was messing with an old Linux system, QEMU crashed as I tried to run `make test` on a package:
+```
+ERROR:../accel/tcg/tcg-accel-ops.c:83:tcg_handle_interrupt: assertion failed: (qemu_mutex_iothread_locked())
+Bail out! ERROR:../accel/tcg/tcg-accel-ops.c:83:tcg_handle_interrupt: assertion failed: (qemu_mutex_iothread_locked())
+```
+Running QEMU straight from the master branch (c167c80) didn't help either. The backtrace is as follows:
+```
+(gdb) bt
+#0  0x00007ffff55ac26c in  () at /usr/lib/libc.so.6
+#1  0x00007ffff555ca08 in raise () at /usr/lib/libc.so.6
+#2  0x00007ffff5545538 in abort () at /usr/lib/libc.so.6
+#3  0x00007ffff6bae05e in g_assertion_message
+    (domain=domain@entry=0x0, file=file@entry=0x555555f90a98 "../accel/tcg/tcg-accel-ops.c", line=line@entry=83, func=func@entry=0x55555607a130 <__func__.3> "tcg_handle_interrupt", message=message@entry=0x7fff9c15ee10 "assertion failed: (qemu_mutex_iothread_locked())") at ../glib/glib/gtestutils.c:3450
+#4  0x00007ffff6c0ef40 in g_assertion_message_expr
+    (domain=domain@entry=0x0, file=file@entry=0x555555f90a98 "../accel/tcg/tcg-accel-ops.c", line=line@entry=83, func=func@entry=0x55555607a130 <__func__.3> "tcg_handle_interrupt", expr=expr@entry=0x555555f79cf8 "qemu_mutex_iothread_locked()") at ../glib/glib/gtestutils.c:3476
+#5  0x0000555555c97369 in tcg_handle_interrupt (cpu=0x555557434cb0, mask=2) at ../accel/tcg/tcg-accel-ops.c:83
+#6  tcg_handle_interrupt (cpu=0x555557434cb0, mask=2) at ../accel/tcg/tcg-accel-ops.c:81
+#7  0x0000555555b4d58b in pic_irq_request (opaque=<optimized out>, irq=<optimized out>, level=1) at ../hw/i386/x86.c:555
+#8  0x0000555555b4f218 in gsi_handler (opaque=0x5555579423d0, n=13, level=1) at ../hw/i386/x86.c:611
+#9  0x00007fffa42bde14 in code_gen_buffer ()
+#10 0x0000555555c724bb in cpu_tb_exec (cpu=cpu@entry=0x555557434cb0, itb=<optimized out>, tb_exit=tb_exit@entry=0x7fffe9bfd658) at ../accel/tcg/cpu-exec.c:457
+#11 0x0000555555c7298e in cpu_loop_exec_tb (tb_exit=0x7fffe9bfd658, last_tb=<synthetic pointer>, pc=3221283547, tb=<optimized out>, cpu=<optimized out>) at ../accel/tcg/cpu-exec.c:919
+#12 cpu_exec_loop (cpu=cpu@entry=0x555557434cb0, sc=sc@entry=0x7fffe9bfd6f0) at ../accel/tcg/cpu-exec.c:1040
+#13 0x0000555555c731dd in cpu_exec_setjmp (cpu=cpu@entry=0x555557434cb0, sc=sc@entry=0x7fffe9bfd6f0) at ../accel/tcg/cpu-exec.c:1057
+#14 0x0000555555c73810 in cpu_exec (cpu=cpu@entry=0x555557434cb0) at ../accel/tcg/cpu-exec.c:1083
+#15 0x0000555555c974ff in tcg_cpus_exec (cpu=cpu@entry=0x555557434cb0) at ../accel/tcg/tcg-accel-ops.c:75
+#16 0x0000555555c97657 in mttcg_cpu_thread_fn (arg=arg@entry=0x555557434cb0) at ../accel/tcg/tcg-accel-ops-mttcg.c:95
+#17 0x0000555555e283e8 in qemu_thread_start (args=0x5555574935f0) at ../util/qemu-thread-posix.c:541
+#18 0x00007ffff55aa44b in  () at /usr/lib/libc.so.6
+#19 0x00007ffff562de40 in  () at /usr/lib/libc.so.6
+```
+
+After further testing, it seems related to inftest.awk. However, the crash doesn't occur right after I run the file, but only when I do specific operations afterwards.
+
+With `-accel kvm`
+```
+> gawk -f test/inftest.awk
+(output trimmed)
+1e+305 1e+302
+1e+308 1e+305
+gawk: test/inftest.awk:3: fatal: floating point exception
+> echo Test # No crash
+Test
+> cat test/inftest.awk # No crash
+```
+
+With `-accel tcg`
+```
+> gawk -f test/inftest.awk
+(output trimmed)
+1e+308 1e+305
+Infinity 1e+308
+Infinity Infinity
+loop terminated
+> echo Test # No crash
+Test
+> cat test/inftest.awk # QEMU crash
+```
+Steps to reproduce:
+1. Start the VM
+2. Press any key except for enter to go through the SVGA prompt
+3. Enter `root` to login. No password is required
+4. Run `cd /usr/src2/gawk-2.14`
+5. Run `gawk -f test/inftest.awk`
+6. Run certain commands that interact with the kernel (ex. `ls`, `cat test/inftest.awk`, `whoami`)
+7. Observe the crash
+Additional information:
+[00000-bootFloppy.raw](/uploads/379f6b601132980af4ea721fe77dbae4/00000-bootFloppy.raw)
+[artifact.qcow2](/uploads/d721a35bc55e764e17087e8bc1a7531e/artifact.qcow2)

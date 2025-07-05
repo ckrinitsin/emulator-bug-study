@@ -1,0 +1,86 @@
+
+
+QEMU/TCG generates #GP instead #SS for RBP/RSP based faults
+Description of problem:
+Setting RSP/RBP to a non-canonical address and trying to access a memory location based on RSP/RBP generates a #GP under QEMU/TCG while it should generate an #SS exception instead. This difference in behavior triggers a [Xen selftest](https://github.com/xen-project/xen/blob/1145d94c738e/xen/arch/x86/extable.c#L142-L144) violation as can be seen below.
+
+- A successful run should look like this, e.g. when run under KVM:
+
+```
+(XEN) Running stub recovery selftests...
+(XEN) Fixup #UD[0000]: ffff82d07fffe040 [ffff82d07fffe040] -> ffff82d04038b9e7
+(XEN) Fixup #GP[0000]: ffff82d07fffe041 [ffff82d07fffe041] -> ffff82d04038b9e7
+(XEN) Fixup #SS[0000]: ffff82d07fffe040 [ffff82d07fffe040] -> ffff82d04038b9e7
+(XEN) Fixup #BP[0000]: ffff82d07fffe041 [ffff82d07fffe041] -> ffff82d04038b9e7
+```
+
+- Under QEMU/TCG it triggers this scary warning:
+
+```
+(XEN) Running stub recovery selftests...
+(XEN) Fixup #UD[0000]: ffff82d07fffe040 [ffff82d07fffe040] -> ffff82d04038b9e7
+(XEN) Fixup #GP[0000]: ffff82d07fffe041 [ffff82d07fffe041] -> ffff82d04038b9e7
+(XEN) Fixup #GP[0000]: ffff82d07fffe040 [ffff82d07fffe040] -> ffff82d04038b9e7
+(XEN) Selftest 2 failed: Opc 02 04 04 c3 expected 12[0000], got 13[0000]
+(XEN) Fixup #BP[0000]: ffff82d07fffe041 [ffff82d07fffe041] -> ffff82d04038b9e7
+[...]
+(XEN) ***************************************************
+(XEN) SELFTEST FAILURE: CORRECT BEHAVIOR CANNOT BE GUARANTEED
+(XEN) ***************************************************
+(XEN) 3... 2... 1...
+```
+Steps to reproduce:
+The attached program ([noncanon.c](/uploads/34599a2fe23c6bbf1e9efd8cb8704537/noncanon.c)) generates the following output when run on native hardware or under KVM:
+
+```shell-session
+minipli@bell:~$ for i in "" -sp -bp; do ./noncanon $i; done
+Non-canonical acces via RAX: SIGSEGV, signo 11, error 0, code 128, addr (nil)
+Non-canonical acces via RSP: SIGBUS, signo 7, error 0, code 128, addr (nil)
+Non-canonical acces via RBP: SIGBUS, signo 7, error 0, code 128, addr (nil)
+```
+
+However, when run under QEMU using TCG, I get the following output:
+
+```shell-session
+root@box:~# for i in "" -sp -bp; do ./noncanon $i; done
+Non-canonical acces via RAX: SIGSEGV, signo 11, error 0, code 128, addr (nil)
+Non-canonical acces via RSP: SIGSEGV, signo 11, error 0, code 128, addr (nil)
+Non-canonical acces via RBP: SIGSEGV, signo 11, error 0, code 128, addr (nil)
+```
+
+Please note how RSP/RBP based access generates SIGSEGV instead of the expected SIGBUS.
+Additional information:
+The problem seems to be that QEMU always generates a #GP for non-canonical addresses, while it should differentiate, based on the register that led to the non-canonical address: #SS if RSP/RBP is involved, #GP otherwise. However, short of an instruction decoder, I don't see how this can easily be told apart.
+
+```diff
+diff --git a/target/i386/tcg/sysemu/excp_helper.c b/target/i386/tcg/sysemu/excp_helper.c
+index e1b6d8868338..ac4a6351a49d 100644
+--- a/target/i386/tcg/sysemu/excp_helper.c
++++ b/target/i386/tcg/sysemu/excp_helper.c
+@@ -386,6 +386,7 @@ static int handle_mmu_fault(CPUState *cs, vaddr addr, int size,
+             sext = (int64_t)addr >> (pg_mode & PG_MODE_LA57 ? 56 : 47);
+             if (sext != 0 && sext != -1) {
+                 env->error_code = 0;
++                // XXX: or EXCP0C_STACK for SP/BP bassed error
+                 cs->exception_index = EXCP0D_GPF;
+                 return 1;
+             }
+```
+
+Relevant excerpt from the Intel SDM:
+
+> **6.15 EXCEPTION AND INTERRUPT REFERENCE**  
+> [...]  
+> **Interrupt 12—Stack Fault Exception (#SS)**  
+> [...] 
+> - A canonical violation is detected in 64-bit mode during an operation that reference memory using the stack pointer register containing a non-canonical memory address.
+
+Please note the lack of mentioning the base pointer register, but tests on real hardware show it's subject to this as well.
+
+The AMD manual is more precise about that:
+> **8.2.13 #SS—Stack Exception (Vector 12)**  
+> An #SS exception can occur in the following situations:  
+> - Implied stack references in which the stack address is not in canonical form. Implied stack references include all push and pop instructions, and any instruction using RSP or RBP as a base register  
+> [...]
+
+It explicitly mentions "any instruction using RSP or RBP as a base register".

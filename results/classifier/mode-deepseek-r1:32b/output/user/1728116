@@ -1,0 +1,49 @@
+
+
+Empty /proc/self/auxv (linux-user)
+
+The userspace Linux API virtualization used to fake access to /proc/self/auxv, to provide meaningful data for the guest process.
+
+For newer qemu versions, this fails: The openat() is intercepted, but there's no content: /proc/self/auxv has length zero (i.e. reading from it returns 0 bytes).
+
+Good:
+
+$ x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+256 /proc/self/auxv
+
+Bad:
+
+$ x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+0 /proc/self/auxv
+
+This worked in 2.7.1, and fails in 2.10.1.
+
+This causes e.g. any procps-ng-based tool to segfault while reading from /proc/self/auxv in an endless loop (probably worth another bug report...)
+
+Doing a "git bisect" shows that this commit: https://github.com/qemu/qemu/commit/7c4ee5bcc introduced the problem.
+
+It might be a simple logic (subtraction in the wrong direction?) or sign-ness error: Adding some logging (to v2.10.1)
+
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9b6364a..49285f9 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7469,6 +7469,9 @@ static int open_self_auxv(void *cpu_env, int fd)
+     abi_ulong len = ts->info->auxv_len;
+     char *ptr;
+ 
++    gemu_log(TARGET_ABI_FMT_lu"\n", len);
++    gemu_log(TARGET_ABI_FMT_ld"\n", len);
++
+     /*
+      * Auxiliary vector is stored in target process stack.
+      * read in whole auxv vector and copy it to file
+
+shows this output:
+
+$  x86_64-linux-user/qemu-x86_64 /usr/bin/cat /proc/self/auxv | wc -c
+18446744073709551264
+-352
+0
+
+And 352 could be the expected length.

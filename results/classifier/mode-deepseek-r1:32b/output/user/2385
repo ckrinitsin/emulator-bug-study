@@ -1,0 +1,109 @@
+
+
+sparc: SIGILL stepping over `std` in gdb
+Description of problem:
+Certain cases of single-stepping thru the `std` store double-word instruction causes SIGILL fatal trap, while normal execution of the program is fine. Unfortunately I do not have access to real SPARC hardware so I cannot attest whether this is an emulation issue or not.
+
+My previous bugfix #2281 fixed any single-stepping in a debugger from panicking the kernel, associated with the `lda` on ASI_USERTXT in the `default_fuword32` function. I suspect further bugs like this could be related somehow. Perhaps a different instruction is used for the 64-bit access that needs a similar fix.
+
+This problem was experienced while testing some shell-spawning assembly:
+```
+-bash-4.3$ cat test.s
+.section ".text"
+.global main
+main:   
+        sethi  %hi(0x2f626800), %l6
+        or  %l6, 0x16e, %l6     ! 0x2f62696e
+        sethi  %hi(0x2f6b7000), %l7
+        or  %l7, 0x368, %l7     ! 0x2f6b7368
+        and  %sp, %sp, %o0
+        add  %sp, 0xc, %o1
+        xor  %o2, %o2, %o2
+        add  %sp, 0x14, %sp
+        std  %l6, [ %sp + -20 ]
+        clr  [ %sp + -12 ]
+        st  %sp, [ %sp + -8 ]
+        clr  [ %sp + -4 ]
+        mov  0x3b, %g1
+        ta  8
+        xor  %o7, %o7, %o0
+        mov  1, %g1
+        ta  8
+```
+
+```
+-bash-4.3$ gcc test.s -o test
+-bash-4.3$ ./test
+$ echo HELLO
+HELLO
+$ exit
+```
+
+As you can see the program works when ran directly from the shell, but when single-stepping in gdb, a SIGILL (illegal instruction) trap occurs
+```
+-bash-4.3$ gdb test
+GNU gdb (GDB) 7.4.1
+[...]
+(gdb) disas main
+Dump of assembler code for function main:
+   0x0001061c <+0>:     sethi  %hi(0x2f626800), %l6
+   0x00010620 <+4>:     or  %l6, 0x16e, %l6     ! 0x2f62696e
+   0x00010624 <+8>:     sethi  %hi(0x2f6b7000), %l7
+   0x00010628 <+12>:    or  %l7, 0x368, %l7     ! 0x2f6b7368
+   0x0001062c <+16>:    and  %sp, %sp, %o0
+   0x00010630 <+20>:    add  %sp, 0xc, %o1
+   0x00010634 <+24>:    xor  %o2, %o2, %o2
+   0x00010638 <+28>:    add  %sp, 0x14, %sp
+   0x0001063c <+32>:    std  %l6, [ %sp + -20 ]
+   0x00010640 <+36>:    clr  [ %sp + -12 ]
+   0x00010644 <+40>:    st  %sp, [ %sp + -8 ]
+   0x00010648 <+44>:    clr  [ %sp + -4 ]
+   0x0001064c <+48>:    mov  0x3b, %g1
+   0x00010650 <+52>:    ta  8
+   0x00010654 <+56>:    xor  %o7, %o7, %o0
+   0x00010658 <+60>:    mov  1, %g1
+   0x0001065c <+64>:    ta  8
+End of assembler dump.
+(gdb) b main
+Breakpoint 1 at 0x1061c
+(gdb) r
+Starting program: /export/home/bazz/iob/test 
+
+Breakpoint 1, 0x0001061c in main ()
+(gdb) si
+0x00010620 in main ()
+(gdb) 
+0x00010624 in main ()
+[...]
+Program received signal SIGILL, Illegal instruction.
+0x0001063c in main ()
+```
+
+However, if I continue execution _over_ the `std` instruction, the SIGILL does not occur. it will get to the usual SIGTRAP after execve,
+but then complains about memory accesses that I've never seen before.
+```
+(gdb) r
+Starting program: /export/home/bazz/iob/test 
+
+Breakpoint 1, 0x0001061c in main ()
+(gdb) c
+Continuing.
+
+Program received signal SIGTRAP, Trace/breakpoint trap.
+0xef783af4 in _rt_boot () from /usr/lib/ld.so.1
+(gdb) c
+Continuing.
+Cannot access memory at address 0x2800007
+Cannot access memory at address 0x2800003
+(gdb) c
+Continuing.
+Cannot access memory at address 0x2800007
+Cannot access memory at address 0x2800003
+(gdb) c
+Continuing.
+$ 
+```
+
+It does eventually get a shell though.
+
+On mdb, instead of single-stepping into a SIGILL, everything goes unresponsive after stepping the `std` instruction. Then I have to kill mdb.

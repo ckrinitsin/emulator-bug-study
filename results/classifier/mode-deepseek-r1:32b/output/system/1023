@@ -1,0 +1,62 @@
+
+
+TCG & LA57 (5-level page tables) causes intermittent triple fault when setting %CR3
+Description of problem:
+Enabling LA57 (5-level page tables) + TCG causes an intermittent triple fault when the kernel loads %cr3 in preparation for jumping to protected mode.  It is quite rare, only happening on perhaps 1 in 20 runs.
+
+The observed behaviour for most users is that we see SeaBIOS messages, and no kernel messages, and qemu exits.  (Triple fault in TCG code causes qemu to reset the virtual CPU, and we are using `-no-reboot` so that causes qemu to exit).
+
+There's a simple reproducer below.  I enabled qemu -d options to capture the full instruction traces which can be found here:
+
+http://oirase.annexia.org/tmp/fullexec-failed (error case)
+http://oirase.annexia.org/tmp/fullexec-good (successful run)
+
+I also added an `abort()` into qemu after the triple fault message in order to capture a stack trace, which can be found here: https://bugzilla.redhat.com/show_bug.cgi?id=2082806#c8
+Steps to reproduce:
+1. Save the following script into a file, adjusting the two variables at the top as appropriate:
+
+```
+#!/bin/bash -
+
+# Point this to any kernel in /boot:
+kernel=/boot/vmlinuz-4.18.0-387.el8.x86_64
+
+# Point this to qemu:
+qemu=/usr/libexec/qemu-kvm
+#qemu=/home/rjones/d/qemu/build/qemu-system-x86_64
+
+log=/tmp/log
+
+cpu=max
+#cpu=max,la57=off
+
+while $qemu \
+    -global virtio-blk-pci.scsi=off \
+    -no-user-config \
+    -nodefaults \
+    -display none \
+    -machine accel=tcg,graphics=off \
+    -cpu "$cpu" \
+    -m 2048 \
+    -no-reboot \
+    -rtc driftfix=slew \
+    -no-hpet \
+    -global kvm-pit.lost_tick_policy=discard \
+    -kernel $kernel \
+    -object rng-random,filename=/dev/urandom,id=rng0 \
+    -device virtio-rng-pci,rng=rng0 \
+    -device virtio-serial-pci \
+    -serial stdio \
+    -append "panic=1 console=ttyS0" >& $log &&
+    grep -sq "Linux version" $log; do
+    echo -n .
+done
+```
+
+2. Run the script.  It will run qemu many times, checking that it reaches the kernel.
+3. Eventually the script may exit. 
+4. Check `/tmp/log` and see if you only see SeaBIOS messages.
+5. Modify the script to add `-cpu max,la57=off` and the error will stop happening.
+Additional information:
+Downstream bug report: https://bugzilla.redhat.com/show_bug.cgi?id=2082806
+LA57 was enabled here: https://gitlab.com/qemu-project/qemu/-/issues/661

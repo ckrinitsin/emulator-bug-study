@@ -1,0 +1,93 @@
+
+
+[RISCV] sfence.vma need to end the translation block
+
+QEMU emulator version 5.0.0
+
+sfence.vma will flush the tlb, so after this instruction, the translation block should be end. The following code will only work in single step mode:
+```
+relocate:
+	li a0, OFFSET
+
+	la t0, 1f
+	add t0, t0, a0
+	csrw stvec, t0
+
+        la t0, early_pgtbl
+	srl t0, t0, PAGE_SHIFT
+	li t1, SATP_SV39
+	or t0, t1, t0
+
+        csrw satp, t0
+1:
+	sfence.vma
+	la t0, trap_s
+	csrw stvec, t0
+	ret
+```
+
+In this code, I want to relocate pc to virtual address with the OFFSET prefix, before writing to satp, pc run at physic address, stvec has been set a label 1 with a virtual prefix and virtual address has been mapping in early_pgtbl, after writing satp, there will throw a page fault, and pc will set to virtual address of label 1.
+
+The problem is that, in this situation, the translation block will not end after sfence.vma, and stvec will be set to trap_s,
+
+```
+----------------
+IN:
+Priv: 1; Virt: 0
+0x00000000800000dc:  00a080b3          add             ra,ra,a0
+0x00000000800000e0:  00007297          auipc           t0,28672        # 0x800070e0
+0x00000000800000e4:  f2028293          addi            t0,t0,-224
+0x00000000800000e8:  00c2d293          srli            t0,t0,12
+0x00000000800000ec:  fff0031b          addiw           t1,zero,-1
+0x00000000800000f0:  03f31313          slli            t1,t1,63
+0x00000000800000f4:  005362b3          or              t0,t1,t0
+0x00000000800000f8:  18029073          csrrw           zero,satp,t0
+
+----------------
+IN:
+Priv: 1; Virt: 0
+0x00000000800000fc:  12000073          sfence.vma      zero,zero
+0x0000000080000100:  00000297          auipc           t0,0            # 0x80000100
+0x0000000080000104:  1c828293          addi            t0,t0,456
+0x0000000080000108:  10529073          csrrw           zero,stvec,t0
+
+riscv_raise_exception: 12
+riscv_raise_exception: 12
+riscv_raise_exception: 12
+riscv_raise_exception: 12
+...
+```
+
+So, the program will crash, and the program will work in single step mode:
+```
+----------------
+IN:
+Priv: 1; Virt: 0
+0x00000000800000f8:  18029073          csrrw           zero,satp,t0
+
+----------------
+IN:
+Priv: 1; Virt: 0
+0x00000000800000fc:  12000073          sfence.vma      zero,zero
+
+riscv_raise_exception: 12
+----------------
+IN:
+Priv: 1; Virt: 0
+0xffffffff800000fc:  12000073          sfence.vma      zero,zero
+
+----------------
+IN:
+Priv: 1; Virt: 0
+0xffffffff80000100:  00000297          auipc           t0,0            # 0xffffffff80000100
+
+```
+The pc will set to label 1, instead of trap_s.
+
+I try to patch the code in fence.i in trans_rvi.inc.c to sfence.vma:
+```
+    tcg_gen_movi_tl(cpu_pc, ctx->pc_succ_insn);
+    exit_tb(ctx);
+    ctx->base.is_jmp = DISAS_NORETURN;
+```
+This codes can help to end the tranlate block, since I'm not a qemu guy, I'm not sure if this is a corret method.

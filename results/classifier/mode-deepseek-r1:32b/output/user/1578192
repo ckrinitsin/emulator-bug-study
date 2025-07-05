@@ -1,0 +1,58 @@
+
+
+GTK+ interface doesn't translate keycodes properly with Wayland backend
+
+I already posted this on the mailing list (https://lists.nongnu.org/archive/html/qemu-devel/2016-05/msg00119.html) but I decided to do a formal bug report so it can be tracked and doesn't get lost.
+
+... I'm no expert, but it looks like GTK+ key events come in at the ui/gtk.c:gd_key_event callback function, which calls ui/gtk.c:gd_map_keycode to translate the GTK+ keycode into the Qemu keycode before sending it on using qemu_input_event_send_key_number. The problem is that gd_map_keycode is incomplete when GTK+ is running on a backend other than X11.
+
+static int gd_map_keycode(GtkDisplayState *s, GdkDisplay *dpy, int gdk_keycode)
+{
+    int qemu_keycode;
+
+#ifdef GDK_WINDOWING_WIN32
+    if (GDK_IS_WIN32_DISPLAY(dpy)) {
+        qemu_keycode = MapVirtualKey(gdk_keycode, MAPVK_VK_TO_VSC);
+        switch (qemu_keycode) {
+        case 103:   /* alt gr */
+            qemu_keycode = 56 | SCANCODE_GREY;
+            break;
+        }
+        return qemu_keycode;
+    }
+#endif
+
+    if (gdk_keycode < 9) {
+        qemu_keycode = 0;
+    } else if (gdk_keycode < 97) {
+        qemu_keycode = gdk_keycode - 8;
+#ifdef GDK_WINDOWING_X11
+    } else if (GDK_IS_X11_DISPLAY(dpy) && gdk_keycode < 158) {
+        if (s->has_evdev) {
+            qemu_keycode = translate_evdev_keycode(gdk_keycode - 97);
+        } else {
+            qemu_keycode = translate_xfree86_keycode(gdk_keycode - 97);
+        }
+#endif
+    } else if (gdk_keycode == 208) { /* Hiragana_Katakana */
+        qemu_keycode = 0x70;
+    } else if (gdk_keycode == 211) { /* backslash */
+        qemu_keycode = 0x73;
+    } else {
+        qemu_keycode = 0;
+    }
+
+    return qemu_keycode;
+}
+
+In my case, I'm using GTK+'s Wayland backend, so keycodes 97 through 157 (this includes KEY_HOME(102), KEY_PAGEUP(104), KEY_PAGEDOWN(109), KEY_END(107), etc.) are never translated into a qemu_keycode, and the final 'else' block is hit, causing gd_map_keycode to return 0, which is an invalid keycode and thus cannot be handled by xen-kbdfront. At least that's my best guess as to what is happening.
+
+The solution that comes to mind is provide an alternative to translate_{evdev,xfree86}_keycode that is compatable with Wayland/libinput, but I don't know exactly which API would provide this functionality, much less do I have a patch. Intuition tells me that translate_evdev_keycode would probably work under Wayland because Weston uses libinput which uses evdev as its backend, but I don't know this for a fact, and I don't know if it would be the Right Way (i.e. Wayland or libinput might provide an API for this purpose, but I don't know).
+
+I may try to do some testing with translate_evdev_keycode on Wayland and also look into any possible APIs for keycode translation, but I just wanted to put it out there and get some feedback awhile.
+
+Qemu 2.2.1 from Xen 4.6.1 (relevant code appears unchanged in Qemu master)
+GTK+ 3.18.7
+Wayland 1.9.0
+Weston 1.9.0
+libinput 1.2.3

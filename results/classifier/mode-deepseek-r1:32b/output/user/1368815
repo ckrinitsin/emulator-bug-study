@@ -1,0 +1,39 @@
+
+
+qemu-img convert intermittently corrupts output images
+
+-- Found in releases qemu-2.0.0, qemu-2.0.2, qemu-2.1.0. Tested on Ubuntu 14.04 using Ext4 filesystems.
+
+The command
+
+  qemu-img convert -O raw inputimage.qcow2 outputimage.raw
+
+intermittently creates corrupted output images, when the input image is not yet fully synchronized to disk. While the issue has actually been discovered in operation of of OpenStack nova, it can be reproduced "easily" on command line using
+
+  cat $SRC_PATH > $TMP_PATH && $QEMU_IMG_PATH convert -O raw $TMP_PATH $DST_PATH && cksum $DST_PATH
+
+on filesystems exposing this behavior. (The difficult part of this exercise is to prepare a filesystem to reliably trigger this race. On my test machine some filesystems are affected while other aren't, and unfortunately I haven't found the relevant difference between them, yet. Possible it's timing issues completely out of userspace control ...)
+
+The root cause, however, is the same as in
+
+  http://lists.gnu.org/archive/html/coreutils/2011-04/msg00069.html
+
+and it can be solved the same way as suggested in
+
+  http://lists.gnu.org/archive/html/coreutils/2011-04/msg00102.html
+
+In qemu, file block/raw-posix.c use the FIEMAP_FLAG_SYNC, i.e change 
+
+    f.fm.fm_flags = 0;
+
+to
+
+    f.fm.fm_flags = FIEMAP_FLAG_SYNC;
+
+As discussed in the thread mentioned above, retrieving a page cache coherent map of file extents is possible only after fsync on that file.
+
+See also
+
+  https://bugs.launchpad.net/nova/+bug/1350766
+
+In that bug report filed against nova, fsync had been suggested to be performed by the framework invoking qemu-img. However, as the choice of fiemap -- implying this otherwise unneeded fsync of a temporary file  -- is not made by the caller but by qemu-img, I agree with the nova bug reviewer's objection to put it into nova. The fsync should instead be triggered by qemu-img utilizing the FIEMAP_FLAG_SYNC, specifically intended for that purpose.

@@ -1,0 +1,360 @@
+
+
+linux-user: emulated process reading /proc/self/mem doesn't see guest view of memory map
+Description of problem:
+QEMU user-mode emulation of a 32-bit guest on a 64-bit host doesn't seem to emulate `/proc/self/mem` (or `/proc/$pid/mem`) correctly. Based on the contents of `/proc/self/maps`, there seems to be some sort of address translation happening that `/proc/self/mem` doesn't honor.
+
+The following source file:
+
+```c
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+static const char string[] = "Hello, world!\n";
+
+static bool copy_to_stdout(const char *path)
+{
+	bool success = false;
+
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		perror("open");
+		return false;
+	}
+
+	char buf[16 * 1024];
+	while (true) {
+		ssize_t bytes_read = read(fd, buf, sizeof(buf));
+		if (bytes_read == 0) {
+			success = true;
+			goto out;
+		} else if (bytes_read < 0) {
+			perror("read");
+			goto out;
+		}
+		ssize_t bytes_written = 0;
+		while (bytes_written < bytes_read) {
+			ssize_t ret = write(STDOUT_FILENO, buf + bytes_written,
+					    bytes_read - bytes_written);
+			if (ret < 0) {
+				perror("write");
+				goto out;
+			}
+			bytes_written += ret;
+		}
+	}
+
+out:
+	close(fd);
+	return success;
+}
+
+static bool dump_maps(void)
+{
+	printf("Maps read by self:\n");
+	fflush(stdout);
+	if (!copy_to_stdout("/proc/self/maps"))
+		return false;
+
+	printf("\nMaps read by child process:\n");
+	fflush(stdout);
+	pid_t pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		return false;
+	}
+	if (pid == 0) {
+		char parent_maps[32];
+		sprintf(parent_maps, "/proc/%u/maps", (unsigned int)getppid());
+		if (copy_to_stdout(parent_maps))
+			_exit(EXIT_SUCCESS);
+		else
+			_exit(EXIT_FAILURE);
+	}
+	int wstatus;
+	if (waitpid(pid, &wstatus, 0) < 0 ||
+	    !WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != EXIT_SUCCESS)
+		return false;
+
+	printf("\n");
+	return true;
+}
+
+int main(void)
+{
+	if (!dump_maps())
+		return EXIT_FAILURE;
+
+	int fd = open("/proc/self/mem", O_RDONLY);
+	if (fd < 0) {
+		perror("open: /proc/self/mem");
+		return EXIT_FAILURE;
+	}
+
+	char buf[sizeof(string)];
+	printf("Reading %zu bytes from %p (%" PRIuPTR ") to %p of PID %u\n",
+	       sizeof(buf), string, (uintptr_t)string, buf,
+	       (unsigned int)getpid());
+	fflush(stdout);
+
+	if (pread(fd, buf, sizeof(buf), (uintptr_t)string) < 0) {
+		perror("pread: /proc/self/mem");
+		return EXIT_FAILURE;
+	}
+
+	if (memcmp(buf, string, sizeof(buf)) != 0) {
+		fprintf(stderr, "buffer doesn't match\n");
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
+}
+```
+
+when compiled for 32-bit ARM produces the following output:
+
+```
+Maps read by self:
+10000-7c000 r-xp 00000000 00:19 8275924                                  /home/osandov/repro
+7c000-8b000 ---p 00000000 00:00 0                                        
+8b000-8c000 r--p 0006b000 00:19 8275924                                  /home/osandov/repro
+8c000-8d000 rw-p 0006c000 00:19 8275924                                  /home/osandov/repro
+8d000-b0000 rw-p 00000000 00:00 0                                        
+3ffff000-40000000 r-xp 00000000 00:00 0                                  
+40000000-40001000 ---p 00000000 00:00 0                                  
+40001000-40801000 rw-p 00000000 00:00 0                                  [stack]
+
+Maps read by child process:
+00010000-00020000 ---p 00000000 00:00 0 
+00020000-0008c000 r--p 00000000 00:19 8275924                            /home/osandov/repro
+0008c000-0009b000 ---p 00000000 00:00 0 
+0009b000-0009c000 r--p 0006b000 00:19 8275924                            /home/osandov/repro
+0009c000-0009d000 rw-p 0006c000 00:19 8275924                            /home/osandov/repro
+0009d000-000c0000 rw-p 00000000 00:00 0 
+000c0000-4000f000 ---p 00000000 00:00 0 
+4000f000-40010000 r--p 00000000 00:00 0 
+40010000-40011000 ---p 00000000 00:00 0 
+40011000-40811000 rw-p 00000000 00:00 0 
+40811000-100000000 ---p 00000000 00:00 0 
+100000000-100001000 r--p 00000000 00:00 0 
+5636dd7a2000-5636dd8a4000 r--p 00000000 00:19 8270028                    /home/osandov/repos/qemu/build/qemu-arm
+5636dd8a4000-5636ddb13000 r-xp 00102000 00:19 8270028                    /home/osandov/repos/qemu/build/qemu-arm
+5636ddb13000-5636ddf69000 r--p 00371000 00:19 8270028                    /home/osandov/repos/qemu/build/qemu-arm
+5636ddf6a000-5636ddfe7000 r--p 007c7000 00:19 8270028                    /home/osandov/repos/qemu/build/qemu-arm
+5636ddfe7000-5636ddff3000 rw-p 00844000 00:19 8270028                    /home/osandov/repos/qemu/build/qemu-arm
+5636ddff3000-5636de010000 rw-p 00000000 00:00 0 
+5636df67b000-5636df80c000 rw-p 00000000 00:00 0                          [heap]
+7f3008000000-7f300ffff000 rwxp 00000000 00:00 0 
+7f300ffff000-7f3010000000 ---p 00000000 00:00 0 
+7f3010000000-7f3010021000 rw-p 00000000 00:00 0 
+7f3010021000-7f3014000000 ---p 00000000 00:00 0 
+7f3017119000-7f301719a000 rw-p 00000000 00:00 0 
+7f301719a000-7f301719b000 ---p 00000000 00:00 0 
+7f301719b000-7f30179a1000 rw-p 00000000 00:00 0 
+7f30179a1000-7f30179a3000 r--p 00000000 00:19 3660771                    /usr/lib/libffi.so.8.1.0
+7f30179a3000-7f30179a9000 r-xp 00002000 00:19 3660771                    /usr/lib/libffi.so.8.1.0
+7f30179a9000-7f30179ab000 r--p 00008000 00:19 3660771                    /usr/lib/libffi.so.8.1.0
+7f30179ab000-7f30179ac000 r--p 00009000 00:19 3660771                    /usr/lib/libffi.so.8.1.0
+7f30179ac000-7f30179ad000 rw-p 0000a000 00:19 3660771                    /usr/lib/libffi.so.8.1.0
+7f30179ad000-7f30179be000 r--p 00000000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f30179be000-7f3017a32000 r-xp 00011000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f3017a32000-7f3017a49000 r--p 00085000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f3017a49000-7f3017a4a000 ---p 0009c000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f3017a4a000-7f3017a4c000 r--p 0009c000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f3017a4c000-7f3017a4d000 rw-p 0009e000 00:19 1476709                    /usr/lib/libgmp.so.10.4.1
+7f3017a4d000-7f3017a56000 r--p 00000000 00:19 2871144                    /usr/lib/libhogweed.so.6.4
+7f3017a56000-7f3017a69000 r-xp 00009000 00:19 2871144                    /usr/lib/libhogweed.so.6.4
+7f3017a69000-7f3017a93000 r--p 0001c000 00:19 2871144                    /usr/lib/libhogweed.so.6.4
+7f3017a93000-7f3017a95000 r--p 00045000 00:19 2871144                    /usr/lib/libhogweed.so.6.4
+7f3017a95000-7f3017a96000 rw-p 00047000 00:19 2871144                    /usr/lib/libhogweed.so.6.4
+7f3017a96000-7f3017a98000 rw-p 00000000 00:00 0 
+7f3017a98000-7f3017aa4000 r--p 00000000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017aa4000-7f3017ac5000 r-xp 0000c000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017ac5000-7f3017adb000 r--p 0002d000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017adb000-7f3017adc000 ---p 00043000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017adc000-7f3017ade000 r--p 00043000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017ade000-7f3017adf000 rw-p 00045000 00:19 2871147                    /usr/lib/libnettle.so.8.4
+7f3017adf000-7f3017ae2000 r--p 00000000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017ae2000-7f3017aee000 r-xp 00003000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017aee000-7f3017af2000 r--p 0000f000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017af2000-7f3017af3000 ---p 00013000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017af3000-7f3017af4000 r--p 00013000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017af4000-7f3017af5000 rw-p 00014000 00:19 2550729                    /usr/lib/libtasn1.so.6.6.1
+7f3017af5000-7f3017b06000 r--p 00000000 00:19 937656                     /usr/lib/libunistring.so.2.1.0
+7f3017b06000-7f3017b3b000 r-xp 00011000 00:19 937656                     /usr/lib/libunistring.so.2.1.0
+7f3017b3b000-7f3017c72000 r--p 00046000 00:19 937656                     /usr/lib/libunistring.so.2.1.0
+7f3017c72000-7f3017c76000 r--p 0017c000 00:19 937656                     /usr/lib/libunistring.so.2.1.0
+7f3017c76000-7f3017c77000 rw-p 00180000 00:19 937656                     /usr/lib/libunistring.so.2.1.0
+7f3017c77000-7f3017c79000 r--p 00000000 00:19 3212638                    /usr/lib/libidn2.so.0.3.7
+7f3017c79000-7f3017c7d000 r-xp 00002000 00:19 3212638                    /usr/lib/libidn2.so.0.3.7
+7f3017c7d000-7f3017c97000 r--p 00006000 00:19 3212638                    /usr/lib/libidn2.so.0.3.7
+7f3017c97000-7f3017c98000 r--p 0001f000 00:19 3212638                    /usr/lib/libidn2.so.0.3.7
+7f3017c98000-7f3017c99000 rw-p 00020000 00:19 3212638                    /usr/lib/libidn2.so.0.3.7
+7f3017c99000-7f3017cc2000 r--p 00000000 00:19 3663986                    /usr/lib/libp11-kit.so.0.3.0
+7f3017cc2000-7f3017d60000 r-xp 00029000 00:19 3663986                    /usr/lib/libp11-kit.so.0.3.0
+7f3017d60000-7f3017dba000 r--p 000c7000 00:19 3663986                    /usr/lib/libp11-kit.so.0.3.0
+7f3017dba000-7f3017dc4000 r--p 00120000 00:19 3663986                    /usr/lib/libp11-kit.so.0.3.0
+7f3017dc4000-7f3017dce000 rw-p 0012a000 00:19 3663986                    /usr/lib/libp11-kit.so.0.3.0
+7f3017dce000-7f3017dd0000 r--p 00000000 00:19 2549813                    /usr/lib/libdl-2.33.so
+7f3017dd0000-7f3017dd2000 r-xp 00002000 00:19 2549813                    /usr/lib/libdl-2.33.so
+7f3017dd2000-7f3017dd3000 r--p 00004000 00:19 2549813                    /usr/lib/libdl-2.33.so
+7f3017dd3000-7f3017dd4000 r--p 00004000 00:19 2549813                    /usr/lib/libdl-2.33.so
+7f3017dd4000-7f3017dd5000 rw-p 00005000 00:19 2549813                    /usr/lib/libdl-2.33.so
+7f3017dd5000-7f3017dd7000 rw-p 00000000 00:00 0 
+7f3017dd7000-7f3017dd9000 r--p 00000000 00:19 3020974                    /usr/lib/libpcre.so.1.2.13
+7f3017dd9000-7f3017e2f000 r-xp 00002000 00:19 3020974                    /usr/lib/libpcre.so.1.2.13
+7f3017e2f000-7f3017e4c000 r--p 00058000 00:19 3020974                    /usr/lib/libpcre.so.1.2.13
+7f3017e4c000-7f3017e4d000 r--p 00074000 00:19 3020974                    /usr/lib/libpcre.so.1.2.13
+7f3017e4d000-7f3017e4e000 rw-p 00075000 00:19 3020974                    /usr/lib/libpcre.so.1.2.13
+7f3017e4e000-7f3017e74000 r--p 00000000 00:19 2549806                    /usr/lib/libc-2.33.so
+7f3017e74000-7f3017fbf000 r-xp 00026000 00:19 2549806                    /usr/lib/libc-2.33.so
+7f3017fbf000-7f301800b000 r--p 00171000 00:19 2549806                    /usr/lib/libc-2.33.so
+7f301800b000-7f301800e000 r--p 001bc000 00:19 2549806                    /usr/lib/libc-2.33.so
+7f301800e000-7f3018011000 rw-p 001bf000 00:19 2549806                    /usr/lib/libc-2.33.so
+7f3018011000-7f301801a000 rw-p 00000000 00:00 0 
+7f301801a000-7f3018021000 r--p 00000000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018021000-7f3018030000 r-xp 00007000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018030000-7f3018034000 r--p 00016000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018034000-7f3018035000 ---p 0001a000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018035000-7f3018036000 r--p 0001a000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018036000-7f3018037000 rw-p 0001b000 00:19 2549847                    /usr/lib/libpthread-2.33.so
+7f3018037000-7f301803b000 rw-p 00000000 00:00 0 
+7f301803b000-7f301803e000 r--p 00000000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f301803e000-7f3018050000 r-xp 00003000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f3018050000-7f3018053000 r--p 00015000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f3018053000-7f3018054000 ---p 00018000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f3018054000-7f3018055000 r--p 00018000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f3018055000-7f3018056000 rw-p 00019000 00:19 2550528                    /usr/lib/libgcc_s.so.1
+7f3018056000-7f3018065000 r--p 00000000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f3018065000-7f30180ff000 r-xp 0000f000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f30180ff000-7f3018197000 r--p 000a9000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f3018197000-7f3018198000 ---p 00141000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f3018198000-7f3018199000 r--p 00141000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f3018199000-7f301819a000 rw-p 00142000 00:19 2549819                    /usr/lib/libm-2.33.so
+7f301819a000-7f3018233000 r--p 00000000 00:19 2550558                    /usr/lib/libstdc++.so.6.0.29
+7f3018233000-7f3018333000 r-xp 00099000 00:19 2550558                    /usr/lib/libstdc++.so.6.0.29
+7f3018333000-7f301839f000 r--p 00199000 00:19 2550558                    /usr/lib/libstdc++.so.6.0.29
+7f301839f000-7f30183ac000 r--p 00204000 00:19 2550558                    /usr/lib/libstdc++.so.6.0.29
+7f30183ac000-7f30183ad000 rw-p 00211000 00:19 2550558                    /usr/lib/libstdc++.so.6.0.29
+7f30183ad000-7f30183b2000 rw-p 00000000 00:00 0 
+7f30183b2000-7f30183e6000 r--p 00000000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f30183e6000-7f3018508000 r-xp 00034000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f3018508000-7f301859d000 r--p 00156000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f301859d000-7f301859e000 ---p 001eb000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f301859e000-7f30185af000 r--p 001eb000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f30185af000-7f30185b1000 rw-p 001fc000 00:19 2907924                    /usr/lib/libgnutls.so.30.30.0
+7f30185b1000-7f30185b3000 rw-p 00000000 00:00 0 
+7f30185b3000-7f30185b5000 r--p 00000000 00:19 3662215                    /usr/lib/libgmodule-2.0.so.0.7000.0
+7f30185b5000-7f30185b7000 r-xp 00002000 00:19 3662215                    /usr/lib/libgmodule-2.0.so.0.7000.0
+7f30185b7000-7f30185b8000 r--p 00004000 00:19 3662215                    /usr/lib/libgmodule-2.0.so.0.7000.0
+7f30185b8000-7f30185b9000 r--p 00004000 00:19 3662215                    /usr/lib/libgmodule-2.0.so.0.7000.0
+7f30185b9000-7f30185ba000 rw-p 00005000 00:19 3662215                    /usr/lib/libgmodule-2.0.so.0.7000.0
+7f30185ba000-7f30185d7000 r--p 00000000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f30185d7000-7f3018664000 r-xp 0001d000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f3018664000-7f30186ec000 r--p 000aa000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f30186ec000-7f30186ed000 ---p 00132000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f30186ed000-7f30186ee000 r--p 00132000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f30186ee000-7f30186ef000 rw-p 00133000 00:19 3662212                    /usr/lib/libglib-2.0.so.0.7000.0
+7f30186ef000-7f30186f0000 rw-p 00000000 00:00 0 
+7f30186f0000-7f30186f2000 r--p 00000000 00:19 3440204                    /usr/lib/liburing.so.2.1.0
+7f30186f2000-7f30186f4000 r-xp 00002000 00:19 3440204                    /usr/lib/liburing.so.2.1.0
+7f30186f4000-7f30186f5000 r--p 00004000 00:19 3440204                    /usr/lib/liburing.so.2.1.0
+7f30186f5000-7f30186f6000 r--p 00004000 00:19 3440204                    /usr/lib/liburing.so.2.1.0
+7f30186f6000-7f30186f7000 rw-p 00005000 00:19 3440204                    /usr/lib/liburing.so.2.1.0
+7f30186f7000-7f30186fa000 r--p 00000000 00:19 2549855                    /usr/lib/librt-2.33.so
+7f30186fa000-7f30186fe000 r-xp 00003000 00:19 2549855                    /usr/lib/librt-2.33.so
+7f30186fe000-7f3018700000 r--p 00007000 00:19 2549855                    /usr/lib/librt-2.33.so
+7f3018700000-7f3018701000 r--p 00008000 00:19 2549855                    /usr/lib/librt-2.33.so
+7f3018701000-7f3018702000 rw-p 00009000 00:19 2549855                    /usr/lib/librt-2.33.so
+7f3018702000-7f3018705000 r--p 00000000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f3018705000-7f3018713000 r-xp 00003000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f3018713000-7f3018719000 r--p 00011000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f3018719000-7f301871a000 ---p 00017000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f301871a000-7f301871b000 r--p 00017000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f301871b000-7f301871c000 rw-p 00018000 00:19 15838                      /usr/lib/libz.so.1.2.11
+7f301871c000-7f301871e000 rw-p 00000000 00:00 0 
+7f301871e000-7f301871f000 r--p 00000000 00:19 2549795                    /usr/lib/ld-2.33.so
+7f301871f000-7f3018743000 r-xp 00001000 00:19 2549795                    /usr/lib/ld-2.33.so
+7f3018743000-7f301874c000 r--p 00025000 00:19 2549795                    /usr/lib/ld-2.33.so
+7f301874c000-7f301874e000 r--p 0002d000 00:19 2549795                    /usr/lib/ld-2.33.so
+7f301874e000-7f3018750000 rw-p 0002f000 00:19 2549795                    /usr/lib/ld-2.33.so
+7ffc5c8f6000-7ffc5c917000 rw-p 00000000 00:00 0                          [stack]
+7ffc5c935000-7ffc5c939000 r--p 00000000 00:00 0                          [vvar]
+7ffc5c939000-7ffc5c93b000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+
+Reading 15 bytes from 0x6377c (407420) to 0x40800638 of PID 278331
+buffer doesn't match
+```
+
+The program is trying to read from 0x6377c, which according to the emulated maps is in this mapping:
+
+```
+10000-7c000 r-xp 00000000 00:19 8275924                                  /home/osandov/repro
+```
+
+but on the host, it's mapped differently:
+
+```
+00020000-0008c000 r--p 00000000 00:19 8275924                            /home/osandov/repro
+```
+
+When using `qemu-arm-static` (version `6.1.0 (Debian 1:6.1+dfsg-6)`) via `binfmt_misc`, I also saw a case where the address isn't mapped in the host at all:
+
+```
+Maps read by self:
+10000-7c000 r-xp 00000000 00:19 8275924                                  /home/osandov/repro
+7c000-8b000 ---p 00000000 00:00 0                                        
+8b000-8c000 r--p 0006b000 00:19 8275924                                  /home/osandov/repro
+8c000-8d000 rw-p 0006c000 00:19 8275924                                  /home/osandov/repro
+8d000-b0000 rw-p 00000000 00:00 0                                        
+40000000-40001000 ---p 00000000 00:00 0                                  
+40001000-40801000 rw-p 00000000 00:00 0                                  [stack]
+
+Maps read by child process:
+00400000-00401000 r--p 00000000 00:19 297                                /usr/bin/qemu-arm-static
+00401000-00769000 r-xp 00001000 00:19 297                                /usr/bin/qemu-arm-static
+00769000-00abe000 r--p 00369000 00:19 297                                /usr/bin/qemu-arm-static
+00abe000-00c58000 r--p 006bd000 00:19 297                                /usr/bin/qemu-arm-static
+00c58000-00cd3000 rw-p 00857000 00:19 297                                /usr/bin/qemu-arm-static
+00cd3000-00cf7000 rw-p 00000000 00:00 0 
+0253c000-0268e000 rw-p 00000000 00:00 0                                  [heap]
+42645000-42655000 ---p 00000000 00:00 0 
+42655000-426c1000 r--p 00000000 00:19 8275924                            /home/osandov/repro
+426c1000-426d0000 ---p 00000000 00:00 0 
+426d0000-426d1000 r--p 0006b000 00:19 8275924                            /home/osandov/repro
+426d1000-426d2000 rw-p 0006c000 00:19 8275924                            /home/osandov/repro
+426d2000-426f5000 rw-p 00000000 00:00 0 
+426f5000-82645000 ---p 00000000 00:00 0 
+82645000-82646000 ---p 00000000 00:00 0 
+82646000-82e46000 rw-p 00000000 00:00 0 
+82e46000-142635000 ---p 00000000 00:00 0 
+142635000-142636000 r--p 00000000 00:00 0 
+7f5584000000-7f558bfff000 rwxp 00000000 00:00 0 
+7f558bfff000-7f558c000000 ---p 00000000 00:00 0 
+7f558c000000-7f558c021000 rw-p 00000000 00:00 0 
+7f558c021000-7f5590000000 ---p 00000000 00:00 0 
+7f55929b5000-7f5592a36000 rw-p 00000000 00:00 0 
+7f5592a36000-7f5592a37000 ---p 00000000 00:00 0 
+7f5592a37000-7f5593237000 rw-p 00000000 00:00 0 
+7ffc4971a000-7ffc4973b000 rw-p 00000000 00:00 0                          [stack]
+7ffc497fa000-7ffc497fe000 r--p 00000000 00:00 0                          [vvar]
+7ffc497fe000-7ffc49800000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+
+Reading 15 bytes from 0x6377c (407420) to 0x40800648 of PID 278443
+pread: /proc/self/mem: Input/output error
+```
+Steps to reproduce:
+1. Download statically-linked ARM [reproducer](/uploads/5563ad67d01f0ec4a10f27d1967216c4/repro).
+2. Run `qemu-arm ./repro`.
+Additional information:
+I encountered this when trying out a CI system that uses QEMU user-mode emulation for 32-bit ARM builds. My project is a debugger that uses `/proc/self/mem`, and a test case tripped over this. See https://github.com/osandov/drgn/pull/126.
+
+This also seems to happen with a i386 guest, but not with an aarch64 guest, so I'm assuming that it's a 32-bit guest issue.

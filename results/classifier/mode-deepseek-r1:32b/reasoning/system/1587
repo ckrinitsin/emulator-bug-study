@@ -1,0 +1,31 @@
+<think>
+Okay, so I need to figure out whether this bug in QEMU is user-mode or system-mode related. Let me start by understanding the problem described.
+
+The issue arises when certain load instructions are allowed despite being blocked by PMP (Physical Memory Protection) after an mret instruction. The sequence given involves setting up machine mode, changing MPP and MPRV, entering an ISR, loading from an address which populates the TLB, then executing mret to set MPP back. After that, another load is done which should fail but succeeds because the TLB didn't refill.
+
+The user provided a script to reproduce this using QEMU, and it fails there, but passes on Spike (the reference emulator). They also noted that adding a tlb_flush in helper_mret fixes it for them, though they aren't sure if it's valid.
+
+Looking at the steps:
+
+1. Machine mode.
+2. MPP set to U (0).
+3. MPRV set to 1, which makes the CPU use the user privilege level when accessing memory.
+4. Entering an ISR changes MPP back to M (3).
+5. Load from address populates QEMU TLB.
+6. mret sets MPP back to U.
+7. Next load should fail but doesn't because TLB didn't refill.
+
+So, the problem is that after mret, which changes the privilege level, the existing TLB entries are still used, allowing access that shouldn't be permitted under PMP settings when in a lower privilege mode.
+
+In RISC-V, the MPRV bit affects whether the current privilege level uses machine or user mappings. When MPRV is set (1), loads and stores use the user privilege for address translation, which should enforce any PMP settings that restrict access based on the effective privilege.
+
+The bug seems to be that after mret, which changes the privilege mode back to U, the TLB isn't being flushed or updated properly. So when a load is attempted again, it uses the old TLB entry from when MPRV was 1 and MPP was M. This bypasses PMP checks because the TLB still has an entry that allows access.
+
+QEMU's TLB handling might not be correctly invalidating entries when privilege levels change due to mret. In Spike, this works as expected, implying QEMU is missing some steps in its TLB management during context switches or privilege changes.
+
+The user suggested a possible fix by flushing the TLB in helper_mret. Flushing would ensure that any existing TLB mappings are cleared before switching back to U mode, forcing the next load to refill from the correct mappings and respect PMP settings.
+
+So, this issue is related to how QEMU handles TLB entries during privilege level changes, specifically after returning from a machine-mode interrupt (mret). Since it involves changing privilege levels and handling of memory protection mechanisms like PMP, which are system-level features, this bug falls under system-mode operations.
+</think>
+
+system

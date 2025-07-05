@@ -1,0 +1,43 @@
+<think>
+Okay, so I'm trying to help Philippe debug this issue where qemu-arm-static is stuck at 100% CPU while cross-compiling Emacs for an Alpine Docker image. Let me try to break down what's happening here.
+
+First, the setup: Philippe is using an Ubuntu 18.04 machine with a Docker environment to build a multi-arch image for Emacs. He's trying to target an ARM platform, which means he needs to use QEMU user-mode emulation to run the compilation process on his x86_64 host.
+
+He runs `docker build` with the `--platform arm` flag, and everything goes fine until a specific step where it starts running `qemu-arm-static`. The command in question is `/usr/bin/qemu-arm-static ../src/bootstrap-emacs -batch --no-site-file --no-site-lisp --eval (setq load-prefer-newer t) -f batch-byte-compile emacs-lisp/macroexp.el`.
+
+The problem is that this process isn't completing as expected. Instead of taking a few seconds, it's maxing out the CPU and doesn't finish. When he straces the process, he sees a loop where `getdents64` and `lseek` are being called repeatedly, followed by attempts to send signals with `tgkill`, which fail with EAGAIN.
+
+So, looking at the strace output:
+
+- The process is reading directory entries using `getdents64`.
+- It's seeking back to the start of the directory each time.
+- Then it tries to send a real-time signal (SIGRT_2) to another thread in the same process, but this fails with EAGAIN.
+
+This loop suggests that something is causing the process to continuously check for directory entries and try to signal a thread that might not be responsive or doesn't exist anymore. 
+
+Now, considering QEMU's modes:
+
+- **User-mode emulation** allows running binaries of different architectures without full virtualization. It translates system calls from the target architecture (ARM in this case) into the host's syscalls.
+- **System-mode** involves emulating an entire operating system with hardware devices, which is more resource-intensive and used for things like VMs.
+
+In this scenario, Philippe is using QEMU user-static to run an ARM binary on his x86_64 host. This is definitely user-mode because he's not trying to boot a full OS or emulate hardware devices; it's just running the Emacs compilation process under emulation.
+
+The fact that the issue occurs consistently across multiple versions of QEMU (2.11.1, 4.1.1-1, 4.2.0-2) suggests it might be a known bug or a configuration issue specific to how the cross-compilation is set up in Docker.
+
+Possible causes could include:
+
+1. **Signal handling issues**: The `tgkill` attempts failing with EAGAIN might indicate that the target thread isn't responding, possibly due to a deadlock or another issue within the emulated process.
+2. **Directory monitoring**: The repeated `getdents64` and `lseek` calls could be part of some file watching mechanism in Emacs's build process, which is causing an infinite loop when run under QEMU.
+3. **Resource limitations**: Maybe Docker isn't allocating enough resources to the container, or there are cgroup restrictions affecting performance.
+
+To debug further, I might suggest:
+
+- Checking if the same compilation step works without Docker on the host machine using `qemu-arm`.
+- Inspecting the Dockerfile for any potential issues with mounts or directory structures that could be causing problems under emulation.
+- Monitoring system resources during the build to see if there are any bottlenecks or if other processes are interfering.
+- Looking at QEMU's logs (if available) for any error messages or warnings that could provide more context.
+
+But based on the initial information, it seems like this is a user-mode issue because it's related to running an emulated binary and its interaction with host system calls during compilation. There doesn't seem to be involvement of full OS virtualization or hardware emulation, which would fall under system-mode.
+</think>
+
+user
