@@ -1,0 +1,227 @@
+
+
+
+qemu 6.2 user mode memory leak when mmap + munmap is called
+Description of problem:
+Launch a program with qemu user mode emulator,
+If this program calls mmap to allocate 40GB virtual memory and call munmap to free it later, the memory const of qemu user mode emulator grows to a very big value. 
+
+Excepted behavior: qemu-x86_64 costs very less memory after munmap is called.
+Observed behavior: qemu-x86_64 costs around 2.5GiB after munmap is called. Most of the memory is consumed by [heap].
+Steps to reproduce:
+1.Compile this code with g++.
+```shell
+g++ -o main.bin main.cpp
+```
+```cpp
+#include <chrono>
+#include <cstdio>
+#include <sys/types.h>
+#include <unistd.h>
+#include <cstdlib>
+#include <sys/mman.h>
+
+#include <thread>
+
+static constexpr size_t  pageSize = 4096;
+
+int main(){
+	constexpr size_t size = 1024*100*pageSize*1000;
+
+	void* data = mmap(nullptr, size, PROT_NONE,  MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	
+	if(data == nullptr){
+		perror("mmap failed");
+		exit(1);
+	}
+
+	int error = munmap(data, size);
+
+	if(error !=0){
+		perror("munmap failed");
+		exit(1);
+	}
+	
+
+	printf("mmap munmap test done\n");
+	while(true){
+		std::this_thread::sleep_for(std::chrono::seconds(10000));
+	}
+	
+	return 0;
+}
+```
+2. run main.bin with qemu-x86_64
+```shell
+$ qemu-x86_64 ./main.bin
+mmap munmap test done
+```
+3. check memory usage by top
+```
+$ top -p `pgrep "qemu"`
+top - 16:00:39 up  6:41,  1 user,  load average: 0.08, 0.12, 0.10
+Tasks:   1 total,   0 running,   1 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.0 us,  0.0 sy,  0.0 ni,100.0 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+MiB Mem :  15969.1 total,   8249.3 free,   6048.2 used,   1671.5 buff/cache
+MiB Swap:   2048.0 total,   1209.6 free,    838.4 used.   9544.3 avail Mem 
+
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND                                                                                                                             
+  38521 jcq       20   0 2634324   2.3g   7840 S   0.0  14.8   0:04.48 qemu-x86_64                                                                                                                         
+```
+
+4. check memory usage by mmap. Heap is 5611ca5e0000-56125d125000, the size of heap is more than 2GiB.
+```shell
+$ cat /proc/38521/maps
+4000000000-4000001000 r--p 00000000 00:35 49812                          /mnt/hgfs/workspace/LearningProjects/CMakeLearn/src/main.bin
+4000001000-4000002000 r--p 00001000 00:35 49812                          /mnt/hgfs/workspace/LearningProjects/CMakeLearn/src/main.bin
+4000002000-4000003000 r--p 00002000 00:35 49812                          /mnt/hgfs/workspace/LearningProjects/CMakeLearn/src/main.bin
+4000003000-4000004000 r--p 00002000 00:35 49812                          /mnt/hgfs/workspace/LearningProjects/CMakeLearn/src/main.bin
+4000004000-4000005000 rw-p 00003000 00:35 49812                          /mnt/hgfs/workspace/LearningProjects/CMakeLearn/src/main.bin
+4000005000-4000026000 rw-p 00000000 00:00 0 
+4001005000-4001006000 ---p 00000000 00:00 0 
+4001006000-4001806000 rw-p 00000000 00:00 0 
+4001806000-400183d000 r--p 00000000 08:05 4456513                        /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+400183d000-400183e000 ---p 00000000 00:00 0 
+400183e000-4001840000 r--p 00037000 08:05 4456513                        /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+4001840000-4001842000 rw-p 00039000 08:05 4456513                        /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+4001842000-4001844000 rw-p 00000000 00:00 0 
+4001863000-4001a78000 r--p 00000000 08:05 4456541                        /usr/lib/x86_64-linux-gnu/libc.so.6
+4001a78000-4001a7c000 r--p 00214000 08:05 4456541                        /usr/lib/x86_64-linux-gnu/libc.so.6
+4001a7c000-4001a7e000 rw-p 00218000 08:05 4456541                        /usr/lib/x86_64-linux-gnu/libc.so.6
+4001a7e000-4001a8d000 rw-p 00000000 00:00 0 
+5611c96af000-5611c9734000 r--p 00000000 08:05 4467878                    /usr/bin/qemu-x86_64
+5611c9734000-5611c9885000 r-xp 00085000 08:05 4467878                    /usr/bin/qemu-x86_64
+5611c9885000-5611c9901000 r--p 001d6000 08:05 4467878                    /usr/bin/qemu-x86_64
+5611c9902000-5611c993c000 r--p 00252000 08:05 4467878                    /usr/bin/qemu-x86_64
+5611c993c000-5611c9950000 rw-p 0028c000 08:05 4467878                    /usr/bin/qemu-x86_64
+5611c9950000-5611c996e000 rw-p 00000000 00:00 0 
+5611ca5e0000-56125d125000 rw-p 00000000 00:00 0                          [heap]
+7f2038000000-7f203ffff000 rwxp 00000000 00:00 0 
+7f203ffff000-7f2040000000 ---p 00000000 00:00 0 
+7f2040000000-7f2040021000 rw-p 00000000 00:00 0 
+7f2040021000-7f2044000000 ---p 00000000 00:00 0 
+7f2047def000-7f2047e70000 rw-p 00000000 00:00 0 
+7f2047e70000-7f2047e71000 ---p 00000000 00:00 0 
+7f2047e71000-7f2048676000 rw-p 00000000 00:00 0 
+7f2048676000-7f2048678000 r--p 00000000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f2048678000-7f204867f000 r-xp 00002000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f204867f000-7f2048680000 r--p 00009000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f2048680000-7f2048681000 ---p 0000a000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f2048681000-7f2048682000 r--p 0000a000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f2048682000-7f2048683000 rw-p 0000b000 08:05 4456538                    /usr/lib/x86_64-linux-gnu/libffi.so.8.1.0
+7f2048683000-7f204868d000 r--p 00000000 08:05 4457088                    /usr/lib/x86_64-linux-gnu/libgmp.so.10.4.1
+7f204868d000-7f20486ec000 r-xp 0000a000 08:05 4457088                    /usr/lib/x86_64-linux-gnu/libgmp.so.10.4.1
+7f20486ec000-7f2048703000 r--p 00069000 08:05 4457088                    /usr/lib/x86_64-linux-gnu/libgmp.so.10.4.1
+7f2048703000-7f2048704000 r--p 0007f000 08:05 4457088                    /usr/lib/x86_64-linux-gnu/libgmp.so.10.4.1
+7f2048704000-7f2048705000 rw-p 00080000 08:05 4457088                    /usr/lib/x86_64-linux-gnu/libgmp.so.10.4.1
+7f2048705000-7f204870d000 r--p 00000000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f204870d000-7f2048720000 r-xp 00008000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f2048720000-7f204874a000 r--p 0001b000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f204874a000-7f204874b000 ---p 00045000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f204874b000-7f204874c000 r--p 00045000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f204874c000-7f204874d000 rw-p 00046000 08:05 4461541                    /usr/lib/x86_64-linux-gnu/libhogweed.so.6.4
+7f204874d000-7f2048757000 r--p 00000000 08:05 4464736                    /usr/lib/x86_64-linux-gnu/libnettle.so.8.4
+7f2048757000-7f204877a000 r-xp 0000a000 08:05 4464736                    /usr/lib/x86_64-linux-gnu/libnettle.so.8.4
+7f204877a000-7f2048790000 r--p 0002d000 08:05 4464736                    /usr/lib/x86_64-linux-gnu/libnettle.so.8.4
+7f2048790000-7f2048792000 r--p 00042000 08:05 4464736                    /usr/lib/x86_64-linux-gnu/libnettle.so.8.4
+7f2048792000-7f2048793000 rw-p 00044000 08:05 4464736                    /usr/lib/x86_64-linux-gnu/libnettle.so.8.4
+7f2048793000-7f2048795000 rw-p 00000000 00:00 0 
+7f2048795000-7f2048798000 r--p 00000000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f2048798000-7f20487a6000 r-xp 00003000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f20487a6000-7f20487aa000 r--p 00011000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f20487aa000-7f20487ab000 ---p 00015000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f20487ab000-7f20487ac000 r--p 00015000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f20487ac000-7f20487ad000 rw-p 00016000 08:05 4459610                    /usr/lib/x86_64-linux-gnu/libtasn1.so.6.6.2
+7f20487ad000-7f20487be000 r--p 00000000 08:05 4460136                    /usr/lib/x86_64-linux-gnu/libunistring.so.2.2.0
+7f20487be000-7f20487f4000 r-xp 00011000 08:05 4460136                    /usr/lib/x86_64-linux-gnu/libunistring.so.2.2.0
+7f20487f4000-7f2048952000 r--p 00047000 08:05 4460136                    /usr/lib/x86_64-linux-gnu/libunistring.so.2.2.0
+7f2048952000-7f2048956000 r--p 001a5000 08:05 4460136                    /usr/lib/x86_64-linux-gnu/libunistring.so.2.2.0
+7f2048956000-7f2048957000 rw-p 001a9000 08:05 4460136                    /usr/lib/x86_64-linux-gnu/libunistring.so.2.2.0
+7f2048957000-7f2048959000 r--p 00000000 08:05 4465922                    /usr/lib/x86_64-linux-gnu/libidn2.so.0.3.7
+7f2048959000-7f204895d000 r-xp 00002000 08:05 4465922                    /usr/lib/x86_64-linux-gnu/libidn2.so.0.3.7
+7f204895d000-7f2048976000 r--p 00006000 08:05 4465922                    /usr/lib/x86_64-linux-gnu/libidn2.so.0.3.7
+7f2048976000-7f2048977000 r--p 0001e000 08:05 4465922                    /usr/lib/x86_64-linux-gnu/libidn2.so.0.3.7
+7f2048977000-7f2048978000 rw-p 0001f000 08:05 4465922                    /usr/lib/x86_64-linux-gnu/libidn2.so.0.3.7
+7f2048978000-7f20489a1000 r--p 00000000 08:05 4459606                    /usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.0
+7f20489a1000-7f2048a45000 r-xp 00029000 08:05 4459606                    /usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.0
+7f2048a45000-7f2048a9f000 r--p 000cd000 08:05 4459606                    /usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.0
+7f2048a9f000-7f2048aa9000 r--p 00126000 08:05 4459606                    /usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.0
+7f2048aa9000-7f2048ab3000 rw-p 00130000 08:05 4459606                    /usr/lib/x86_64-linux-gnu/libp11-kit.so.0.3.0
+7f2048ab3000-7f2048ab5000 r--p 00000000 08:05 4456747                    /usr/lib/x86_64-linux-gnu/libpcre.so.3.13.3
+7f2048ab5000-7f2048b0a000 r-xp 00002000 08:05 4456747                    /usr/lib/x86_64-linux-gnu/libpcre.so.3.13.3
+7f2048b0a000-7f2048b27000 r--p 00057000 08:05 4456747                    /usr/lib/x86_64-linux-gnu/libpcre.so.3.13.3
+7f2048b27000-7f2048b28000 r--p 00073000 08:05 4456747                    /usr/lib/x86_64-linux-gnu/libpcre.so.3.13.3
+7f2048b28000-7f2048b29000 rw-p 00074000 08:05 4456747                    /usr/lib/x86_64-linux-gnu/libpcre.so.3.13.3
+7f2048b29000-7f2048b51000 r--p 00000000 08:05 4456541                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2048b51000-7f2048ce6000 r-xp 00028000 08:05 4456541                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2048ce6000-7f2048d3e000 r--p 001bd000 08:05 4456541                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2048d3e000-7f2048d42000 r--p 00214000 08:05 4456541                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2048d42000-7f2048d44000 rw-p 00218000 08:05 4456541                    /usr/lib/x86_64-linux-gnu/libc.so.6
+7f2048d44000-7f2048d53000 rw-p 00000000 00:00 0 
+7f2048d53000-7f2048d56000 r--p 00000000 08:05 4457972                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7f2048d56000-7f2048d6d000 r-xp 00003000 08:05 4457972                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7f2048d6d000-7f2048d71000 r--p 0001a000 08:05 4457972                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7f2048d71000-7f2048d72000 r--p 0001d000 08:05 4457972                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7f2048d72000-7f2048d73000 rw-p 0001e000 08:05 4457972                    /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+7f2048d73000-7f2048d81000 r--p 00000000 08:05 4456717                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7f2048d81000-7f2048dfd000 r-xp 0000e000 08:05 4456717                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7f2048dfd000-7f2048e58000 r--p 0008a000 08:05 4456717                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7f2048e58000-7f2048e59000 r--p 000e4000 08:05 4456717                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7f2048e59000-7f2048e5a000 rw-p 000e5000 08:05 4456717                    /usr/lib/x86_64-linux-gnu/libm.so.6
+7f2048e5a000-7f2048e8b000 r--p 00000000 08:05 4456481                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0
+7f2048e8b000-7f2048fb4000 r-xp 00031000 08:05 4456481                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0
+7f2048fb4000-7f2049031000 r--p 0015a000 08:05 4456481                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0
+7f2049031000-7f2049041000 r--p 001d6000 08:05 4456481                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0
+7f2049041000-7f2049043000 rw-p 001e6000 08:05 4456481                    /usr/lib/x86_64-linux-gnu/libgnutls.so.30.31.0
+7f2049043000-7f2049045000 rw-p 00000000 00:00 0 
+7f2049045000-7f2049047000 r--p 00000000 08:05 4465165                    /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0.7200.0
+7f2049047000-7f2049049000 r-xp 00002000 08:05 4465165                    /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0.7200.0
+7f2049049000-7f204904a000 r--p 00004000 08:05 4465165                    /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0.7200.0
+7f204904a000-7f204904b000 r--p 00004000 08:05 4465165                    /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0.7200.0
+7f204904b000-7f204904c000 rw-p 00005000 08:05 4465165                    /usr/lib/x86_64-linux-gnu/libgmodule-2.0.so.0.7200.0
+7f204904c000-7f2049069000 r--p 00000000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f2049069000-7f20490f8000 r-xp 0001d000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f20490f8000-7f2049182000 r--p 000ac000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f2049182000-7f2049183000 ---p 00136000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f2049183000-7f2049184000 r--p 00136000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f2049184000-7f2049185000 rw-p 00137000 08:05 4465132                    /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0.7200.0
+7f2049185000-7f2049186000 rw-p 00000000 00:00 0 
+7f2049186000-7f2049188000 r--p 00000000 08:05 4463546                    /usr/lib/x86_64-linux-gnu/liburing.so.2.1.0
+7f2049188000-7f204918a000 r-xp 00002000 08:05 4463546                    /usr/lib/x86_64-linux-gnu/liburing.so.2.1.0
+7f204918a000-7f204918b000 r--p 00004000 08:05 4463546                    /usr/lib/x86_64-linux-gnu/liburing.so.2.1.0
+7f204918b000-7f204918c000 r--p 00004000 08:05 4463546                    /usr/lib/x86_64-linux-gnu/liburing.so.2.1.0
+7f204918c000-7f204918d000 rw-p 00005000 08:05 4463546                    /usr/lib/x86_64-linux-gnu/liburing.so.2.1.0
+7f20491ac000-7f20491ae000 rw-p 00000000 00:00 0 
+7f20491ae000-7f20491b0000 r--p 00000000 08:05 4456513                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f20491b0000-7f20491da000 r-xp 00002000 08:05 4456513                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f20491da000-7f20491e5000 r--p 0002c000 08:05 4456513                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f20491e6000-7f20491e8000 r--p 00037000 08:05 4456513                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f20491e8000-7f20491ea000 rw-p 00039000 08:05 4456513                    /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7fffe17ee000-7fffe1810000 rw-p 00000000 00:00 0                          [stack]
+7fffe19d1000-7fffe19d5000 r--p 00000000 00:00 0                          [vvar]
+7fffe19d5000-7fffe19d7000 r-xp 00000000 00:00 0                          [vdso]
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+```
+Additional information:
+qemu is installed by ubuntu's apt.
+
+sudo apt install qemu-user
+
+compiler version:
+```
+g++ --version
+g++ (Ubuntu 11.2.0-19ubuntu1) 11.2.0
+Copyright (C) 2021 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+```
+
+libc version:
+```
+ldd --version
+ldd (Ubuntu GLIBC 2.35-0ubuntu3) 2.35
+Copyright (C) 2022 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+Written by Roland McGrath and Ulrich Drepper.
+```

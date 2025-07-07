@@ -1,0 +1,117 @@
+
+
+
+A bug in ARM VCMLA.f16/VCMLA.f32 instructions
+Description of problem:
+The vcmla instruction performs complex-number operations on the vector registers. There is a bug in which this instruction modifies the contents of an irrelevant vector register.
+
+The reason is simple out-of-bound; the helper functions should correctly check the number of modified elements:
+```
+// target/arm/tcg/vec_helper.c
+void HELPER(gvec_fcmlah_idx)(void *vd, void *vn, void *vm, void *va,
+                             void *vfpst, uint32_t desc)
+{
+    uintptr_t opr_sz = simd_oprsz(desc);
+    float16 *d = vd, *n = vn, *m = vm, *a = va;
+    float_status *fpst = vfpst;
+    intptr_t flip = extract32(desc, SIMD_DATA_SHIFT, 1);
+    uint32_t neg_imag = extract32(desc, SIMD_DATA_SHIFT + 1, 1);
+    intptr_t index = extract32(desc, SIMD_DATA_SHIFT + 2, 2);
+    uint32_t neg_real = flip ^ neg_imag;
+    intptr_t elements = opr_sz / sizeof(float16);
+    intptr_t eltspersegment = 16 / sizeof(float16); // This should be fixed;
+    intptr_t i, j;
+
+    ...
+}
+
+...
+
+void HELPER(gvec_fcmlas_idx)(void *vd, void *vn, void *vm, void *va,
+                             void *vfpst, uint32_t desc)
+{
+    uintptr_t opr_sz = simd_oprsz(desc);
+    float32 *d = vd, *n = vn, *m = vm, *a = va;
+    float_status *fpst = vfpst;
+    intptr_t flip = extract32(desc, SIMD_DATA_SHIFT, 1);
+    uint32_t neg_imag = extract32(desc, SIMD_DATA_SHIFT + 1, 1);
+    intptr_t index = extract32(desc, SIMD_DATA_SHIFT + 2, 2);
+    uint32_t neg_real = flip ^ neg_imag;
+    intptr_t elements = opr_sz / sizeof(float32);
+    intptr_t eltspersegment = 16 / sizeof(float32); // This should be fixed;
+    intptr_t i, j;
+
+    ...
+}
+```
+Steps to reproduce:
+1. Write `test.c`.
+```
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+// zero inputs should produce zero output
+char i_D4[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+char i_D8[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+char i_D30[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
+char i_D31[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff }; // this should never be touched
+char o_D30[8];
+char o_D31[8];
+
+void __attribute__ ((noinline)) show_state() {
+    printf("D30: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%02x ", o_D30[i]);
+    }
+    printf("\n");
+    printf("D31: ");
+    for (int i = 0; i < 8; i++) {
+        printf("%02x ", o_D31[i]);
+    }
+    printf("\n");
+}
+
+void __attribute__ ((noinline)) run() {
+    __asm__ (
+        "movw r7, #:lower16:i_D4\n"
+        "movt r7, #:upper16:i_D4\n"
+        "vldr d4, [r7]\n"
+        "movw r7, #:lower16:i_D8\n"
+        "movt r7, #:upper16:i_D8\n"
+        "vldr d8, [r7]\n"
+        "movw r7, #:lower16:i_D30\n"
+        "movt r7, #:upper16:i_D30\n"
+        "vldr d30, [r7]\n"
+        "movw r7, #:lower16:i_D31\n"
+        "movt r7, #:upper16:i_D31\n"
+        "vldr d31, [r7]\n"
+        "adr r7, Lbl_thumb + 1\n"
+        "bx r7\n"
+        ".thumb\n"
+        "Lbl_thumb:\n"
+        ".inst 0xfed8e804\n" // vcmla.f32       d30, d8, d4[0], #90
+        "adr r7, Lbl_arm\n"
+        "bx r7\n"
+        ".arm\n"
+        "Lbl_arm:\n"
+        "movw r7, #:lower16:o_D30\n"
+        "movt r7, #:upper16:o_D30\n"
+        "vstr d30, [r7]\n"
+        "movw r7, #:lower16:o_D31\n"
+        "movt r7, #:upper16:o_D31\n"
+        "vstr d31, [r7]\n"
+    );
+}
+
+int main(int argc, char **argv) {
+    run();
+    show_state();
+    return 0;
+}
+```
+2. Compile `test.bin` using this command: `arm-linux-gnueabihf-gcc-12 -O2 -no-pie -marm -march=armv7-a+vfpv4 ./test.c -o ./test.bin`.
+3. Run QEMU using this command: `qemu-arm -L /usr/arm-linux-gnueabihf/ ./test.bin`.
+4. The program, runs on top of the buggy QEMU, prints the value of D31 as `00 00 c0 7f 00 00 c0 7f`. It should print `ff ff ff ff ff ff ff ff` after the bug is fixed.
+Additional information:
+

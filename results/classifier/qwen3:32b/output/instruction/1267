@@ -1,0 +1,96 @@
+
+
+
+qemu-i386 missing VDSO
+Description of problem:
+Qemu crashes with a segmentation fault when running any binary using qemu-i386. Steps to reproduce are trivial, simply run `qemu-user ./test`. The file is here: [test](/uploads/fe0d498713e79d7e39f417e69ad64c2f/test). Basically any binary compiled with `GOARCH=386` using [TinyGo](https://tinygo.org/) should reproduce this issue.
+I also tried some trivial Go compiled binary and they also crash, but this time with an internal Go error that suggests something is terribly broken over there too: `fatal error: mallocgc called without a P or outside bootstrapping`
+
+Interestingly, qemu-x86_64 and qemu-arm appear to work just fine.
+
+Unfortunately I couldn't get a good backtrace on newer versions. It looks like this in the git version, which I doubt is correct:
+
+```
+~/src/qemu/build$ /bin/lldb ./qemu-i386
+(lldb) target create "./qemu-i386"
+Current executable set to '/home/ayke/src/qemu/build/qemu-i386' (aarch64).
+(lldb) run /home/ayke/src/tinygo/tinygo/test
+Process 97986 launched: '/home/ayke/src/qemu/build/qemu-i386' (aarch64)
+Process 97986 stopped
+* thread #1, name = 'qemu-i386', stop reason = unknown crash reason
+    frame #0: 0x0000fffff78fb9fc libc.so.6`__sigsuspend + 92
+libc.so.6`__sigsuspend:
+->  0xfffff78fb9fc <+92>:  svc    #0
+    0xfffff78fba00 <+96>:  cmn    x0, #0x1, lsl #12         ; =0x1000 
+    0xfffff78fba04 <+100>: b.hi   0xfffff78fba3c            ; <+156>
+    0xfffff78fba08 <+104>: mov    w19, w0
+(lldb) bt
+* thread #1, name = 'qemu-i386', stop reason = unknown crash reason
+  * frame #0: 0x0000fffff78fb9fc libc.so.6`__sigsuspend + 92
+    frame #1: 0x0000aaaaaabfcedc qemu-i386`dump_core_and_abort(target_sig=11) at signal.c:745:5
+    frame #2: 0x0000aaaaaabfc128 qemu-i386`handle_pending_signal(cpu_env=0x0000aaaaaae5d2e0, sig=11, k=0x0000aaaaaae68af8) at signal.c:1061:13
+    frame #3: 0x0000aaaaaabfbe48 qemu-i386`process_pending_signals(cpu_env=0x0000aaaaaae5d2e0) at signal.c:1141:13
+    frame #4: 0x0000aaaaaaae5a04 qemu-i386`cpu_loop(env=0x0000aaaaaae5d2e0) at cpu_loop.c:315:9
+    frame #5: 0x0000aaaaaabf5e7c qemu-i386`main(argc=2, argv=0x0000ffffffffecd8, envp=0x0000ffffffffecf0) at main.c:925:5
+    frame #6: 0x0000fffff78e7b80 libc.so.6`___lldb_unnamed_symbol2945 + 112
+    frame #7: 0x0000fffff78e7c60 libc.so.6`__libc_start_main + 160
+    frame #8: 0x0000aaaaaaae0430 qemu-i386`_start at start.S:81
+(lldb) ^D
+```
+
+I got a better (but still not great) backtrace in Qemu 7.0.0:
+
+```
+~/src/tinygo/tinygo$ /bin/lldb qemu-i386
+(lldb) target create "qemu-i386"
+Current executable set to 'qemu-i386' (aarch64).
+(lldb) run test
+Process 98106 launched: '/usr/bin/qemu-i386' (aarch64)
+Process 98106 stopped
+* thread #1, name = 'qemu-i386', stop reason = signal SIGSEGV: address access protected (fault address: 0x8000)
+    frame #0: 0x0000aaaaaac4b564 qemu-i386`cpu_ldub_code + 32
+qemu-i386`cpu_ldub_code:
+->  0xaaaaaac4b564 <+32>: ldrb   w0, [x0, w1, uxtw]
+    0xaaaaaac4b568 <+36>: str    xzr, [x2]
+    0xaaaaaac4b56c <+40>: ret    
+
+qemu-i386`cpu_lduw_code:
+    0xaaaaaac4b570 <+0>:  mrs    x2, TPIDR_EL0
+(lldb) bt
+* thread #1, name = 'qemu-i386', stop reason = signal SIGSEGV: address access protected (fault address: 0x8000)
+  * frame #0: 0x0000aaaaaac4b564 qemu-i386`cpu_ldub_code + 32
+    frame #1: 0x0000aaaaaac4a4a8 qemu-i386`translator_ldub_swap + 72
+    frame #2: 0x0000aaaaaabe6714 qemu-i386`___lldb_unnamed_symbol6310 + 144
+    frame #3: 0x0000aaaaaabed2e8 qemu-i386`___lldb_unnamed_symbol6311 + 24
+    frame #4: 0x0000aaaaaac4a040 qemu-i386`translator_loop + 400
+    frame #5: 0x0000aaaaaabed5a8 qemu-i386`gen_intermediate_code + 72
+    frame #6: 0x0000aaaaaac486ec qemu-i386`tb_gen_code + 364
+    frame #7: 0x0000aaaaaac43068 qemu-i386`cpu_exec + 1480
+    frame #8: 0x0000aaaaaabaa4b0 qemu-i386`cpu_loop + 208
+    frame #9: 0x0000aaaaaab8cb54 qemu-i386`main + 2020
+    frame #10: 0x0000fffff7687b80 libc.so.6`___lldb_unnamed_symbol2945 + 112
+    frame #11: 0x0000fffff7687c60 libc.so.6`__libc_start_main + 160
+    frame #12: 0x0000aaaaaab8d3b0 qemu-i386`_start + 48
+(lldb) ^D
+```
+
+And an even better backtrace for an even older version (5.2.0). Though I should note that this GDB also had an assertion failue, but the backtrace looks reasonable:
+
+```
+#0  0x0000aaaaaaba7804 in cpu_ldub_code (env=env@entry=0x0, ptr=0) at ../../accel/tcg/user-exec.c:1170
+#1  0x0000aaaaaab40d04 in translator_ldub_swap (do_swap=false, pc=<optimized out>, env=<optimized out>) at ./include/exec/translator.h:176
+#2  translator_ldub (pc=<optimized out>, env=<optimized out>) at ./include/exec/translator.h:176
+#3  x86_ldub_code (env=env@entry=0xaaaaaad809f0, s=s@entry=0xffffffffe990) at ../../target/i386/translate.c:1916
+#4  0x0000aaaaaab51670 in disas_insn (s=s@entry=0xffffffffe990, cpu=<optimized out>, cpu=<optimized out>) at ../../target/i386/translate.c:4506
+#5  0x0000aaaaaab5e1c8 in i386_tr_translate_insn (dcbase=0xffffffffe990, cpu=<optimized out>) at ../../target/i386/translate.c:8569
+#6  0x0000aaaaaabbc9f4 in translator_loop (ops=0xaaaaaacd62b0 <i386_tr_ops>, db=0xffffffffe990, cpu=0xaaaaaad786a0, tb=<optimized out>, max_insns=<optimized out>)
+    at ../../accel/tcg/translator.c:103
+#7  0x0000aaaaaab5e470 in gen_intermediate_code (cpu=cpu@entry=0xaaaaaad786a0, tb=tb@entry=0xffffe8007f00, max_insns=max_insns@entry=512)
+    at ../../target/i386/translate.c:8631
+#8  0x0000aaaaaabcd54c in tb_gen_code (cpu=cpu@entry=0xaaaaaad786a0, pc=pc@entry=0, cs_base=cs_base@entry=0, flags=flags@entry=4194483, cflags=-16777216, 
+    cflags@entry=0) at ../../accel/tcg/translate-all.c:1744
+#9  0x0000aaaaaabbe2a8 in tb_find (cf_mask=0, tb_exit=0, last_tb=0x0, cpu=0xaaaaaad786a0) at ../../accel/tcg/cpu-exec.c:414
+#10 cpu_exec (cpu=cpu@entry=0xaaaaaad786a0) at ../../accel/tcg/cpu-exec.c:770
+#11 0x0000aaaaaab3a438 in cpu_loop (env=env@entry=0xaaaaaad809f0) at ../../linux-user/i386/cpu_loop.c:207
+#12 0x0000aaaaaab1df00 in main (argc=<optimized out>, argv=<optimized out>, envp=<optimized out>) at ../../linux-user/main.c:882
+```
