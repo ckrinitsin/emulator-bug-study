@@ -1,0 +1,56 @@
+instruction: 0.389
+runtime: 0.335
+syscall: 0.275
+
+
+
+AVX instruction VMOVDQU implementation error for YMM registers
+
+Hi,
+
+Tested with Qemu 4.2.0, and with git version bddff6f6787c916b0e9d63ef9e4d442114257739.
+
+The x86 AVX instruction VMOVDQU doesn't work properly with YMM registers (32 bytes).
+It works with XMM registers (16 bytes) though.
+
+See the attached test case `ymm.c`: when copying from memory-to-ymm0 and then back from ymm0-to-memory using VMOVDQU, Qemu only copies the first 16 of the total 32 bytes.
+
+```
+user@ubuntu ~/Qemu % gcc -o ymm ymm.c -Wall -Wextra -Werror
+
+user@ubuntu ~/Qemu % ./ymm
+00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F
+
+user@ubuntu ~/Qemu % ./x86_64-linux-user/qemu-x86_64 -cpu max ymm
+00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+This seems to be because in `translate.c > gen_sse()`, the case handling the VMOVDQU instruction calls `gen_ldo_env_A0` which always performs a 16 bytes copy using two 8 bytes load and store operations (with `tcg_gen_qemu_ld_i64` and `tcg_gen_st_i64`).
+
+Instead, the `gen_ldo_env_A0` function should generate a copy with a size corresponding to the used register.
+
+
+```
+static void gen_sse(CPUX86State *env, DisasContext *s, int b,
+                    target_ulong pc_start, int rex_r)
+{
+        [...]
+        case 0x26f: /* movdqu xmm, ea */
+            if (mod != 3) {
+                gen_lea_modrm(env, s, modrm);
+                gen_ldo_env_A0(s, offsetof(CPUX86State, xmm_regs[reg]));
+            } else { 
+        [...]
+```
+
+```
+static inline void gen_ldo_env_A0(DisasContext *s, int offset)
+{
+    int mem_index = s->mem_index;
+    tcg_gen_qemu_ld_i64(s->tmp1_i64, s->A0, mem_index, MO_LEQ);
+    tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(0)));
+    tcg_gen_addi_tl(s->tmp0, s->A0, 8);
+    tcg_gen_qemu_ld_i64(s->tmp1_i64, s->tmp0, mem_index, MO_LEQ);
+    tcg_gen_st_i64(s->tmp1_i64, cpu_env, offset + offsetof(ZMMReg, ZMM_Q(1)));
+}
+```

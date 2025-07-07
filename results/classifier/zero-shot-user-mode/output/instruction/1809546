@@ -1,0 +1,49 @@
+instruction: 0.621
+runtime: 0.264
+syscall: 0.115
+
+
+Writing a byte to a pl011 SFR overwrites the whole SFR
+
+The bug is present in QEMU 2.8.1 and, if my analysis is correct, also on master.
+
+I first noticed that a PL011 UART driver, which is fine on real hardware, fails to enable the RX interrupt in the IMSC register when running in QEMU. However, the problem only comes up if the code is compiled without optimizations. I think I've narrowed it down to a minimal example that will exhibit the problem if run as a bare-metal application.
+
+Given:
+
+pl011_addr: .word 0x10009000
+
+The following snippet will be problematic:
+
+     ldr r3, pl011_addr
+     ldrb r2, [r3, #0x38]        // IMSC
+     mov r2, #0
+     orr r2, r2, #0x10           // R2 == 0x10
+     strb r2, [r3, #0x38]        // Whole word reads correctly after this
+     ldrb r2, [r3, #0x39]
+     mov r2, #0
+     strb r2, [r3, #0x39]        // Problem here! Overwrites offset 0x38 as well
+
+After the first strb instruction, which writes to 0x10009038, everything is fine. It can be seen in the QEMU monitor:
+
+(qemu) xp 0x10009038
+0000000010009038: 0x00000010
+
+After the second strb instruction, the write to 0x10009039 clears the entire word:
+
+(qemu) xp 0x10009038
+0000000010009038: 0x00000000
+
+QEMU command-line, using the vexpress-a9 which has the PL011 at 0x10009000:
+
+qemu-system-arm -S -M vexpress-a9 -m 32M -no-reboot -nographic -monitor telnet:127.0.0.1:1234,server,nowait -kernel pl011-sfr.bin -gdb tcp::2159 -serial mon:stdio
+
+Compiling the original C code with optimizations makes the driver work. It compiles down to assembly that only does a single write:
+
+    ldr r3, pl011_addr
+    mov r2, #0x10
+    str r2, [r3, #0x38]
+
+Attached is the an assembly file, and linkscript, that shows the problem, and also includes the working code.
+
+I haven't debugged inside of QEMU itself but it seems to me that the problem is in pl011_write in pl011.c - the functions looks at which offset is being written, and then writes the entire SFR that offset falls under, which means that changing a single byte will change the whole SFR.

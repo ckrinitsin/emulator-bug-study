@@ -1,0 +1,68 @@
+syscall: 0.535
+instruction: 0.287
+runtime: 0.178
+
+
+
+QEMU-user ignores MADV_DONTNEED
+
+There is comment int the code "This is a hint, so ignoring and returning success is ok"
+https://github.com/qemu/qemu/blob/b1cffefa1b163bce9aebc3416f562c1d3886eeaa/linux-user/syscall.c#L11941
+
+But it seems incorrect with the current state of Linux
+
+"man madvise" or https://man7.org/linux/man-pages/man2/madvise.2.html
+says the following:
+>>  These advice values do not influence the semantics
+>>       of the application (except in the case of MADV_DONTNEED)
+
+>> After a successful MADV_DONTNEED operation, the semantics
+>> of memory access in the specified region are changed:
+>> subsequent accesses of pages in the range will succeed,
+>> but will result in either repopulating the memory contents
+>> from the up-to-date contents of the underlying mapped file
+>> (for shared file mappings, shared anonymous mappings, and
+>> shmem-based techniques such as System V shared memory
+>> segments) or zero-fill-on-demand pages for anonymous
+>> private mappings.
+
+Some applications use this behavior clear memory and it
+would be nice to be able to run them on QEMU without
+workarounds.
+
+Reproducer on "Debian 5.10.24 x86_64 GNU/Linux" as a host.
+
+
+```
+#include "assert.h"
+#include "stdio.h"
+#include <sys/mman.h>
+#include <errno.h>
+
+int main() {
+  char *P = (char *)mmap(0, 4096, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  assert(P);
+  *P = 'A';
+  while (madvise(P, 4096, MADV_DONTNEED) == -1 && errno == EAGAIN) {
+  }
+  assert(*P == 0);
+
+  printf("OK\n");
+}
+
+/*
+gcc /tmp/madvice.c -o /tmp/madvice
+
+qemu-x86_64 /tmp/madvice
+madvice: /tmp/madvice.c:13: main: Assertion `*P == 0' failed.
+qemu: uncaught target signal 6 (Aborted) - core dumped
+Aborted
+
+/tmp/madvice
+OK
+
+
+*/
+
+```

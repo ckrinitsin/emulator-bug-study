@@ -1,0 +1,49 @@
+instruction: 0.406
+runtime: 0.322
+syscall: 0.272
+
+
+
+qemu8-user on Linux: SIGSEGV because brk(NULL) does not exist
+Description of problem:
+On Linux, the return value of the system call brk(NULL) need not point to a page that exists.
+If so, then qemu8-user will generate SIGSEGV at the next call to brk() with a higher value,
+because qemu8 believes that it should maintain contiguous .bss with bytes of value 0.
+Thus qemu8-user so calls `memset(g2h_untagged(target_brk), 0, brk_page - target_brk);
+in do_brk() at ../linux-user/syscall.c:867, and this generates SIGSEGV at
+the non-existent page that covers brk(NULL).
+
+Instead, the safest thing to do is nothing at all.
+Linux deliberately returns a random value for brk(NULL), subject to the conditions
+that the value be at least as large as the maximum over all PT_LOAD of (.p_vaddr + .p_memsz),
+and "somewhat near" that maximum.  The purpose of randomness is to use variability
+to interfere with effectiveness of malware, and to expose application coding errors
+regarding brk() and sbrk().  If qemu-user wants to preserve contiguous .bss,
+then qemu-user should call memset() only if the first page of the range exists.
+(As explained in the next paragraph, "contiguous .bss" is a murky concept.)
+
+Linux itself is partly to blame, because it computes the maximum (.p_vaddr + .p_memsz)
+over all the PT_LOAD of the most recent execve().  The most recent execve() seen by
+Linux might have no relationship to the state of the address space at the time of
+_either_ call to brk().  The app can do arbitrary mmap, munmap, mprotect at any time.
+In particular, the run-time de-compressor of UPX does exactly that for a compressed
+main program.  The maximum computed by Linux is for the compressed program,
+which has a different layout than the de-compressed program.
+
+There is a Linux system call prctl(PR_SET_MM_BRK, new_value) which sets a value
+for "the brk", but that syscall tries to validate the new_value based on
+the most recent execve().  Once again, that has no relationship to the current
+layout of the address space produced by the UPX de-compressor.
+Steps to reproduce:
+1. build qemu8-x86_64 from
+```
+commit fcb237e64f9d026c03d635579c7b288d0008a6e5 (HEAD -> master, origin/master, origin/HEAD)
+Merge: 2ff49e96ac c00aac6f14
+Date:   Mon Jul 10 09:17:06 2023 +0100
+```
+2. run `build/qemu-x86_64 -strace upx-4.0.2-amd64_linux/upx --version` where the upx
+is from https://github.com/upx/upx/releases/download/v4.0.2/upx-4.0.2-amd64_linux.tar.xz
+3. output ends with
+```
+372621 close(3) = 0
+372621 munmap(0x0000004000803000,3055) = 0
