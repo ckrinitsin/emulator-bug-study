@@ -1,0 +1,171 @@
+[LA64] CREATE_VALIST_FROM_VALIST fail to work for float/double
+Hi,
+
+Reduced Testcase:
+```
+#include <glib.h>
+
+static void func(const gchar* format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  g_variant_new_va(format, NULL, &ap);
+  va_end(ap);
+}
+
+int main(int argc, char* argv[]) {
+  func("(byixdddd)", TRUE, 'A', 3, 4, 5.5, 6.6, 7.7, 8.8);
+  return 0;
+}
+```
+
+Just print[1] the x64_va_list_t value in the [my_g_variant_new_va](https://github.com/ptitSeb/box64/blob/main/src/wrapped/wrappedglib2.c#L1080), the float/double values are wrong:
+```
+2504|0x4006ae: Calling g_variant_new_va(0x400830, 0x0, 0xFFF7616E40, ...) =>Warning: my_g_variant_new_va: CREATE_VALIST_FROM_VALIST with 8 XMM register!
+gp_offset: 8 n: 5
+fp_offset: 48 m: 8
+my_g_variant_new_va: fmt: (byixdddd)
+1: 1
+2: 65
+3: 3
+4: 4
+=>5: 0.000000
+=>6: 0.000000
+=>7: 0.000000
+=>8: 0.000000
+ return 0x3B334B60
+```
+
+Consider about The Register Save Area[2] for 128 bit XMM register and only print the `lo64` of 128 bit XMM register, the float/double values are correct:
+```
+11762|0x4006ae: Calling g_variant_new_va(0x400830, 0x0, 0xFFF639EE40, ...) =>Warning: my_g_variant_new_va: CREATE_VALIST_FROM_VALIST with 8 XMM register!
+gp_offset: 8 n: 5
+fp_offset: 48 m: 8
+my_g_variant_new_va: fmt: (byixdddd)
+1: 1
+2: 65
+3: 3
+4: 4
+5: 5.500000
+6: 6.600000
+7: 7.700000
+8: 8.800000
+ return 0x412E8B60
+```
+
+Unfortunately the patch overlapped the `overflow_arg_area` part, so Reduced Testcase `func("(bynixiiid)", TRUE, 'A', 3, 4, 5, 6, 7, 8, 9.9);` fail to work again:
+```
+4771|0x4006ae: Calling g_variant_new_va(0x40083B, 0x0, 0xFFF53EAE40, ...) =>Warning: my_g_variant_new_va: CREATE_VALIST_FROM_VALIST with 8 XMM register!
+gp_offset: 8 n: 5
+fp_offset: 48 m: 8
+my_g_variant_new_va: fmt: (bynixiiid)
+1: 1
+2: 65
+3: 3
+4: 4
+5: 5
+=>6: -858993459
+=>7: 0
+=>8: 1717986918
+=>9: 7.700000
+ return 0x361B5600
+```
+
+Compared with AArch64's [aarch64_build_builtin_va_list](https://github.com/gcc-mirror/gcc/blob/master/gcc/config/aarch64/aarch64.cc#L21344) which also use 128 bit SIMD register, doesn't need to "eat" `hi64` for 64bit FPR, so [CONVERT_VALIST](https://github.com/ptitSeb/box64/blob/main/src/include/myalign.h#L73) float/double works well for AArch64.
+
+[1] Print the x64_va_list_t value in the my_g_variant_new_va
+```
+diff --git a/src/wrapped/wrappedglib2.c b/src/wrapped/wrappedglib2.c
+index 210729f0..4a919e34 100644
+--- a/src/wrapped/wrappedglib2.c
++++ b/src/wrapped/wrappedglib2.c
+@@ -3,6 +3,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <dlfcn.h>
++#include <stdarg.h>
+
+ #include "wrappedlibs.h" 
+
+@@ -1079,6 +1080,36 @@ EXPORT void* my_g_variant_new_va(x64emu_t* emu, char* fmt, void* endptr, x64_va_
+     #else
+     CREATE_VALIST_FROM_VALIST(*b, emu->scratch);
+     #endif
++    printf_log(LOG_DEBUG, "%s: fmt: %s\n", __FUNCTION__, fmt);
++    const char* p = fmt;
++    int i = 0;
++    while (*p) {
++        switch (*p) {
++        case 'b':
++        case 'y':
++        case 'n':
++        case 'q':
++        case 'i':
++        case 'h':
++        case 'u':
++            printf_log(LOG_DEBUG, "%d: %d\n", i, va_arg(VARARGS, int));
++            break;
++        case 'x':
++        case 't':
++            printf_log(LOG_DEBUG, "%d: %ld\n", i, va_arg(VARARGS, long));
++            break;
++        case 'd':
++#if defined(__loongarch64) || defined(__riscv)
++            va_arg(VARARGS, double); // eat hi64
++#endif
++            printf_log(LOG_DEBUG, "%d: %f\n", i, va_arg(VARARGS, double));
++            break;
++        default:
++            break;
++        }
++        p++;
++        i++;
++    }
+     va_list* aligned = &VARARGS;
+     return my->g_variant_new_va(fmt, endptr, &aligned);
+ }
+```
+
+[2] The Register Save Area for 128 bit XMM register
+```
+diff --git a/src/include/myalign.h b/src/include/myalign.h
+index 8e33aef1..90340cb1 100644
+--- a/src/include/myalign.h
++++ b/src/include/myalign.h
+@@ -73,7 +73,11 @@ typedef struct  va_list {
+ #define CONVERT_VALIST(A)                                         \
+   va_list sysv_varargs;                                           \
+   sysv_varargs.__gr_offs=-(6*8)+(A)->gp_offset;                   \
++  printf_log(LOG_DEBUG, "gp_offset: %d\n", (A)->gp_offset);       \
++  printf_log(LOG_DEBUG, "gr_offs: %d\n", sysv_varargs.__gr_offs); \
+   sysv_varargs.__vr_offs=-(8*16)+((A)->fp_offset-X64_VA_MAX_REG); \
++  printf_log(LOG_DEBUG, "fp_offset: %d\n", (A)->fp_offset);       \
++  printf_log(LOG_DEBUG, "vr_offs: %d\n", sysv_varargs.__vr_offs); \
+   sysv_varargs.__stack=(A)->overflow_arg_area;                    \
+   sysv_varargs.__gr_top=(A)->reg_save_area + X64_VA_MAX_REG;      \
+   sysv_varargs.__vr_top=(A)->reg_save_area + X64_VA_MAX_XMM;
+@@ -135,15 +139,18 @@ typdef struct {
+ #define CREATE_SYSV_VALIST(A) \
+   va_list sysv_varargs = (va_list)A
+ // not creating CONVERT_VALIST(A) on purpose
+-// this one will create a VA_LIST from x64_va_list using only GPRS and 100 stack element
++// this one will create a VA_LIST from x64_va_list using not only GPRS but also FPRS and 100 stack element
+ #define CREATE_VALIST_FROM_VALIST(VA, SCRATCH)                          \
+   va_list sysv_varargs;                                                 \
+   {                                                                     \
+     if((VA)->fp_offset!=X64_VA_MAX_XMM) printf_log(LOG_DEBUG, "Warning: %s: CREATE_VALIST_FROM_VALIST with %d XMM register!\n", __FUNCTION__, (X64_VA_MAX_XMM - (VA)->fp_offset)/16);\
+     uintptr_t *p = (uintptr_t*)(SCRATCH);                               \
+     int n = (X64_VA_MAX_REG - (VA)->gp_offset)/8;                       \
+-    if(n) memcpy(&p[0], (VA)->reg_save_area+X64_VA_MAX_REG-n*8, n*8);   \
+-    memcpy(&p[n], (VA)->overflow_arg_area, 20*8);                       \
++    printf_log(LOG_DEBUG, "gp_offset: %d n: %d\n", (VA)->gp_offset, n); \
++    int m = (X64_VA_MAX_XMM - (VA)->fp_offset)/16;                      \
++    printf_log(LOG_DEBUG, "fp_offset: %d m: %d\n", (VA)->fp_offset, m); \
++    if(n) memcpy(&p[0], (VA)->reg_save_area+X64_VA_MAX_REG-n*8, n*8+m*16);\
++    memcpy(&p[n+m], (VA)->overflow_arg_area, 20*8);                     \
+     sysv_varargs = (va_list)p;                                          \
+   }
+ // this is an approximation, and if the va_list have some float/double, it will fail!
+```
+
+Thanks,
+Leslie Zhai

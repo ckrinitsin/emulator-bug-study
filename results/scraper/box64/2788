@@ -1,0 +1,59 @@
+[WRAPPER] XCreateWindow Display's resource_alloc is x64 entry
+Hi,
+
+testcase: [Scilab 6.0.1](https://www.scilab.org/download/6.0.1/scilab-6.0.1.bin.linux-x86_64.tar.gz)
+XCreateWindow Display's resource_alloc `0x3f180fa330` is x64 entry:
+```
+ ...  =>[BOX64] PltResolver64: Addr=0x3c2aea00, Slot=367 Return=0x3f180e4996(/mnt/home/zhaixiang/scilab-6.0.1/lib/thirdparty/libtk8.5.so/TkpMakeWindow + 0xa6): elf is /mnt/home/zhaixiang/scilab-6.0.1/lib/thirdparty/libtk8.5.so (VerSym=0x7774, deepbind=0, local_maplib=(nil)) func param: 0xffd40328d0, 0x39d...
+[BOX64]             Apply STB_GLOBAL R_X86_64_JUMP_SLOT 0x3f18339548 with sym=XCreateWindow(ver 0: XCreateWindow) (0x3f18033246 -> 0x300d0c00 / box64) 
+ return 0x0
+16823|0x3f180e4996: Calling XCreateWindow(0xffd40328d0, 0x39d, 0, 0, 1, 1, 0, 24, 1, 0xffd404bad0, 0x2a10, 0xffd405d020) 
+=>[BOX64] DEBUG: my_XCreateWindow:1627 resource_alloc: 0x3f180fa330 is x64 entry
+                                                       ^--- x64 entry
+```
+
+`0x3f18000000` is the base address, so just `objdump -d lib/thirdparty/libtk8.5.so` to see `0xfa330` entry:
+```
+00000000000fa330 <AllocXId>:
+   fa330:       55                      push   %rbp   
+   fa331:       48 89 fd                mov    %rdi,%rbp
+   fa334:       53                      push   %rbx   
+   fa335:       48 83 ec 08             sub    $0x8,%rsp
+   fa339:       e8 22 8b f3 ff          callq  32e60 <TkGetDisplay@plt>
+...
+```
+
+libtk [set Display's resource_alloc entry](https://github.com/tcltk/tk/blob/core-8-5-b3/unix/tkUnixXId.c#L80) to `AllocXId`:  
+```
+void
+TkInitXId(
+    TkDisplay *dispPtr)         /* Tk's information about the display. */
+{
+    dispPtr->idStackPtr = NULL;
+    dispPtr->defaultAllocProc = (XID (*) (Display *display))
+            dispPtr->display->resource_alloc;
+=>    dispPtr->display->resource_alloc = AllocXId;
+                                         ^--- x64 entry
+    dispPtr->windowStackPtr = NULL;
+    dispPtr->idCleanupScheduled = (Tcl_TimerToken) 0;
+}
+
+``` 
+
+So SIGILL if just directly jump to x64 entry `0x3f180fa330` but it actually needs a pre-creation of the JIT code for the x64 entry:
+```
+[BOX64] 16823|SIGILL @0x3f180fa330 (???(0x3f180fa330)) (x64pc=0x300d0c13/"???", rsp=0xffeb686198, stack=0xffe3688000:0xffeb688000 
+                                        ^--- x64 entry
+own=0xffe3688000 fp=0xffd405cf80), for accessing (nil) (code=128/prot=0), db=(nil)((nil):(nil)/(nil):(nil)/???:clean, hash:0/0) handler=0x3f011bb570
+RSP-0x20:0x00000008eb6861a0 RSP-0x18:0x000000ffeb006b00 RSP-0x10:0x000000003c2aea00 RSP-0x08:0x000000000000016f
+RSP+0x00:0x0000003f180e4996 RSP+0x08:0x000000ff00000000 RSP+0x10:0x000000ff00000018 RSP+0x18:0x000000ff00000001
+RAX:0x0000000000000000 RCX:0x0000000000000000 RDX:0x0000000000000000 RBX:0x000000000000039d 
+RSP:0x000000ffeb686198 RBP:0x000000ffd405cf80 RSI:0x000000000000039d RDI:0x000000ffd40328d0 
+ R8:0x0000000000000001  R9:0x0000000000000001 R10:0x000000ffd405ce80 R11:0x0000003f183493a8 
+R12:0x0000003f18349730 R13:0x000000ffd40451c0 R14:0x0000003f18333dc0 R15:0x000000ffd4059a20 
+ES:0x002b CS:0x0033 SS:0x002b DS:0x002b FS:0x0043 GS:0x0053  opcode=55 48 89 FD 53 48 83 EC (C3 00 00 F4 E6)
+                                                                    ^--- x64 entry
+```
+
+Thanks,
+Leslie Zhai

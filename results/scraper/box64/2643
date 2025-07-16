@@ -1,0 +1,50 @@
+Remove `rb_get_end` lookup in `allocProtection`
+I made a local  [commit](https://github.com/devarajabc/box64/commit/1b00139bbf932ae958f8b8ac52e4da435bd0c696) and it passes my tests ( CI and ansibenchmark), saving one **O(log n)** tree lookup on every call.
+
+However, I'm not sure if I missed anything, especially since the original comment says:
+> **block is here or absent, no half-block handled..**
+> **don't need to add precise tracking probably**
+
+I'm unclear on what it refers to.
+
+From my understand:
+
+`allocProtection()` is responsible for inserting new memory mappings into `mapallmem`, mirroring what’s in `/proc/self/maps` (via `loadProtectionFromMap()`).
+
+Currently, before inserting a new allocation, `rb_get_end` checks whether the memory range already exists. However, this introduces several issues:
+
+1. Partial-range bug
+
+    If addr lies inside an existing node but the new mapping extends past its end, `rb_get_end` returns true and skips the insertion—losing the “tail” of the new range.
+
+2. High-memory reservations
+
+    `reserveHighMem()` is called only once at startup to reserve a region above user-space . 
+Since that reserved range never expands, we might skip all `allocProtection` calls for addresses within it.
+
+
+3. Tree insert semantics
+
+     `rb_set()`  skips duplicates, so the preliminary lookup might be save.
+
+```diff
+void allocProtection(uintptr_t addr, size_t size, uint32_t prot)
+{
++   uintptr_t Reseved_addr = box64_is32bits?(1ULL<<32):(1ULL<<47);
++   if (addr >= Reseved_addr)
++      return;
+   dynarec_log(LOG_DEBUG, "allocProtection %p:%p 0x%x\n", (void*)addr, (void*)(addr+size-1), prot);
+   size = ALIGN(size);
+   addr &= ~(box64_pagesize-1);
+    LOCK_PROT();
+-   uint32_t val;
+-   uintptr_t endb; 
+-   int there = rb_get_end(mapallmem, addr, &val, &endb);
+    // block is here or absent, no half-block handled..
+-  if(!there)
+        rb_set(mapallmem, addr, addr+size, MEM_ALLOCATED);
+    UNLOCK_PROT();
+    // don't need to add precise tracking probably
+}
+```
+

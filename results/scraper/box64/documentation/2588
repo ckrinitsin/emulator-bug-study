@@ -1,0 +1,84 @@
+[Doc] Box64 Memory Allocator (for review and feedback)
+This document describes the memory management design in Box64 (`custommem.c`).
+The goal is to verify the correctness and gather feedback for improvements.
+Below is the current draft:
+
+### High-Level Overview
+The memory allocator operates similarly to a segregated free list by maintaining an array of **blocks**.
+In this context, a "**block**" refers to one of three types of fixed-size memory mappings:
+
+- 512 KB blocks for general use
+
+- 128 KB blocks for fixed 128-byte slices
+
+- 2 MB blocks for dynarec (dynamic recompilation)
+
+Within each block, smaller pieces — called **subblocks** — are carved out.
+**Subblocks** are the actual allocation units returned to the caller.
+
+There are two types of free subblock tracking implementations:
+
+- `BTYPE_LIST`:  Managed using an implicit free list, with `blockmark_t` headers placed before each payload.
+The end of a block is indicated by a special subblock where `next.x32 == 0`.
+
+- `BTYPE_MAP`: Subblocks are tracked using a `bitmap` at the end of the block.
+
+Each block is tracked by a `blocklist_s` structure — metadata for each mapped region:
+```c
+typedef struct blocklist_s {
+    void*    block;    // Base address of the mapped region
+    size_t   maxfree;  // Largest contiguous free space (in bytes) available
+    size_t   size;     // Total size of the region (including bitmap if present)
+    void*    first;    // Pointer to bitmap (`BTYPE_MAP`) or to the first free subblock (`BTYPE_LIST`)
+    uint32_t lowest;   // Hint index for next allocation scan (bitmap only)
+    uint8_t  type;     // Either `BTYPE_LIST` or `BTYPE_MAP`
+} blocklist_t;
+
+```
+In `BTYPE_LIST`, subblocks are linked implicitly via the offset field (offs) in `blockmark_s`:
+```c
+typedef struct blockmark_s {
+    mark_t  prev;    // Marker for the previous subblock
+    mark_t  next;    // Marker for the next subblock
+    uint8_t mark[];  // Flexible array member; payload starts here
+} blockmark_t;
+```
+Where `mark_t` represents the distance between two subblock headers:
+```c
+typedef union mark_s {
+    struct {
+        unsigned int offs : 31;  // Byte offset to the next or previous header
+        unsigned int fill : 1;   // Allocation flag (0 = free, 1 = allocated)
+    };
+    uint32_t x32;
+} mark_t;
+
+```
+A set of macros is provided to help navigate between subblocks inside a block.
+These macros rely on the offs fields inside the `mark_t` structures:
+
+```c
+#define NEXT_BLOCK(b)  ((blockmark_t*)((uintptr_t)(b) + (b)->next.offs))
+// Get the pointer to the next subblock.
+
+#define PREV_BLOCK(b)  ((blockmark_t*)((uintptr_t)(b) - (b)->prev.offs))
+// Get the pointer to the previous subblock.
+
+#define LAST_BLOCK(b, s)  ((blockmark_t*)((uintptr_t)(b) + (s)) - sizeof(blockmark_t))
+// Get the pointer to the subblock at the end of the block with size 's'.
+
+#define SIZE_BLOCK(b)  (((ssize_t)(b).offs) - sizeof(blockmark_t))
+// Get the usable payload size of a subblock (excluding the size of its own header).
+```
+
+
+
+
+
+
+
+
+
+
+
+

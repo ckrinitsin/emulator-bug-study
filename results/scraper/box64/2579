@@ -1,0 +1,70 @@
+[NON4KPAGE] Some more adjustments for non-4Kpagesize system regression
+Hi,
+
+[PltResolver64 is not able to store offs](https://github.com/ptitSeb/box64/blob/main/src/elfs/elfloader.c#L1911) to `R_X86_64_JUMP_SLOT` `0x3f00003fb0` because `0x3f00003fb0` is read only:
+
+```
+[BOX64] PltResolver64: Addr=0xff88005130, Slot=5 Return=0x3f000011a6(/yourpath/jdk/build/linux-x86_64-server-release/images/test/hotspot/jtreg/native/libTest35859.so/Java_Test35859_inc + 0x26): elf is /yourpath/jdk/build/linux-x86_64-server-release/images/test/hotspot/jtreg/native/libTest35859.so (VerSym=0x678, deepbind=0, local_maplib=0xff8800de30) func param: 0xba, 0xffc95ea018...
+[BOX64]             Apply STB_GLOBAL R_X86_64_JUMP_SLOT 0x3f00003fb0 with sym=syscall(optver 2: syscall@GLIBC_2.2.5) (0x3f00001086 -> 0x30020740 / box64)
+...
+=> [BOX64] 3f00000000-3f00004000 r--p 00000000 00:00 0 
+                                 ^--- read only
+[BOX64] 3f00004000-3f00008000 rw-p 00000000 00:00 0
+...
+#8  0x000000ff8de852b0 in PltResolver64 (emu=0xff8800b470) at /yourpath/box64/src/elfs/elfloader.c:1912
+#9  0x000000ff8de92cb0 in x64Int3 (emu=0xff8800b470, addr=<optimized out>) at /yourpath/box64/src/emu/x64int3.c:330
+#10 0x000000ffc8d602fc in ?? ()
+...
+(gdb) frame 8
+#8  0x000000ff8de852b0 in PltResolver64 (emu=0xff8800b470) at /yourpath/box64/src/elfs/elfloader.c:1912
+1912	            *p = offs;
+(gdb) x p
+0x3f00003fb0:	0x00001086
+(gdb) x/22i $pc-44
+   0xff8de85284 <PltResolver64+1076>:	st.d	$r27,$r3,8(0x8)
+   0xff8de85288 <PltResolver64+1080>:	st.d	$r16,$r3,0
+   0xff8de8528c <PltResolver64+1084>:	move	$r10,$r25
+   0xff8de85290 <PltResolver64+1088>:	move	$r8,$r11
+   0xff8de85294 <PltResolver64+1092>:	move	$r7,$r23
+   0xff8de85298 <PltResolver64+1096>:	pcaddu12i	$r5,2749(0xabd)
+   0xff8de8529c <PltResolver64+1100>:	addi.d	$r5,$r5,-1064(0xbd8)
+   0xff8de852a0 <PltResolver64+1104>:	addi.w	$r4,$r0,1(0x1)
+   0xff8de852a4 <PltResolver64+1108>:	bl	-75028(0xffedaec) # 0xff8de72d90 <printf_ftrace>
+   0xff8de852a8 <PltResolver64+1112>:	bl	-42440(0xfff5a38) # 0xff8de7ace0 <loadProtectionFromMap>
+   0xff8de852ac <PltResolver64+1116>:	ld.d	$r13,$r3,136(0x88)
+=> 0xff8de852b0 <PltResolver64+1120>:	st.d	$r13,$r23,0
+   0xff8de852b4 <PltResolver64+1124>:	beqz	$r26,192(0xc0) # 0xff8de85374 <PltResolver64+1316>
+   0xff8de852b8 <PltResolver64+1128>:	beq	$r26,$r22,188(0xbc) # 0xff8de85374 <PltResolver64+1316>
+   0xff8de852bc <PltResolver64+1132>:	beqz	$r22,184(0xb8) # 0xff8de85374 <PltResolver64+1316>
+   0xff8de852c0 <PltResolver64+1136>:	ld.d	$r5,$r26,656(0x290)
+   0xff8de852c4 <PltResolver64+1140>:	beqz	$r5,176(0xb0) # 0xff8de85374 <PltResolver64+1316>
+   0xff8de852c8 <PltResolver64+1144>:	move	$r4,$r22
+   0xff8de852cc <PltResolver64+1148>:	bl	-24684(0xfff9f94) # 0xff8de7f260 <checkElfLib>
+   0xff8de852d0 <PltResolver64+1152>:	ld.d	$r4,$r3,136(0x88)
+   0xff8de852d4 <PltResolver64+1156>:	ld.d	$r1,$r3,248(0xf8)
+   0xff8de852d8 <PltResolver64+1160>:	st.d	$r4,$r24,136(0x88)
+(gdb) i r $r13 $r23
+r13            0x30020740          805439296
+r23            0x3f00003fb0        270582955952
+```
+
+Just revert the [req_prot](https://github.com/ptitSeb/box64/blob/main/src/dynarec/dynablock.c#L203)  for non-4Kpagesize system in the commit a30433ea120ba502045782296db85bb27f643d6b  the testcase Passed:
+
+```
+diff --git a/src/dynarec/dynablock.c b/src/dynarec/dynablock.c
+index 097d16d9..7fd3ba4d 100644
+--- a/src/dynarec/dynablock.c
++++ b/src/dynarec/dynablock.c
+@@ -200,7 +200,7 @@ static dynablock_t* internalDBGetBlock(x64emu_t* emu, uintptr_t addr, uintptr_t
+ {
+     if(hasAlternate((void*)addr))
+         return NULL;
+-    const uint32_t req_prot = (box64_pagesize==4096)?(PROT_EXEC|PROT_READ):PROT_READ;
++    const uint32_t req_prot = PROT_EXEC|PROT_READ;
+     dynablock_t* block = getDB(addr);
+     if(block || !create) {
+         if(block && getNeedTest(addr) && (getProtection(addr)&req_prot)!=req_prot)
+```
+
+Thanks,
+Leslie Zhai

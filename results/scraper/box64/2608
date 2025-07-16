@@ -1,0 +1,57 @@
+[NON4KPAGE] AllocLoadElfMemory multiblocks wrong alignment
+Hi,
+
+[jtreg testcase](https://github.com/openjdk/jdk/blob/master/test/hotspot/jtreg/vmTestbase/vm/jit/LongTransitions/libLTTest.cpp#L3397) `objdump -d /your/path/jdk/build/linux-x86_64-server-release/images/test/hotspot/jtreg/native/libLTTest.so `
+```
+0000000000046b50 <Java_vm_jit_LongTransitions_LTTest_nativeFnc52>:
+   46b50:       55                      push   %rbp
+...
+=>   47fff:       b8 01 00 00 00          mov    $0x1,%eax
+                     ^--- expected
+   48004:       e8 67 a0 fb ff          callq  2070 <fprintf@plt>
+...
+```
+
+[AllocLoadElfMemory multiblocks wrong alignment](https://github.com/ptitSeb/box64/blob/main/src/elfs/elfloader.c#L302) failed to decode `0x3f00047fff` expected `B8 01 00 00 00`:
+```
+...
+[BOX64] New Instruction x64:0x3f00047fff, native:0xffc8d68628
+=> [BOX64] 0x3f00047fff: B8 00 00 00 00  MOV Reg, Id
+                            ^--- wrong
+[BOX64] 0xffc8d68628: 1 emitted opcodes, inst=631, barrier=0 state=0/1(0), set=0/0, use=0, need=80/80, fuse=0, sm=0(0/0), pred=630, last_ip=0x3f00047fed Q0:XMM0
+        0380000c        ORI             xRAX_r12, xZR, 0x0
+...
+```
+
+After changed the `balign` with `box64_pagesize`:
+```
+diff --git a/src/elfs/elfloader.c b/src/elfs/elfloader.c
+index 2dadbda4..91b1df2e 100644
+--- a/src/elfs/elfloader.c
++++ b/src/elfs/elfloader.c
+@@ -299,8 +299,8 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
+             uint8_t prot = ((e->p_flags & PF_R)?PROT_READ:0)|((e->p_flags & PF_W)?PROT_WRITE:0)|((e->p_flags & PF_X)?PROT_EXEC:0);
+             // check if alignment is correct
+             uintptr_t balign = head->multiblocks[n].align-1;
+-            if(balign<4095) balign = 4095;
+-            head->multiblocks[n].asize = (e->p_memsz+(e->p_paddr&balign)+4095)&~4095;
++            if (balign < (box64_pagesize - 1)) balign = box64_pagesize - 1;
++            head->multiblocks[n].asize = (e->p_memsz + (e->p_paddr & balign) + (box64_pagesize - 1)) & ~(box64_pagesize - 1);
+             int try_mmap = 1;
+             if(e->p_paddr&balign)
+                 try_mmap = 0;
+```
+
+Decoded `0x3f00047fff` correctly:
+```
+...
+[BOX64] New Instruction x64:0x3f00047fff, native:0xffc8d68628
+=> [BOX64] 0x3f00047fff: B8 01 00 00 00  MOV Reg, Id
+                             ^--- correct
+[BOX64] 0xffc8d68628: 2 emitted opcodes, inst=631, barrier=0 state=0/1(0), set=0/0, use=0, need=0/0, fuse=0, sm=0(0/0), pred=630, last_ip=0x3f00047fed Q0:XMM0
+        0380040c        ORI             xRAX_r12, xZR, 0x1
+...
+```
+
+Thanks,
+Leslie Zhai

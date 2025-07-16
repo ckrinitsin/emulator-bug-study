@@ -1,0 +1,62 @@
+Is it possible to regenerate `table64` for a dynablock?
+## Background
+
+I am implementing a external cache-system (my research project, wip), so that the generated dynablock for program A could be reused in the other programs or the next time program A starts. This idea could help to by-pass the complex `native_pass`es.
+
+Currently the dynablock can be stored in the cache system correctly and box64 can lookup the external cache correctly. I found however the fetched external cache (dynablock) can not be used directly, as it contains many position-dependent information. For example (if I am wrong, please correct me):
+1. the first `void *` word of the block: easy to regenerate
+2. the `next` pointer in the block, and the `jmpnext` address: easy to regenerate
+3. the `table64` in the block: **hard to regenerate???**
+4. ... (any other information? I am not sure ...)
+
+https://github.com/ptitSeb/box64/blob/27a8d19f31327c5c620c5037b4534b0cb200a2a9/src/dynarec/dynarec_native.c#L542-L551
+
+SO, I think the cache can be effectively reused if we can have a (cheap) way to regenerate the `table64`.
+
+## But, how to?
+
+I tried to introduced a `native_pass4` to regenerate the `table64`. To define this new pass, I basically created such header file:
+
+```c
+#define INIT
+#define FINI
+#define EMIT(A)
+
+#define MESSAGE(A, ...)
+#define NEW_INST
+#define INST_EPILOG
+#define INST_NAME(name)
+
+#define TABLE64(A, V)   {int val64offset = Table64(dyn, (V), 4); MESSAGE(LOG_DUMP, "  Table64: 0x%lx\n", (V)); AUIPC(A, SPLIT20(val64offset)); LD(A, A, SPLIT12(val64offset));}
+#define FTABLE64(A, V)  {mmx87_regs_t v = {.d = V}; int val64offset = Table64(dyn, v.q, 4); MESSAGE(LOG_DUMP, "  FTable64: %g\n", v.d); AUIPC(x1, SPLIT20(val64offset)); FLD(A, x1, SPLIT12(val64offset));}
+```
+
+and adapted some conditional-compilation directives in the codebase, e.g.:
+
+```diff
+- #if STEP == 3
++ #if STEP == 3 || STEP == 4
+  #define X87_COMBINE(A, B) extcache_st_coherency(dyn, ninst, A, B)
+  #else
+```
+
+Before calling `native_pass4`, I set the `helper` (just like before calling `native_pass3` in the original code path):
+
+```c
+helper.block = block->block;
+helper.tablestart = (uintptr_t)tablestart;
+helper.jmp_next = (uintptr_t)next + sizeof(void*);
+helper.instsize = (instsize_t*)(block->instsize);
+helper.table64cap = (next - tablestart) / sizeof(uint64_t);
+helper.table64 = (uint64_t*)tablestart;
+helper.native_size = 0;
+helper.table64size = 0;
+helper.insts_size = 0;
+native_pass4(&helper, addr, alternate, is32bits);
+```
+
+However, this seemed not working well. The `table64` seemed not generated correctly. I think it could be something wrong at the `helper`, because I actually did not do all actions on `helper` as the original code path does before `native_pass3`.
+
+So, my question is, _is it possible to regenerate the `table64`?_ :thinking: 
+
+I would appreciate it if you can help me to understand how `FillBlock64` generates `table64` or give some hints to regenerate the `table64` for an existing dynablock.

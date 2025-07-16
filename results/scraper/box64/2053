@@ -1,0 +1,81 @@
+[LA64_DYNAREC] Linux x64 jdk23 infinite loop on not support AMCAS platform 
+Hi,
+
+Testcase:
+
+```
+./build/box64 /yourpath/jdk-23/bin/java -version
+```
+
+Reproduced infinite loop[2] on not support `AMCAS` platform, for example: 3A5000.  But 3A6000, which supports `AMCAS` and `AMBH`, will not reproduce this issue. The root cause is `LL.W/SC.W` not equivalent to `cmpxchg8` so `native_lock_write_b` AKA `la64_lock_cas_b_slow` always return `1`[3]. We often use `AMCAS` to codegen the `compareAndExchangeB` node, but there is `predicate(UseAMCAS)` restrict[4], and there is also `UseAMCAS == true` assert[5] for `cmpxchg8` macroAssembler.
+
+Build options:
+```
+cmake .. -DLARCH64=ON -DLARCH64_DYNAREC=ON
+```
+
+[1] Linux/x64 OpenJDK: https://download.java.net/java/GA/jdk23.0.1/c28985cbf10d4e648e4004050f8781aa/11/GPL/openjdk-23.0.1_linux-x64_bin.tar.gz
+
+[2]
+```
+22263|0x3f01ca9736: Calling pthread_mutex_lock(0x3F0254EBC0, 0x3F0254EBC0, 0xFFFFFFFD, ...) => return 0x0
+22263|0x3f01ca9893: Calling __tls_get_addr(0x3F024DB3D8, 0x64, 0xFFFFFFFD, ...) => return 0xFFD0010B18
+22263|0x3f01d01f53: Calling clock_gettime(0x1, 0xFFE6BBBE00, 0xFFFFFFFD, ...) => return 0x0
+22263|0x3f01d01ff7: Calling pthread_cond_timedwait(0x3F0254EBE8, 0x3F0254EBC0, 0xFFE6BBBDF0, ...) =>^C
+Thread 1 "java" received signal SIGINT, Interrupt.
+0x000000fff7d196f8 in __GI___pthread_timedjoin_ex (threadid=1099340214128, threadid@entry=<error reading variable: value has been optimized out>, thread_return=0xfff7cdabf8, thread_return@entry=<error reading variable: value has been optimized out>, abstime=0x0, abstime@entry=<error reading variable: value has been optimized out>, block=<error reading variable: value has been optimized out>) at pthread_join_common.c:89
+
+(gdb) info threads
+  Id   Target Id         Frame 
+* 1    Thread 0xfff7ced3c0 (LWP 22237) "java" 0x000000fff7d196f8 in __GI___pthread_timedjoin_ex (threadid=1099340214128, threadid@entry=<error reading variable: value has been optimized out>, thread_return=0xfff7cdabf8, thread_return@entry=<error reading variable: value has been optimized out>, abstime=0x0, abstime@entry=<error reading variable: value has been optimized out>, block=<error reading variable: value has been optimized out>) at pthread_join_common.c:89
+  2    Thread 0xfff5c86f70 (LWP 22244) "java" 0x0000000034845cd8 in cmp8 (emu=emu@entry=0x368054a0, d=100 'd', s=s@entry=100 'd') at /home/zhaixiang/repo/box64/src/emu/x64primop.c:326
+  3    Thread 0xfff4a62f70 (LWP 22258) "GC Thread#0" futex_abstimed_wait_cancelable (private=0, abstime=0x0, expected=0, futex_word=0xfff00ab6a8) at ../sysdeps/unix/sysv/linux/futex-internal.h:205
+  4    Thread 0xfff4436f70 (LWP 22259) "G1 Main Marker" futex_wait_cancelable (private=0, expected=0, futex_word=0x3f0254f310) at ../sysdeps/unix/sysv/linux/futex-internal.h:88
+  5    Thread 0xffe7ffef70 (LWP 22260) "G1 Conc#0" futex_abstimed_wait_cancelable (private=0, abstime=0x0, expected=0, futex_word=0xfff00c3198) at ../sysdeps/unix/sysv/linux/futex-internal.h:205
+  6    Thread 0xffe7562f70 (LWP 22261) "G1 Refine#0" futex_wait_cancelable (private=0, expected=0, futex_word=0x3f0254f310) at ../sysdeps/unix/sysv/linux/futex-internal.h:88
+  7    Thread 0xffe6f56f70 (LWP 22262) "G1 Service" futex_wait_cancelable (private=0, expected=0, futex_word=0x3f0254f310) at ../sysdeps/unix/sysv/linux/futex-internal.h:88
+  8    Thread 0xffe66b6f70 (LWP 22263) "VM Periodic Tas" futex_reltimed_wait_cancelable (private=0, reltime=0xffe66b60b0, expected=0, futex_word=0x3f0254ec10) at ../sysdeps/unix/sysv/linux/futex-internal.h:142
+  9    Thread 0xffe540af70 (LWP 22303) "VM Thread" futex_wait_cancelable (private=0, expected=0, futex_word=0x3f0254da10) at ../sysdeps/unix/sysv/linux/futex-internal.h:88
+(gdb) thread 2
+[Switching to thread 2 (Thread 0xfff5c86f70 (LWP 22244))]
+#0  0x0000000034845cd8 in cmp8 (emu=emu@entry=0x368054a0, d=100 'd', s=s@entry=100 'd') at /home/zhaixiang/repo/box64/src/emu/x64primop.c:326
+326        RESET_FLAGS(emu);
+(gdb) bt
+#0  0x0000000034845cd8 in cmp8 (emu=emu@entry=0x368054a0, d=100 'd', s=s@entry=100 'd') at /home/zhaixiang/repo/box64/src/emu/x64primop.c:326
+#1  0x0000000034f08bf4 in RunF0 (emu=emu@entry=0x368054a0, rex=..., rex@entry=..., addr=<optimized out>) at /home/zhaixiang/repo/box64/src/emu/x64runf0.c:303
+#2  0x0000000034ee3d3c in Run (emu=emu@entry=0x368054a0, step=<optimized out>, step@entry=1) at /home/zhaixiang/repo/box64/src/emu/x64run.c:1912
+#3  0x0000000034831da4 in DynaRun (emu=emu@entry=0x368054a0) at /home/zhaixiang/repo/box64/src/dynarec/dynarec.c:217
+#4  0x00000000348602fc in pthread_routine (p=0x367ada10) at /home/zhaixiang/repo/box64/src/libtools/threads.c:257
+#5  0x000000fff7d182b0 in start_thread (arg=<optimized out>) at pthread_create.c:486
+#6  0x000000fff7ef5744 in __thread_start () at ../sysdeps/unix/sysv/linux/loongarch/clone.S:89
+``` 
+
+[3]
+```
+...
+                case 0xB0:                      /* CMPXCHG Eb,Gb */
+                    CHECK_FLAGS(emu);
+                    nextop = F8;
+                    GETGB;
+                    GETEB(0);
+#if defined(DYNAREC) && !defined(TEST_INTERPRETER)
+                    do {
+                        tmp8u = native_lock_read_b(EB);
+                        cmp8(emu, R_AL, tmp8u);
+                        if(ACCESS_FLAG(F_ZF)) {
+=>                            tmp32s = native_lock_write_b(EB, GB); 
+                        } else {
+                            R_AL = tmp8u;
+                            tmp32s = 0; 
+                        }
+                    } while(tmp32s);
+#else
+...
+```
+
+[4] `predicate(UseAMCAS)` in `compareAndExchangeB` node:  https://github.com/loongson/jdk/blob/loongarch-port/src/hotspot/cpu/loongarch/loongarch_64.ad#L11591
+
+[5] `assert(UseAMCAS == true, "UseAMCAS == true")` in `cmpxchg8` macroAssembler: https://github.com/loongson/jdk/blob/loongarch-port/src/hotspot/cpu/loongarch/macroAssembler_loongarch.cpp#L1707
+
+Thanks,
+Leslie Zhai
