@@ -1,0 +1,43 @@
+Support thunking of multi-instance Vulkan applications
+FEX's libvulkan thunks don't work if multiple `VkInstances` are used that return different function pointers to `vkGetDeviceProcAddr`. This is because to implement `vkGetDeviceProcAddr` in the first place, FEX needs to pre-query a `VkInstance`-specific function pointer during initialization. The function pointer itself is called without any direct reference to the original `VkInstance`, so FEX acts as if only the first VkInstance created by the application was used.
+
+In the broader picture, the problem is a restriction in the thunk generator: Functions that must be guest-callable through host function pointers can not use a custom guest entrypoint.
+
+### Suggested solution: Extending framework for guest-callable host function pointers
+
+Currently, guest-callable host function pointers are implemented by linking the host function pointer to a generic template function that forwards the packed argument list *plus* the original host function pointer to a `hostcall_` thunk. In this case, the function pointer is `vkGetDeviceProcAddr` as returned from `vkGetInstanceProcAddr`. What's needed is a way of customizing the target function: Instead of calling the thunk that initiates a Guest->Host transition, a custom function should be called.
+
+Implementation sketch of the guest-side thunk library:
+```cpp
+template<auto Function, typename Result, typename... Args>
+inline Result ReadHiddenArgumentAndCall(Args... args) {
+    uintptr_t hidden_arg;
+    asm("mov %%rax, %0" : "=r" (hidden_arg));
+    return Function(args..., hidden_arg);
+}
+
+PFN_vkVoidFunction vkGetDeviceProcAddr_indirect(VkDevice a_0, const char* a_1, void* host_ptr) {
+    PackedArguments<PFN_vkVoidFunction, VkDevice, const char*, uintptr_t> args = { a_0, a_1, host_ptr };
+    fexthunks_libvulkan_hostcall_vkGetDeviceProcAddr(&args);
+    LinkGuestAddressToHostFunction(args.rv, PtrsToLookUp.at(a_1));
+    return args.rv;
+}
+
+#if 0
+// For illustration only: Public entrypoint of this function (if it were needed)
+PFN_vkVoidFunction vkGetDeviceProcAddr(VkDevice a_0, const char* a_1) {
+    return vkGetDeviceProcAddr_indirect(a_0, a_1, fexldr_ptr_vkGetDeviceProcAddr);
+}
+#endif
+
+PFN_vkVoidFunction vkGetInstanceProcAddr(VkInstance a_0, const char* a_1){
+    auto Ret = fexfn_pack_vkGetInstanceProcAddr(a_0, a_1);
+    if (a_1 != std::string_view { "vkGetDeviceProcAddr" }) {
+        LinkGuestAddressToHostFunction(Ret, PtrsToLookUp.at(a_1));
+        return Ret;
+    } else {
+        LinkGuestAddressToHostFunction(Ret, ReadHiddenArgumentAndCall<vkGetDeviceProcAddr_indirect>);
+        return Ret;
+    }
+}
+```

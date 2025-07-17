@@ -1,0 +1,65 @@
+AVX128: Zeroing of upper bits can be more optimal with 128-bit operation
+```json
+    "vfmadd231ss xmm0, xmm1, xmm2": {
+      "ExpectedInstructionCount": 3,
+      "Comment": [
+        "Map 2 0b01 0xb9 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s17, s18, s16",
+        "movi v2.2d, #0x0",
+        "str q2, [x28, #16]"
+      ]
+    },
+ ```
+
+In the common case of an AVX instruction operating at 128-bits we have a movi+str pair to zero the upper 128-bit lane.
+There's a couple benefits of this,
+
+1. We cache this zero register in multiple instruction blocks. This allows multiple 128-bit operations to eat a single move and dead store elimination will eliminate all the stores aside from the last one.
+2. The zero register retains the FPRClass to make RA sane. (This is a note for how an improvement can change the class type)
+
+An annoyance with this approach is that if we know we are storing zero to the upper 128-bit lane, and then storing that zero to the context, it would be more optimal to remove the movi and do an `stp xzr, xzr, [x28, #16]`
+
+1. This removes the movi instruction
+2. This uses a GPR stp instruction which is one cycle on Cortex
+3. Removes the movi->stp dependency
+
+The downside to this approach is if that zero register actually needs to be in a vector register, it gets confusing. Think about a 128-bit AVX instruction zeroing the upper bits, and then a 256-bit AVX instruction doing a vector or or something, merging the bottom 128-bit lane but effectively doing a move to the top 128-bits. Need to be careful not to make the intermixed version worse. Which would likely degrade in to a context store, then load to avoid the RA class mishmash when today it could have just stayed as a living value without hitting context.
+
+Will need some noodling to figure out what is best here. Maybe we need to pump the `IsInlineConstant` value through from OpcodeDispatcher to backend for vector sources but supporting only the source being `_LoadNamedVectorConstant(Size, IR::NamedVectorConstant::NAMED_VECTOR_ZERO)`?
+
+
+example of what the previous example could turn in to
+```json
+    "vfmadd231ss xmm0, xmm1, xmm2": {
+      "ExpectedInstructionCount": 2,
+      "Comment": [
+        "Map 2 0b01 0xb9 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fmadd s16, s17, s18, s16",
+        "stp xzr, xzr, [x28, #16]"
+      ]
+    },
+ ```
+
+
+Example of a test case that we don't want to make worse
+```json
+    "128-bit test": {
+      "ExpectedInstructionCount": 6,
+      "x86Insts": [
+        "vaddps xmm0, xmm1, xmm2",
+        "vorps ymm0, ymm3"
+      ],
+      "ExpectedArm64ASM": [
+        "fadd v16.4s, v17.4s, v18.4s",
+        "movi v2.2d, #0x0",
+        "ldr q3, [x28, #64]",
+        "orr v16.16b, v16.16b, v19.16b",
+        "orr v2.16b, v2.16b, v3.16b",
+        "str q2, [x28, #16]"
+      ]
+    },
+```

@@ -1,0 +1,175 @@
+Scalar vector performance issues with FMOD
+FMOD burns a CPU core, specifically in Hollow Knight's title screen. Seems to be a little loop that spins really hot that we don't optimize well. It's bad enough that a ton of Unity+FMOD games will stutter their audio quite hard.
+
+This is due to how the code is using a loop-unrolled scalar FMA to process audio blocks and FEX converting the code badly.
+
+Original code.
+```asm
+01aaf061  89ce               mov     esi, ecx
+01aaf063  4889ea             mov     rdx, rbp
+01aaf066  4889d8             mov     rax, rbx
+
+01aaf069  f30f1012           movss   xmm2, dword [rdx]
+01aaf06d  4883c020           add     rax, 0x20
+01aaf071  f30f59d0           mulss   xmm2, xmm0
+01aaf075  4883c220           add     rdx, 0x20
+01aaf079  f30f5850e0         addss   xmm2, dword [rax-0x20]
+01aaf07e  f30f1150e0         movss   dword [rax-0x20], xmm2
+01aaf083  f30f1052e4         movss   xmm2, dword [rdx-0x1c]
+01aaf088  f30f59d1           mulss   xmm2, xmm1
+01aaf08c  f30f5850e4         addss   xmm2, dword [rax-0x1c]
+01aaf091  f30f1150e4         movss   dword [rax-0x1c], xmm2
+01aaf096  f30f1052e8         movss   xmm2, dword [rdx-0x18]
+01aaf09b  f30f59d0           mulss   xmm2, xmm0
+01aaf09f  f30f5850e8         addss   xmm2, dword [rax-0x18]
+01aaf0a4  f30f1150e8         movss   dword [rax-0x18], xmm2
+01aaf0a9  f30f1052ec         movss   xmm2, dword [rdx-0x14]
+01aaf0ae  f30f59d1           mulss   xmm2, xmm1
+01aaf0b2  f30f5850ec         addss   xmm2, dword [rax-0x14]
+01aaf0b7  f30f1150ec         movss   dword [rax-0x14], xmm2
+01aaf0bc  f30f1052f0         movss   xmm2, dword [rdx-0x10]
+01aaf0c1  f30f59d0           mulss   xmm2, xmm0
+01aaf0c5  f30f5850f0         addss   xmm2, dword [rax-0x10]
+01aaf0ca  f30f1150f0         movss   dword [rax-0x10], xmm2
+01aaf0cf  f30f1052f4         movss   xmm2, dword [rdx-0xc]
+01aaf0d4  f30f59d1           mulss   xmm2, xmm1
+01aaf0d8  f30f5850f4         addss   xmm2, dword [rax-0xc]
+01aaf0dd  f30f1150f4         movss   dword [rax-0xc], xmm2
+01aaf0e2  f30f1052f8         movss   xmm2, dword [rdx-0x8]
+01aaf0e7  f30f59d0           mulss   xmm2, xmm0
+01aaf0eb  f30f5850f8         addss   xmm2, dword [rax-0x8]
+01aaf0f0  f30f1150f8         movss   dword [rax-0x8], xmm2
+01aaf0f5  f30f1052fc         movss   xmm2, dword [rdx-0x4]
+01aaf0fa  f30f59d1           mulss   xmm2, xmm1
+01aaf0fe  f30f5850fc         addss   xmm2, dword [rax-0x4]
+01aaf103  f30f1150fc         movss   dword [rax-0x4], xmm2
+01aaf108  83ee01             sub     esi, 0x1
+01aaf10b  0f8558ffffff       jne     0x1aaf069
+```
+Single step of the job:
+``` asm
+00010029  f30f1052e0         movss   xmm2, dword [rdx-0x20]
+0001002e  f30f59d0           mulss   xmm2, xmm0
+00010032  f30f5850e0         addss   xmm2, dword [rax-0x20]
+00010037  f30f1150e0         movss   dword [rax-0x20], xmm2
+```
+
+Resulting AArch64 asm
+```asm
+   0x0000ffffe2d000bc:  ldur    s18, [x6, #-32]
+   0x0000ffffe2d000c0:  fmul    s4, s18, s16
+   0x0000ffffe2d000c4:  mov     v18.s[0], v4.s[0]
+   0x0000ffffe2d000c8:  ldur    s4, [x4, #-32]
+   0x0000ffffe2d000cc:  fadd    s4, s18, s4
+   0x0000ffffe2d000d0:  mov     v18.s[0], v4.s[0]
+   0x0000ffffe2d000d4:  eor     v0.16b, v0.16b, v0.16b
+   0x0000ffffe2d000d8:  mov     v0.s[0], v18.s[0]
+   0x0000ffffe2d000dc:  mov     v4.16b, v0.16b
+   0x0000ffffe2d000e0:  stur    s4, [x4, #-32]
+```
+
+Ideally the AArch64 asm should be:
+```asm
+ldur    s18, [x6, #-32]
+fmul    s18, s18, s16
+ldur    s4, [x4, #-32]
+fadd    s18, s18, s4
+stur    s18, [x4, #-32]
+```
+
+IPC numbers are trash according to llvm-mca:
+```bash
+ryanh@ubuntu-linux-20-04-desktop:~$ llvm-mca -mcpu=cortex-a57 test.s
+Iterations:        100
+Instructions:      1000
+Total Cycles:      3214
+Total uOps:        1300
+
+Dispatch Width:    3
+uOps Per Cycle:    0.40
+IPC:               0.31
+Block RThroughput: 5.0
+```
+
+Theoretical improvements:
+```bash
+ryanh@ubuntu-linux-20-04-desktop:~$ llvm-mca -mcpu=cortex-a57 test_opt.s
+Iterations:        100
+Instructions:      500
+Total Cycles:      217
+Total uOps:        500
+
+Dispatch Width:    3
+uOps Per Cycle:    2.30
+IPC:               2.30
+Block RThroughput: 2.0
+```
+
+
+Sample FEX ASM unit test that can see the issue looking at the generated code.
+```asm
+
+; This is based on the hottest block of Unity+FMOD's audio code from Hollow Knight
+; This is doing some sort of unrolled scalar FMA that works on a full block at a time
+
+; xmm0 contains one channel multiplication value
+; xmm1 contains the other channel?
+; These come from arguments
+movss xmm0, dword [rel scalar_val]
+movss xmm1, dword [rel scalar_val2]
+
+; Break the block to be closer to original block
+jmp local
+local:
+
+; RAX contains the source block of data. Each block containing 32-bytes of data
+; The data is modified in-place
+; Data format
+; struct Data {
+;   float data;
+;   float adder;
+; }
+mov rax, 0xe8000000
+; ESI contains the number of blocks to operate on, Only one block in this test
+mov esi, 1
+; RDX contains the source value to multiply by
+mov rdx, 0xe8000020
+
+top:
+
+add rax, 0x20 ; Increment Source block
+add rdx, 0x20 ; Increment multiplier stereo blocks
+
+; Do the remainder in a repeating macro
+%macro OneChannelUnroll 2
+; Load chan1
+  movss xmm2, dword [rdx - %1]
+; Multiply chan1 by channel multiplier
+  mulss xmm2, %2
+; Add to data source and store back to memory
+  addss xmm2, dword [rax - %1]
+  movss dword [rax - %1], xmm2
+%endmacro
+
+; Channel 1
+OneChannelUnroll 0x20, xmm0
+; Channel 2
+OneChannelUnroll 0x1c, xmm1
+
+;OneChannelUnroll 0x18, xmm0
+;OneChannelUnroll 0x14, xmm1
+;OneChannelUnroll 0x10, xmm0
+;OneChannelUnroll 0x0c, xmm1
+;OneChannelUnroll 0x08, xmm0
+;OneChannelUnroll 0x04, xmm1
+
+sub esi, 1
+jne top
+
+hlt
+
+scalar_val:
+dd 1.0
+scalar_val2:
+dd 1.0
+```

@@ -1,0 +1,27 @@
+static-pie is incompatible with thunks due to glibc bug
+When glibc is initializing it has some allocation functions that are setup at certain times.
+These are the `__rtld_` functions located here: https://sourceware.org/git/?p=glibc.git;a=blob;f=elf/dl-minimal.c;h=4e7f11aeabb70f2d50cf767bc54a3c5237574b57;hb=HEAD#l42
+
+On executable start the function `__rtld_malloc_init_stubs` will be called to set these to some small helper functions.
+This needs to be done since there isn't any state tracking happening yet in glibc so it can't do memory management.
+This function gets called from `_dl_start` for the initial set.
+
+At some point `_dl_main` will call `__rtld_malloc_init_real` which scans the main map and set these pointers to the real allocation function pointers.
+
+Now in the case of static-pie. This all happens accordingly and works fine.
+Then we try to `dlopen` a library. At first glance it works correctly.
+You can pull symbols out, you can allocate memory. Seems fine.
+Then once that library tries to create a thread, glibc will try allocating some memory using its internal symbols for allocations.
+These are now currently set to **!!zero!!**, causing the application to immediately crash.
+
+This is because even though FEX has started up correctly and set these function pointers, when you dlopen a library there are a bunch of things that happen.
+Primarily:
+- glibc shared libraries are now loaded in to memory
+- ld-linux.so
+- libc.so
+- libpthread.so
+- etc
+These libraries now being loaded in to memory have not run through glibc's initialization routines in the expected manner.
+This causes the rtld function pointers to now be pointing to zero, which causes the crash.
+
+This is a glibc bug where they haven't tested a complex use case of {static, static-pie} + dlopen and needs to be resolved on their end.

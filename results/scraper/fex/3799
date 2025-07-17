@@ -1,0 +1,92 @@
+SVE256: AVX implementation fails to retain upper 128-bits of results
+We don't have any unit tests that aggressively mix SSE and AVX unit tests. In some (most?) cases the SVE256 bit implementation of our AVX emulation doesn't correctly retain the upper 128-bits of the register when an SSE operation occurs.
+
+This can be seen in the following unit test:
+```asm
+%ifdef CONFIG
+{
+  "RegData": {
+    "XMM0": ["0xfdecd28fab3fa4a5", "0x7d7ccd8836d09fc2", "0xccdbcfc31f3ff0f3", "0x108390defebac4be"],
+    "XMM1": ["0xc4be43cc1ad6970b", "0x4559bd7eb46a1278", "0", "0"],
+    "XMM2": ["0xc4be43cc1ad6970b", "0x4549bd7eb46a1278", "0xf793ef673dac6e4c", "0xbb7b5b3d85d34271"],
+    "XMM3": ["0x000043cc1ad6970b", "0x4549bd7eb46a1278", "0xf793ef673dac6e4c", "0xbb7b5b3d85d34271"]
+  }
+}
+%endif
+
+vmovaps ymm0, [rel .data]
+vmovaps ymm1, [rel .data + (1 * 32)]
+vmovaps ymm2, [rel .data + (2 * 32)]
+vmovaps ymm3, [rel .data + (3 * 32)]
+
+addpd xmm0, xmm1
+vaddpd xmm1, xmm2, xmm3
+
+hlt
+
+align 32
+.data:
+dq 0xfdecd28fab3fa4a5, 0x7d7ccd8836d09fc2, 0xccdbcfc31f3ff0f3, 0x108390defebac4be
+dq 0x43cc1ad6970b4549, 0xbd7eb46a1278f793, 0xef673dac6e4cbb7b, 0x5b3d85d342718be9
+dq 0xc4be43cc1ad6970b, 0x4549bd7eb46a1278, 0xf793ef673dac6e4c, 0xbb7b5b3d85d34271
+dq 0x000043cc1ad6970b, 0x4549bd7eb46a1278, 0xf793ef673dac6e4c, 0xbb7b5b3d85d34271
+```
+
+This unit test works with ASIMD and SVE128, but fails with SVE256. Looking at an instcountci test shows why this occurs
+
+First with ASIMD/SVE128:
+```json
+    "addpd xmm0, xmm1": {
+      "ExpectedInstructionCount": 1,
+      "Comment": [
+        "Map 1 0b00 0x10 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fadd v16.2d, v16.2d, v17.2d"
+      ]
+    },
+    "vaddpd xmm0, xmm0, xmm1": {
+      "ExpectedInstructionCount": 3,
+      "Comment": [
+        "Map 1 0b00 0x10 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fadd v16.2d, v16.2d, v17.2d",
+        "movi v2.2d, #0x0",
+        "str q2, [x28, #16]"
+      ]
+    },
+```
+
+Next with SVE256:
+```json
+    "addpd xmm0, xmm1": {
+      "ExpectedInstructionCount": 1,
+      "Comment": [
+        "Map 1 0b00 0x10 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fadd v16.2d, v16.2d, v17.2d"
+      ]
+    },
+    "vaddpd xmm0, xmm0, xmm1": {
+      "ExpectedInstructionCount": 1,
+      "Comment": [
+        "Map 1 0b00 0x10 128-bit"
+      ],
+      "ExpectedArm64ASM": [
+        "fadd v16.2d, v16.2d, v17.2d"
+      ]
+    },
+```
+
+As seen, the addpd and vaddpd behaviour is different on ASIMD/SVE128 versus SVE256.
+SSE addpd:
+- ASIMD: gains insert capability because of discontiguous registers ✅
+- SVE256: zero-extends due to ASIMD results zero extending ❌
+
+AVX vaddpd:
+- ASIMD: Lower 128-bits is calculated correctly. Additional mov+str for upper 128-bit zext. ✅
+- SVE256: Lower 128-bits is calculated and zero-extended correctly using ASIMD semantics ✅
+
+SVE256 needs to retain the upper 128-bits of the result register and do an insert when executing an SSE instruction.

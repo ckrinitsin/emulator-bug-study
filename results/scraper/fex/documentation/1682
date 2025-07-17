@@ -1,0 +1,61 @@
+Signal Handling
+Splitting from #1558 & #1677, as well as discussions with @neobrain  and @Sonicadvance1.
+
+## The issues
+(a) Signals can interrupt the JIT compiler or syscall, other FEX-related code, 3rd party libraries, or thunked libraries, which are not guaranteed to be signal re-entrant safe. Any code that touches non-stack memory, or uses mutexes is possibly not signal safe. We currently block signals around some code, either using `ScopedSignalMaskWith*` guards or manually (eg, the dispatcher disabling signal handling around calls to CompileCode)
+
+(b) Signals can interrupt the translated code in the middle of operations that would normally be atomic wrt signals. This may or may not be a problem, depending on how we have implemented x86. A good example is REP* operations. This can be an issue even without LSE elimination, as the recovered guest state might be "teared".
+
+(c) Similar to above, signals can interrupt the translated code in places where we can't recover the guest architectural place, due to optimisations.
+
+(d) Similar to above, synchronous signals might be generated which need to recover a full context and cannot be deffered.
+
+Group 1: From x86 instructions
+- SIGSEGV (memops, permissions / unmapped memory)
+- SIGBUS (meops, mapping past end of file)
+- SIGFPE (all floating point exceptions? Integer overflow too?)
+
+Group 2: Handled from the x86 frontend
+- SIGILL (not handled instruction)
+- SIGTRAP (breakpoint, `int3` or `int 0x3`
+- SIGEMT (not generated)
+
+Group 3: Generated from system calls
+- SIGSYS (Bad system call, SVr4; seccomp)
+- SIGABRT (raise / __pthread_kill / kill  others?)
+
+(e) Signal latency. Whenever we disable the signal mask, like we do around `::CompileCode`, or with the signal + mutex lock guards, signal delivery gets delayed. This is mostly a concern for long-standing/non constant time signal blocking, like around `::CompileCode`  (can take up to 10+ miliseconds with complex blocks). There is an argument to be made that we should compile blocks faster, though that will never 100% solve the issue. Also, signal handlers can be delayed while code for them is getting compiled, particularly during their first run.
+
+(f) With deferred signals the opposite problem also appears, that we consume the signal too fast. I'm not sure if this results to an extra signal being possibly queued while a signal is deferred. Also, the signal might appear 'dequeued' to the sender, while it is still 'pending' in FEX, which might lead to some guest instructions running (a bit of 'execution overshoot'), a condition that can be detected, but extremely unlikely to matter to the guest. 
+
+(g) While signal delivery is not guaranteed to happen at any speed, lovely features like signal queue merging, which can lead to losing information about the delivered signals, can uncover bugs / assumptions done in the guest code. 
+
+## Current status
+Our current "signal safety strategy" for (a) is to sprinkle signal disabling code around regions that deadlock. This is very inconsistent throughput the codebase, and there are several bugs waiting to be hit. In general, this is a compromise between "likely to lockup" and "performant code". 
+
+For (b) and (c) we currently only partially recover the guest architectural state, store it alongside the host architectural state, and hope the guest code doesn't care too much about the contents of the guest state, and that it will not modify it. We depend on returning to the interrupted host code using the stored host architectural state, in order to resume execution in the middle of any teared instructions, and eventually exit from some point with a valid guest state. This poses another limitation, that the interrupted block cannot be discarded from the code cache, so the code cache cannot be cleared. This might also have further implications around SMC and code invalidations.
+
+## Proposed solutions
+For (a) I'd like us to have clear guidelines on how to handle this, as well as a mode that might be slower but offers guaranteed stability. This needs some thought, but is not too hard.
+
+For (b) and (c) the only viable solution I can think of is a combination of deferring the signal delivery until we have a fully recoverable guest state, and storing metadata that can help us exit from the middle of a block. (c) Can be avoided by limiting store elimination from LSE and disabling DSE. We can have a tradeoff between "defer delay" vs "runtime performance".
+
+For (d.1), we'll need special state flushing semantics and/or recovery metadata and/or exit blocks in instructions that may cause them. This requires extra caution around SRA.
+
+For (d.2), the frontend can take care of everything.
+
+For (d.3), we can likely merge it with the syscall handling case of (a)
+
+For (e) we can implement some form of 'aborts' for long running cases with blocked signals, ie early exits during `::CompileCode` or even possible `conditional aborts` ie temporarily pausing the execution but only aborting if re-executed before getting resumed.
+
+For (f), we can modify the behavior syscalls where signal queueing status can be detected, and make them take actual signal delivery by FEX to the guest into account. This cannot be perfect during guest/host process interop.
+
+For (g), we can implement 'user mode queueing', possibly on top of (g), to get closer to native guest behaviour.
+
+(e) + (f) + (g) are edge case behaviors that is unlikely to matter in practice, and can mostly get triggered by compilation stutter completely altering the expected timing of the guest application.
+
+## Related Tickets
+#518, #650, #1228, #1666
+
+## Other information
+Unity depends on at least graceful handling of asynchronous SIGPWR, SIGXCPU (GC, loose context requirements) and SIGSEGV w/ null pointers (NullReferenceException generation, strict context requirements).

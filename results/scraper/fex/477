@@ -1,0 +1,85 @@
+Perf: <<ByteMark to 80% native>> Roadmap
+# <<ByteMark to 80% native>> Roadmap
+
+Bytemark performance tracking: [Graph](https://docs.google.com/spreadsheets/d/e/2PACX-1vStbhGzR4w1Zqw57iMgsTm04EV0JkjA3LsS4aQXrY2ZlXwYBjVkZK6bz5atigxzwBkUk9GOfy64-8XS/pubchart?oid=1396476138&format=interactive)
+
+Based on the systemic profiling/perf work of the past 2 weeks, + `skmp/optihacks-1`, `skmp/optihacks-2` and `skmp/optihacks-3` + some analysis on ByteMark today I think the following is a good game plan for this goal:
+
+## Cleanup changes in `skmp/optihacks-3`. 
+- Compat limits: Optional PF disable, Optional InvalidateFlags for ABI crossings.
+
+## Lightweight guest branching & dispatch
+Targets: Switch tables, indirect functions
+### Reduce Lookup overhead
+Current paged lookup + alias check + validation check is clearly not optimal.
+
+I suggest a 2-layer approach, with the first layer being a cache and the second a tree / paged tree.
+
+For the first layer, I'd use 24 bit lookup + alias check + lazy allocate LUT.
+
+#### Basic Structure
+```
+struct { uint64_t guest; uint64_t host } entry_t;
+entry_t *LUT; // possibly mmap + segfault backed for lazy allocation
+```
+
+#### Indirect Code Lookup
+```
+_fast_loopup:
+and x0,  pc , ( (1 << 24) -1)
+add entry_ptr, lookup_base + x0* 16
+ldp x0,x1, [entry_ptr]
+cmp x0, pc
+b.ne _full_lookup<pc_reg> // we need a detwiddling table here
+br x1
+```
+
+### Block linking
+Blocks that are statically mapped should link to each other. I propose to use indirect branches to implement this, with the branch vectors being allocated near the block.
+
+#### Basic Structure
+```
+struct BlockInfo { .... uintptr_t* StaticBranchHostPtr; uint64_t StaticBranchGuest; }
+
+// during code emition do a _non_mapped_handler: .dq addr <default_handler> and initialize StaticBranchHostPtr
+```
+#### Block ending for blocks that exit with CALL_DIRECT, JUMP_DIRECT
+```
+ldr x0 =_non_mapped_handler
+blr x0 // BLR is important here, doesn't return
+```
+#### Block ending for blocks that exit with RET, CALL_INDIRECT, JUMP_INDIRECT
+```
+and x0,  pc , ( (1 << 24) -1)
+add entry_ptr, lookup_base + x0* 16
+ldp x0,x1, [entry_ptr]
+cmp x0, pc
+b.ne _full_lookup<pc_reg> // we need a detwiddling table here
+br x1
+```
+
+#### PC-recovery
+In order to reduce overhead, no validation is done on the DIRECT forms - so the default case needs to handle that. We can recover the block from the ret address (that's why BLR is needed). Then we can link the block
+
+#### Block link metadata
+We need to keep lists of which blocks link to witch for block invalidations
+
+## Static Register Allocation
+Allocate 8 or 16 GPRs statically, do RA for SSA values on the rest regs. Make sure to support "lifetime sharing" when an SSA should share the host register with a guest reg as long as it is valid, and generate movs as needed.
+
+### Multiblock
+#### Multiple Entry Points
+Right only the main entry point is exported to the cache. Big blocks that call other blocks should export secondary entry points at the expected return points, to avoid multiple partial code compilations of the same function
+
+#### PHI nodes (possibly not needed to meet goals)
+We need the RA to support PHI nodes
+
+#### MB-DCLSE (possibly not needed to meet goals)
+We need Dead Context Load Store Elim to generate PHI nodes
+
+### Address important pathological code gen
+Shuffles are one example, and there might be a few more important cases for ByteMARK
+
+---
+
+@Sonicadvance1 @phire thoughts?

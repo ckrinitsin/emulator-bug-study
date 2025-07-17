@@ -1,0 +1,56 @@
+Support thunking of vtables and function pointer members
+Many APIs return objects with function pointer data members (e.g. vtables). These are difficult to handle, since both the host libraries (invoked through thunklibs) and the guest program expect to be able to call them. FEX's existing callback mechanism isn't suitable for this.
+
+I've researched other strategies to handle this scenario, the most universal one being Option 3 below. The other options are included for reference, since their drawbacks highlight why option 3 is needed for the general case.
+
+*For illustration, consider this example guest API: `Object* CreateObject()` and `struct Object { void (*funcptr)(Object*); }`.*
+
+## Approach 1: Guest-side mirror copy
+
+In addition to the hostlib-created object, a mirror copy is created where all function pointers are replaced with guest-function pointers. The two are stored in a wrapper struct `struct Wrapped {  Object guest_obj; Object* host_obj; }`, which can be cast to/from the `Object` pointer as seen by the guest.
+
+This requires synchronizing the two copies at each guest<->host transition point. For guest->host, data (excluding function pointers) from `guest_obj` must be copied to `*host_obj`, and vice-versa for host->guest.
+
+👎 Overhead due to object copying
+👎 Only works for function pointers that take a `this` argument (otherwise, there's no way to look up `host_obj`)
+👎 Requires lots of boilerplate
+👎 Does not work for APIs where the guest is in charge of destroying the object using external functions (e.g. free() instead of XDestroyImage). More generally it doesn't work for libraries that have any dependency on the object address whatsoever.
+👎 Unreliable if the host may modify Object data outside of API calls (e.g. for async code)
+👎 Further workarounds required if the guest overwrites function pointers
+
+## Approach 2: `Object*->host_vtable` dictionary
+
+CreateObject in Host-thunklib replaces the vtable of the created object with guest function pointers but stores the old one in an `std::unordered_map` for future lookup.
+
+This approach requires the vtable in the object to be swapped for each host<->guest transition, but compared to approach 1 this is cheaper and requires less boilerplate.
+
+👎 Only works for function pointers that take a `this` argument (otherwise, there's no way to look up `host_vtable`)
+👎 Space overhead due to the (possibly large) dictionary
+👎 Small performance overhead due to dictionary lookup
+👎 Requires some boilerplate
+👎 Further workarounds required if the guest overwrites function pointers
+
+## Approach 3: Making selected host addresses callable from guest
+
+Host-thunklib forwards the unmodified object as created by the hostlib, including host function pointers. The host function pointers are made guest-callable by instructing FEX's JIT insert a trampoline in the block cache at the function pointer address. This trampoline initiates a guest->host transition to call the host function pointer. (This is possible since no guest code could've possibly been loaded at the host function pointer address anyway.)
+
+👍 Works for virtually all cases (no need for `this` args)
+👍 No boilerplate (trampoline code is always the same)
+👍 No overhead
+👎 Further workarounds required if the guest overwrites function pointers
+👎 Complexity
+
+## Approach 4: Trampolines that are valid x86 and ARM64 code
+
+*Okay, we're entering pretty ridiculous territory here, but for the sake of completeness if we wanted to have something like approach 3 but couldn't involve the JIT:*
+
+Host-thunklib forwards the unmodified object as created by the hostlib, including host function pointers. The guest-thunklib wraps each of these function pointers in a trampoline that performs a guest->host transition and then jumps to the original function pointer.
+
+The twist is: These trampolines are carefully written in x86 assembly code such that they [also make for valid ARM64 code](https://github.com/ixty/xarch_shellcode/tree/master/stage0). When interpreted as ARM64 code, the first instruction would be a branch to ARM64-exclusive code, skipping past the x86 payload and instead invoking the original host function pointer.
+
+👎 No idea if this could reasonably be made working
+👍 This is a hilariously evil hack that would be so cool to see working
+
+## Unsolved problems:
+
+All approaches listed above fall apart if the guest program *overwrites* function pointers. However, in practice that's unlikely to be a problem: After all, few (no?) applications would create an object through a library and then override its vtable.

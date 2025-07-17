@@ -1,0 +1,62 @@
+CMPXCHG16B no longer produces optimal code
+This /used/ to produce optimal code before SRA was introduced, and maybe before some enums were rearranged.
+
+Test case:
+```asm
+%ifdef CONFIG
+{
+}
+%endif
+
+mov rsp, 0xe0001000
+cmpxchg16b [rsp]
+
+hlt
+```
+
+ASM for cmpxchg16b
+```asm
+0x00007f3ec2e80060  10ffffe0            adr x0, #-0x4 (addr 0x7f3ec2e8005c)
+0x00007f3ec2e80064  f9005f80            str x0, [x28, #184]
+; Moving SRA registers RDX:RAX in to element pair (expected).
+0x00007f3ec2e80068  aa0403f4            mov x20, x4
+0x00007f3ec2e8006c  aa0603f5            mov x21, x6
+; Moving SRA registers RCX:RBX in to element pair (Desired).
+0x00007f3ec2e80070  aa0703f6            mov x22, x7
+0x00007f3ec2e80074  aa0503f7            mov x23, x5
+; Moving *expected* in to temporaries. Because the ARM instruction overwrites these . (In IR Op)
+; We don't detect when Dst == Expected, nor have constraints to enforce it.
+0x00007f3ec2e80078  aa1403e2            mov x2, x20
+0x00007f3ec2e8007c  aa1503e3            mov x3, x21
+; Rock the caspal
+0x00007f3ec2e80080  4862fd16            caspal x2, x3, x22, x23, [x8]
+; Move the result back in to destination (In IR Op)
+0x00007f3ec2e80084  aa0203f4            mov x20, x2
+0x00007f3ec2e80088  aa0303f5            mov x21, x3
+; ExtractElementPair(0) - Ugh RA.
+0x00007f3ec2e8008c  aa1403f6            mov x22, x20
+; ExtractElementPair(1) - Ugh RA.
+0x00007f3ec2e80090  aa1503f4            mov x20, x21
+; Calculate if Memory == Expected
+0x00007f3ec2e80094  ca0402d5            eor x21, x22, x4
+0x00007f3ec2e80098  ca060297            eor x23, x20, x6
+0x00007f3ec2e8009c  aa1702b5            orr x21, x21, x23
+0x00007f3ec2e800a0  f10002bf            cmp x21, #0x0 (0)
+0x00007f3ec2e800a4  9a9f17f7            cset x23, eq
+; Set ZF to result
+0x00007f3ec2e800a8  390b1b97            strb w23, [x28, #710]
+; Skip block if ZF was expected.
+0x00007f3ec2e800ac  b4000075            cbz x21, #+0xc (addr 0x7f3ec2e800b8)
+; If ZF wasn't expected, RDX:RAX gets set to the memory that was loaded.
+; Need to be careful here, CMPXCHG8B must /not/ clear the upper bits if memory was expected.
+; Could generate more optimal code if we know the upper bits are already zero, operating in 32-bit mode, or 16B since upper bits will always be set
+0x00007f3ec2e800b0  aa1603e4            mov x4, x22
+0x00007f3ec2e800b4  aa1403e6            mov x6, x20
+; Tail block.
+0x00007f3ec2e800b8  58000040            ldr x0, pc+8 (addr 0x7f3ec2e800c0)
+0x00007f3ec2e800bc  d63f0000            blr x0
+0x00007f3ec2e800c0  d8d7f128            prfm plil1keep, pc-328156 (addr 0x7f3ec2e2fee4)
+0x00007f3ec2e800c4  00007f3e            udf #0x7f3e
+0x00007f3ec2e800c8  0001000a            unallocated (Unallocated)
+0x00007f3ec2e800cc  00000000            udf #0x0
+```

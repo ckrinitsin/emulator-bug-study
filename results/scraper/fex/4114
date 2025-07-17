@@ -1,0 +1,24 @@
+32-bit games that use EVDEV for gamepad input are broken
+After months of knowing that gamepad input was flaky for 32-bit processes, I finally spent some time looking at the problem.
+
+Initially I thought it was either a joydev or evdev ioctl issue, since a lot of those ioctls are opaque and the kernel has compat handlers for them. Going through each of the ioctls though, the compat handlers are actually just in-place for big-endian byte swapping of 64-bit words, so behaviour matches on little endian machines.
+
+I then tracked back to evdev read/write syscalls to see what happens there, and this is where the problem lies.
+Readers and writers for evdev events happen in `drivers/input/input-compat.c` with three functions:
+- input_event_from_user - Handles write events that aren't force feedback...?
+- input_event_to_user - Handles input events (read events)
+- input_ff_effect_from_user - Handles force-feedback events
+
+These three functions will check if the process running is a 32-bit process and will handle the data as if it were `struct input_event` or `struct input_event_compat` depending. This struct has a different layout depending on 32-bit or 64-bit because they decided to stick the timestamp at the start of the struct and the type, code, value elements after the timestamp. Completely borking the information because the timestamp is different sized.
+
+Force feedback also has a different layout, but it might also randomly work because the data that changes is at the end? Haven't looked too closely at it.
+
+There's no way to have FEX correctly work around this problem today other than categorizing FDs somehow to know it is an evdev FD, and fixing it up in our 32-bit read/write syscall handlers.
+
+#4106 worked around the issue by adding support for a prctl in their kernel that forces the application to use the compat path, which while it works, it's only a bandage shortterm until we can get something permanent in place. As this only solves the problem for 32-bit evdev/input events, doesn't handle potential other devices that could encounter the same issues with read, write, lseek, etc.
+
+Ideally the upstream Linux kernel would allow us to land our 32-bit compat path patches, but that won't ever happen. https://lore.kernel.org/all/20210518090658.9519-1-amanieu@gmail.com/
+
+When I get a moment I'll add read/write to our wiki about 32-bit problems. https://wiki.fex-emu.com/index.php/Development:32Bit_Syscall_Woes
+
+I don't have any solutions here, just tracking the issue.

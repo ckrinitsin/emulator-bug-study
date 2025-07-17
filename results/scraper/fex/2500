@@ -1,0 +1,59 @@
+FEX needs to drop std:: in favour of fextl::
+# Whhhhhhhhhhhy?!
+- FEX needs to stop replacing the glibc allocator with jemalloc
+
+# But just use std::allocators
+- That's what fextl:: is. Vetted std:: containers that replace the allocator with FEX's allocator by default
+
+# Whhhhhhhhhhhy?!
+To ease mental burden about thinking if a std:: class has been vetted to not allocate memory outside of FEX's allocator
+
+# Why does FEX need to control how memory is allocated?
+All of FEX's allocations take up precious virtual address space, when FEX is running a a 32-bit application it will consume all 64-bit VA space then allocate out of it.
+FEX currently uses jemalloc's glibc hooking to replace the global allocator to let the guest application consume the remaining space.
+
+# Why not just keep using that?
+FEX's thunking system is also affected by the global glibc allocator since the jemalloc replacement extends to anything that we dlopen. In the case of 32-bit thunking, this would mean that pointers returned by libGL and libVulkan would only ever be in the 64-bit VA space.
+
+# Okay, we need to stop replacing the glibc allocator then? That's easy. Why fextl?
+You're right, if we stop replacing the glibc allocator then that will no longer be an issue. We then have a different issue.
+FEX allocates a lot of memory (Mostly virtual, some resident), this takes up virtual address space. When running a 32-bit application this will mean FEX quickly exhausts the 4GB of virtual address space that the 32-bit application has.
+
+This problem can be seen today by disabling JEMalloc and trying to run Steam, it will almost immediately run out of memory.
+
+# Well stop using so much memory
+Never.
+
+But really, 32-bit games without emulation already run out of memory and we need to stay out of their way as much as physically possible.
+
+# How will this be enforced?
+A new CI option will hook the glibc allocators and immediately fault if something tries allocating memory outside of FEX's allocator.
+This will be put in place once FEX is "glibc allocator clean".
+
+# What if I want to use something in the `std::` namespace that isn't in `fextl::`
+Vet it to make sure it doesn't allocate memory and then create an alias. It lowers mental burden when needing to think "Does this one-off use case of std:: allocate memory or not?"
+
+# What about things in the `std::` namespace that allocate memory and don't have a way to replace the allocator?
+This is why we have CI to ensure this. If you're using unvetted `std::` and then try aliasing it by adding a `fextl::` version, CI should ensure that it doesn't allocate memory.
+There are some known bad `std::` namespace functions that allocate memory regardless of what we do and should be avoided.
+
+## Non exhaustive list:
+- std::filesystem::path
+- std::filesystem::absolute
+- std::filesystem::canonical
+- std::fstream
+
+# What about things not in the `std::` namespace that allocate memory?
+Same thing as before, these should be avoid at all cost and hopefully CI should catch it. We will be on the lookout for these, work on removing them, and make sure CI can capture someone trying to add this in the future
+
+## Non exhaustive list
+- get_nprocs_conf
+- getcwd
+- strerror
+  - This one is particularly annoying because it allocates memory for locales.
+
+# What if something just temporarily allocates memory?
+We really don't want to allow this since it just means that everyone can just say "well this allocates memory temporarily so it's not an issue". That's not the case, any sort of allocations is highly likely to impact the 32-bit VA space and can easily run out of memory.
+
+...But if we /really/ need to, we can add an escape hatch so there are some sections in CI that hit this and won't fault.
+But I'm going to complain very loudly every. single. time. one of these get added and they better have a good justification.

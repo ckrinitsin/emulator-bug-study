@@ -1,0 +1,155 @@
+AArch64 Virtual Address space problems.
+AArch64 ships with up to a 48-bit Virtual address space (Or 52-bit with LPA2 but due to how that is implemented doesn't matter).
+This is contrary to x86-64 which only gives userspace a 47-bit VA.
+
+This causes a problem where on running an x86-64 application under FEX, we need to reserve the entire 48-bit VA space to ensure the guest application never allocates memory in that space. See #1346 for real application bugs here. This means FEX always has 128TB of VA space allocated at start up.
+
+In addition to this, 32-bit applications only exist in the lower 32-bits of VA. This causes us to need to reserve all 64-bit VA space.
+Same problems here but now we take even longer and reserve 256GB of VA space (Subtract 4GB).
+
+This means we have two different problem spaces to tackle immediately.
+In addition to this, we have Thunks which complicate this matter.
+
+Syscalls that allocate memory:
+- mmap, mmap2(Doesn't exist on ARM), mremap, shmat, ioctl
+
+**For people coming in from external projects**
+```
+What is FEX-Emu?
+FEX is a AArch64 ONLY userspace emulator of 32-bit x86 and x86-64.
+32-bit x86 runs inside of an AArch64 container, which future proofs FEX for when ARM CPUs lose support for AArch32.
+Adds additional problems for VA on top of the x86-64 specific VA problems.
+
+Host versus Guest?
+  - Host is everything inside of FEX code
+  - Guest is the application being emulated
+
+Thunks cause pain:
+  - What is a thunk?
+    - A bridge library between the x86/x86-64 guest library and a true AArch64 host library.
+
+TL;DR: VA reservation for guest applications that take a short amount of time completely dominate execution time. Things like `ls`, `echo`, `cat`
+```
+**End of minor Information**
+
+**FEX+64Bit:**
+  - Common problems:
+    - Guest can not allocate memory in the 48-bit VA space
+
+  - Current workarounds:
+    - Allocate 128TB of VA space on application startup in the 48-bit range
+      - Takes **5-20ms**, benchmarked on Apple M1. Cortex is slower.
+      - Only on >= 48-bit VA. Anything setup with smaller VA is spared this horror.
+  - Thunks Off:
+    - FEX controls all guest syscalls
+    - All *guest* memory allocation syscalls must return data in the VA range below 47-bit to match x86-64
+    - All *host* memory allocations are unrestricted and can be allowed to go in to the 48-bit range
+
+    - Problem examples:
+      - Guest application loads shared library with `mmap(nullptr, <size>, <prot>, <flags>, <fd>, <some offset>)`
+        - This needs to return in the lower 47-bit
+      - Guest application does an ioctl syscall, which calls IOCTL_DRM, allocates buffer
+        - This needs to return in the lower 47-bit
+      - Guest application does mmap with MAP_32BIT flag
+        - This doesn't exist on ARM
+        - Use mmap_range to restrict the range INSIDE of the prctl range to match 32-bit x86 range
+          - Range is [0x4000'0000, 0x8000'0000)
+      - FEX internal allocator calls mmap to allocate some memory
+        - This can return in the entire unrestricted 48-bit VA range.
+
+    - Possible solutions
+      - typedef struct va_limit { uint64_t lower_bound, uint64_t upper_bound };
+        - Lower bound provided since other emulators can reuse this as a base_offset limit
+      - **prctl(PR_SET_VA_LIMITS, const struct va_limit *limit);**
+        - Sets the VA limits, clamping to the range of configured VA (TASK_SIZE_64) so that mmap won't return bad values
+        - Fixes mmap, mmap2, mremap, shmat, ioctl memory allocations to ensure they fit inside the range.
+        - Does /NOT/ fix FEX wanting to freely allocate
+          - See following *_range syscalls
+        - memory allocation with MAP_FIXED/MAP_FIXED_NOREPLACE should still work outside this limit.
+      - **prctl(PR_GET_VA_LIMITS, struct va_limit *limit);**
+        - Gets the current set VA limits. Introspection as to what the current VA limit is and ensuring restriction was set.
+
+      - mmap_range(uint64_t begin_range, uint64_t end_range, size_t size, int prot, int flags, int fd, off_t offset);
+      - mremap_range(void *old_address, size_t old_size, size_t new_size, int flags, uint64_t begin_range, uint64_t end_range);
+        - Useful for MREMAP_MAYMOVE
+      - shmat_range(int shmid, uint64_t begin_range, uint64_t end_range, int shmflg);
+        - Else restrict range to range provided
+      - ioctl_range - *Nope* - use prctl to limit its allocation range.
+
+      - For each of the syscalls that have a begin_range and end_range
+        - if begin_range < end_range
+          - Allowed allocation region must fit fully within [begin_range, end_range) exclusive
+        - if begin_range == end_range
+          - behave like their non-ranged versions
+        - if begin_range > end_range
+          - This should cause the range to wrap around
+          - This allows the SET_VA_LIMITS prctl to place the limit at an `lower_bound` offset greather than 0 (or 0x1'0000 since
+            first 16kb is preotected). This means that you can allocate around the hole of memory still
+
+  - Thunks On:
+    - FEX no longer controls all syscalls.
+    - Syscalls inside of the emulated space are still captured.
+    - Syscalls from a thunk library (like libGL) are uncaptured
+    - All *guest AND thunk* memory allocation syscalls must return data in the VA range below 47-bit to match x86-64
+    - FEX itself can still allocate in 48-bit range fine.
+
+    - Problem examples:
+      - AArch64 glibc loads shared library thunk with `mmap(nullptr, <size>, <prot>, <flags>, <fd>, <some offset>)`
+        - This needs to return in the lower 47-bit
+        - AArch64 thunk libraries need to be returned in same guest address space because of returning local pointers.
+      - AArch64 thunked library does an ioctl syscall, which calls IOCTL_DRM, allocates buffer
+        - This needs to return in the lower 47-bit
+      - FEX internal allocator calls mmap to allocate some memory
+        - This can return in the entire unrestricted 48-bit VA range.
+
+    - Possible solutions
+      - Same solutions as Thunks off
+
+FEX+32Bit:
+  - Common problems:
+    - Guest can not allocate memory in the >4GB VA space
+  - Current workarounds:
+    - Allocate all VA space above 4GB. Up to 256TB (subtract 4GB) of VA space
+      - Takes **50-100 ms**, benchmarked on Apple M1. Cortex is slower.
+      - Additional time comes from searching for holes in the space due to library allocations already existing.
+
+  - Thunks Off:
+    - FEX controls all guest syscalls
+    - All *guest* memory allocation syscalls must return data in the VA range below 4GB to match 32-bit x86
+    - All *host* memory allocations are unrestricted and can be allowed to go in to the 48-bit range
+
+    - Problem examples:
+      - Guest application loads shared library with `mmap(nullptr, <size>, <prot>, <flags>, <fd>, <some offset>)`
+        - This needs to return in the lower 4GB
+      - Guest application does an ioctl syscall, which calls IOCTL_DRM, allocates buffer
+        - This needs to return in the lower 4GB
+      - FEX internal allocator calls mmap to allocate some memory
+        - This can return in the entire unrestricted 48-bit VA range.
+
+    - Possible solutions:
+      Same solutions as the 64-bit side, but instead of restricting ranges to the lower 47-bits, restricting ranges to the lower 4GB.
+
+  - Thunks On:
+    - FEX no longer controls all syscalls.
+    - Syscalls inside of the emulated space are still captured.
+    - Syscalls from a thunk library (like libGL) are uncaptured
+    - All *guest AND thunk* memory allocation syscalls must return data in the VA range below 4GB to match 32-bit x86
+    - FEX itself can still allocate in 48-bit range fine.
+
+    - Problem examples:
+      - AArch64 glibc loads shared library thunk with `mmap(nullptr, <size>, <prot>, <flags>, <fd>, <some offset>)`
+        - This needs to return in the lower 4GB
+        - AArch64 thunk libraries need to be returned in same guest address space because of returning local pointers.
+      - AArch64 thunked library does an ioctl syscall, which calls IOCTL_DRM, allocates buffer
+        - This needs to return in the lower 4GB
+      - FEX internal allocator calls mmap to allocate some memory
+        - This can return in the entire unrestricted 48-bit VA range.
+
+    - Possible solutions
+      - Same solutions as Thunks off
+
+Possible pain points:
+  - A thunk library allocating memory might pick up on FEX's internal memory allocator.
+    - This can be fixed with time and symbol visibility fixes
+    - For now FEX might leak /some/ data in to guest VA range when thunks are enabled
+    - Thunks not enabled there is no leak

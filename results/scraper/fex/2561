@@ -1,0 +1,80 @@
+BEXTR concerns (formerly "shift thoughts")
+Sorry if these are incorrect or already on the to-do list. Feel free to ignore it, but I was just reading the code and figured this might be helpful.
+
+---
+
+[DONE] I noticed a lot of comments saying "x86 masks the shift by 0x3F or 0x1F depending on size of op", followed by emitting AND operations.
+
+https://github.com/FEX-Emu/FEX/blob/fea0162/External/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp#L2075-L2080
+
+```cpp
+  // x86 masks the shift by 0x3F or 0x1F depending on size of op
+  if (Size == 64) {
+    Src = _And(Src, _Constant(Size, 0x3F));
+  } else {
+    Src = _And(Src, _Constant(Size, 0x1F));
+  }
+```
+
+AArch64 has the same masking behaviour, so this seems unnecessary? (Though I'm not sure about the IR semantics, and maybe this is optimised out later anyway, or helpful for computing flags or something).
+
+---
+
+[DONE] SVE has [shifts where "the shift amount operand is a vector of unsigned elements in which all bits are significant"](https://developer.arm.com/documentation/ddi0596/2021-12/SVE-Instructions/LSL--vectors---Logical-shift-left-by-vector--predicated--), seemingly matching AVX, which would make the DUP/UMIN unnecessary:
+
+https://github.com/FEX-Emu/FEX/blob/fea0162/External/FEXCore/Source/Interface/Core/JIT/Arm64/VectorOps.cpp#L2102-L2108
+
+```cpp
+    const auto Mask = PRED_TMP_32B.Merging();
+
+    dup_imm(SubRegSize, VTMP2.Z(), MaxShift);
+    umin(SubRegSize, VTMP2.Z(), Mask, VTMP2.Z(), ShiftVector.Z());
+
+    movprfx(Dst.Z(), Vector.Z());
+    lsl(SubRegSize, Dst.Z(), Mask, Dst.Z(), VTMP2.Z());
+```
+
+---
+
+[DONE] On the Adv.SIMD side, I figured I'd mention that you can clamp the 64-bit shift amount using UQSHL + USHR, saving a couple of instructions. (That also works for smaller element sizes, but the latency is worse than the current MOVI + UMIN.)
+
+https://github.com/FEX-Emu/FEX/blob/fea0162/External/FEXCore/Source/Interface/Core/JIT/Arm64/VectorOps.cpp#L2110-L2122
+
+```cpp
+    if (ElementSize < 8) {
+      movi(SubRegSize, VTMP1.Q(), MaxShift);
+      umin(SubRegSize, VTMP1.Q(), VTMP1.Q(), ShiftVector.Q());
+    } else {
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, MaxShift);
+      dup(SubRegSize, VTMP1.Q(), TMP1.R());
+
+      // UMIN is silly on Adv.SIMD and doesn't have a variant that handles 64-bit elements
+      cmhi(SubRegSize, VTMP2.Q(), ShiftVector.Q(), VTMP1.Q());
+      bif(VTMP1.Q(), ShiftVector.Q(), VTMP2.Q());
+    }
+
+    ushl(SubRegSize, Dst.Q(), Vector.Q(), VTMP1.Q());
+```
+
+---
+
+And finally your BEXTR looks a little suspicious:
+
+https://github.com/FEX-Emu/FEX/blob/fea0162/External/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp#L2309-L2321
+```cpp
+  // Now handle the length specifier.
+  auto Length = _Bfe(8, 8, Src2);
+  auto SanitizedLength = _Select(IR::COND_ULE,
+                                 Length, MaxSrcBitOp,
+                                 Length, MaxSrcBitOp);
+
+  // Now build up the mask
+  // (1 << SanitizedLength) - 1
+  auto One = _Constant(SrcSize, 1);
+  auto Mask = _Sub(_Lshl(One, SanitizedLength), One);
+
+  // Now put it all together and make the result.
+  auto Dest = _And(SanitizedShifted, Mask);
+```
+
+Length is sanitised so it's at most SrcSize-1, but I believe BEXTR allows you to specify length=SrcSize and start=0, and get the whole register unchanged? (Unfortunately I can't see a way to support both that and length=0 without adding instructions.)

@@ -1,0 +1,159 @@
+Automate thunk library generation using libclang
+**Draft** sketching a possible design for a libclang-based thunk library generator.
+
+# Terminology
+
+* host library: Native host library installed globally, e.g. /usr/lib/aarch64-linux-gnu/libX11.so
+* guest library: Native guest library installed in the rootfs, e.g. $ROOTFS/usr/lib/x86_64-linux-gnu/libX11.so
+* guest thunk library: The shim library shipped with FEX and loaded in place of the actual guest library
+* host thunk library: The shim library shipped with FEX and exporting symbols linked to guest thunk functions
+* guest/host thunk functions: Shim functions exported by the guest/host thunk library
+* guest/host library functions: Functions exported by the guest/host library
+
+# Syntax
+
+[Example generator input](https://gist.github.com/neobrain/67f3dc9f14d3c8a8e88bae808242dcc2)
+
+Thunked functions are defined by defining a struct called `fex_gen_config` and specializing it for each function that should be exported from the guest/host thunk libraries. The code emitted by the thunk generator can be customized by defining certain members to the specialized structs, as outlined below.
+
+```cpp
+template<auto>
+struct fex_gen_config {
+  // Global per-module (or per-namespace) settings
+};
+
+// For each exported function:
+template<> struct fex_gen_config<XCreateIC> {
+  // Per-function config, see below
+};
+```
+
+C++ namespaces can be used to group functions together with different settings specified in the non-specialized `fex_gen_config`.
+
+## Per-function config
+
+### Variadic functions
+
+If the member alias `uniform_va_type` of type `arg_type` is defined, a variadic guest-function of the form `ret func(other_params, ...)` will be linked to a host-function `ret func(other_params, arg_type* args, size_t num_args)`. As indicated by the name "uniform", this can only be used when the implementation treats all parameters as the same type.
+
+```cpp
+template<> struct fex_gen_config<XCreateIC> {
+    using uniform_va_type = unsigned long;
+};
+```
+
+### Function pointer parameters ("callbacks")
+
+Guest function pointers can't be used as callbacks for host libraries, so it's required to specify a strategy on how to deal with this:
+
+* If `fex_gen_config` inherits from `callback_through_user_data<cb_idx, data_idx>`, the guest-provided callback (parameter index `cb_idx`) is replaced by a fixed host-function and the data pointer (parameter index `data_idx`) is replaced by a custom struct containing original data pointer and the original guest callback. This wrapped data will be heap-allocated and must be deallocated explicitly.
+
+* If `fex_gen_config` inherits from `callback_through_user_data_on_stack<cb_idx, data_idx>`, this will have the same effect as inheriting from `callback_through_user_data`, but the internal user data struct is placed on the stack so that memory doesn't need to be deallocated explicitly. This only works if the native host library doesn't use the callback after it returns from the thunked function.
+
+* If `fex_gen_config` inherits from `callback_stub<cb_idx>`, the guest-provided callback is replaced by a fixed host-function that will trigger a runtime error when being called.
+
+* If `fex_gen_config` inherits from `callback_guest<cb_idx>`, the guest-provided callback is assumed to never be called on the host-side. This is ensured by replacing the corresponding parameter in the host library function with an uncallable opaque handle type that can only be passed back to the guest thunk library.
+
+### Factory functions that return objects with vtables/function pointers
+
+Vtables and function pointers initialized by host functions (such as when constructing objects) cannot be called by the guest. If `fex_gen_config` inherits from `fixup_vtable_in_return`, FEX will generate additional code to fixup returned function pointers with function pointers that are both host-callable and guest-callable. This is done recursively for any (possibly nested) function pointer members in the returned object.
+
+```cpp
+template<> struct fex_gen_config<XCreateImage> : fex_gen::fixup_vtable_in_return {
+};
+```
+
+If `fex_gen_config` inherits from `returns_guest_pointer`, FEX will *not* generate this magic and instead trust that the host endpoint of the thunk will return a pointer that can safely be used by the guest (and will never be used by the host itself).
+
+- [ ] TODO: If the function returns an object with vtables but this customization is not specified, should the generator fail loudly or should it assume the function did not freshly create the object?
+
+- [ ] TODO: Should a customization point be added for the returned function pointer?
+
+### Overriding host thunk function
+
+Host thunk functions usually just forward their arguments to host library functions. If `fex_gen_config` inherits from `custom_host_impl`, the thunk unpacker will call `fexfn_impl_FUNC` instead of the host library function. (The latter is still available through `fex_ldr` though, hence it can be used in `fexfn_impl_FUNC` if needed.)
+
+```cpp
+template<> struct fex_gen_config<XFree> : fex_gen::custom_host_impl {
+};
+```
+
+### Overriding guest thunk function
+
+Guest thunk functions usually just pack their arguments into a struct that is passed to `fex_thunks_<lib>_<function>`. If `fex_gen_config` inherits from `custom_guest_impl`, the generator will expect the guest entrypoint to be defined manually such that functions can be customized more freely. Packing the arguments and invoking the thunk can be done explicitly by calling `fexfn_pack_<function>`.
+
+```cpp
+template<> struct fex_gen_config<XFree> : fex_gen::custom_guest_impl {
+};
+```
+
+### Adding internal parameters
+
+Host thunk functions usually have the same signature as the guest thunk function they're linked to. If a member type alias`internal_args`, its type will be appended to the host thunk function.
+
+```cpp
+template<> struct fex_gen_config<XInitThreads> {
+    using internal_args = XUnlockMutex_fn_type;
+};
+```
+
+- [ ] TODO: How to specify multiple parameters? Is `std::tuple` suitable or do we need a custom type list?
+
+### Disabling thunking locally
+
+Some functions (such as printf-likes) don't need thunking per se and may be simpler to implement without. If `fex_gen_config` inherits from `guest_only`, no thunks or (un-)packing functions will be generated. The guest-side entrypoint must be defined manually
+
+```cpp
+template<> struct fex_gen_config<XFree> : fex_gen::guest_only {
+};
+```
+
+## Global per-module settings
+
+### Automatic function discovery
+
+Instead of manually listing functions to be exported, the generator can automatically treat all functions declared in a library's header as if they had been defined with an empty `fex_gen_config`. Functions that cannot be processed without explicit annotation will trigger an error unless an explicit `fex_gen_config` is defined for them.
+
+- [ ] TODO: What syntax to use for this? How can we appropriately constrain the set to avoid invalid exports?
+
+### Custom host function loader
+Usually, the host thunk library will load any required symbols from the native host library using dlsym. Some libraries (such as libGL) requires thunking functions that aren't exported by the library directly but exposed through a dedicated lookup function (e.g. glXGetProcAddress).
+
+```cpp
+template<auto>
+struct fex_gen_config {
+  // Must refer to a function defined manually
+  const char* loader = "InternalGetProcAddress";
+};
+
+template<>
+struct fex_gen_config<glBegin> {
+};
+```
+
+### Guest-side symbol table
+
+All host-side thunk libraries define a table called `export` listing all thunked functions. Some libraries (notably libGL) require a similar guest-side table to be created to map each function name (as `const char*`) to the corresponding packing function. This can be requested by making the unspecialized `fex_gen_config` inherit from `guest_symbol_table`. The generated symbol table will be named after the containing namespace:
+
+```cpp
+namespace internal_functions {
+
+template<auto>
+struct fex_gen_config : guest_symbol_table {
+  // Will cause a guest-side symbol table called "internal_functions_symtable" to be generated
+};
+
+} // end of namespace
+```
+
+# Update history
+
+- 17 Sep 2021: Binary function customization parameters are now implemented using inheritance from a tag type. Previously, a boolean member had to be declared.
+- 17 Sep 2021: Type-based function customization parameters are now implemented using `using customization_name = type;`. Previously, a member had to be declared where its type would act as the actual parameter.
+- 18 Sep 2021: `custom_host_unpack` renamed to `custom_host_impl`. Instead of replacing the `fexfn_unpack_func`, the unpacker is now autogenerated as usual but will call a user-provided `fexfn_impl_func` function instead of the host library function (`fex_ldr_func`).
+- 2 Oct 2021: Added tags for callback parameters (`callback_through_user_data` and `callback_stub`)
+- 5 Oct 2021: Added tags for guest-side symbol tables
+- 6 Oct 2021: Added `returns_guest_pointer` tag
+- 8 Oct 2021: Added `guest_only` tag for guest-only functions, which don't need thunks
+- 8 Oct 2021: Added `custom_guest_impl` tag
+- 30 Oct 2021: Added `callback_guest` tag to callbacks that are only called guest-side

@@ -1,0 +1,46 @@
+Investigate whether dynamic linking triggers spurious allocations
+EDIT (neobrain): The original observation stem from an invalid CI configuration. It's unconfirmed at this point whether dynamic linking incurs any spurious allocations. Original observation follows:
+
+<hr>
+
+#5476 uncovered this issue using the glibc fault CI test. A runner happened to have libxxhash-dev installed, which causes symbol lookup to happen dynamically, which causes glibc allocations.
+```
+Program terminated with signal SIGILL, Illegal instruction.
+#0  FEXCore::Assert::ForcedAssert () at /home/ryanh/FEX/FEXCore/Source/Utils/ForcedAssert.cpp:9
+9         asm volatile("hlt #1");
+(gdb) y
+Undefined command: "y".  Try "help".
+(gdb) bt
+#0  FEXCore::Assert::ForcedAssert () at /home/ryanh/FEX/FEXCore/Source/Utils/ForcedAssert.cpp:9
+#1  0x0000aaaac2ac23f0 in FEXCore::Allocator::EvaluateReturnAddress (Return=0xffffbb8c0ed4 <__GI__dl_exception_create_format+244>) at /home/ryanh/FEX/FEXCore/Source/Utils/AllocatorOverride.cpp:114
+#2  0x0000aaaac2ac20e4 in fault_malloc (size=56) at /home/ryanh/FEX/FEXCore/Source/Utils/AllocatorOverride.cpp:130
+#3  0x0000ffffbb8c0ed4 in malloc (size=56) at ../include/rtld-malloc.h:56
+#4  __GI__dl_exception_create_format (exception=exception@entry=0xffffeda66d68, objname=0xffffeda6c721 "./Bin/FEXLoader", fmt=fmt@entry=0xffffbb8df4d0 "undefined symbol: %s%s%s") at ./elf/dl-exception.c:157
+#5  0x0000ffffbb8c74a8 in _dl_lookup_symbol_x (undef_name=0xaaaac2508f06 "XXH3_64bits", undef_map=undef_map@entry=0xffffbb8fa370, ref=ref@entry=0xffffeda66dd8, symbol_scope=<optimized out>, version=0xffffbb8bb018, type_class=type_class@entry=1,
+    flags=1, skip_map=skip_map@entry=0x0) at ./elf/dl-lookup.c:877
+#6  0x0000ffffbb8cd080 in _dl_fixup (l=0xffffbb8fa370, reloc_arg=3504) at ./elf/dl-runtime.c:95
+#7  0x0000ffffbb8cf1ac in _dl_runtime_resolve () at ../sysdeps/aarch64/dl-trampoline.S:100
+#8  0x0000aaaac2794140 in FEXCore::IR::AOTIRCaptureCache::LoadAOTIRCacheEntry (this=0xffffbae70568, filename="/home/ryanh/.fex-emu/RootFS/Ubuntu_22_04/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+    at /home/ryanh/FEX/FEXCore/Source/Interface/IR/AOTIR.cpp:384
+#9  0x0000aaaac2662414 in FEXCore::Context::ContextImpl::LoadAOTIRCacheEntry (this=0xffffbae70000, filename="/home/ryanh/.fex-emu/RootFS/Ubuntu_22_04/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+    at /home/ryanh/FEX/FEXCore/Source/Interface/Core/Core.cpp:1054
+#10 0x0000aaaac28d6d64 in FEX::HLE::SyscallHandler::TrackMmap (this=0xffffbae70800, Thread=0x0, Base=140737352839168, Size=8192, Prot=1, Flags=2066, fd=6, Offset=0)
+    at /home/ryanh/FEX/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp:214
+#11 0x0000aaaac2948e68 in FEX::HLE::x64::x64SyscallHandler::GuestMmap (this=0xffffbae70800, Thread=0x0, addr=0x7ffff7ec3000, length=8192, prot=1, flags=2066, fd=6, offset=0)
+    at /home/ryanh/FEX/Source/Tools/LinuxEmulation/LinuxSyscalls/x64/Memory.cpp:41
+#12 0x0000aaaac2645888 in ELFCodeLoader::MapFile (this=0xffffeda6afa0, file=..., Base=140737352839168, Header=..., prot=1, flags=2066, Handler=0xffffbae70800) at /home/ryanh/FEX/Source/Tools/FEXLoader/ELFCodeLoader.h:81
+#13 0x0000aaaac2644d24 in ELFCodeLoader::LoadElfFile (this=0xffffeda6afa0, Elf=..., BrkBase=0x0, Handler=0xffffbae70800, LoadHint=0) at /home/ryanh/FEX/Source/Tools/FEXLoader/ELFCodeLoader.h:147
+#14 0x0000aaaac26343a4 in ELFCodeLoader::MapMemory (this=0xffffeda6afa0, Handler=0xffffbae70800) at /home/ryanh/FEX/Source/Tools/FEXLoader/ELFCodeLoader.h:472
+#15 0x0000aaaac262e688 in main (argc=7, argv=0xffffeda6b798, envp=0xffffeda6b7d8) at /home/ryanh/FEX/Source/Tools/FEXLoader/FEXLoader.cpp:567
+(gdb) frame 8
+#8  0x0000aaaac2794140 in FEXCore::IR::AOTIRCaptureCache::LoadAOTIRCacheEntry (this=0xffffbae70568, filename="/home/ryanh/.fex-emu/RootFS/Ubuntu_22_04/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2")
+    at /home/ryanh/FEX/FEXCore/Source/Interface/IR/AOTIR.cpp:384
+384         auto filename_hash = XXH3_64bits(filename.c_str(), filename.size());
+(gdb)
+```
+
+We can not dynamically link xxhash at the very least. We should double check our other dependencies to ensure we don't hit dynamic linking.
+
+At the end of the day we should only dynamically link against PT_INTERP, libc, libgcc_s, libm, and libstdc++.
+
+Ideally we could also get rid of libstdc++ but I'm not sure if that's viable when doing dlopen against C++ libraries? Would need a bit more investigation for that one.

@@ -1,0 +1,63 @@
+openat() doesn't ignore dirfd if path is absolute
+I'm using FEX 2310, locally built from source according to https://github.com/FEX-Emu/FEX#building-fex, on a Raspberry Pi 4b running the Debian-12-based Raspberry Pi OS; FEX is using an Ubuntu 22.04 rootfs.
+
+## Steps to reproduce
+
+Compile this for x86, copy it to the target device and run it:
+
+```
+#define _GNU_SOURCE
+#include <assert.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main (void)
+{
+  int res = chdir ("/");
+  assert (res == 0);
+
+  int root = openat (AT_FDCWD, "/", O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC);
+  printf ("root: %d\n", root);
+  int fd_abs = openat (root, "/etc/os-release", O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  printf ("fd,abs: %d\n", fd_abs);
+  int cwd_abs = openat (AT_FDCWD, "/etc/os-release", O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  printf ("cwd,abs: %d\n", cwd_abs);
+  int fd_rel = openat (root, "etc/os-release", O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  printf ("fd,rel: %d\n", fd_rel);
+  int cwd_rel = openat (AT_FDCWD, "etc/os-release", O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  printf ("cwd,rel: %d\n", cwd_rel);
+
+  char *s = NULL;
+  res = asprintf (&s, "ls -l /proc/%d/fd", getpid ());
+  assert (res > 0);
+  system (s);
+  return 0;
+}
+```
+
+## Expected result
+
+The fds identified as `fd,abs` (short for "dirfd = root, path is absolute") and `cwd,abs` (dirfd = AT_FDCWD, path is absolute) point to the `/etc/os-release` from the Ubuntu rootfs, the same one you'd read by `FEXBash -c 'cat /etc/os-release'`. In my case this is really `/home/user/.fex-emu/RootFS/Ubuntu_22_04/usr/lib/os-release`, and `/proc` shows it as such.
+
+The fds identified as `fd,rel` (dirfd = root, path is relative) and `cwd,rel` (dirfd = AT_FDCWD, path is relative) point to the `/etc/os-release` from the real rootfs, the same one you'd read by `cat /etc/os-release` from an ordinary ARM shell. In my case this is really `/usr/lib/os-release`.
+
+## Actual result
+
+The fd identified as `fd,abs` is the real /etc/os-release: FEX is not redirecting it to the rootfs' /etc/os-release. This is not as I expected: the openat(2) man page documents "If the pathname given in pathname is absolute, then dirfd is ignored" and I expected the same thing to be true when using FEX.
+
+The other three are as I expected.
+
+## Context
+
+The `fd,abs` case is a simplification of something I was trying to do in a development branch of Steam's steam-runtime-system-info and pressure-vessel, to make sure that we take FEX's rootfs pseudo-overlay into account when reading information about the real root filesystem.
+
+## Workaround
+
+```
+if (path[0] == '/')
+  fd = AT_FDCWD;
+```
+
+to force all accesses to absolute paths onto the `cwd,abs` code path, which FEX implements the way I had expected.

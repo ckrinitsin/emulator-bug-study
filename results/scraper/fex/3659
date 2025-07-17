@@ -1,0 +1,272 @@
+Documenting difference between AVX2 gather loadstores before they're implemented
+Some prototyping of AVX2 gather loadstores in CPP just to show how ugly it is between SVE-256 and SVE-128 before FEX-Emu has implemented it.
+
+<details>
+<summary>CPP</summary>
+
+```cpp
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+
+#ifdef __aarch64__
+// Compile with `-O3 -march=armv8-a+sve -msve-vector-bits=128`
+// Or
+// Compile with `-O3 -march=armv8-a+sve -msve-vector-bits=256`
+// To see the difference
+#include <arm_neon.h>
+#include <arm_sve.h>
+
+struct ContextObject {
+    uint8_t Pad[512];
+    // Maximum uint64_t times 4 times for gather loadstores.
+    uint8_t TempSpace[32];
+};
+
+#if __ARM_FEATURE_SVE_BITS != 128
+using Vec256 = svuint64_t;
+
+template<typename IndexType, size_t Scale>
+Vec256 GatherLoad_ArbitraryScale(
+    ContextObject *Ctx,
+    svbool_t pg_256bit,
+    uint64_t *base,
+    Vec256 indices) {
+    using IndexTypeScaled = typename std::conditional<std::is_signed_v<IndexType>, int64_t, uint64_t>::type;
+    IndexType *Indexes = (IndexType*)Ctx->TempSpace;
+    svst1_u64(pg_256bit, Indexes, indices);
+    for (size_t i = 0; i < 4; ++i) {
+        IndexTypeScaled Index = Indexes[i];
+        uint64_t *Addr = (uint64_t*)((uint64_t)base + (Index << Scale));
+        Indexes[i] = *Addr;
+    }
+
+    return svld1(pg_256bit, Indexes);
+}
+
+Vec256 GatherLoad1_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return svld1_gather_u64offset_u64(pg_256bit, base, indices);
+}
+Vec256 GatherLoad2_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return GatherLoad_ArbitraryScale<uint64_t, 2>(Ctx, pg_256bit, base, indices); 
+}
+Vec256 GatherLoad4_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return GatherLoad_ArbitraryScale<uint64_t, 4>(Ctx, pg_256bit, base, indices); 
+}
+Vec256 GatherLoad8_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return svld1_gather_u64index_u64(pg_256bit, base, indices);
+}
+#elif __ARM_FEATURE_SVE_BITS == 128
+struct Vec256 {
+    uint64x2_t Lower;
+    uint64x2_t Upper;
+};
+
+template<typename IndexType, size_t Scale>
+Vec256 GatherLoad_ArbitraryScale(
+    ContextObject *Ctx,
+    svbool_t pg_256bit,
+    uint64_t *base,
+    Vec256 indices) {
+    using IndexTypeScaled = typename std::conditional<std::is_signed_v<IndexType>, int64_t, uint64_t>::type;
+    IndexType *Indexes = (IndexType*)Ctx->TempSpace;
+    memcpy(Indexes, &indices, sizeof(Vec256));
+    for (size_t i = 0; i < 4; ++i) {
+        IndexTypeScaled Index = Indexes[i];
+        uint64_t *Addr = (uint64_t*)((uint64_t)base + (Index << Scale));
+        Indexes[i] = *Addr;
+    }
+
+    Vec256 Result{};
+    memcpy(&Result, Indexes, sizeof(Vec256));
+    return Result;
+}
+
+Vec256 GatherLoad1_u64(
+    ContextObject *Ctx,
+    svbool_t pg_128bit,
+    uint64_t *base,
+    svuint64_t indices_lower,
+    svuint64_t indices_upper) {
+    Vec256 Result{};
+    uint64_t *Indexes = (uint64_t*)Ctx->TempSpace;
+    auto Lower = svld1_gather_u64offset_u64(pg_128bit, base, indices_lower);
+    auto Upper = svld1_gather_u64offset_u64(pg_128bit, base, indices_upper);
+    svst1_u64(pg_128bit, Indexes, Lower);
+    svst1_u64(pg_128bit, &Indexes[4], Upper);
+    memcpy(&Result, Indexes, sizeof(Vec256));
+    return Result;
+}
+Vec256 GatherLoad2_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return GatherLoad_ArbitraryScale<uint64_t, 2>(Ctx, pg_256bit, base, indices); 
+}
+Vec256 GatherLoad4_u64(ContextObject *Ctx, svbool_t pg_256bit, uint64_t *base, Vec256 indices) {
+    return GatherLoad_ArbitraryScale<uint64_t, 4>(Ctx, pg_256bit, base, indices); 
+}
+Vec256 GatherLoad8_u64(    ContextObject *Ctx,
+    svbool_t pg_128bit,
+    uint64_t *base,
+    svuint64_t indices_lower,
+    svuint64_t indices_upper) {
+    Vec256 Result{};
+    uint64_t *Indexes = (uint64_t*)Ctx->TempSpace;
+    auto Lower = svld1_gather_u64index_u64(pg_128bit, base, indices_lower);
+    auto Upper = svld1_gather_u64index_u64(pg_128bit, base, indices_upper);
+    svst1_u64(pg_128bit, Indexes, Lower);
+    svst1_u64(pg_128bit, &Indexes[4], Upper);
+    memcpy(&Result, Indexes, sizeof(Vec256));
+    return Result;}
+#else
+#error unsupported
+#endif
+
+#else
+#include <immintrin.h>
+// Not quite matching since this is doing an insert and mask which FEX needs to handle
+using Vec256 = __m256i;
+Vec256 GatherLoad1(uint64_t *base, Vec256 indices) {
+    return _mm256_i64gather_epi64 (base, indices, 1);
+}
+Vec256 GatherLoad2(uint64_t *base, Vec256 indices) {
+    return _mm256_i64gather_epi64 (base, indices, 2);
+}
+Vec256 GatherLoad4(uint64_t *base, Vec256 indices) {
+    return _mm256_i64gather_epi64 (base, indices, 4);
+}
+Vec256 GatherLoad8(uint64_t *base, Vec256 indices) {
+    return _mm256_i64gather_epi64 (base, indices, 8);
+}
+#endif
+```
+
+</details>
+<details>
+  <summary>Assembly SVE-128bit</summary>
+
+```asm
+GatherLoad1_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t, __SVUint64_t): // @GatherLoad1_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t, __SVUint64_t)
+        ld1d    { z0.d }, p0/z, [x1, z0.d]
+        mov     x8, #64                         // =0x40
+        mov     x9, #68                         // =0x44
+        ld1d    { z1.d }, p0/z, [x1, z1.d]
+        st1d    { z0.d }, p0, [x0, x8, lsl #3]
+        st1d    { z1.d }, p0, [x0, x9, lsl #3]
+        ldp     q0, q1, [x0, #512]
+        ret
+GatherLoad2_u64(ContextObject*, __SVBool_t, unsigned long*, Vec256): // @GatherLoad2_u64(ContextObject*, __SVBool_t, unsigned long*, Vec256)
+        fmov    x9, d0
+        mov     x8, v0.d[1]
+        stp     q0, q1, [x0, #512]
+        fmov    x10, d1
+        lsl     x9, x9, #2
+        lsl     x8, x8, #2
+        lsl     x10, x10, #2
+        ldr     x9, [x9, x1]
+        str     x9, [x0, #512]
+        mov     x9, v1.d[1]
+        ldr     x8, [x8, x1]
+        str     x8, [x0, #520]
+        ldr     x8, [x10, x1]
+        lsl     x9, x9, #2
+        str     x8, [x0, #528]
+        ldr     x8, [x9, x1]
+        str     x8, [x0, #536]
+        ldp     q0, q1, [x0, #512]
+        ret
+GatherLoad4_u64(ContextObject*, __SVBool_t, unsigned long*, Vec256): // @GatherLoad4_u64(ContextObject*, __SVBool_t, unsigned long*, Vec256)
+        fmov    x9, d0
+        mov     x8, v0.d[1]
+        stp     q0, q1, [x0, #512]
+        fmov    x10, d1
+        lsl     x9, x9, #4
+        lsl     x8, x8, #4
+        lsl     x10, x10, #4
+        ldr     x9, [x9, x1]
+        str     x9, [x0, #512]
+        mov     x9, v1.d[1]
+        ldr     x8, [x8, x1]
+        str     x8, [x0, #520]
+        ldr     x8, [x10, x1]
+        lsl     x9, x9, #4
+        str     x8, [x0, #528]
+        ldr     x8, [x9, x1]
+        str     x8, [x0, #536]
+        ldp     q0, q1, [x0, #512]
+        ret
+GatherLoad8_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t, __SVUint64_t): // @GatherLoad8_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t, __SVUint64_t)
+        ld1d    { z0.d }, p0/z, [x1, z0.d, lsl #3]
+        mov     x8, #64                         // =0x40
+        mov     x9, #68                         // =0x44
+        ld1d    { z1.d }, p0/z, [x1, z1.d, lsl #3]
+        st1d    { z0.d }, p0, [x0, x8, lsl #3]
+        st1d    { z1.d }, p0, [x0, x9, lsl #3]
+        ldp     q0, q1, [x0, #512]
+        ret
+```
+
+</details>
+<details>
+  <summary>Assembly SVE-256bit</summary>
+
+```asm
+GatherLoad1_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t): // @GatherLoad1_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t)
+        ld1d    { z0.d }, p0/z, [x1, z0.d]
+        ret
+GatherLoad2_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t): // @GatherLoad2_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t)
+        mov     x8, #64                         // =0x40
+        st1d    { z0.d }, p0, [x0, x8, lsl #3]
+        ldr     x9, [x0, #512]
+        ldr     x10, [x0, #520]
+        lsl     x9, x9, #2
+        lsl     x10, x10, #2
+        ldr     x9, [x9, x1]
+        str     x9, [x0, #512]
+        ldr     x9, [x0, #528]
+        ldr     x10, [x10, x1]
+        lsl     x9, x9, #2
+        str     x10, [x0, #520]
+        ldr     x10, [x0, #536]
+        ldr     x9, [x9, x1]
+        lsl     x10, x10, #2
+        str     x9, [x0, #528]
+        ldr     x9, [x10, x1]
+        str     x9, [x0, #536]
+        ld1d    { z0.d }, p0/z, [x0, x8, lsl #3]
+        ret
+GatherLoad4_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t): // @GatherLoad4_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t)
+        mov     x8, #64                         // =0x40
+        st1d    { z0.d }, p0, [x0, x8, lsl #3]
+        ldr     x9, [x0, #512]
+        ldr     x10, [x0, #520]
+        lsl     x9, x9, #4
+        lsl     x10, x10, #4
+        ldr     x9, [x9, x1]
+        str     x9, [x0, #512]
+        ldr     x9, [x0, #528]
+        ldr     x10, [x10, x1]
+        lsl     x9, x9, #4
+        str     x10, [x0, #520]
+        ldr     x10, [x0, #536]
+        ldr     x9, [x9, x1]
+        lsl     x10, x10, #4
+        str     x9, [x0, #528]
+        ldr     x9, [x10, x1]
+        str     x9, [x0, #536]
+        ld1d    { z0.d }, p0/z, [x0, x8, lsl #3]
+        ret
+GatherLoad8_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t): // @GatherLoad8_u64(ContextObject*, __SVBool_t, unsigned long*, __SVUint64_t)
+        ld1d    { z0.d }, p0/z, [x1, z0.d, lsl #3]
+        ret
+```
+
+</details>
+
+The index scaling versions that don't match ARM SVE behaviour is particularly nasty but should hopefully not happen too frequently in practice.
+
+The index scaling versions without SVE-256 fall down the worst case path of being basically ASIMD, which can be cleaned up slightly when inside the JIT but is pretty bad.
+
+The index scaling versions that do match SVE behaviour go from 1 instruction with SVE to 7, so it's a bit spicy.
+If the gather operations are implemented with only an ASIMD implementation then it turns in to the equivalent of not matching SVE scaling behaviour with 128-bit operations (pretty bad).
+
+Once we support AVX gather loadstores then this documentation ticket can be closed.

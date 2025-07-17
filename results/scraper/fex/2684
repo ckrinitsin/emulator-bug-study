@@ -1,0 +1,56 @@
+Support PR_SET_MDWE
+Supporting PR_SET_MDWE is complex since FEX needs to allocate RWX JIT sections and this causes an application to no longer be able to execute WX pages.
+
+This is implemented in kernel 6.3 in commit `b507808ebce23561d4ff8c2aa1fb949fe402bc61` from ARM. This was implemented to work around a BPF filter problem where they couldn't implement RX + BTI mappings for systemd's `MemoryDenyWriteExecute` feature.
+
+This doesn't prevent allocating memory mirrors with RW + RX permissions. Additionally this flag gets inherited on new threads/processes, so if the application spins a new thread up then FEX will immediately not be able to allocate JIT memory.
+
+To support this we can do a couple things.
+1) Fake it - Just claim it is enabled and not care?
+2) Emulate in syscall handler - If enabled, just make sure all mprotect and mmap calls never have `PROT_EXEC | PROT_WRITE`.
+   - Since this doesn't affect previously mapped things so it works
+   - An annoyance is FEX needs to track all VMA permissions then (Which we already do for mtrack) and ensure if any are trying to be changed to WX that it gets rejected
+   - Kind of a pain
+3) Implement support for memory mirroring in JIT emitters and just enable.
+   - Probably the best solution since this doesn't block mirrors having different permissions
+   - Means we can pass the prctl through to the host
+   - Need to rewrite the emitter to support this. Given two pointers, one for writing and one for doing PC relative calculations against.
+   - ICache invalidation operating on executable mapped range
+   - XByak would need support added as well, which would be a pain.
+   - Consumes double the VA range for JIT code, should be fine.
+   - Needs memfd support.
+   - New JIT region allocation goes from mmap to memfd_create + ftruncate + mmap + mmap + close.
+   - Code caching also would need to be careful here.
+4) mprotect dance
+   - I have never liked this and don't want it.
+   - Since we do backpatching this would add even more overhead to that when it should be really quick.
+
+example:
+```cpp
+int main() {
+#define PR_SET_MDWE                 65
+#define PR_MDWE_REFUSE_EXEC_GAIN   1
+  prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0L, 0L, 0L);
+
+  // Test MDWE by allocating a mirror range.
+  // One as RX, one as RW.
+  int memfd = memfd_create("", MFD_CLOEXEC);
+  ftruncate(memfd, 4096);
+  // Needs to be MAP_SHARED for the mirror.
+  void* RW = mmap(nullptr, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  void* RX = mmap(nullptr, 4096, PROT_READ | PROT_EXEC, MAP_SHARED, memfd, 0);
+  close(memfd);
+  uint64_t Test = 0xc3c3c3c3c3c3c3c3; // Just a bunch of x86-64 ret.
+  memcpy(RW, &Test, sizeof(Test));
+
+  uint64_t Result{};
+  memcpy(&Result, RX, sizeof(Result));
+  printf("Did: 0x%lx == 0x%lx ? %s\n", Test, Result, Test == Result ? "Yes" : "No");
+
+  using Func = void(*)();
+  Func func = (Func)RX;
+  func(); // Will crash if mirror or protection fails.
+
+  return 0;
+}
+```

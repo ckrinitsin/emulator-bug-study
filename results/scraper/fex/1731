@@ -1,0 +1,68 @@
+Idea for partial TSO cost mitigation/pgo with MTE extensions
+Following up from yesterday's discussion,
+
+#### Overview
+Using `MTE` (https://www.kernel.org/doc/html/latest/arm64/memory-tagging-extension.html) which tracks a 4-bit tag per 16 bytes of memory we can mark every 16 bytes of memory as either being `local` to a cpu core, thus `non-tso` accesses are fine, or as `shared`, thus accesses need to be `tso`. MTE gives us 4 bits, so we can track up to 15 cpu cores plus 1 id used for `shared` memory.
+
+The `rseq` (https://www.efficios.com/blog/2019/02/08/linux-restartable-sequences/) kernel feature can be used to detect when a task is switched between cpu cores.
+
+We can then detect `non-tso` accesses to `shared` and `tso` accesses to `local` memory with a synchronous tag mismatch exception, and backpatch the offending instruction to use slower, tso instructions.
+
+The optimisation depends on `local`/`shared` memory access being a characteristic of the specific memory operation. While this is overall likely to be true, functions like memcpy will have to deal with both `shared` and `local` memory.
+
+There are several limitations to this approach, however it should still be useful for instrumentation and pgo.
+
+#### Limitations
+-  Ping-ponging between `tso` and `non-tso` access modes. I'm not sure there's a good workaround for that, as I don't think we can allow TSO ops to work on both `local` and `shared` memory using MTE
+- Thunks could have issues
+- Object code caching would be possible, but backpatching has to be done per vm group increasing the memory load
+- Linux doesn't support PROT_MTE with non ram file-backed mappings `PROT_MTE is only supported on MAP_ANONYMOUS and RAM-based file mappings (tmpfs, memfd).`
+- Can only support up to 15 host cpu cores
+- While tso ops need only to be done in `shared` memory accesses, not all `shared` memory accesses need to be tso. It is impossible to detect `shared` accesses that don't need to be `tso` using this approach.
+
+#### Variations
+- The actual memops could be interpreted in the segfault handler, either to guarantee forward progress and/or limit backpatching
+
+#### Details
+
+##### Setup
+- Compute `HostCoreId` as such that they are either [0,14] with 15 reserved for `shared` memory, or as [1, 15] with 0 reserved for `shared` memory.
+- Extend the guest cpu frame to have a "current cpu core mte id" field, `frame->HostCoreId`
+- Dedicate a caller saved register in the jit to shadow this value, `rHostCoreId`
+- Reload `rHostCoreId`  from `frame->HostCoreId` on every re-enter to the jit abi
+- Using rseq, keep `frame->HostCoreId` in sync with the current `HostCoreId`. An alternative is to read from the rseq core id field.
+- Using rseq, update `rHostCoreId` on cpu core migration if the code is in the jit abi
+
+Assuming 0 is used to indicate `shared` memory
+
+##### `local` memops
+```
+[0] rAddr = x86AddressGen(...)
+[1] bfi rAddr[59:56], rHostCoreId
+[2] non-tso memop rAddr, data, ....
+```
+
+##### `shared` memops
+```
+[0] rAddr = x86AddressGen(...)
+[1] bfc rAddr[59:56]
+[2] tso memop rAddr, data, ....
+```
+
+##### `local` -> `shared` migration & backpatching
+- on `SIGSEGV` with `.si_code = SEGV_MTESERR` where the offending memop is a `non-tso` memop
+- take some lock
+- change `.si_addr` TAG to 0
+- backpatch memop[1] to bfc
+- backpatch memop[2] to `tso` memop 
+- release lock
+- re-execute the sequence
+
+##### `shared` -> `local` migration & backpatching
+- on `SIGSEGV` with `.si_code = SEGV_MTESERR` where the offending memop is a `tso` memop
+- take some lock
+- change `.si_addr` TAG to `CoreId`
+- backpatch memop[1] to bfi
+- backpatch memop[2] to `non-tso` memop
+- release lock
+- re-execute the sequence

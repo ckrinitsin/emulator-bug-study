@@ -1,0 +1,51 @@
+Guest long jump out of signal handler doesn't reset host stack location
+Simple example:
+```cpp
+#include <csetjmp>
+#include <cstddef>
+#include <cstdint>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/mman.h>
+#include <sys/signal.h>
+#include <vector>
+#include <thread>
+
+static std::jmp_buf longjump{};
+int Result;
+
+static void SignalHandler(int Signal, siginfo_t *info, void *context) {
+  std::longjmp(longjump, 1);
+}
+
+static void Thread() {
+  struct sigaction act{};
+  act.sa_sigaction = SignalHandler;
+  act.sa_flags = SA_SIGINFO | SA_NODEFER;
+  sigaction(SIGSEGV, &act, nullptr);
+
+  size_t DataSize = 16 * 4096;
+  void *Data = mmap(nullptr, DataSize, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+  setjmp(longjump);
+
+  // This will infinite SIGSEGV now through the signal handler.
+  Result = ((int*)Data)[0];
+}
+
+int main() {
+  std::thread t(Thread);
+  t.join();
+  return Result;
+}
+```
+
+This run under FEX will eventually overrun the host stack, and also the host stacks sigaltstack, and then infinitely loop through the host alt-stack. It spins up a thread to ensure our host thread is one of the threads with an 8MB stack rather than the primary which has 128MB.
+
+We can't capture long jump since on x86 this is purely a userspace construct.
+This is likely only a problem if the guest signal handler is set with NODEFER since otherwise the signal gets masked and long jumping out means the mask doesn't get updated again and they won't receive the signal again...Although I guess multiple signals could be affecting each other so NODEFER isn't the only viable option to know when this can occur?
+
+Maybe we store guest stack frame locations on signal and then on the next signal see if the the guest has rewound the stack past the previous stored? If rewound then unwind the host stack similar to how we previously unwound the stack with the interpreter? Might get a little weird to unwind frames that live outside of the JIT. Also we don't currently store where our host stack lives, so we would need need to store guest stack location plus the host stack location which we currently store on the guest stack.
+
+I believe a game that uses this behaviour is moon-buggy. If it wasn't that one then it is one of the other games from the bsdgames package.
+Noticed this while working on deferred signals and thought that I was going to change behaviour but turned out this was already broken.

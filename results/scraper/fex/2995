@@ -1,0 +1,44 @@
+cvttpd2dq is probably broken
+According to InstCountCI,
+```
+cvttpd2dq xmm0, xmm1
+```
+Translates to:
+```
+fcvtn v4.2s, v17.2d
+fcvtzs v16.4s, v4.4s
+```
+
+`fcvtn` converts from a double to a float, which is a lossy operation. For example, the double 100000001.0 turns into the float 100000000.0f. (These are safely within the integer range, so the result will be the integer 100000000 instead of 100000001.)
+
+I suspect the tests are inadequate, mostly testing small, positive numbers: https://github.com/FEX-Emu/FEX/blob/c5f358b47adfc7afe00f7aeeddbd8fb28b5f601c/unittests/ASM/VEX/vcvttpd2dq.asm#L47-L55
+
+As well as a value that is too small to see the problem (0x4142434445464748 -> 2393736.541207228), and a value that is too large (0x5152535455565758 -> 5.562560877255032e+83) (and -1.0 and -2.0):
+
+https://github.com/FEX-Emu/FEX/blob/c5f358b47adfc7afe00f7aeeddbd8fb28b5f601c/unittests/ASM/OpSize/66_E6.asm#L25-L28
+
+I'd recommend testing with positive and negative powers of two (2^0 through 2^33 for a 32-bit operation like this) ± {1, 0.5, 0.25, 0.75} for tests, and adding zero, positive and negative infinity, and NaN:
+
+* 2**30±1 covers loss of precision
+* 2**n±0.5 ensures that numbers half-way between integers are rounding correctly
+* 2**n±0.25/0.75 test for rounding up/down/nearest.
+* Going up to 2**33 tests the out-of-range result.
+* Including negative numbers tests negative-out-of-range, and negative-rounding (e.g. rounding towards zero vs towards negative-infinity are indistinguishable when testing only positive numbers).
+* Infinity, NaN and zero are common floating point special cases.
+
+Python code to generate these:
+```python
+import struct
+
+l = set()
+for i in range(34):
+	for j in [0, 1, 0.5, 0.25, 0.75]:
+		l.add(float(2**i+j))
+		l.add(float(2**i-j))
+
+for i in list(l):
+	l.add(-i)
+
+for i in [float('-inf')] + sorted(l) + [float('inf'), float('nan')]:
+	print('dq 0x%016X ; %r' % (struct.unpack('<Q', struct.pack('<d',i))[0], i))
+```
